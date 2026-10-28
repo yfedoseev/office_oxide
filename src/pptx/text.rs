@@ -10,6 +10,7 @@ impl PptxDocument {
     pub(crate) fn unreadable_warnings(&self) -> Vec<String> {
         self.unreadable_parts
             .iter()
+            .chain(self.cosmetic_parts.iter())
             .map(|(part, err)| format!("skipped unreadable part {part}: {err}"))
             .chain(
                 (self.unreadable_parts_omitted > 0).then(|| {
@@ -26,7 +27,6 @@ impl PptxDocument {
     pub(crate) fn unreadable_text_warnings(&self) -> Vec<String> {
         self.unreadable_parts
             .iter()
-            .filter(|(part, _)| crate::core::unreadable::part_affects_text(part))
             .map(|(part, err)| format!("skipped unreadable part {part}: {err}"))
             .chain(
                 (self.unreadable_parts_omitted > 0).then(|| {
@@ -38,11 +38,7 @@ impl PptxDocument {
 
     /// Whether a part that can change the text could not be read.
     pub(crate) fn unreadable_loses_text(&self) -> bool {
-        self.unreadable_parts_omitted > 0
-            || self
-                .unreadable_parts
-                .iter()
-                .any(|(part, _)| crate::core::unreadable::part_affects_text(part))
+        self.unreadable_parts_omitted > 0 || !self.unreadable_parts.is_empty()
     }
 
     /// Extract plain text from the entire presentation.
@@ -663,6 +659,7 @@ mod tests {
             embedded_fonts: Vec::new(),
             unreadable_parts: Vec::new(),
             unreadable_parts_omitted: 0,
+            cosmetic_parts: Vec::new(),
             layouts: Vec::new(),
             masters: Vec::new(),
         }

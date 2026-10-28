@@ -126,6 +126,9 @@ pub struct DocxDocument {
     /// How many unreadable parts beyond the first 100 in [`Self::unreadable_parts`]
     /// were left out of the list.
     pub unreadable_parts_omitted: usize,
+    /// Unreadable parts that hold no text (the theme): in the metadata
+    /// warnings only; they change neither the text nor `text_truncated`.
+    pub(crate) cosmetic_parts: Vec<String>,
     /// Set when hyperlink target text copied while reading exceeded the text
     /// budget and some link lost its fragment or its target.
     pub(crate) link_notice: Option<String>,
@@ -234,6 +237,11 @@ impl DocxDocument {
         let skip_unreadable = |part: &str, e: &dyn std::fmt::Display| {
             unreadable_parts.borrow_mut().record(part, e);
         };
+        // A part reached through a relationship that holds no text (the
+        // theme): reported as a warning, never as lost text.
+        let skip_cosmetic = |part: &str, e: &dyn std::fmt::Display| {
+            unreadable_parts.borrow_mut().record_cosmetic(part, e);
+        };
         // A package or main-part relationships part the zip cannot decode
         // does not refuse the document: it reads as it did when such a part
         // was taken for absent (no relationships), with the loss reported.
@@ -260,7 +268,7 @@ impl DocxDocument {
             .and_then(|rel| match main_part.resolve_relative(&rel.target) {
                 Ok(pn) => Some(pn),
                 Err(e) => {
-                    skip_unreadable(&rel.target, &e);
+                    skip_cosmetic(&rel.target, &e);
                     None
                 },
             })
@@ -268,14 +276,14 @@ impl DocxDocument {
             .and_then(|pn| match opc.read_part(&pn) {
                 Ok(data) => Some((pn, data)),
                 Err(e) => {
-                    skip_unreadable(pn.as_str(), &e);
+                    skip_cosmetic(pn.as_str(), &e);
                     None
                 },
             })
             .and_then(|(pn, data)| match Theme::parse(&data) {
                 Ok(t) => Some(t),
                 Err(e) => {
-                    skip_unreadable(pn.as_str(), &e);
+                    skip_cosmetic(pn.as_str(), &e);
                     None
                 },
             });
@@ -749,7 +757,8 @@ impl DocxDocument {
             images.len()
         );
         package_properties.crc_mismatched_parts = opc.crc_mismatched_parts();
-        let (unreadable_parts, unreadable_parts_omitted) = unreadable_parts.into_inner().finish();
+        let (unreadable_parts, unreadable_parts_omitted, cosmetic_parts) =
+            unreadable_parts.into_inner().finish_with_cosmetic();
         Ok(DocxDocument {
             body,
             styles,
@@ -763,6 +772,10 @@ impl DocxDocument {
                 .map(|(part, reason)| format!("{part}: {reason}"))
                 .collect(),
             unreadable_parts_omitted,
+            cosmetic_parts: cosmetic_parts
+                .into_iter()
+                .map(|(part, reason)| format!("{part}: {reason}"))
+                .collect(),
             link_notice: links.notice(),
             embedded_fonts,
             images,

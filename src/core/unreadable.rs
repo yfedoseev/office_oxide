@@ -35,6 +35,10 @@ pub(crate) struct UnreadableParts {
     /// [`MAX_SEEN_BYTES`] of them).
     seen: HashSet<String>,
     seen_bytes: usize,
+    /// Parts the reader reached through a relationship it knows holds no text
+    /// (a theme) and could not read: kept apart from `listed`, because the
+    /// document reads as it did without them.
+    cosmetic: Vec<(String, String)>,
 }
 
 impl UnreadableParts {
@@ -78,41 +82,34 @@ impl UnreadableParts {
         self.listed.push((part, reason));
     }
 
-    /// The parts kept and the number left out.
+    /// Record a part reached through a relationship that holds no text (a
+    /// theme), which could not be read. It is a warning only: the text is
+    /// what it was, and no notice is written into it. What decides this is
+    /// how the reader reached the part, never the part's name, which the file
+    /// chooses.
+    pub(crate) fn record_cosmetic(&mut self, part: &str, reason: &dyn std::fmt::Display) {
+        if self.cosmetic.len() >= MAX_UNREADABLE_PARTS {
+            return;
+        }
+        let cut = |s: &str| s.chars().take(MAX_REPORT_CHARS).collect::<String>();
+        let (part, reason) = (cut(part), cut(&reason.to_string()));
+        log::warn!("{}: skipping unreadable part {part}: {reason}", self.label);
+        self.cosmetic.push((part, reason));
+    }
+
+    /// The parts kept and the number left out (the unit tests' view; the
+    /// readers use [`Self::finish_with_cosmetic`]).
+    #[cfg(test)]
     pub(crate) fn finish(self) -> (Vec<(String, String)>, usize) {
         (self.listed, self.omitted)
     }
-}
 
-/// Whether losing `part` can change the text a document yields.
-///
-/// A theme, an embedded font, the package properties, custom XML and printer
-/// settings colour, size or describe a document but hold none of its text, so
-/// a document that lost one still yields every word it did before: that is
-/// reported in the metadata warnings, but it is not a truncation and it adds
-/// no notice to the text. The name is compared as a zip lookup compares it
-/// (case and `\` against `/` aside).
-pub(crate) fn part_affects_text(part: &str) -> bool {
-    let name: String = part
-        .chars()
-        .map(|c| {
-            if c == '\\' {
-                '/'
-            } else {
-                c.to_ascii_lowercase()
-            }
-        })
-        .collect();
-    let name = name.trim_start_matches('/');
-    !(name.contains("/theme/")
-        || name.starts_with("theme/")
-        || name.contains("/fonts/")
-        || name.starts_with("fonts/")
-        || name.starts_with("docprops/")
-        || name.starts_with("customxml/")
-        || name.contains("/customxml/")
-        || name.contains("printersettings")
-        || name.contains("thumbnail"))
+    /// The parts kept, the number left out, and the parts that held no text.
+    pub(crate) fn finish_with_cosmetic(
+        self,
+    ) -> (Vec<(String, String)>, usize, Vec<(String, String)>) {
+        (self.listed, self.omitted, self.cosmetic)
+    }
 }
 
 /// The warning for `omitted` parts left out of a list.

@@ -293,6 +293,54 @@ fn test_a_damaged_theme_is_a_warning_and_not_a_loss_of_text() {
     }
 }
 
+/// The `docx()` fixture with its header stored at `word/{header}`.
+fn docx_with_header_at(header: &str) -> Vec<u8> {
+    zip_of(&[
+        (
+            "[Content_Types].xml",
+            types(&format!(
+                r#"<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/{header}" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>"#
+            )),
+        ),
+        ("_rels/.rels", root_rels("word/document.xml")),
+        (
+            "word/_rels/document.xml.rels",
+            rels(&format!(r#"<Relationship Id="rId2" Type="{R}/header" Target="{header}"/>"#)),
+        ),
+        (
+            "word/document.xml",
+            format!(
+                r#"<w:document xmlns:w="{WML}" xmlns:r="{R}"><w:body><w:p><w:r><w:t>body</w:t></w:r></w:p><w:sectPr><w:headerReference w:type="default" r:id="rId2"/></w:sectPr></w:body></w:document>"#
+            ),
+        ),
+        (
+            &format!("word/{header}"),
+            format!(r#"<w:hdr xmlns:w="{WML}"><w:p><w:r><w:t>HEAD</w:t></w:r></w:p></w:hdr>"#),
+        ),
+    ])
+}
+
+#[test]
+fn test_a_part_that_holds_text_is_a_loss_whatever_its_name_says() {
+    // Only a part the reader reached through a theme relationship is taken
+    // for one without text. A header that the file stores under a name that
+    // looks like a theme, a font or a thumbnail is still a header: losing it
+    // is reported in the text and sets the flag.
+    for header in [
+        "theme/header1.xml",
+        "fonts/header1.xml",
+        "thumbnail/header1.xml",
+    ] {
+        for how in DAMAGES {
+            let bytes = damage(docx_with_header_at(header), &format!("word/{header}"), how);
+            let doc = open(bytes, DocumentFormat::Docx);
+            assert_reported_damaged(&reported(&doc), header, &format!("{header} {how:?}"));
+            assert!(doc.plain_text().contains("skipped unreadable part"), "{header} {how:?}");
+            assert!(doc.to_ir().metadata.text_truncated, "{header} {how:?}");
+        }
+    }
+}
+
 // ---- pptx -----------------------------------------------------------------
 
 fn pptx() -> Vec<u8> {

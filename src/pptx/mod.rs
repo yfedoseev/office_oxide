@@ -98,6 +98,9 @@ pub struct PptxDocument {
     /// How many unreadable parts beyond the first 100 in [`Self::unreadable_parts`]
     /// were left out of the list.
     pub unreadable_parts_omitted: usize,
+    /// Unreadable parts that hold no text (the theme): in the metadata
+    /// warnings only; they change neither the text nor `text_truncated`.
+    pub(crate) cosmetic_parts: Vec<(String, String)>,
     /// The slide layouts the slides use, in first-use order
     /// ([`Slide::layout_index`] points here). Their static text belongs to
     /// no single slide: every rendering carries it once, after the slides;
@@ -201,7 +204,7 @@ impl PptxDocument {
             .and_then(|rel| match main_part.resolve_relative(&rel.target) {
                 Ok(pn) => Some(pn),
                 Err(e) => {
-                    parts.unreadable.record(&rel.target, &e);
+                    parts.unreadable.record_cosmetic(&rel.target, &e);
                     None
                 },
             })
@@ -209,14 +212,14 @@ impl PptxDocument {
             .and_then(|pn| match opc.read_part(&pn) {
                 Ok(data) => Some((pn, data)),
                 Err(e) => {
-                    parts.unreadable.record(pn.as_str(), &e);
+                    parts.unreadable.record_cosmetic(pn.as_str(), &e);
                     None
                 },
             })
             .and_then(|(pn, data)| match Theme::parse(&data) {
                 Ok(t) => Some(t),
                 Err(e) => {
-                    parts.unreadable.record(pn.as_str(), &e);
+                    parts.unreadable.record_cosmetic(pn.as_str(), &e);
                     None
                 },
             });
@@ -603,7 +606,8 @@ impl PptxDocument {
             embedded_fonts.len()
         );
         package_properties.crc_mismatched_parts = opc.crc_mismatched_parts();
-        let (unreadable_parts, unreadable_parts_omitted) = unreadable_parts.finish();
+        let (unreadable_parts, unreadable_parts_omitted, cosmetic_parts) =
+            unreadable_parts.finish_with_cosmetic();
         Ok(PptxDocument {
             presentation,
             slides,
@@ -615,6 +619,7 @@ impl PptxDocument {
             has_macros,
             unreadable_parts,
             unreadable_parts_omitted,
+            cosmetic_parts,
             layouts,
             masters,
         })

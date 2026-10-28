@@ -19,6 +19,7 @@ impl DocxDocument {
     pub(crate) fn unreadable_warnings(&self) -> Vec<String> {
         self.unreadable_parts
             .iter()
+            .chain(self.cosmetic_parts.iter())
             .map(|p| format!("skipped unreadable part {p}"))
             .chain(
                 (self.unreadable_parts_omitted > 0).then(|| {
@@ -28,16 +29,13 @@ impl DocxDocument {
             .collect()
     }
 
-    /// The warnings for the unreadable parts that can change the text, and
-    /// for the rest left out of the list: what every rendering writes in
-    /// band. A part that holds no text (a theme, a font) is only in
+    /// The warnings for the unreadable parts that lost text, and for the
+    /// rest left out of the list: what every rendering writes in band. A
+    /// part that holds no text (the theme) is only in
     /// [`Self::unreadable_warnings`].
     pub(crate) fn unreadable_text_warnings(&self) -> Vec<String> {
         self.unreadable_parts
             .iter()
-            .filter(|p| {
-                crate::core::unreadable::part_affects_text(p.split(": ").next().unwrap_or(p))
-            })
             .map(|p| format!("skipped unreadable part {p}"))
             .chain(
                 (self.unreadable_parts_omitted > 0).then(|| {
@@ -47,12 +45,9 @@ impl DocxDocument {
             .collect()
     }
 
-    /// Whether a part that can change the text could not be read.
+    /// Whether a part that held text could not be read.
     pub(crate) fn unreadable_loses_text(&self) -> bool {
-        self.unreadable_parts_omitted > 0
-            || self.unreadable_parts.iter().any(|p| {
-                crate::core::unreadable::part_affects_text(p.split(": ").next().unwrap_or(p))
-            })
+        self.unreadable_parts_omitted > 0 || !self.unreadable_parts.is_empty()
     }
 
     /// Extract all text as a plain string. Paragraphs are separated by newlines.

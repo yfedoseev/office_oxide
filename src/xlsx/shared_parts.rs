@@ -59,14 +59,24 @@ impl ReportList {
         if !self.seen.insert(part_key(entries, path)) {
             return;
         }
-        if !crate::core::unreadable::part_affects_text(path) {
-            if self.cosmetic.len() < MAX_REPORTS {
-                let cut = |s: &str| s.chars().take(MAX_REPORT_CHARS).collect::<String>();
-                self.cosmetic.push((cut(path), cut(reason)));
-            }
+        self.push(path, reason);
+    }
+
+    /// Record that the part at `path`, reached through a relationship that
+    /// holds no text (the theme), could not be read: a warning only. What
+    /// decides this is how the reader reached the part, never its name,
+    /// which the file chooses.
+    pub(super) fn record_cosmetic(
+        &mut self,
+        entries: &opc::ZipEntryIndex,
+        path: &str,
+        reason: &str,
+    ) {
+        if !self.seen.insert(part_key(entries, path)) || self.cosmetic.len() >= MAX_REPORTS {
             return;
         }
-        self.push(path, reason);
+        let cut = |s: &str| s.chars().take(MAX_REPORT_CHARS).collect::<String>();
+        self.cosmetic.push((cut(path), cut(reason)));
     }
 
     /// Record that the item `name` could not be read, for `reason`. Every

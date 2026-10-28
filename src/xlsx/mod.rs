@@ -304,8 +304,12 @@ impl XlsxDocument {
             });
 
         // Read theme data lazily
-        let theme_data =
-            read_optional(&mut archive, &entries, "xl/theme/theme1.xml", &mut shared.unreadable);
+        let theme_data = read_optional_cosmetic(
+            &mut archive,
+            &entries,
+            "xl/theme/theme1.xml",
+            &mut shared.unreadable,
+        );
 
         // Parse workbook
         let wb_data = Self::read_xml_entry(&mut archive, &entries, "xl/workbook.xml")?;
@@ -1357,6 +1361,25 @@ fn read_optional<R: Read + Seek>(
         Err(e) => {
             log::warn!("xlsx: part {path} unreadable: {e}");
             unreadable.record(entries, path, &e.to_string());
+            None
+        },
+    }
+}
+
+/// As [`read_optional`], for a part that holds no text (the theme): one that
+/// cannot be read is a warning in the metadata, not a loss of text.
+fn read_optional_cosmetic<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &opc::ZipEntryIndex,
+    path: &str,
+    unreadable: &mut shared_parts::ReportList,
+) -> Option<Vec<u8>> {
+    match XlsxDocument::read_xml_entry(archive, entries, path) {
+        Ok(data) => Some(data),
+        Err(crate::core::Error::MissingPart(_)) => None,
+        Err(e) => {
+            log::warn!("xlsx: part {path} unreadable: {e}");
+            unreadable.record_cosmetic(entries, path, &e.to_string());
             None
         },
     }
