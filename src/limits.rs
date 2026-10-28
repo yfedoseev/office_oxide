@@ -338,7 +338,13 @@ impl IrPaddingBudget {
 
     /// Charge `cells` empty cells. `false` — from the first refusal on —
     /// when the allowance is spent; the caller stops building rows.
+    ///
+    /// A charge of no cells is always allowed: a row that needs no padding
+    /// costs nothing, whatever an earlier sheet spent.
     pub(crate) fn charge_cells(&mut self, cells: usize) -> bool {
+        if cells == 0 {
+            return true;
+        }
         if self.exhausted {
             return false;
         }
@@ -358,6 +364,7 @@ impl IrPaddingBudget {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn exhausted(&self) -> bool {
         self.exhausted
     }
@@ -374,7 +381,8 @@ impl IrPaddingBudget {
         format!(
             "[workbook truncated: its rows are padded to the sheet's width with more than {} \
              bytes of empty table cells (office_oxide::limits::set_max_ir_padding_bytes) — \
-             later rows are missing]",
+             this sheet's later rows, and the rows of each later sheet that needs padding, are \
+             missing]",
             self.total
         )
     }
@@ -769,6 +777,7 @@ mod tests {
         assert!(b.exhausted());
         assert!(b.notice().contains("empty table cells"));
         assert!(!IrPaddingBudget::with_limit(usize::MAX).charge_cells(usize::MAX));
+        assert!(b.charge_cells(0), "a row that needs no padding costs nothing, spent or not");
     }
 
     #[test]
