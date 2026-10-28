@@ -4344,6 +4344,53 @@ mod tests {
         );
     }
 
+    /// The last-resort scan of every text atom in the stream runs after the
+    /// `Slide` container walk and draws on what that walk left of the deck's
+    /// text budget. Here the walk spends the whole budget on text that is then
+    /// dropped as a field placeholder, so the loose text after it is not read
+    /// under a fresh allowance.
+    #[test]
+    fn test_last_resort_text_scan_continues_the_walks_text_budget() {
+        let mut stream: Vec<u8> = (0..10)
+            .flat_map(|_| {
+                let mut c = slide_atom_following(0, false);
+                c.extend(other_text_shape(&"*".repeat(100), None));
+                make_container(RT_SLIDE, 0, &c)
+            })
+            .collect();
+        for i in 0..20 {
+            stream.extend(other_text_shape(&format!("{i:02}{}", "t".repeat(98)), None));
+        }
+        let whole = extract_deck_text(&stream, None);
+        let whole_chars: usize = whole
+            .slides
+            .iter()
+            .flat_map(|s| &s.text_runs)
+            .map(|r| r.text.len())
+            .sum();
+        assert_eq!(whole_chars, 2_000, "{:?}", whole.notices);
+
+        let cut = extract_deck_text_with_budget(
+            &stream,
+            None,
+            crate::limits::TextBudget::with_limit(500),
+        );
+        let total: usize = cut
+            .slides
+            .iter()
+            .flat_map(|s| &s.text_runs)
+            .map(|r| r.text.len())
+            .sum();
+        assert!(total <= 500, "{total} characters under a 500 budget");
+        assert!(
+            cut.notices
+                .iter()
+                .any(|n| n.contains("500 character budget")),
+            "{:?}",
+            cut.notices
+        );
+    }
+
     /// The master walk's text counts against the deck's budget, not against a
     /// fresh one per shape.
     #[test]
