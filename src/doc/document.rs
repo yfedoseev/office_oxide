@@ -1,6 +1,7 @@
 //! High-level DOC document API.
 
 use std::io::{Read, Seek};
+use std::sync::Arc;
 
 use crate::cfb::{CfbReader, SummaryProperties};
 
@@ -67,6 +68,10 @@ pub struct DocDocument {
     /// entry per section (`PlcfSed`), with an empty story inheriting the
     /// previous section's. Empty when the document has no `PlcfHdd`.
     header_footers: Vec<HeaderFooterStories>,
+    /// What is left of the document's text budget after the piece table and
+    /// the header/footer stories were read; the IR conversion spends the
+    /// same budget on the per-section copies it makes of those stories.
+    text_budget: crate::limits::TextBudget,
     /// Individual comments, split from the merged Comments substory using
     /// `PlcfandTxt`'s CP boundaries and attributed via `PlcfandRef`'s
     /// `ATRDPre10.ibst` index into `comment_authors`. Empty when either
@@ -182,23 +187,24 @@ pub struct ParsedComment {
 }
 
 /// One document section's header/footer content, split out of the
-/// merged header-document blob using `PlcfHdd`'s story boundaries.
+/// merged header-document blob using `PlcfHdd`'s story boundaries. A story a
+/// section inherits is shared with the section it comes from, not copied.
 #[derive(Debug, Clone, Default)]
 pub struct HeaderFooterStories {
     /// Even-page header (story 0 of a section's group).
-    pub even_header: Option<String>,
+    pub even_header: Option<Arc<str>>,
     /// Odd-page header — used on every page when even/odd headers
     /// aren't separately enabled (story 1).
-    pub odd_header: Option<String>,
+    pub odd_header: Option<Arc<str>>,
     /// Even-page footer (story 2).
-    pub even_footer: Option<String>,
+    pub even_footer: Option<Arc<str>>,
     /// Odd-page footer — used on every page when even/odd footers
     /// aren't separately enabled (story 3).
-    pub odd_footer: Option<String>,
+    pub odd_footer: Option<Arc<str>>,
     /// First-page header (story 4).
-    pub first_header: Option<String>,
+    pub first_header: Option<Arc<str>>,
     /// First-page footer (story 5).
-    pub first_footer: Option<String>,
+    pub first_footer: Option<Arc<str>>,
 }
 
 impl HeaderFooterStories {
@@ -357,6 +363,8 @@ impl DocDocument {
         // table's character space, each delimited by its own `ccp*` length.
         let mut subdocuments = Vec::new();
         let mut header_footers = Vec::new();
+        // Set when the text budget ran out while header/footer stories were read.
+        let mut hdd_cut = false;
         let section_ends = parse_plcf_sed_ends(&table_stream, fib.fc_plcf_sed, fib.lcb_plcf_sed);
         let mut comments = Vec::new();
         let mut cp = fib.text_len;
@@ -380,13 +388,19 @@ impl DocDocument {
             // the way the split below already keeps them out of the IR.
             let mut text_start = 0;
             if kind == SubDocumentKind::HeadersFooters {
-                header_footers = parse_plcf_hdd_stories(
+                let (stories, cut) = parse_plcf_hdd_stories(
                     &table_stream,
                     &raw,
                     fib.fc_plcf_hdd,
                     fib.lcb_plcf_hdd,
                     section_ends.len().max(1),
+                    &mut text_budget,
                 );
+                header_footers = stories;
+                if cut {
+                    work_warnings.push(text_budget.notice());
+                    hdd_cut = true;
+                }
                 text_start =
                     plcf_hdd_first_section_cp(&table_stream, fib.fc_plcf_hdd, fib.lcb_plcf_hdd)
                         .unwrap_or(0);
@@ -520,7 +534,7 @@ impl DocDocument {
         let summary_properties = crate::cfb::read_document_properties(&mut cfb);
         // A container stream that came back shorter than its declared size
         // lost content just as surely as a piece-table gap.
-        let text_complete = text_complete && cfb.truncated_streams().is_empty();
+        let text_complete = text_complete && !hdd_cut && cfb.truncated_streams().is_empty();
         let mut warnings = container_warnings(&cfb);
         warnings.extend(style_warnings);
         warnings.extend(work_warnings);
@@ -537,6 +551,7 @@ impl DocDocument {
             list_formatting,
             comment_authors,
             header_footers,
+            text_budget,
             comments,
             ole_objects,
             warnings,
@@ -627,6 +642,7 @@ impl DocDocument {
             list_formatting: ListFormatting::default(),
             comment_authors: Vec::new(),
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             comments: Vec::new(),
             ole_objects: super::ole_objects::extract_ole_objects(cfb),
             warnings,
@@ -678,6 +694,7 @@ impl DocDocument {
             list_formatting: ListFormatting::default(),
             comment_authors: Vec::new(),
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
             warnings: Vec::new(),
@@ -706,6 +723,12 @@ impl DocDocument {
     /// the file stores them.
     pub fn subdocuments(&self) -> &[SubDocument] {
         &self.subdocuments
+    }
+
+    /// What is left of the document's text budget once the text and the
+    /// header/footer stories are read (see the field).
+    pub(crate) fn text_budget(&self) -> crate::limits::TextBudget {
+        self.text_budget
     }
 
     /// Comment author names declared by `GrpXstAtnOwners`, in file order.
@@ -912,22 +935,37 @@ fn parse_plcf_hdd_stories(
     fc: u32,
     lcb: u32,
     sections: usize,
-) -> Vec<HeaderFooterStories> {
+    budget: &mut crate::limits::TextBudget,
+) -> (Vec<HeaderFooterStories>, bool) {
     let Some(cps) = plcf_hdd_cps(table_stream, fc, lcb) else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
 
-    let char_range = |lo: usize, hi: usize| -> Option<String> {
-        if hi <= lo {
+    // Byte offset of every character, built once: slicing a story out by
+    // skipping characters from the start made each of the six stories of
+    // every section a scan of the whole header document.
+    let mut starts: Vec<usize> = raw_header_text.char_indices().map(|(i, _)| i).collect();
+    starts.push(raw_header_text.len());
+    let chars = starts.len() - 1;
+
+    // A story's characters are charged against the document's text budget
+    // before they are copied out; ranges that overlap are charged each time.
+    let cut = std::cell::Cell::new(false);
+    let mut char_range = |lo: usize, hi: usize| -> Option<Arc<str>> {
+        if hi <= lo || lo >= chars || cut.get() {
             return None;
         }
-        let text: String = raw_header_text.chars().skip(lo).take(hi - lo).collect();
-        let sanitized = sanitize_text(&text);
+        let hi = hi.min(chars);
+        if !budget.charge(hi - lo) {
+            cut.set(true);
+            return None;
+        }
+        let sanitized = sanitize_text(&raw_header_text[starts[lo]..starts[hi]]);
         let trimmed = sanitized.trim();
         if trimmed.is_empty() {
             None
         } else {
-            Some(trimmed.to_string())
+            Some(Arc::from(trimmed))
         }
     };
 
@@ -954,6 +992,10 @@ fn parse_plcf_hdd_stories(
             first_header: char_range(cps[base + 4], cps[base + 5]),
             first_footer: char_range(cps[base + 5], cps[base + 6]),
         };
+        if cut.get() {
+            // The stories after the one that did not fit are left out.
+            break;
+        }
         let merged = HeaderFooterStories {
             even_header: own.even_header.or_else(|| prev.even_header.clone()),
             odd_header: own.odd_header.or_else(|| prev.odd_header.clone()),
@@ -965,7 +1007,7 @@ fn parse_plcf_hdd_stories(
         out.push(merged.clone());
         prev = merged;
     }
-    out
+    (out, cut.get())
 }
 
 /// The story boundary CPs (`aCP`) of `PlcftxbxTxt`/`PlcfHdrtxbxTxt`
@@ -1312,6 +1354,7 @@ mod tests {
             ole_objects: Vec::new(),
             warnings: Vec::new(),
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "First paragraph\nSecond paragraph\n\nAfter gap".into(),
@@ -1343,6 +1386,7 @@ mod tests {
                 description: "Embedded Equation Editor/MathType Object".into(),
             }],
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "Body".into(),
@@ -1377,6 +1421,7 @@ mod tests {
             ole_objects: Vec::new(),
             warnings: Vec::new(),
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "Price list follows.".into(),
@@ -1401,6 +1446,7 @@ mod tests {
             ole_objects: Vec::new(),
             warnings: Vec::new(),
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "Hello World".into(),
@@ -1431,6 +1477,7 @@ mod tests {
             ole_objects: Vec::new(),
             warnings: Vec::new(),
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "Main body text".into(),
@@ -1461,6 +1508,7 @@ mod tests {
             ole_objects: Vec::new(),
             warnings: Vec::new(),
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "Body".into(),
@@ -1487,6 +1535,7 @@ mod tests {
             ole_objects: Vec::new(),
             warnings: Vec::new(),
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "only the recovered fragment".into(),
@@ -1521,6 +1570,7 @@ mod tests {
             ole_objects: Vec::new(),
             warnings: Vec::new(),
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: text.to_string(),
@@ -1543,6 +1593,7 @@ mod tests {
             ole_objects: Vec::new(),
             warnings: Vec::new(),
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: String::new(),
@@ -1998,8 +2049,16 @@ mod tests {
             table_stream.extend_from_slice(&cp.to_le_bytes());
         }
 
-        let stories =
-            &parse_plcf_hdd_stories(&table_stream, raw, 0, table_stream.len() as u32, 1)[0];
+        let (stories, cut) = parse_plcf_hdd_stories(
+            &table_stream,
+            raw,
+            0,
+            table_stream.len() as u32,
+            1,
+            &mut crate::limits::TextBudget::new(),
+        );
+        assert!(!cut);
+        let stories = &stories[0];
         assert_eq!(stories.even_header.as_deref(), Some("EVEN HEADER"));
         assert_eq!(stories.odd_header.as_deref(), Some("ODD HEADER"));
         assert_eq!(stories.even_footer.as_deref(), Some("EVEN FOOTER"));
@@ -2028,7 +2087,8 @@ mod tests {
 
     #[test]
     fn test_plcf_hdd_zero_length_yields_no_stories() {
-        let stories = parse_plcf_hdd_stories(&[0u8; 8], "", 0, 0, 1);
+        let (stories, _) =
+            parse_plcf_hdd_stories(&[0u8; 8], "", 0, 0, 1, &mut crate::limits::TextBudget::new());
         assert!(stories.is_empty());
     }
 
@@ -2037,7 +2097,14 @@ mod tests {
         // Only the 6 fixed separators (n=6, needs n+2=8 CPs) — no
         // section's worth of header/footer stories at all.
         let table_stream = vec![0u8; 8 * 4];
-        let stories = parse_plcf_hdd_stories(&table_stream, "", 0, table_stream.len() as u32, 1);
+        let (stories, _) = parse_plcf_hdd_stories(
+            &table_stream,
+            "",
+            0,
+            table_stream.len() as u32,
+            1,
+            &mut crate::limits::TextBudget::new(),
+        );
         assert!(stories.is_empty());
     }
 
@@ -2054,8 +2121,8 @@ mod tests {
             "irrelevant merged blob",
         )];
         doc.header_footers = vec![HeaderFooterStories {
-            odd_header: Some("The Odd Header".to_string()),
-            first_footer: Some("The First Footer".to_string()),
+            odd_header: Some("The Odd Header".into()),
+            first_footer: Some("The First Footer".into()),
             ..Default::default()
         }];
 
@@ -2075,6 +2142,68 @@ mod tests {
             "must not also dump the merged blob as a generic TextBox once structured: {:?}",
             section.elements
         );
+    }
+
+    /// One header inherited by thousands of sections is copied into every
+    /// section's IR; those copies are charged to the document's text budget,
+    /// and the sections past it are left without one and the file reported
+    /// truncated, instead of the header multiplying by the section count.
+    #[test]
+    fn test_inherited_headers_copied_per_section_are_charged_to_the_budget() {
+        let mut paras: Vec<DocParagraph> = Vec::new();
+        for _ in 0..100 {
+            let mut p = pap("x", crate::doc::sprm::PapProps::default());
+            p.terminator = '\u{C}';
+            paras.push(p);
+        }
+        let mut doc = make_doc_with_paragraphs(paras);
+        doc.header_footers = vec![HeaderFooterStories {
+            odd_header: Some("h".repeat(1000).into()),
+            ..Default::default()
+        }];
+        doc.text_budget = crate::limits::TextBudget::with_limit(5500);
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        assert_eq!(ir.sections.len(), 100);
+        let with_header = ir.sections.iter().filter(|s| s.header.is_some()).count();
+        assert_eq!(with_header, 5, "the budget covers five copies of 1,000 bytes");
+        assert!(ir.metadata.text_truncated);
+        assert!(
+            ir.metadata
+                .warnings
+                .iter()
+                .any(|w| w.contains("character budget"))
+        );
+    }
+
+    /// Stories whose ranges overlap are charged each time they are copied
+    /// out, and reading stops at the story that does not fit.
+    #[test]
+    fn test_overlapping_header_stories_are_charged_before_they_are_copied() {
+        // Six separators, then ten sections each claiming the whole 1,000
+        // characters for every story (a PLC whose CPs run backwards between
+        // groups): without a charge that is 60 copies of the text.
+        let mut cps: Vec<u32> = vec![0; 6];
+        for _ in 0..10 {
+            cps.extend_from_slice(&[0, 1000, 1000, 1000, 1000, 1000]);
+        }
+        cps.extend_from_slice(&[1000, 1000]);
+        let mut table_stream = Vec::new();
+        for cp in &cps {
+            table_stream.extend_from_slice(&cp.to_le_bytes());
+        }
+        let raw = "y".repeat(1000);
+        let mut budget = crate::limits::TextBudget::with_limit(2500);
+        let (stories, cut) = parse_plcf_hdd_stories(
+            &table_stream,
+            &raw,
+            0,
+            table_stream.len() as u32,
+            10,
+            &mut budget,
+        );
+        assert!(cut);
+        assert!(stories.len() < 10);
+        assert!(budget.exhausted());
     }
 
     #[test]
