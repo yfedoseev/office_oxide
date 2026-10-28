@@ -5,17 +5,29 @@
 //! string is stored once, the rendered text is the string times the cell
 //! count. A 110 KB `.xlsx` holding a 1 MB string referenced from 12,000
 //! cells rendered to 393 MB; the same string from a million rows would be
-//! 32 GB from a 300 KB file. The spreadsheet paths — XLSX text rendering
-//! (`plain_text`/CSV/Markdown/HTML over cells), the XLSX → IR converter,
-//! and the legacy `.xls` reader (which materialises each referencing
-//! cell's copy at open) — charge the characters they emit against one
-//! per-document budget and stop, loudly, when it is spent. The word-
-//! processing and presentation paths do not: their text is stored once
-//! per occurrence, so its size is already bounded by the package's
-//! decompressed size. The one exception is a paragraph style's name,
-//! which is stored once in the style sheet and copied into every
-//! paragraph that uses the style; `classify_style_name` bounds it. Apache
-//! POI does the same with `ZipSecureFile.setMaxTextSize`.
+//! 32 GB from a 300 KB file. Every reader and converter that can copy
+//! stored text charges the characters it emits against one per-document
+//! budget ([`max_text_chars`]) and stops, loudly, when it is spent: the
+//! XLSX text rendering and IR converter, the legacy `.xls` reader (which
+//! materialises each referencing cell's copy at open), the legacy `.doc`
+//! piece table and its header, footer and comment stories, the legacy `.ppt`
+//! slide, notes and master text, and the DOCX and PPTX Markdown and IR
+//! converters for what they copy out of shared storage (hyperlink targets,
+//! shared headers, notes, a paragraph style's name — `classify_style_name`
+//! bounds that one). Apache POI does the same with
+//! `ZipSecureFile.setMaxTextSize`.
+//!
+//! The text budget is one of several, each for the thing that multiplies:
+//! pictures ([`max_image_bytes`], [`max_total_image_bytes`] and, for the
+//! compressed metafiles of the legacy formats,
+//! [`max_inflated_image_bytes`]); the empty slots and table cells that pad
+//! the rows of a sparse sheet ([`max_grid_padding_cells`] and
+//! [`max_sheet_grid_padding_cells`] for `.xls`, [`max_ir_padding_bytes`] and
+//! [`max_sheet_ir_padding_bytes`] for the IR); the blocks, list items and
+//! table cells of parsed Markdown ([`max_markdown_elements`],
+//! [`max_markdown_list_items`], [`max_markdown_table_cells`]); and the
+//! sheets and table cells a writer will write ([`max_write_sheets`],
+//! [`max_write_table_cells`]).
 //!
 //! The default keeps every genuine workbook this crate has been tested
 //! against (the largest, 181 MB of cell text, with room to spare) and
@@ -91,24 +103,28 @@ pub fn set_max_text_chars(chars: usize) {
     MAX_TEXT_CHARS.store(chars, Ordering::Relaxed);
 }
 
-/// The default per-document allowance of empty grid slots: 8 Mi.
+/// The default per-document allowance of empty grid slots: 16 Mi.
 ///
 /// A legacy `.xls` sheet is stored as rows that run to their last used
 /// column, so one number in column 255 of each of 65,535 rows costs 256
 /// slots per row: 16.7M slots from 65,535 records, and six such sheets
 /// made a 7 MB file allocate 2.6 GB. Each slot is a `CellValue` and an
 /// `XF` index in the sheet, and converting the sheet to the IR adds a table
-/// cell for it, about 70 bytes in all: the earlier 32 Mi allowance let that
-/// file reach 0.9 GB on open and 2.1 GB in `to_ir`; 8 Mi bounds both near a
-/// quarter of that. Only the *empty* slots that pad a row out to its last
-/// cell are charged, never the cells themselves, so a dense 65,536 x 256
-/// sheet (which carries 16.7M cells and a file to match) costs nothing, and
-/// a sheet whose rows reach their last column with up to about 32,000 rows
-/// of nothing in between still fits. A workbook that needs more is cut at
-/// the row that does not fit, loudly; processes that read such workbooks
-/// raise the allowance with
-/// [the setter](crate::limits::set_max_grid_padding_cells).
-pub const DEFAULT_MAX_GRID_PADDING_CELLS: usize = 8 << 20;
+/// cell for it, about 70 bytes in all: a 32 Mi allowance let that file
+/// reach 0.9 GB on open and 2.1 GB in `to_ir`; 16 Mi bounds both near half of
+/// that. Only the *empty* slots that pad a row out to its last cell are
+/// charged, never the cells themselves, so a dense 65,536 x 256 sheet (which
+/// carries 16.7M cells and a file to match) costs nothing, and a sheet whose
+/// rows reach their last column with up to about 64,000 rows of nothing in
+/// between still fits.
+///
+/// The document's allowance is shared by its sheets, but no sheet may spend
+/// more than [`DEFAULT_MAX_SHEET_GRID_PADDING_CELLS`] of it, so one sparse
+/// sheet cannot leave the later sheets of a workbook without rows. A
+/// workbook that needs more is cut at the row that does not fit, loudly, and
+/// the notice names the sheet; processes that read such workbooks raise the
+/// allowance with [the setter](crate::limits::set_max_grid_padding_cells).
+pub const DEFAULT_MAX_GRID_PADDING_CELLS: usize = 16 << 20;
 
 static MAX_GRID_PADDING_CELLS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_GRID_PADDING_CELLS);
 
@@ -121,6 +137,30 @@ pub fn max_grid_padding_cells() -> usize {
 /// afterwards. `usize::MAX` disables the bound.
 pub fn set_max_grid_padding_cells(cells: usize) {
     MAX_GRID_PADDING_CELLS.store(cells, Ordering::Relaxed);
+}
+
+/// The default allowance of empty grid slots for one `.xls` sheet: 8 Mi.
+///
+/// This is what the whole document was allowed before sheets had their own:
+/// a sheet that fitted then fits now. A realistic wide sheet (65,000 rows of
+/// 60 columns, 60% filled) pads about 2.4M slots, so a workbook of several
+/// such sheets fits within the document's
+/// [`DEFAULT_MAX_GRID_PADDING_CELLS`], while a hostile sparse sheet is cut at
+/// this and leaves the rest of the document its allowance.
+pub const DEFAULT_MAX_SHEET_GRID_PADDING_CELLS: usize = 8 << 20;
+
+static MAX_SHEET_GRID_PADDING_CELLS: AtomicUsize =
+    AtomicUsize::new(DEFAULT_MAX_SHEET_GRID_PADDING_CELLS);
+
+/// The per-sheet allowance of empty slots padding spreadsheet rows.
+pub fn max_sheet_grid_padding_cells() -> usize {
+    MAX_SHEET_GRID_PADDING_CELLS.load(Ordering::Relaxed)
+}
+
+/// Set the per-sheet empty-slot allowance for every document read
+/// afterwards. `usize::MAX` disables the bound.
+pub fn set_max_sheet_grid_padding_cells(cells: usize) {
+    MAX_SHEET_GRID_PADDING_CELLS.store(cells, Ordering::Relaxed);
 }
 
 /// The default per-document allowance of inflated image bytes: 256 Mi.
@@ -181,61 +221,142 @@ impl InflateBudget {
     }
 }
 
-/// A document's remaining allowance of empty grid slots.
-#[derive(Debug, Clone, Copy)]
+/// How many cut sheets a notice names before it counts the rest.
+const GRID_CUTS_NAMED: usize = 5;
+
+/// A document's remaining allowance of empty grid slots: a total for the
+/// document, and one for the sheet being read.
+#[derive(Debug, Clone)]
 pub(crate) struct GridBudget {
     total: usize,
     remaining: usize,
+    sheet_total: usize,
+    sheet_remaining: usize,
+    /// The sheet being read has spent its own allowance.
+    sheet_exhausted: bool,
+    /// The document's allowance is spent.
     exhausted: bool,
+    /// Name of the sheet being read.
+    sheet: String,
+    /// Sheets cut so far: `(name, cut by the document's allowance)`.
+    cuts: Vec<(String, bool)>,
 }
 
 impl GridBudget {
     pub(crate) fn new() -> Self {
-        Self::with_limit(max_grid_padding_cells())
+        Self::with_limits(max_grid_padding_cells(), max_sheet_grid_padding_cells())
     }
 
+    /// An allowance of `total` for the document that no sheet may exceed on
+    /// its own: the first sheet to need more than `total` takes it all.
+    #[cfg(test)]
     pub(crate) fn with_limit(total: usize) -> Self {
+        Self::with_limits(total, total)
+    }
+
+    pub(crate) fn with_limits(total: usize, per_sheet: usize) -> Self {
         Self {
             total,
             remaining: total,
+            sheet_total: per_sheet,
+            sheet_remaining: per_sheet,
+            sheet_exhausted: false,
             exhausted: false,
+            sheet: String::new(),
+            cuts: Vec::new(),
         }
     }
 
-    /// Charge `slots` empty slots. Returns `false` when they do not fit, and
-    /// for every nonzero charge once the allowance is spent; the caller stops
-    /// building rows. A charge of zero always succeeds: a row that needs no
-    /// padding costs nothing, however much of the allowance is gone.
+    /// Start a sheet: it gets its own allowance, within what is left of the
+    /// document's.
+    pub(crate) fn begin_sheet(&mut self, name: &str) {
+        self.sheet_remaining = self.sheet_total;
+        self.sheet_exhausted = false;
+        self.sheet.clear();
+        self.sheet.push_str(name);
+    }
+
+    /// Charge `slots` empty slots. Returns `false` when they do not fit the
+    /// sheet's or the document's allowance, and for every nonzero charge once
+    /// either is spent; the caller stops building rows. A charge of zero
+    /// always succeeds: a row that needs no padding costs nothing, however
+    /// much of the allowance is gone.
     pub(crate) fn charge(&mut self, slots: usize) -> bool {
         if slots == 0 {
             return true;
         }
-        if self.exhausted {
+        if self.exhausted || self.sheet_exhausted {
             return false;
         }
-        match self.remaining.checked_sub(slots) {
-            Some(rest) => {
+        match (self.remaining.checked_sub(slots), self.sheet_remaining.checked_sub(slots)) {
+            (Some(rest), Some(sheet_rest)) => {
                 self.remaining = rest;
+                self.sheet_remaining = sheet_rest;
                 true
             },
-            None => {
-                self.remaining = 0;
-                self.exhausted = true;
+            (rest, _) => {
+                // The document's allowance is what ran out when it cannot
+                // pay; otherwise the sheet's own.
+                let by_document = rest.is_none();
+                if by_document {
+                    self.remaining = 0;
+                    self.exhausted = true;
+                } else {
+                    self.sheet_remaining = 0;
+                    self.sheet_exhausted = true;
+                }
+                self.cuts.push((self.sheet.clone(), by_document));
                 false
             },
         }
     }
 
-    pub(crate) fn exhausted(&self) -> bool {
-        self.exhausted
+    /// One notice for the sheets cut by their own allowance and one for the
+    /// sheet the document's allowance ran out on, each naming the sheets.
+    pub(crate) fn notices(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let by_sheet: Vec<&str> = self
+            .cuts
+            .iter()
+            .filter(|(_, by_document)| !by_document)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !by_sheet.is_empty() {
+            out.push(format!(
+                "[sheet truncated: the sparse rows of {} need more than {} empty cells of padding \
+                 (office_oxide::limits::set_max_sheet_grid_padding_cells) — later rows of \
+                 {} are missing]",
+                Self::name_list(&by_sheet),
+                self.sheet_total,
+                if by_sheet.len() == 1 {
+                    "this sheet"
+                } else {
+                    "these sheets"
+                }
+            ));
+        }
+        if let Some((name, _)) = self.cuts.iter().find(|(_, by_document)| *by_document) {
+            out.push(format!(
+                "[workbook truncated: its sparse rows need more than {} empty cells of padding \
+                 (office_oxide::limits::set_max_grid_padding_cells) — rows from sheet '{name}' \
+                 on are missing]",
+                self.total
+            ));
+        }
+        out
     }
 
-    pub(crate) fn notice(&self) -> String {
-        format!(
-            "[workbook truncated: its sparse rows need more than {} empty cells of padding \
-             (office_oxide::limits::set_max_grid_padding_cells) — later rows are missing]",
-            self.total
-        )
+    fn name_list(names: &[&str]) -> String {
+        let shown: Vec<String> = names
+            .iter()
+            .take(GRID_CUTS_NAMED)
+            .map(|n| format!("'{n}'"))
+            .collect();
+        let mut list = shown.join(", ");
+        if names.len() > GRID_CUTS_NAMED {
+            list.push_str(&format!(" and {} more", names.len() - GRID_CUTS_NAMED));
+        }
+        format!("sheet{} {list}", if names.len() == 1 { "" } else { "s" })
     }
 }
 
@@ -438,61 +559,105 @@ pub fn set_max_total_image_bytes(bytes: u64) {
 }
 
 thread_local! {
-    /// Image bytes still available to the conversion running on this
-    /// thread, and whether it ran out.
-    static IMAGE_BUDGET: std::cell::Cell<(u64, bool)> =
-        const { std::cell::Cell::new((u64::MAX, false)) };
+    /// Image bytes still available to the conversion running on this thread,
+    /// and whether it ran out; `None` outside a conversion's scope.
+    static IMAGE_BUDGET: std::cell::Cell<Option<(u64, bool)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// A conversion's image budget, alive while the guard is. Dropping it —
+/// at the end of the conversion, on an early return or while unwinding —
+/// puts back the budget that was running before, so a conversion's spent
+/// allowance can never reach the next one on the same thread.
+#[must_use = "the budget ends when the guard is dropped"]
+pub(crate) struct ImageBudgetScope {
+    previous: Option<(u64, bool)>,
+}
+
+impl Drop for ImageBudgetScope {
+    fn drop(&mut self) {
+        let _ = IMAGE_BUDGET.try_with(|b| b.set(self.previous));
+    }
 }
 
 /// Start a conversion's image budget at the configured limit.
-pub(crate) fn begin_image_budget() {
-    IMAGE_BUDGET.with(|b| b.set((max_image_bytes() as u64, false)));
+pub(crate) fn begin_image_budget() -> ImageBudgetScope {
+    let previous = IMAGE_BUDGET.with(|b| b.replace(Some((max_image_bytes() as u64, false))));
+    ImageBudgetScope { previous }
 }
 
 thread_local! {
     /// Text the running conversion has copied out of the document's shared
-    /// storage (a hyperlink target, a shared header, a speaker-notes body).
-    static COPIED_TEXT: std::cell::RefCell<TextBudget> =
-        std::cell::RefCell::new(TextBudget::new());
+    /// storage (a hyperlink target, a shared header, a speaker-notes body);
+    /// `None` outside a conversion's scope.
+    static COPIED_TEXT: std::cell::Cell<Option<TextBudget>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// A conversion's budget for copied text, alive while the guard is; see
+/// [`ImageBudgetScope`].
+#[must_use = "the budget ends when the guard is dropped"]
+pub(crate) struct CopiedTextScope {
+    previous: Option<TextBudget>,
+}
+
+impl Drop for CopiedTextScope {
+    fn drop(&mut self) {
+        let _ = COPIED_TEXT.try_with(|b| b.set(self.previous));
+    }
 }
 
 /// Start a conversion's budget for copied text at the configured limit
 /// ([`max_text_chars`]).
-pub(crate) fn begin_copied_text_budget() {
-    COPIED_TEXT.with(|b| *b.borrow_mut() = TextBudget::new());
+pub(crate) fn begin_copied_text_budget() -> CopiedTextScope {
+    let previous = COPIED_TEXT.with(|b| b.replace(Some(TextBudget::new())));
+    CopiedTextScope { previous }
 }
 
 /// Charge `chars` of text about to be copied into the output against the
 /// running conversion's budget, before the copy is made. `false` (from the
-/// first refusal on) means the caller leaves the text out.
+/// first refusal on) means the caller leaves the text out. Outside a
+/// conversion's scope each copy is held to the configured limit on its own,
+/// as no running total exists to charge.
 pub(crate) fn charge_copied_text(chars: usize) -> bool {
-    COPIED_TEXT.with(|b| b.borrow_mut().charge(chars))
+    COPIED_TEXT.with(|b| match b.get() {
+        Some(mut budget) => {
+            let ok = budget.charge(chars);
+            b.set(Some(budget));
+            ok
+        },
+        None => chars <= max_text_chars(),
+    })
 }
 
 /// The line to report when copied text was left out, or `None` when the
 /// budget held.
 pub(crate) fn copied_text_notice() -> Option<String> {
     COPIED_TEXT.with(|b| {
-        let b = b.borrow();
-        b.exhausted().then(|| b.notice())
+        let budget = b.get()?;
+        budget.exhausted().then(|| budget.notice())
     })
 }
 
 /// Charge `bytes` of image data against the running conversion's budget.
 /// `false` (from the first refusal on) means the caller leaves the bytes out.
+/// Outside a conversion's scope each picture is held to the configured
+/// limit on its own, as no running total exists to charge.
 pub(crate) fn charge_image_bytes(bytes: usize) -> bool {
     IMAGE_BUDGET.with(|b| {
-        let (remaining, exhausted) = b.get();
+        let Some((remaining, exhausted)) = b.get() else {
+            return bytes as u64 <= max_image_bytes() as u64;
+        };
         if exhausted {
             return false;
         }
         match remaining.checked_sub(bytes as u64) {
             Some(rest) => {
-                b.set((rest, false));
+                b.set(Some((rest, false)));
                 true
             },
             None => {
-                b.set((0, true));
+                b.set(Some((0, true)));
                 false
             },
         }
@@ -502,26 +667,31 @@ pub(crate) fn charge_image_bytes(bytes: usize) -> bool {
 /// The warning a conversion records when image bytes were left out, or
 /// `None` when the budget held.
 pub(crate) fn image_budget_warning() -> Option<String> {
-    IMAGE_BUDGET.with(|b| b.get().1).then(|| {
-        format!(
-            "some image bytes were left out: the document's images exceed the {} byte budget \
-             (office_oxide::limits::set_max_image_bytes)",
-            max_image_bytes()
-        )
-    })
+    IMAGE_BUDGET
+        .with(|b| b.get())
+        .is_some_and(|(_, exhausted)| exhausted)
+        .then(|| {
+            format!(
+                "some image bytes were left out: the document's images exceed the {} byte \
+                 budget (office_oxide::limits::set_max_image_bytes)",
+                max_image_bytes()
+            )
+        })
 }
 
 /// The line a rendering of the IR shows when image bytes were left out, or
 /// `None` when the budget held. Said in the content itself because a
 /// Markdown or HTML rendering carries no metadata.
 pub(crate) fn image_budget_notice() -> Option<String> {
-    IMAGE_BUDGET.with(|b| b.get().1).then(|| {
-        format!(
-            "[some pictures not shown: together they exceed the {} byte picture budget \
+    IMAGE_BUDGET
+        .with(|b| b.get().is_some_and(|state| state.1))
+        .then(|| {
+            format!(
+                "[some pictures not shown: together they exceed the {} byte picture budget \
              (office_oxide::limits::set_max_image_bytes)]",
-            max_image_bytes()
-        )
-    })
+                max_image_bytes()
+            )
+        })
 }
 
 /// The default most table cells one IR may hold when it is written to
@@ -589,17 +759,40 @@ pub fn set_max_markdown_list_items(items: usize) {
 /// The default most blocks one Markdown document may parse into: 100,000.
 ///
 /// A block costs a section, a paragraph, a heading, a code block, a break,
-/// a list or a table as 1, and each table cell as 4 (a cell is about four
-/// times the IR of a paragraph). Each is 0.5-1.4 KB of IR from a few bytes
-/// of Markdown: 100,000 sections were 214 MB, 200,000 paragraphs 285 MB and
-/// one table row of 100,000 columns 490 MB. List items have a limit of their
-/// own, [`max_markdown_list_items`].
+/// a list or a table as 1. Each is 0.5-1.4 KB of IR from a few bytes of
+/// Markdown: 100,000 sections were 214 MB and 200,000 paragraphs 285 MB.
+/// List items and table cells have limits of their own,
+/// [`max_markdown_list_items`] and [`max_markdown_table_cells`].
 pub const DEFAULT_MAX_MARKDOWN_ELEMENTS: usize = 100_000;
+
+/// The default most table cells one Markdown document may parse into: 150,000.
+///
+/// A cell is about 1.2 KB of IR whether it is in a header row or a body row
+/// (measured: peak memory of 118 MB for a 100,000-column header row, 292 MB
+/// for 250,000), so the default keeps the cells of one document near 180 MB;
+/// with the block limit's own bound the IR of a parse stays under about
+/// 350 MB. A table of 1,000 rows by 25 columns is a sixth of it. Past it the rows that do not fit are dropped, with a
+/// notice, and the rest of the document is read.
+pub const DEFAULT_MAX_MARKDOWN_TABLE_CELLS: usize = 150_000;
+
+static MAX_MARKDOWN_TABLE_CELLS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_MARKDOWN_TABLE_CELLS);
+
+/// The most table cells `DocumentIR::from_markdown` keeps, over all of a
+/// document's tables.
+pub fn max_markdown_table_cells() -> usize {
+    MAX_MARKDOWN_TABLE_CELLS.load(Ordering::Relaxed)
+}
+
+/// Set the Markdown table-cell limit for every parse afterwards.
+/// `usize::MAX` disables the bound.
+pub fn set_max_markdown_table_cells(cells: usize) {
+    MAX_MARKDOWN_TABLE_CELLS.store(cells, Ordering::Relaxed);
+}
 
 static MAX_MARKDOWN_ELEMENTS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_MARKDOWN_ELEMENTS);
 
 /// The most blocks (sections, paragraphs, headings, code blocks, breaks,
-/// lists and tables at 1, table cells at 4) `DocumentIR::from_markdown`
+/// lists and tables) `DocumentIR::from_markdown`
 /// keeps; the rest of the document is dropped with a notice.
 pub fn max_markdown_elements() -> usize {
     MAX_MARKDOWN_ELEMENTS.load(Ordering::Relaxed)
@@ -795,6 +988,34 @@ mod tests {
     }
 
     #[test]
+    fn test_grid_notices_name_the_sheets_and_the_limit_that_cut_them() {
+        let mut b = GridBudget::with_limits(100, 10);
+        b.begin_sheet("A");
+        assert!(b.charge(10));
+        assert!(!b.charge(1), "the sheet's allowance is spent");
+        assert!(b.charge(0));
+        b.begin_sheet("B");
+        assert!(b.charge(10), "a new sheet has its own allowance");
+        for name in ["C", "D", "E", "F", "G", "H"] {
+            b.begin_sheet(name);
+            assert!(!b.charge(11));
+        }
+        let notices = b.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("'A'") && notices[0].contains("and 2 more"), "{notices:?}");
+        assert!(notices[0].contains("set_max_sheet_grid_padding_cells"));
+        let mut b = GridBudget::with_limits(15, 10);
+        b.begin_sheet("A");
+        assert!(b.charge(10));
+        b.begin_sheet("B");
+        assert!(!b.charge(6), "only 5 of the document's allowance is left");
+        let notices = b.notices();
+        assert!(
+            notices[0].contains("sheet 'B'") && notices[0].contains("set_max_grid_padding_cells")
+        );
+    }
+
+    #[test]
     fn test_take_grants_what_is_left_then_nothing() {
         let mut b = TextBudget::with_limit(10);
         assert_eq!(b.take(4), 4);
@@ -807,10 +1028,126 @@ mod tests {
     /// it would truncate every other test's output.
     #[test]
     fn test_setter_round_trips() {
-        let before = max_text_chars();
-        set_max_text_chars(before.saturating_add(1));
-        assert_eq!(max_text_chars(), before.saturating_add(1));
-        set_max_text_chars(before);
-        assert_eq!(max_text_chars(), before);
+        // One more than the default of a limit that only sheet-by-sheet
+        // conversions read, so no other test in this binary can notice it.
+        let mut limits = test_support::LimitScope::new();
+        limits.set(
+            max_total_image_bytes,
+            set_max_total_image_bytes,
+            DEFAULT_MAX_TOTAL_IMAGE_BYTES + 1,
+        );
+        assert_eq!(max_total_image_bytes(), DEFAULT_MAX_TOTAL_IMAGE_BYTES + 1);
+        drop(limits);
+        assert_eq!(max_total_image_bytes(), DEFAULT_MAX_TOTAL_IMAGE_BYTES);
+    }
+
+    /// A conversion that returns early (or fails) leaves nothing behind for
+    /// the next one on the thread: the scopes end with the function, so the
+    /// budgets of one conversion are never the next one's.
+    #[test]
+    fn test_an_early_return_leaves_no_budget_for_the_next_conversion() {
+        fn conversion(fail: bool) -> bool {
+            let _image = begin_image_budget();
+            let _text = begin_copied_text_budget();
+            assert!(!charge_copied_text(usize::MAX));
+            assert!(!charge_image_bytes(usize::MAX));
+            assert!(copied_text_notice().is_some());
+            assert!(image_budget_warning().is_some());
+            if fail {
+                return false;
+            }
+            true
+        }
+        assert!(!conversion(true));
+        assert!(copied_text_notice().is_none(), "the spent text budget leaked");
+        assert!(image_budget_warning().is_none(), "the spent image budget leaked");
+
+        // A panic unwinding through a conversion ends its scope as well.
+        let unwound = std::panic::catch_unwind(|| {
+            let _text = begin_copied_text_budget();
+            let _image = begin_image_budget();
+            charge_copied_text(usize::MAX);
+            charge_image_bytes(usize::MAX);
+            panic!("conversion failed");
+        });
+        assert!(unwound.is_err());
+        assert!(copied_text_notice().is_none());
+        assert!(image_budget_warning().is_none());
+
+        // The next conversion starts fresh.
+        let _text = begin_copied_text_budget();
+        assert!(charge_copied_text(10));
+        assert!(copied_text_notice().is_none());
+    }
+
+    /// A scope inside another gives the outer budget back when it ends.
+    #[test]
+    fn test_a_nested_scope_restores_the_budget_it_replaced() {
+        let _outer = begin_copied_text_budget();
+        assert!(charge_copied_text(5));
+        {
+            let _inner = begin_copied_text_budget();
+            assert!(!charge_copied_text(usize::MAX));
+            assert!(copied_text_notice().is_some());
+        }
+        assert!(
+            copied_text_notice().is_none(),
+            "the inner budget replaced the outer one for good"
+        );
+        assert!(charge_copied_text(5));
+    }
+
+    /// Outside any conversion there is no running total, but a charge is not
+    /// unlimited either: it is held to the configured limit on its own.
+    #[test]
+    fn test_charges_outside_a_conversion_are_held_to_the_configured_limit() {
+        assert!(charge_image_bytes(1));
+        assert!(!charge_image_bytes(usize::MAX));
+        assert!(charge_copied_text(1));
+        assert!(!charge_copied_text(usize::MAX));
+        assert!(copied_text_notice().is_none());
+        assert!(image_budget_warning().is_none());
+    }
+}
+
+/// Serialises tests that change a process-wide limit, and puts the limit
+/// back when the test ends, however it ends.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Mutex, MutexGuard};
+
+    static LIMITS: Mutex<()> = Mutex::new(());
+
+    /// Holds the lock on the limits for as long as it lives and restores
+    /// every limit it set, in reverse order, when dropped.
+    pub(crate) struct LimitScope {
+        restore: Vec<Box<dyn FnOnce()>>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl LimitScope {
+        pub(crate) fn new() -> Self {
+            Self {
+                restore: Vec::new(),
+                // A test that failed while holding the lock leaves it
+                // poisoned, and its guard has already restored the limits.
+                _lock: LIMITS.lock().unwrap_or_else(|e| e.into_inner()),
+            }
+        }
+
+        /// Set a limit for the rest of the scope.
+        pub(crate) fn set<T: Copy + 'static>(&mut self, get: fn() -> T, set: fn(T), value: T) {
+            let before = get();
+            set(value);
+            self.restore.push(Box::new(move || set(before)));
+        }
+    }
+
+    impl Drop for LimitScope {
+        fn drop(&mut self) {
+            while let Some(restore) = self.restore.pop() {
+                restore();
+            }
+        }
     }
 }

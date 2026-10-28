@@ -19,7 +19,7 @@ impl DocxDocument {
     /// renderers. All three used to disagree, so a consumer's word count
     /// changed depending on which method they called.
     pub fn plain_text(&self) -> String {
-        crate::limits::begin_copied_text_budget();
+        let _text_scope = crate::limits::begin_copied_text_budget();
         let mut out = String::new();
         let styles = self.styles.as_ref();
         for hf in self
@@ -82,7 +82,7 @@ impl DocxDocument {
     /// of every page. Without this, simple-but-meaningful artefacts like
     /// `My header` / `My footer` are silently dropped.
     pub fn to_markdown(&self) -> String {
-        crate::limits::begin_copied_text_budget();
+        let _text_scope = crate::limits::begin_copied_text_budget();
         let mut out = String::new();
         let ctx = MarkdownCtx {
             styles: self.styles.as_ref(),

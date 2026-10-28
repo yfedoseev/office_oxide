@@ -21,6 +21,57 @@ use std::io::Cursor;
 
 pub mod ppt;
 
+/// Serialises the tests of one binary that change a process-wide limit
+/// (`office_oxide::limits::set_max_*`) against each other and against the
+/// tests that need the defaults, and puts every limit back when the test
+/// ends, however it ends.
+static LIMITS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// A test that sets limits holds one of these: the exclusive lock on the
+/// limits for as long as it lives, and every limit it set restored, last set
+/// first, when it is dropped.
+#[allow(dead_code)]
+pub struct LimitScope {
+    restore: Vec<Box<dyn FnOnce()>>,
+    _lock: std::sync::RwLockWriteGuard<'static, ()>,
+}
+
+#[allow(dead_code)]
+impl LimitScope {
+    /// Take the exclusive lock on the limits.
+    pub fn new() -> Self {
+        Self {
+            restore: Vec::new(),
+            // A test that failed while holding the lock poisoned it; its
+            // guard has already restored the limits.
+            _lock: LIMITS.write().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+
+    /// Set a limit for the rest of the scope: `get` and `set` are the
+    /// limit's accessor and setter in `office_oxide::limits`.
+    pub fn set<T: Copy + 'static>(&mut self, get: fn() -> T, set: fn(T), value: T) {
+        let before = get();
+        set(value);
+        self.restore.push(Box::new(move || set(before)));
+    }
+}
+
+impl Drop for LimitScope {
+    fn drop(&mut self) {
+        while let Some(restore) = self.restore.pop() {
+            restore();
+        }
+    }
+}
+
+/// A test that relies on the default limits holds one of these, so a sibling
+/// test that lowers a limit cannot do so while it runs.
+#[allow(dead_code)]
+pub fn default_limits() -> std::sync::RwLockReadGuard<'static, ()> {
+    LIMITS.read().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Sentinel directory id: no sibling / child.
 const NO_ENTRY: u32 = 0xFFFF_FFFF;
 
@@ -213,6 +264,35 @@ pub fn build_doc_streams(
     tweaks: FibTweaks,
 ) -> (Vec<u8>, Vec<u8>) {
     build_streams(paras, subdocs, tweaks, &[], &[])
+}
+
+/// Append a `PlcfandTxt` ([MS-DOC] "PlcfandTxt", the comment-body boundary
+/// CPs `aCP`: `n + 2` entries for `n` comments) and a `PlcfandRef` of `n`
+/// 30-byte `ATRDPre10` entries to a built document's Table stream and point
+/// the FIB's `fcPlcfandRef`/`fcPlcfandTxt` (0x00BA/0x00C2) at them, so the
+/// reader sees `and_txt_cps.len() - 2` comments.
+#[allow(dead_code)]
+pub fn with_comment_plcs(word_doc: &mut [u8], table: &mut Vec<u8>, and_txt_cps: &[u32]) {
+    let n = and_txt_cps.len().saturating_sub(2);
+    let fc_ref = table.len() as u32;
+    for i in 0..=n {
+        table.extend_from_slice(&(i as u32).to_le_bytes());
+    }
+    table.extend(std::iter::repeat_n(0u8, 30 * n));
+    let lcb_ref = table.len() as u32 - fc_ref;
+    let fc_txt = table.len() as u32;
+    for cp in and_txt_cps {
+        table.extend_from_slice(&cp.to_le_bytes());
+    }
+    let lcb_txt = table.len() as u32 - fc_txt;
+    for (off, v) in [
+        (0x00BA, fc_ref),
+        (0x00BE, lcb_ref),
+        (0x00C2, fc_txt),
+        (0x00C6, lcb_txt),
+    ] {
+        word_doc[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
 }
 
 /// Build a synthetic `.doc` whose paragraphs carry the given PAPX `istd` values
@@ -1353,4 +1433,40 @@ pub fn cfb_with_streams(streams: &[(&str, &[u8])]) -> Vec<u8> {
         file[off..off + 4].copy_from_slice(&v.to_le_bytes());
     }
     file
+}
+
+/// A BIFF8 `.xls` ([MS-XLS]) of one `NUMBER` cell per `(row, col)` pair in
+/// each sheet, for the paths that pad sparse rows: sheet `i` is named `S{i}`.
+#[allow(dead_code)]
+pub fn sparse_xls(sheets: &[Vec<(u16, u16)>]) -> Vec<u8> {
+    let bof = |dt: u16| {
+        // BOF ([MS-XLS] 2.4.21): vers 0x0600, dt, then build/year/flags.
+        let mut b = 0x0600u16.to_le_bytes().to_vec();
+        b.extend_from_slice(&dt.to_le_bytes());
+        b.extend_from_slice(&[0u8; 12]);
+        biff(0x0809, &b)
+    };
+    let mut s = bof(0x0005);
+    for i in 0..sheets.len() {
+        // BoundSheet8 ([MS-XLS] 2.4.28): lbPlyPos, hsState, dt, name.
+        let name = format!("S{i}");
+        let mut b = 0u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&[0, 0, name.len() as u8, 0]);
+        b.extend_from_slice(name.as_bytes());
+        s.extend(biff(0x0085, &b));
+    }
+    s.extend(biff(0x000A, &[]));
+    for cells in sheets {
+        s.extend(bof(0x0010));
+        for &(row, col) in cells {
+            // Number ([MS-XLS] 2.4.180): rw, col, ixfe, num.
+            let mut d = row.to_le_bytes().to_vec();
+            d.extend_from_slice(&col.to_le_bytes());
+            d.extend_from_slice(&0u16.to_le_bytes());
+            d.extend_from_slice(&1.0f64.to_le_bytes());
+            s.extend(biff(0x0203, &d));
+        }
+        s.extend(biff(0x000A, &[]));
+    }
+    cfb_with_stream("Workbook", &s)
 }

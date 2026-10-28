@@ -632,6 +632,7 @@ impl XlsDocument {
                             &mut xf_numfmt,
                             date1904,
                         );
+                        grid_budget.begin_sheet(&name);
                         let (rows, xf) = build_grid(&mut cells, &mut grid_budget);
                         sheets.push(Sheet {
                             name,
@@ -828,9 +829,7 @@ impl XlsDocument {
         if text_budget.exhausted() {
             notices.push(text_budget.notice());
         }
-        if grid_budget.exhausted() {
-            notices.push(grid_budget.notice());
-        }
+        notices.extend(grid_budget.notices());
         if missing_sst_refs > 0 {
             let table = if sst_malformed {
                 "the shared string table is malformed".to_string()
@@ -2355,6 +2354,55 @@ mod tests {
         assert!(!whole.truncated());
     }
 
+    /// One sparse sheet cannot spend the whole document's allowance: it is cut
+    /// at its own, and the sheets after it keep theirs.
+    #[test]
+    fn test_a_sparse_sheet_leaves_later_sheets_their_own_allowance() {
+        let mut sparse = Vec::new();
+        for r in 0..10u16 {
+            sparse.extend(number(r, 255, 0, 1.0));
+        }
+        let mut second = Vec::new();
+        for r in 0..3u16 {
+            second.extend(number(r, 255, 0, 1.0));
+        }
+        let stream = workbook_stream(&[("Sparse", 0, sparse), ("Second", 0, second)]);
+        let doc = XlsDocument::parse_workbook_stream_with_limits(
+            &stream,
+            20_000_000,
+            crate::limits::GridBudget::with_limits(255 * 10, 255 * 3),
+        )
+        .expect("parses");
+        assert_eq!(doc.sheets[0].rows.len(), 3, "the sparse sheet is cut at its own allowance");
+        assert_eq!(doc.sheets[1].rows.len(), 3, "the next sheet is not starved by it");
+        assert!(doc.truncated());
+        let text = doc.plain_text();
+        assert!(text.contains("'Sparse'"), "the cut sheet is named: {text}");
+        assert!(!text.contains("'Second'"), "{text}");
+    }
+
+    /// The document's total still bounds the sheets together, and the notice
+    /// names the sheet it ran out on.
+    #[test]
+    fn test_the_document_total_still_bounds_the_sheets_together() {
+        let mut body = Vec::new();
+        for r in 0..3u16 {
+            body.extend(number(r, 255, 0, 1.0));
+        }
+        let stream = workbook_stream(&[("First", 0, body.clone()), ("Second", 0, body)]);
+        let doc = XlsDocument::parse_workbook_stream_with_limits(
+            &stream,
+            20_000_000,
+            crate::limits::GridBudget::with_limits(255 * 4, 255 * 3),
+        )
+        .expect("parses");
+        assert_eq!(doc.sheets[0].rows.len(), 3);
+        assert_eq!(doc.sheets[1].rows.len(), 1, "only what is left of the total");
+        let text = doc.plain_text();
+        assert!(text.contains("sheet 'Second'"), "{text}");
+        assert!(text.contains("set_max_grid_padding_cells"), "{text}");
+    }
+
     /// Once the allowance is spent by a sparse sheet, a later sheet whose
     /// rows need no padding (dense, or a single column) keeps every row; only
     /// a row that needs padding is refused.
@@ -2407,7 +2455,7 @@ mod tests {
     fn test_default_padding_allowance_bounds_the_sparse_worst_case() {
         let slot = std::mem::size_of::<CellValue>() + std::mem::size_of::<u16>();
         let worst = crate::limits::DEFAULT_MAX_GRID_PADDING_CELLS * slot;
-        assert!(worst <= 320 << 20, "{} MiB of padding at the default allowance", worst >> 20);
+        assert!(worst <= 640 << 20, "{} MiB of padding at the default allowance", worst >> 20);
         let mut body = Vec::new();
         for r in 0..=u16::MAX - 1 {
             body.extend(number(r, 255, 0, 1.0));

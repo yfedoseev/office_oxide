@@ -2,16 +2,14 @@
 //!
 //! A shared string referenced from every cell is rendered once per cell;
 //! nothing else bounds that product, and a 110 KB workbook rendered to
-//! 393 MB. The budget is process-global, so every test in this binary
-//! sets the same low value — the tests are safe to run in parallel with
-//! each other and must not share a binary with tests that render more
-//! than a few kilobytes.
+//! 393 MB. The budget is process-global, so every test holds the scope that
+//! serialises them and puts the default back.
 
 mod common;
 
 use std::io::{Cursor, Write};
 
-use common::{biff, cfb_with_stream};
+use common::{LimitScope, biff, cfb_with_stream};
 use office_oxide::limits::{max_text_chars, set_max_text_chars};
 use office_oxide::{Document, DocumentFormat};
 
@@ -75,7 +73,8 @@ fn assert_truncated(surface: &str, out: &str) {
 
 #[test]
 fn test_xlsx_renderers_stop_at_the_budget_with_a_notice() {
-    set_max_text_chars(BUDGET);
+    let mut limits = LimitScope::new();
+    limits.set(max_text_chars, set_max_text_chars, BUDGET);
     let doc = open_xlsx(8);
     assert_truncated("plain_text", &doc.plain_text());
     assert_truncated("to_markdown", &doc.to_markdown());
@@ -87,7 +86,8 @@ fn test_xlsx_renderers_stop_at_the_budget_with_a_notice() {
 
 #[test]
 fn test_a_workbook_within_the_budget_is_untouched() {
-    set_max_text_chars(BUDGET);
+    let mut limits = LimitScope::new();
+    limits.set(max_text_chars, set_max_text_chars, BUDGET);
     let doc = open_xlsx(2);
     for (surface, out) in [
         ("plain_text", doc.plain_text()),
@@ -104,7 +104,8 @@ fn test_a_workbook_within_the_budget_is_untouched() {
 /// document that fits the lowered value still carries no notice.
 #[test]
 fn test_the_limit_is_configurable() {
-    set_max_text_chars(BUDGET);
+    let mut limits = LimitScope::new();
+    limits.set(max_text_chars, set_max_text_chars, BUDGET);
     assert_eq!(max_text_chars(), BUDGET);
     assert!(!open_xlsx(2).plain_text().contains("character budget"));
     assert!(open_xlsx(3).plain_text().contains("character budget"));
@@ -151,7 +152,8 @@ fn xls_fan_out(cells: u16) -> Vec<u8> {
 
 #[test]
 fn test_xls_open_stops_copying_shared_strings_at_the_budget() {
-    set_max_text_chars(BUDGET);
+    let mut limits = LimitScope::new();
+    limits.set(max_text_chars, set_max_text_chars, BUDGET);
     let doc = Document::from_reader(Cursor::new(xls_fan_out(8)), DocumentFormat::Xls).unwrap();
     let text = doc.plain_text();
     assert_eq!(cells_in(&text, 'y'), 2, "the two cells that fit are kept");
@@ -193,7 +195,8 @@ fn docx_shared_header(sections: usize) -> Vec<u8> {
 
 #[test]
 fn test_docx_ir_stops_copying_a_shared_header_at_the_budget() {
-    set_max_text_chars(BUDGET);
+    let mut limits = LimitScope::new();
+    limits.set(max_text_chars, set_max_text_chars, BUDGET);
     let doc =
         Document::from_reader(Cursor::new(docx_shared_header(8)), DocumentFormat::Docx).unwrap();
     let ir = doc.to_ir();

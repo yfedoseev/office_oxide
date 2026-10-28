@@ -14,7 +14,7 @@ impl PptxDocument {
     /// [`super::layout::MASTER_TEXT_SECTION_TITLE`]; see the
     /// [`super::layout`] module.
     pub fn plain_text(&self) -> String {
-        crate::limits::begin_copied_text_budget();
+        let _text_scope = crate::limits::begin_copied_text_budget();
         let mut parts = Vec::new();
         // Notes shared by many slides are printed with each (see
         // `crate::limits`), so the slides' text is charged to the budget.
@@ -54,7 +54,7 @@ impl PptxDocument {
 
     /// Extract plain text from a single slide by index.
     pub fn slide_plain_text(&self, index: usize) -> Option<String> {
-        crate::limits::begin_copied_text_budget();
+        let _text_scope = crate::limits::begin_copied_text_budget();
         let mut text = self.slide_plain(index)?;
         if let Some(notice) = crate::limits::copied_text_notice() {
             text.push_str("\n\n");
@@ -108,7 +108,7 @@ impl PptxDocument {
     /// Layout and master static text follows the slides once, as for
     /// [`Self::plain_text`].
     pub fn to_markdown(&self) -> String {
-        crate::limits::begin_copied_text_budget();
+        let _text_scope = crate::limits::begin_copied_text_budget();
         let mut parts = Vec::new();
         let mut budget = crate::limits::TextBudget::new();
         for (i, _) in self.slides.iter().enumerate() {
@@ -148,7 +148,7 @@ impl PptxDocument {
 
     /// Convert a single slide to markdown by index.
     pub fn slide_to_markdown(&self, index: usize) -> Option<String> {
-        crate::limits::begin_copied_text_budget();
+        let _text_scope = crate::limits::begin_copied_text_budget();
         let mut md = self.slide_markdown(index)?;
         if let Some(notice) = crate::limits::copied_text_notice() {
             md.push_str("\n\n");

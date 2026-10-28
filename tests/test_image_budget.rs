@@ -1,13 +1,18 @@
 //! Image bytes copied into an IR: many pictures can share one image part,
 //! and every picture's `Image` owns a copy. The copies are charged to a
-//! per-document budget. These tests lower the process-wide budgets, so they
-//! have a test binary to themselves, and each sets the same values.
+//! per-document budget. These tests lower the process-wide budgets, so each
+//! holds the scope that serialises them and restores the budgets.
 
 use std::io::{Cursor, Write};
 
 use office_oxide::ir::{Element, Section};
-use office_oxide::limits::{set_max_image_bytes, set_max_text_chars};
+use office_oxide::limits::{
+    max_image_bytes, max_text_chars, set_max_image_bytes, set_max_text_chars,
+};
 use office_oxide::{Document, DocumentFormat};
+
+mod common;
+use common::LimitScope;
 
 const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const PKG_REL: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
@@ -22,9 +27,11 @@ const IMAGE_BUDGET: usize = 9_000;
 /// base64 plus structure), a second does not.
 const TEXT_BUDGET: usize = 8_000;
 
-fn limits() {
-    set_max_image_bytes(IMAGE_BUDGET);
-    set_max_text_chars(TEXT_BUDGET);
+fn limits() -> LimitScope {
+    let mut scope = LimitScope::new();
+    scope.set(max_image_bytes, set_max_image_bytes, IMAGE_BUDGET);
+    scope.set(max_text_chars, set_max_text_chars, TEXT_BUDGET);
+    scope
 }
 
 fn zip_of(parts: Vec<(String, Vec<u8>)>) -> Vec<u8> {
@@ -105,7 +112,7 @@ fn image_copies(sections: &[Section]) -> usize {
 
 #[test]
 fn test_docx_pictures_sharing_one_image_stop_copying_at_the_budget() {
-    limits();
+    let _limits = limits();
     let body: String = (0..20)
         .map(|_| format!("<w:p>{}</w:p>", drawing("rId5")))
         .collect();
@@ -187,7 +194,7 @@ fn test_docx_pictures_within_the_budget_add_no_notice() {
 /// not off the text budget, so the text of every section's header survives.
 #[test]
 fn test_docx_header_with_a_large_image_shared_by_many_sections_charges_the_image_budget() {
-    limits();
+    let _limits = limits();
     let sections: String = (0..20)
         .map(|i| {
             format!(
@@ -228,7 +235,7 @@ fn test_docx_header_with_a_large_image_shared_by_many_sections_charges_the_image
 
 #[test]
 fn test_pptx_pictures_sharing_one_image_stop_copying_at_the_budget() {
-    limits();
+    let _limits = limits();
     let pic = r#"<p:pic><p:nvPicPr><p:cNvPr id="3" name="P"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId1"/></p:blipFill><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="100" cy="100"/></a:xfrm></p:spPr></p:pic>"#;
     let pics = pic.repeat(20);
     let slide = format!(
@@ -326,7 +333,7 @@ fn test_pptx_pictures_sharing_one_image_stop_copying_at_the_budget() {
 /// where two copies of the notes alone would.
 #[test]
 fn test_pptx_shared_notes_made_of_link_targets_stay_bounded() {
-    limits();
+    let _limits = limits();
     let n = 20;
     let url = format!("http://example.com/{}", "u".repeat(3_000));
     let notes = format!(
@@ -391,7 +398,7 @@ fn test_pptx_shared_notes_made_of_link_targets_stay_bounded() {
 /// where the IR copies them.
 #[test]
 fn test_pptx_ole_previews_sharing_one_image_stop_copying_at_the_budget() {
-    limits();
+    let _limits = limits();
     let frame = |i: usize| {
         format!(
             r#"<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="{id}" name="O{i}"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="0" y="0"/><a:ext cx="100" cy="100"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/presentationml/2006/ole"><p:oleObj name="W" r:id="rId9" progId="Excel.Sheet.12"><p:embed/><p:pic><p:nvPicPr><p:cNvPr id="0" name=""/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId1"/></p:blipFill><p:spPr/></p:pic></p:oleObj></a:graphicData></a:graphic></p:graphicFrame>"#,

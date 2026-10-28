@@ -382,6 +382,42 @@ fn tool_error(id: &Value, message: &str) -> Value {
 mod tests {
     use super::*;
 
+    /// Serialises the tests that lower a process-wide limit against the ones
+    /// that open and render documents under the defaults: the test that bounds
+    /// the budgets holds the write lock, the others the read lock.
+    static LIMITS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    fn default_limits() -> std::sync::RwLockReadGuard<'static, ()> {
+        LIMITS.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The text and image budgets lowered for the length of a test and put
+    /// back when it ends, however it ends.
+    struct BudgetScope {
+        before: (usize, usize),
+        _lock: std::sync::RwLockWriteGuard<'static, ()>,
+    }
+
+    impl BudgetScope {
+        fn bound_to(text_chars: usize, image_bytes: usize) -> Self {
+            let lock = LIMITS.write().unwrap_or_else(|e| e.into_inner());
+            let before =
+                (office_oxide::limits::max_text_chars(), office_oxide::limits::max_image_bytes());
+            bound_resource_budgets_to(text_chars, image_bytes);
+            Self {
+                before,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for BudgetScope {
+        fn drop(&mut self) {
+            office_oxide::limits::set_max_text_chars(self.before.0);
+            office_oxide::limits::set_max_image_bytes(self.before.1);
+        }
+    }
+
     /// A unique scratch directory for one test.
     fn scratch_dir(tag: &str) -> std::path::PathBuf {
         let dir =
@@ -402,6 +438,7 @@ mod tests {
     /// every format, including the streamed IR path.
     #[test]
     fn test_extract_refuses_output_over_the_size_limit() {
+        let _defaults = default_limits();
         let dir = scratch_dir("size_limit");
         let path = dir.join("doc.docx");
         write_docx(&path, &"lorem ipsum ".repeat(200));
@@ -433,17 +470,14 @@ mod tests {
             }
         }
         w.save(&path).unwrap();
-        let before =
-            (office_oxide::limits::max_text_chars(), office_oxide::limits::max_image_bytes());
+        let scope = BudgetScope::bound_to(2_000, 1_000);
         let doc = office_oxide::Document::open(&path).unwrap();
-        let full = render(&doc, "text", usize::MAX).unwrap();
-        assert!(full.len() >= 20_000);
-
-        bound_resource_budgets_to(2_000, 1_000);
         let cut = render(&doc, "markdown", usize::MAX);
         let info = call_info(&json!(1), &json!({ "file_path": path.to_str().unwrap() }));
-        office_oxide::limits::set_max_text_chars(before.0);
-        office_oxide::limits::set_max_image_bytes(before.1);
+        drop(scope);
+        let _defaults = default_limits();
+        let full = render(&doc, "text", usize::MAX).unwrap();
+        assert!(full.len() >= 20_000);
 
         let cut = cut.unwrap();
         assert!(cut.len() < full.len() / 2, "{} bytes of {}", cut.len(), full.len());
@@ -508,6 +542,7 @@ mod tests {
     /// keywords and the dates were parsed but not reported.
     #[test]
     fn test_info_reports_metadata_and_the_truncation_warning() {
+        let _defaults = default_limits();
         use office_oxide::format::DocumentFormat;
         use office_oxide::ir::Metadata;
         let mut metadata = Metadata {
@@ -550,6 +585,7 @@ mod tests {
     /// original with the result while reporting success.
     #[test]
     fn test_replace_text_with_empty_find_is_an_error_and_leaves_the_file_alone() {
+        let _defaults = default_limits();
         let dir = scratch_dir("empty_find");
         let path = dir.join("doc.docx");
         write_docx(&path, "Hello world");

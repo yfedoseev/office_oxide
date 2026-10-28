@@ -1,5 +1,5 @@
 //! Resource bounds on the create path. These tests lower a process-wide
-//! limit, so they have a test binary to themselves.
+//! limit, so each holds the scope that serialises them and restores it.
 
 use std::io::Cursor;
 
@@ -8,6 +8,12 @@ use office_oxide::OfficeError;
 use office_oxide::core::Error as CoreError;
 use office_oxide::create::create_from_ir_to_writer;
 use office_oxide::ir::*;
+use office_oxide::limits::{
+    max_write_sheets, max_write_table_cells, set_max_write_sheets, set_max_write_table_cells,
+};
+
+mod common;
+use common::LimitScope;
 
 const CELL_LIMIT: usize = 50;
 
@@ -51,7 +57,8 @@ fn write(ir: &DocumentIR, format: DocumentFormat) -> Result<(), OfficeError> {
 
 #[test]
 fn test_a_table_with_too_many_cells_is_refused_when_writing() {
-    office_oxide::limits::set_max_write_table_cells(CELL_LIMIT);
+    let mut limits = LimitScope::new();
+    limits.set(max_write_table_cells, set_max_write_table_cells, CELL_LIMIT);
     for format in [DocumentFormat::Docx, DocumentFormat::Pptx] {
         let big = ir_with(vec![Element::Table(table(10, 10))], format);
         let err = write(&big, format).expect_err("100 cells exceed a limit of 50");
@@ -71,7 +78,8 @@ fn test_a_table_with_too_many_cells_is_refused_when_writing() {
 /// only 40 cell entries, but the writers build 21 x 20 cells.
 #[test]
 fn test_one_wide_row_among_many_narrow_rows_is_charged_at_the_padded_width() {
-    office_oxide::limits::set_max_write_table_cells(CELL_LIMIT);
+    let mut limits = LimitScope::new();
+    limits.set(max_write_table_cells, set_max_write_table_cells, CELL_LIMIT);
     let mut t = table(20, 1);
     t.rows.extend(table(1, 20).rows);
     for format in [DocumentFormat::Docx, DocumentFormat::Pptx] {
@@ -89,7 +97,8 @@ fn test_one_wide_row_among_many_narrow_rows_is_charged_at_the_padded_width() {
 /// The `.pptx` writer ignores spans: its table stays three cells.
 #[test]
 fn test_column_spans_are_charged_as_the_grid_they_widen() {
-    office_oxide::limits::set_max_write_table_cells(CELL_LIMIT);
+    let mut limits = LimitScope::new();
+    limits.set(max_write_table_cells, set_max_write_table_cells, CELL_LIMIT);
     let mut t = table(3, 1);
     for row in &mut t.rows {
         row.cells[0].col_span = 100;
@@ -110,7 +119,8 @@ fn test_column_spans_are_charged_as_the_grid_they_widen() {
 
 #[test]
 fn test_cells_are_counted_across_tables_and_inside_nested_content() {
-    office_oxide::limits::set_max_write_table_cells(CELL_LIMIT);
+    let mut limits = LimitScope::new();
+    limits.set(max_write_table_cells, set_max_write_table_cells, CELL_LIMIT);
     // Three 20-cell tables: none is over the limit alone, together they are.
     let three =
         ir_with((0..3).map(|_| Element::Table(table(4, 5))).collect(), DocumentFormat::Docx);
@@ -125,7 +135,8 @@ fn test_cells_are_counted_across_tables_and_inside_nested_content() {
 
 #[test]
 fn test_a_workbook_with_too_many_sections_is_refused_when_writing() {
-    office_oxide::limits::set_max_write_sheets(3);
+    let mut limits = LimitScope::new();
+    limits.set(max_write_sheets, set_max_write_sheets, 3);
     let sections = |n: usize| DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Xlsx,
@@ -143,7 +154,8 @@ fn test_a_workbook_with_too_many_sections_is_refused_when_writing() {
 #[test]
 fn test_a_direct_writer_caller_past_the_sheet_limit_gets_an_error() {
     use office_oxide::xlsx::write::{CellData, XlsxWriter};
-    office_oxide::limits::set_max_write_sheets(3);
+    let mut limits = LimitScope::new();
+    limits.set(max_write_sheets, set_max_write_sheets, 3);
     let mut w = XlsxWriter::new();
     for i in 0..3 {
         w.add_sheet(&format!("s{i}"));

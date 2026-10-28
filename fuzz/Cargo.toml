@@ -45,3 +45,24 @@ name = "fuzz_doc_pieces"
 path = "fuzz_targets/fuzz_doc_pieces.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_doc_comments"
+path = "fuzz_targets/fuzz_doc_comments.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ppt_slide_list"
+path = "fuzz_targets/fuzz_ppt_slide_list.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_xls_sparse"
+path = "fuzz_targets/fuzz_xls_sparse.rs"
+test = false
+doc = false
+bench = false

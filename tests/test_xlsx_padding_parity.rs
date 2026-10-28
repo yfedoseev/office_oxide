@@ -2,13 +2,16 @@
 //! documented budgets contains: a workbook that `to_markdown` renders in
 //! full is not cut short in `to_ir`/`to_html` by a cost model of its own.
 //!
-//! Budgets are process-global, so this binary holds only tests that want
-//! the same text budget and the default padding allowance.
+//! Budgets are process-global, so each test holds the scope that serialises
+//! them and restores the budget.
 
 use std::io::{Cursor, Write};
 
-use office_oxide::limits::set_max_text_chars;
+use office_oxide::limits::{max_text_chars, set_max_text_chars};
 use office_oxide::{Document, DocumentFormat};
+
+mod common;
+use common::LimitScope;
 
 const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const REL_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
@@ -99,7 +102,8 @@ fn test_a_wide_multi_sheet_export_is_the_same_in_markdown_and_the_ir() {
     // inside the default allowance. In Markdown each absent column costs 3
     // characters of a 100,000 budget; the IR used to charge 64, and cut
     // the workbook short.
-    set_max_text_chars(100_000);
+    let mut limits = LimitScope::new();
+    limits.set(max_text_chars, set_max_text_chars, 100_000);
     let doc = open(wide_export(8, 20)).unwrap();
     let md = doc.to_markdown();
     assert!(md.contains("LASTROW") && !md.contains("character budget"), "Markdown was cut");
@@ -113,7 +117,8 @@ fn test_a_wide_multi_sheet_export_is_the_same_in_markdown_and_the_ir() {
 #[test]
 fn test_a_single_far_cell_over_many_narrow_rows_stays_bounded_in_the_ir() {
     use office_oxide::ir::Element;
-    set_max_text_chars(100_000);
+    let mut limits = LimitScope::new();
+    limits.set(max_text_chars, set_max_text_chars, 100_000);
     // 500 rows with a cell in A and one cell in XFD (16,384 columns): 8
     // million empty table cells if every row were laid out in full, against
     // a 100,000 character budget that Markdown spends 3 per column of.
