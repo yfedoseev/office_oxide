@@ -1904,15 +1904,17 @@ fn convert_list_group(
 }
 
 /// One numbering level's marker, as the IR's `List` describes it.
-struct LevelMarker {
+struct LevelMarker<'a> {
     ordered: bool,
     style: Option<ListStyle>,
-    pattern: Option<String>,
+    /// Borrowed from the numbering level: it is copied into a list only
+    /// after the copy is charged.
+    pattern: Option<&'a str>,
     alignment: Option<ParagraphAlignment>,
 }
 
-impl LevelMarker {
-    fn of(level: &crate::docx::numbering::NumberingLevel, ilvl: u8) -> Self {
+impl<'a> LevelMarker<'a> {
+    fn of(level: &'a crate::docx::numbering::NumberingLevel, ilvl: u8) -> Self {
         use crate::docx::NumberFormat as NF;
         let ordered = !matches!(level.format, NF::Bullet | NF::None);
         // Only an ordered level's `w:lvlText` is a pattern around a counter;
@@ -1921,7 +1923,7 @@ impl LevelMarker {
         // so only a different pattern is reported.
         let plain = format!("%{}.", u32::from(ilvl) + 1);
         let pattern = (ordered && !level.level_text.is_empty() && level.level_text != plain)
-            .then(|| level.level_text.clone());
+            .then_some(level.level_text.as_str());
         let alignment = level.justification.as_ref().and_then(|jc| match jc {
             crate::docx::Justification::Center => Some(ParagraphAlignment::Center),
             crate::docx::Justification::Right => Some(ParagraphAlignment::Right),
@@ -1946,7 +1948,7 @@ fn apply_level_markers(
     list: &mut List,
     items: &[(u8, Vec<InlineContent>)],
     next_item: &mut usize,
-    markers: &std::collections::HashMap<u8, LevelMarker>,
+    markers: &std::collections::HashMap<u8, LevelMarker<'_>>,
     // `Some(top level)` for the top list; `None` for a sub-list, whose
     // level is its first item's.
     top_ilvl: Option<u8>,
@@ -1955,7 +1957,13 @@ fn apply_level_markers(
     let ilvl = top_ilvl.or_else(|| items.get(*next_item).map(|(l, _)| *l));
     if let Some(m) = ilvl.and_then(|l| markers.get(&l)) {
         list.ordered = m.ordered;
-        list.marker_pattern = m.pattern.clone();
+        // The level's text is stored once and copied into every list that
+        // uses the level: charged before it is, and left off (the list is
+        // numbered `%N.`) once the budget is spent.
+        list.marker_pattern = m
+            .pattern
+            .filter(|p| crate::limits::charge_copied_text(p.len()))
+            .map(str::to_string);
         list.marker_alignment = m.alignment.clone();
         if !is_top {
             list.style = m.style.clone();
