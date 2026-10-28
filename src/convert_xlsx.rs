@@ -11,6 +11,10 @@ use crate::xlsx::range_sweep::{CellRange, RangeSweep};
 /// ordinary large spreadsheets while bounding pathological ones.
 const MAX_ROWS_PER_SHEET: usize = 10_000;
 
+/// How many sheets' names the notice for the sheets a spent budget left out
+/// lists; the rest are counted.
+const OMITTED_SHEETS_LISTED: usize = 20;
+
 /// Parse a 6-char hex colour like `"FFA500"` into `[r, g, b]`.
 fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
     let s = s.trim_start_matches('#');
@@ -74,13 +78,17 @@ pub(crate) struct SheetConverter<'d> {
     image_notice_given: bool,
     total_image_notice_given: bool,
     formulas_truncated: bool,
-    padding_notice_given: bool,
+    // How the sheet just built was cut by padding, if it was: `true` when it
+    // was the memory allowance, `false` when the character budget.
+    sheet_padding_cut: Option<bool>,
     // A sheet's own allowances are fresh for the next sheet, so what was
     // cut is remembered here for the document's `text_truncated`.
     padding_cut: bool,
     image_cut: bool,
     pivot_truncated: bool,
     unreadable: bool,
+    // Sheets were left out of the conversion.
+    omitted: bool,
     // Whether the section just built was cut for any reason of its own.
     item_truncated: bool,
     warnings: Vec<String>,
@@ -111,11 +119,12 @@ impl<'d> SheetConverter<'d> {
             image_notice_given: false,
             total_image_notice_given: false,
             formulas_truncated: false,
-            padding_notice_given: false,
+            sheet_padding_cut: None,
             padding_cut: false,
             image_cut: false,
             pivot_truncated: false,
             unreadable: false,
+            omitted: false,
             item_truncated: false,
             warnings: Vec::new(),
         }
@@ -129,11 +138,45 @@ impl<'d> SheetConverter<'d> {
     }
 
     /// Whether what is spent for the whole run ends it: no further sheet is
-    /// converted (the one that spent it carries the notice).
+    /// converted (the one that spent it carries the notice, and the sheets
+    /// left out are named by [`Self::omitted_section`]). The memory allowance
+    /// for padding cells is not one of these: a later sheet that needs no
+    /// padding fits whatever an earlier one spent, and one that does is cut
+    /// at the rows it cannot pay for, with a notice of its own.
     pub(crate) fn should_stop(&self) -> bool {
-        self.budget.exhausted()
-            || self.padding_chars.exhausted()
-            || (self.scope == IrScope::Document && self.padding_budget.exhausted())
+        self.budget.exhausted() || self.padding_chars.exhausted()
+    }
+
+    /// The section naming the worksheets from `from` on, which were not
+    /// converted because the run's budget was spent. `None` when there are
+    /// none. At most [`OMITTED_SHEETS_LISTED`] names are listed.
+    pub(crate) fn omitted_section(&mut self, from: usize) -> Option<Section> {
+        let left = self.doc.worksheets.get(from..).filter(|l| !l.is_empty())?;
+        let mut names: Vec<String> = left
+            .iter()
+            .take(OMITTED_SHEETS_LISTED)
+            .map(|w| format!("{:?}", w.name.chars().take(64).collect::<String>()))
+            .collect();
+        if left.len() > OMITTED_SHEETS_LISTED {
+            names.push(format!("and {} more", left.len() - OMITTED_SHEETS_LISTED));
+        }
+        let notice = format!(
+            "[{} sheet(s) not converted, because the character budget for the workbook was spent \
+             (office_oxide::limits::set_max_text_chars): {}]",
+            left.len(),
+            names.join(", ")
+        );
+        self.warnings.push(notice.clone());
+        self.item_truncated = true;
+        self.omitted = true;
+        Some(Section {
+            title: Some("Sheets not converted".to_string()),
+            elements: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(notice))],
+                ..Default::default()
+            })],
+            ..Default::default()
+        })
     }
 
     /// The warnings the sections built so far have raised.
@@ -144,6 +187,7 @@ impl<'d> SheetConverter<'d> {
     /// Whether anything built so far was cut, for `Metadata::text_truncated`.
     pub(crate) fn text_truncated(&self) -> bool {
         self.unreadable
+            || self.omitted
             || self.pivot_truncated
             || self.budget.exhausted()
             || self.padding_cut
@@ -173,8 +217,8 @@ impl<'d> SheetConverter<'d> {
         }
         match self.scope {
             IrScope::Document => {
-                if self.padding_budget.exhausted() || self.padding_chars.exhausted() {
-                    warnings.push(padding_notice(&self.padding_budget, &self.padding_chars));
+                if self.padding_chars.exhausted() {
+                    warnings.push(self.padding_chars.notice());
                 }
                 if self.image_budget.exhausted() {
                     warnings.push(format!(
@@ -212,16 +256,20 @@ impl<'d> SheetConverter<'d> {
             self.padding_budget = Self::fresh_padding_budget(self.scope);
             self.image_budget =
                 crate::limits::TextBudget::with_limit(crate::limits::max_image_bytes());
-            self.padding_notice_given = false;
             self.image_notice_given = false;
         }
+        self.sheet_padding_cut = None;
         let section = self.convert_sheet_inner(ws_idx, ws);
+        let name = &ws.name;
+        if let Some(by_memory) = self.sheet_padding_cut {
+            let notice = if by_memory {
+                self.padding_budget.notice()
+            } else {
+                self.padding_chars.notice()
+            };
+            self.warnings.push(format!("sheet {name:?}: {notice}"));
+        }
         if self.scope == IrScope::Sheet {
-            let name = &ws.name;
-            if self.padding_budget.exhausted() {
-                self.warnings
-                    .push(format!("sheet {name:?}: {}", self.padding_budget.notice()));
-            }
             if self.image_budget.exhausted() {
                 self.warnings.push(format!(
                     "sheet {name:?}: some pictures were left out: the sheet's pictures exceed the {} \
@@ -230,9 +278,9 @@ impl<'d> SheetConverter<'d> {
                 ));
             }
         }
-        self.padding_cut |= self.padding_budget.exhausted();
+        self.padding_cut |= self.sheet_padding_cut.is_some();
         self.image_cut |= self.image_budget.exhausted();
-        self.item_truncated |= self.padding_budget.exhausted()
+        self.item_truncated |= self.sheet_padding_cut.is_some()
             || self.image_budget.exhausted()
             || ws.comments_truncated
             || ws.formulas_dropped > 0;
@@ -256,7 +304,7 @@ impl<'d> SheetConverter<'d> {
             image_notice_given,
             total_image_notice_given,
             formulas_truncated,
-            padding_notice_given,
+            sheet_padding_cut,
             warnings,
             scope,
             ..
@@ -416,9 +464,13 @@ impl<'d> SheetConverter<'d> {
         // paragraph the same way. The flow renderer then paints
         // both at their absolute EMU rectangle (see
         // `render_text_box`).
-        let mut image_elements: Vec<Element> =
-            Vec::with_capacity(ws.images.len() + ws.text_shapes.len());
-        for ts in &ws.text_shapes {
+        let mut image_elements: Vec<Element> = Vec::new();
+        for ts in ws.text_shapes.iter() {
+            // A drawing is shared by every sheet that names it, but each
+            // sheet's IR owns a copy of its text: paid for before it is made.
+            if !budget.charge(text_shape_chars(ts)) {
+                break;
+            }
             let mut span = TextSpan::plain(ts.text.clone());
             if let Some(sz) = ts.font_size_pt {
                 span.font_size_half_pt =
@@ -451,11 +503,14 @@ impl<'d> SheetConverter<'d> {
                 ..Default::default()
             }));
         }
-        for pic in &ws.images {
+        for pic in ws.images.iter().chain(&ws.cell_images) {
             // A picture drawn from many anchors shares its bytes in the
             // workbook, but each IR image owns a copy, so every one is paid
             // for: the pictures past the budget are left out, and said so.
-            if !image_budget.charge(pic.data.len())
+            // Its alternative text and the elements around it are paid for
+            // as text.
+            if !budget.charge(picture_chars(pic))
+                || !image_budget.charge(pic.data.len())
                 || (*scope == IrScope::Sheet && !total_image_budget.charge(pic.data.len()))
             {
                 break;
@@ -533,10 +588,12 @@ impl<'d> SheetConverter<'d> {
                 // of order). They are paid for as memory, and as characters
                 // too, as Markdown pays for an absent column.
                 let padding = grid_width.saturating_sub(distinct_columns(cells));
-                if !padding_budget.charge_cells(padding)
+                let by_memory = !padding_budget.charge_cells(padding);
+                if by_memory
                     || !padding_chars
                         .charge(padding.saturating_mul(crate::xlsx::text::MARKDOWN_PAD_CHARS))
                 {
+                    *sheet_padding_cut = Some(by_memory);
                     break;
                 }
                 let mut tcells: Vec<TableCell> = Vec::with_capacity(grid_width);
@@ -661,16 +718,22 @@ impl<'d> SheetConverter<'d> {
         // absolute regardless of order, but inline images render
         // first). Empty `image_elements` means no drawing on this sheet.
         // A chart sheet's content is its chart's text; it has no cells.
-        let mut combined: Vec<Element> = ws
-            .chart_text
-            .iter()
-            .map(|t| {
-                Element::Paragraph(Paragraph {
-                    content: vec![InlineContent::Text(TextSpan::plain(t.trim()))],
-                    ..Default::default()
-                })
-            })
-            .collect();
+        // The chart is shared by every chartsheet that displays it, and each
+        // sheet's IR owns a copy of its text: paid for before it is made.
+        let mut combined: Vec<Element> = Vec::new();
+        for t in &ws.chart_text {
+            if !budget.charge(
+                std::mem::size_of::<Paragraph>()
+                    .saturating_add(std::mem::size_of::<TextSpan>())
+                    .saturating_add(t.trim().len()),
+            ) {
+                break;
+            }
+            combined.push(Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(t.trim()))],
+                ..Default::default()
+            }));
+        }
         combined.extend(image_elements);
         combined.extend(elements);
 
@@ -766,27 +829,19 @@ impl<'d> SheetConverter<'d> {
                 crate::limits::MAX_FORMULA_CHARS
             ));
         }
-        if ws.hyperlinks_dropped > 0 {
-            warnings.push(format!(
-                "sheet {:?}: {} hyperlink(s) left out: their target is longer than {} characters",
-                ws.name,
-                ws.hyperlinks_dropped,
-                crate::limits::MAX_HYPERLINK_TARGET_CHARS
-            ));
-        }
         if budget.exhausted() {
             combined.push(Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain(budget.notice()))],
                 ..Default::default()
             }));
         }
-        if (padding_budget.exhausted() || padding_chars.exhausted()) && !*padding_notice_given {
-            *padding_notice_given = true;
+        if let Some(by_memory) = *sheet_padding_cut {
             combined.push(Element::Paragraph(Paragraph {
-                content: vec![InlineContent::Text(TextSpan::plain(padding_notice(
-                    padding_budget,
-                    padding_chars,
-                )))],
+                content: vec![InlineContent::Text(TextSpan::plain(if by_memory {
+                    padding_budget.notice()
+                } else {
+                    padding_chars.notice()
+                }))],
                 ..Default::default()
             }));
         }
@@ -1010,10 +1065,43 @@ impl<'d> SheetConverter<'d> {
                 Some(&doc.package_properties),
             )
         };
+        // Relationship parts that could not be read: the sheet, drawing or
+        // pivot they belong to lacks what they name.
+        metadata.text_truncated |=
+            !doc.unreadable_parts.is_empty() || doc.unreadable_parts_omitted > 0;
+        metadata.warnings.extend(
+            doc.unreadable_parts
+                .iter()
+                .map(|(part, err)| format!("skipped unreadable part {part}: {err}")),
+        );
+        if doc.unreadable_parts_omitted > 0 {
+            metadata.warnings.push(format!(
+                "and {} more unreadable parts not listed",
+                doc.unreadable_parts_omitted
+            ));
+        }
         metadata.warnings.extend(self.warnings.iter().cloned());
         metadata.warnings.extend(self.end_warnings());
         metadata
     }
+}
+
+/// What the IR's text box for a drawn text shape costs: the shape's text and
+/// font name, which the IR copies, and the elements that hold them.
+fn text_shape_chars(ts: &crate::xlsx::worksheet::WorksheetTextShape) -> usize {
+    std::mem::size_of::<TextBox>()
+        .saturating_add(std::mem::size_of::<Paragraph>())
+        .saturating_add(std::mem::size_of::<TextSpan>())
+        .saturating_add(ts.text.len())
+        .saturating_add(ts.font_name.as_ref().map_or(0, String::len))
+}
+
+/// What the IR's image for a picture costs besides its bytes (which the
+/// picture budgets count): its alternative text and the elements that hold it.
+fn picture_chars(pic: &crate::xlsx::worksheet::WorksheetPicture) -> usize {
+    std::mem::size_of::<TextBox>()
+        .saturating_add(std::mem::size_of::<Image>())
+        .saturating_add(pic.alt_text.as_ref().map_or(0, String::len))
 }
 
 /// The notice for picture bytes copied past the total the whole run may copy.
@@ -1046,6 +1134,7 @@ pub struct SheetIr {
 
 enum Stage {
     Sheets(usize),
+    Omitted(usize),
     Charts,
     Pivots,
     Unreadable(usize),
@@ -1110,13 +1199,23 @@ impl Iterator for SheetIrs<'_> {
             let end_before = self.converter.end_warnings();
             match self.stage {
                 Stage::Sheets(i) => {
-                    if i >= self.converter.doc.worksheets.len() || self.converter.should_stop() {
+                    if i >= self.converter.doc.worksheets.len() {
                         self.stage = Stage::Charts;
+                        continue;
+                    }
+                    if self.converter.should_stop() {
+                        self.stage = Stage::Omitted(i);
                         continue;
                     }
                     self.stage = Stage::Sheets(i + 1);
                     let section = self.converter.convert_sheet(i);
                     return Some(self.item(section, end_before));
+                },
+                Stage::Omitted(from) => {
+                    self.stage = Stage::Charts;
+                    if let Some(section) = self.converter.omitted_section(from) {
+                        return Some(self.item(section, end_before));
+                    }
                 },
                 Stage::Charts => {
                     self.stage = Stage::Pivots;
@@ -1172,6 +1271,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     let mut sections = Vec::new();
     for ws_idx in 0..doc.worksheets.len() {
         if converter.should_stop() {
+            sections.extend(converter.omitted_section(ws_idx));
             break;
         }
         sections.push(converter.convert_sheet(ws_idx));
@@ -1243,19 +1343,6 @@ fn cell_is_blank(cell: &TableCell) -> bool {
         Element::Paragraph(p) => p.content.is_empty(),
         _ => false,
     })
-}
-
-/// The notice for padding that ran out: the memory allowance when that is
-/// what was spent, otherwise the character budget.
-fn padding_notice(
-    memory: &crate::limits::IrPaddingBudget,
-    chars: &crate::limits::TextBudget,
-) -> String {
-    if memory.exhausted() {
-        memory.notice()
-    } else {
-        chars.notice()
-    }
 }
 
 /// How many different columns the cells of a row occupy.

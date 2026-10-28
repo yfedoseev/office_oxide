@@ -37,11 +37,16 @@ pub(crate) const MARKDOWN_PAD_CHARS: usize = 3;
 /// the document's text budget.
 pub(crate) const COMMENTS_TRUNCATED_NOTICE: &str = "[comments truncated: the threaded comments exceed the character budget (office_oxide::limits::set_max_text_chars) — later threads are missing]";
 
-/// What a comment adds to a rendering: its cell reference, author and text.
-/// The author is stored once and named by every comment, so this is what
-/// the renderers charge to the budget for each.
+/// What a comment adds to a rendering: its cell reference, author and text,
+/// and the note that holds them in the IR. The author is stored once and
+/// named by every comment, and a comments part may be named by every sheet,
+/// so this is what the renderers charge to the budget for each: a comment of
+/// one character is still a note.
 pub(crate) fn comment_chars(c: &super::worksheet::SheetComment) -> usize {
-    c.cell_ref.len() + c.author.as_ref().map_or(0, |a| a.len()) + c.text.len()
+    std::mem::size_of::<crate::ir::Note>()
+        .saturating_add(c.cell_ref.len())
+        .saturating_add(c.author.as_ref().map_or(0, |a| a.len()))
+        .saturating_add(c.text.len())
 }
 
 /// `B2 (Author)` — the same marker `to_ir()` puts on a comment's endnote.
@@ -155,6 +160,9 @@ impl XlsxDocument {
             }
             // A chart sheet's content is its chart's text.
             for text in &ws.chart_text {
+                if !budget.charge(text.trim().len()) {
+                    break;
+                }
                 out.write_char('\n')?;
                 out.write_str(text.trim())?;
             }
@@ -171,7 +179,7 @@ impl XlsxDocument {
             }
             // Cell comments are document content; `to_ir()` carries them
             // as endnotes, and this direct renderer dropped them.
-            for c in &ws.comments {
+            for c in ws.comments.iter() {
                 // The author's name is repeated by every comment of theirs.
                 if !budget.charge(comment_chars(c)) {
                     break;
@@ -191,11 +199,21 @@ impl XlsxDocument {
             // Text boxes and WordArt drawn on the sheet reached `to_ir()`
             // as text boxes and this renderer not at all — a sheet whose
             // content is a drawn note came back as its name alone.
-            for ts in &ws.text_shapes {
+            for ts in ws.text_shapes.iter() {
                 if !ts.text.trim().is_empty() {
+                    // Shared by every sheet that names the drawing, written
+                    // once for each: paid for like any other text.
+                    if !budget.charge(ts.text.trim().len()) {
+                        break;
+                    }
                     out.write_char('\n')?;
                     out.write_str(ts.text.trim())?;
                 }
+            }
+            if budget.exhausted() {
+                out.write_char('\n')?;
+                out.write_str(&budget.notice())?;
+                break;
             }
         }
         // `to_markdown()` already surfaces chart text (axis titles, series
@@ -430,6 +448,9 @@ impl XlsxDocument {
                 write!(out, "## {}", ws.name)?;
             }
             for text in &ws.chart_text {
+                if !budget.charge(text.trim().len()) {
+                    break;
+                }
                 begin(out)?;
                 out.write_str(text.trim())?;
             }
@@ -442,7 +463,7 @@ impl XlsxDocument {
                 out.write_str(&budget.notice())?;
                 break;
             }
-            for c in &ws.comments {
+            for c in ws.comments.iter() {
                 if !budget.charge(comment_chars(c)) {
                     break;
                 }
@@ -463,11 +484,19 @@ impl XlsxDocument {
                 out.write_str(&budget.notice())?;
                 break;
             }
-            for ts in &ws.text_shapes {
+            for ts in ws.text_shapes.iter() {
                 if !ts.text.trim().is_empty() {
+                    if !budget.charge(ts.text.trim().len()) {
+                        break;
+                    }
                     begin(out)?;
                     out.write_str(ts.text.trim())?;
                 }
+            }
+            if budget.exhausted() {
+                begin(out)?;
+                out.write_str(&budget.notice())?;
+                break;
             }
         }
         // Charts: emit each chart's extracted text under a "## Chart N" heading
@@ -1006,6 +1035,8 @@ mod tests {
             package_properties: Default::default(),
             has_macros: false,
             unreadable_sheets: Vec::new(),
+            unreadable_parts: Vec::new(),
+            unreadable_parts_omitted: 0,
             styles_data: None,
             theme_data: None,
         };
@@ -1027,11 +1058,11 @@ mod tests {
             rows: Vec::new(),
             merged_cells: Vec::new(),
             hyperlinks: Vec::new(),
-            hyperlinks_dropped: 0,
             formulas_dropped: 0,
             page_setup: None,
-            images: Vec::new(),
-            comments: Vec::new(),
+            images: std::sync::Arc::from([]),
+            cell_images: Vec::new(),
+            comments: std::sync::Arc::from([]),
             comments_truncated: false,
             text_shapes: vec![super::super::worksheet::WorksheetTextShape {
                 text: "Lorem ipsum drawn in a text box".to_string(),
@@ -1044,7 +1075,8 @@ mod tests {
                 y_emu: 0,
                 cx_emu: 100,
                 cy_emu: 100,
-            }],
+            }]
+            .into(),
             conditional_formats: Vec::new(),
             data_validations: Vec::new(),
             state: super::super::SheetState::Visible,
@@ -1071,6 +1103,8 @@ mod tests {
             package_properties: Default::default(),
             has_macros: false,
             unreadable_sheets: Vec::new(),
+            unreadable_parts: Vec::new(),
+            unreadable_parts_omitted: 0,
             styles_data: None,
             theme_data: None,
         };
@@ -1106,13 +1140,13 @@ mod tests {
             }],
             merged_cells: Vec::new(),
             hyperlinks: Vec::new(),
-            hyperlinks_dropped: 0,
             formulas_dropped: 0,
             page_setup: None,
-            images: Vec::new(),
-            comments: Vec::new(),
+            images: std::sync::Arc::from([]),
+            cell_images: Vec::new(),
+            comments: std::sync::Arc::from([]),
             comments_truncated: false,
-            text_shapes: Vec::new(),
+            text_shapes: std::sync::Arc::from([]),
             conditional_formats: Vec::new(),
             data_validations: Vec::new(),
             state: super::super::SheetState::Visible,
@@ -1139,6 +1173,8 @@ mod tests {
             package_properties: Default::default(),
             has_macros: false,
             unreadable_sheets: Vec::new(),
+            unreadable_parts: Vec::new(),
+            unreadable_parts_omitted: 0,
             styles_data: None,
             theme_data: None,
         };
@@ -1172,6 +1208,8 @@ mod tests {
             package_properties: Default::default(),
             has_macros: false,
             unreadable_sheets: Vec::new(),
+            unreadable_parts: Vec::new(),
+            unreadable_parts_omitted: 0,
             styles_data: None,
             theme_data: None,
         };

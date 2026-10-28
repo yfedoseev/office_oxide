@@ -338,7 +338,13 @@ impl IrPaddingBudget {
 
     /// Charge `cells` empty cells. `false` — from the first refusal on —
     /// when the allowance is spent; the caller stops building rows.
+    ///
+    /// A charge of no cells is always allowed: a row that needs no padding
+    /// costs nothing, whatever an earlier sheet spent.
     pub(crate) fn charge_cells(&mut self, cells: usize) -> bool {
+        if cells == 0 {
+            return true;
+        }
         if self.exhausted {
             return false;
         }
@@ -358,6 +364,7 @@ impl IrPaddingBudget {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn exhausted(&self) -> bool {
         self.exhausted
     }
@@ -374,7 +381,8 @@ impl IrPaddingBudget {
         format!(
             "[workbook truncated: its rows are padded to the sheet's width with more than {} \
              bytes of empty table cells (office_oxide::limits::set_max_ir_padding_bytes) — \
-             later rows are missing]",
+             this sheet's later rows, and the rows of each later sheet that needs padding, are \
+             missing]",
             self.total
         )
     }
@@ -677,15 +685,6 @@ pub(crate) const MAX_STYLE_NAME_CHARS: usize = 255;
 /// cell that follows it, so a longer one is refused.
 pub(crate) const MAX_FORMULA_CHARS: usize = 8192;
 
-/// The longest hyperlink target kept, in characters: Excel's own limit for a
-/// hyperlink address (2,083, the length Internet Explorer accepts for a URL).
-///
-/// A relationship's target is stored once and named by every `<hyperlink>`
-/// that uses it, so a megabyte target multiplies by the link count into the
-/// reader's maps, the IR and every rendering. A longer one cannot come from a
-/// spreadsheet application: the links that name it are left out, reported.
-pub(crate) const MAX_HYPERLINK_TARGET_CHARS: usize = 2083;
-
 /// The longest number-format code listed on an IR cell, in characters:
 /// Excel's own limit for a custom format (255).
 ///
@@ -769,6 +768,7 @@ mod tests {
         assert!(b.exhausted());
         assert!(b.notice().contains("empty table cells"));
         assert!(!IrPaddingBudget::with_limit(usize::MAX).charge_cells(usize::MAX));
+        assert!(b.charge_cells(0), "a row that needs no padding costs nothing, spent or not");
     }
 
     #[test]
