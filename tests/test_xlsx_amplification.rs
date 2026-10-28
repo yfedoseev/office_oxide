@@ -1051,3 +1051,24 @@ fn test_rich_text_runs_longer_than_the_cell_text_shown_are_charged_in_full() {
     assert!(held <= TEXT_BUDGET, "{held} characters of run text in the IR");
     assert!(ir.metadata.text_truncated);
 }
+
+#[test]
+fn test_hyperlinks_over_one_relationship_share_one_target_allocation() {
+    use office_oxide::xlsx::HyperlinkTarget;
+    set_budgets();
+    let doc = open(hyperlink_fan_out_workbook(100, 2_000)).unwrap();
+    let links = &doc.as_xlsx().unwrap().worksheets[0].hyperlinks;
+    assert_eq!(links.len(), 100);
+    let targets: Vec<_> = links
+        .iter()
+        .map(|l| match &l.target {
+            HyperlinkTarget::External(t) => t.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert!(
+        targets
+            .iter()
+            .all(|t| std::sync::Arc::ptr_eq(t, &targets[0]))
+    );
+}
