@@ -155,31 +155,37 @@ impl SharedParts {
         }
 
         let legacy: Arc<[SheetComment]> = match (legacy_path, legacy_key) {
-            (Some(path), Some(key)) => self
-                .comments
-                .entry(key)
-                .or_insert_with(|| {
-                    XlsxDocument::read_xml_entry(archive, entries, &path)
-                        .ok()
-                        .and_then(|d| worksheet::parse_comments(&d).ok())
-                        .map(Arc::from)
-                })
-                .clone()
-                .unwrap_or_else(|| Arc::from([])),
+            (Some(path), Some(key)) => {
+                let unreadable = &mut self.unreadable;
+                self.comments
+                    .entry(key)
+                    .or_insert_with(|| {
+                        read_parsed(archive, entries, &path, unreadable, worksheet::parse_comments)
+                            .map(Arc::from)
+                    })
+                    .clone()
+                    .unwrap_or_else(|| Arc::from([]))
+            },
             _ => Arc::from([]),
         };
         let threaded: Arc<worksheet::ThreadedComments> = match (threaded_path, threaded_key) {
-            (Some(path), Some(key)) => self
-                .threaded
-                .entry(key)
-                .or_insert_with(|| {
-                    XlsxDocument::read_xml_entry(archive, entries, &path)
-                        .ok()
-                        .and_then(|d| worksheet::parse_threaded_comments(&d).ok())
+            (Some(path), Some(key)) => {
+                let unreadable = &mut self.unreadable;
+                self.threaded
+                    .entry(key)
+                    .or_insert_with(|| {
+                        read_parsed(
+                            archive,
+                            entries,
+                            &path,
+                            unreadable,
+                            worksheet::parse_threaded_comments,
+                        )
                         .map(|messages| Arc::new(worksheet::ThreadedComments::new(messages)))
-                })
-                .clone()
-                .unwrap_or_default(),
+                    })
+                    .clone()
+                    .unwrap_or_default()
+            },
             _ => Arc::default(),
         };
         let merged = if threaded.is_empty() {
@@ -249,17 +255,18 @@ impl SharedParts {
         entries: &opc::ZipEntryIndex,
         path: &str,
     ) -> Option<Arc<str>> {
+        let unreadable = &mut self.unreadable;
         self.charts
             .entry(part_key(entries, path))
             .or_insert_with(|| {
-                let data = XlsxDocument::read_xml_entry(archive, entries, path).ok()?;
+                let data = read_reporting(archive, entries, path, unreadable)?;
                 let text = super::extract_chart_text(&data);
                 (!text.is_empty()).then(|| Arc::from(text))
             })
             .clone()
     }
 
-    /// The table part at `path`, parsed once. `None` (and a log line, once)
+    /// The table part at `path`, parsed once. `None` (and a report, once)
     /// when it is missing or does not parse: the cells it describes are in
     /// the sheet either way.
     pub(super) fn table<R: Read + Seek>(
@@ -268,21 +275,53 @@ impl SharedParts {
         entries: &opc::ZipEntryIndex,
         path: &str,
     ) -> Option<Arc<SheetTable>> {
+        let unreadable = &mut self.unreadable;
         self.tables
             .entry(part_key(entries, path))
             .or_insert_with(|| {
-                match XlsxDocument::read_xml_entry(archive, entries, path)
-                    .map_err(|e| e.to_string())
-                    .and_then(|d| worksheet::parse_table_part(&d).map_err(|e| e.to_string()))
-                {
-                    Ok(t) => Some(Arc::new(t)),
-                    Err(e) => {
-                        log::warn!("xlsx: table part {path} skipped: {e}");
-                        None
-                    },
-                }
+                read_parsed(archive, entries, path, unreadable, worksheet::parse_table_part)
+                    .map(Arc::new)
             })
             .clone()
+    }
+}
+
+/// The part at `path`, read; `None` when it cannot be, with the reason
+/// recorded (once per part) in `unreadable`. Callers keep the outcome, so the
+/// part is not tried again by every reference to it.
+pub(super) fn read_reporting<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &opc::ZipEntryIndex,
+    path: &str,
+    unreadable: &mut ReportList,
+) -> Option<Vec<u8>> {
+    match XlsxDocument::read_xml_entry(archive, entries, path) {
+        Ok(data) => Some(data),
+        Err(e) => {
+            log::warn!("xlsx: part {path} unreadable: {e}");
+            unreadable.record(entries, path, &e.to_string());
+            None
+        },
+    }
+}
+
+/// The part at `path`, read and parsed by `parse`; `None` with the reason
+/// recorded when either fails.
+pub(super) fn read_parsed<R: Read + Seek, T>(
+    archive: &mut ZipArchive<R>,
+    entries: &opc::ZipEntryIndex,
+    path: &str,
+    unreadable: &mut ReportList,
+    parse: impl FnOnce(&[u8]) -> crate::core::Result<T>,
+) -> Option<T> {
+    let data = read_reporting(archive, entries, path, unreadable)?;
+    match parse(&data) {
+        Ok(parsed) => Some(parsed),
+        Err(e) => {
+            log::warn!("xlsx: part {path} unreadable: {e}");
+            unreadable.record(entries, path, &e.to_string());
+            None
+        },
     }
 }
 
@@ -295,13 +334,7 @@ fn read_drawing<R: Read + Seek>(
     drawing_path: &str,
     unreadable: &mut ReportList,
 ) -> Option<SharedDrawing> {
-    let drawing_xml = match XlsxDocument::read_xml_entry(archive, entries, drawing_path) {
-        Ok(d) => d,
-        Err(e) => {
-            log::debug!("XlsxDocument: drawing part {drawing_path} unreadable ({e}); skipping");
-            return None;
-        },
-    };
+    let drawing_xml = read_reporting(archive, entries, drawing_path, unreadable)?;
 
     let drawing_rels =
         read_rels_reporting(archive, entries, &sheet_rels_path(drawing_path), unreadable);
@@ -309,9 +342,8 @@ fn read_drawing<R: Read + Seek>(
     let parsed = match parse_drawing_anchors(&drawing_xml) {
         Ok(a) => a,
         Err(e) => {
-            log::debug!(
-                "XlsxDocument: drawing {drawing_path} failed to parse ({e}); dropping anchors"
-            );
+            log::warn!("xlsx: drawing {drawing_path} failed to parse ({e}); dropping anchors");
+            unreadable.record(entries, drawing_path, &e.to_string());
             return None;
         },
     };
@@ -323,7 +355,12 @@ fn read_drawing<R: Read + Seek>(
             continue;
         };
         let media_path = resolve_relative_zip_path(drawing_path, &rel.target);
-        let Some(bytes) = read_media_cached(archive, entries, &media_path, media) else {
+        // A linked picture names a target outside the package.
+        if rel.target_mode == crate::core::relationships::TargetMode::External {
+            continue;
+        }
+        let Some(bytes) = read_media_cached(archive, entries, &media_path, media, unreadable)
+        else {
             continue;
         };
         let ext = std::path::Path::new(&*rel.target)

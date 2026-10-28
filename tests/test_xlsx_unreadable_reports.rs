@@ -171,3 +171,132 @@ fn test_a_caller_who_drops_each_sheet_ir_still_learns_of_an_unreadable_part() {
     assert!(truncated);
     assert!(warnings.iter().any(|w| w.contains("sheet1.xml.rels")), "{warnings:?}");
 }
+
+const XDR: &str = r#"xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
+
+/// One worksheet `S` whose body ends with `tail`, its relationships `rels`,
+/// and the parts `extra`.
+fn sheet_with(tail: &str, rels: &str, extra: Vec<(String, String)>) -> Vec<u8> {
+    let mut parts = fixed_parts(
+        format!(
+            r#"<workbook xmlns="{NS}" xmlns:r="{R}"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#
+        ),
+        format!(
+            r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#
+        ),
+    );
+    parts.push((
+        "xl/worksheets/sheet1.xml".into(),
+        format!(
+            r#"<worksheet xmlns="{NS}" xmlns:r="{R}"><sheetData><row r="1"><c r="A1"><v>7</v></c></row></sheetData>{tail}</worksheet>"#
+        ),
+    ));
+    parts.push((
+        "xl/worksheets/_rels/sheet1.xml.rels".into(),
+        format!(r#"<Relationships xmlns="{REL_NS}">{rels}</Relationships>"#),
+    ));
+    parts.extend(extra);
+    zip_of(parts)
+}
+
+/// The reported unreadable parts of a workbook.
+fn reported(doc: &Document) -> Vec<String> {
+    let xlsx = doc.as_xlsx().unwrap();
+    xlsx.unreadable_parts
+        .iter()
+        .map(|(part, why)| format!("{part}: {why}"))
+        .collect()
+}
+
+#[test]
+fn test_parts_that_cannot_be_read_or_parsed_are_reported_not_swallowed() {
+    let _g = LimitScope::new();
+    let rel = |id: &str, kind: &str, target: &str| {
+        format!(r#"<Relationship Id="{id}" Type="{R}/{kind}" Target="{target}"/>"#)
+    };
+    let threaded = |target: &str| {
+        format!(
+            r#"<Relationship Id="rT" Type="http://schemas.microsoft.com/office/2017/10/relationships/threadedComment" Target="{target}"/>"#
+        )
+    };
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        // A comments part that is not XML, a table part, a threaded part and
+        // a drawing that do not parse.
+        (
+            "comments1.xml",
+            sheet_with(
+                "",
+                &rel("r1", "comments", "../comments1.xml"),
+                vec![("xl/comments1.xml".into(), "<comments".into())],
+            ),
+        ),
+        (
+            "table1.xml",
+            sheet_with(
+                r#"<tableParts count="1"><tablePart r:id="r1"/></tableParts>"#,
+                &rel("r1", "table", "../tables/table1.xml"),
+                vec![("xl/tables/table1.xml".into(), "<table".into())],
+            ),
+        ),
+        (
+            "t1.xml",
+            sheet_with(
+                "",
+                &threaded("../threadedComments/t1.xml"),
+                vec![(
+                    "xl/threadedComments/t1.xml".into(),
+                    "<ThreadedComments><threadedComment".into(),
+                )],
+            ),
+        ),
+        (
+            "drawing1.xml",
+            sheet_with(
+                r#"<drawing r:id="r1"/>"#,
+                &rel("r1", "drawing", "../drawings/drawing1.xml"),
+                vec![(
+                    "xl/drawings/drawing1.xml".into(),
+                    format!("<xdr:wsDr {XDR}><xdr:oneCellAnchor"),
+                )],
+            ),
+        ),
+        // Parts that are named and not in the package.
+        (
+            "gone.xml",
+            sheet_with(
+                r#"<drawing r:id="r1"/>"#,
+                &rel("r1", "drawing", "../drawings/gone.xml"),
+                vec![],
+            ),
+        ),
+        (
+            "gone.png",
+            sheet_with(
+                r#"<drawing r:id="r1"/>"#,
+                &rel("r1", "drawing", "../drawings/drawing1.xml"),
+                vec![
+                    (
+                        "xl/drawings/drawing1.xml".into(),
+                        format!(
+                            r#"<xdr:wsDr {XDR}><xdr:oneCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx="100" cy="100"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="p"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill><xdr:spPr/></xdr:pic><xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>"#
+                        ),
+                    ),
+                    (
+                        "xl/drawings/_rels/drawing1.xml.rels".into(),
+                        format!(
+                            r#"<Relationships xmlns="{REL_NS}">{}</Relationships>"#,
+                            rel("rId1", "image", "../media/gone.png")
+                        ),
+                    ),
+                ],
+            ),
+        ),
+    ];
+    for (part, bytes) in cases {
+        let doc = open(bytes);
+        let found = reported(&doc);
+        assert!(found.iter().any(|f| f.contains(part)), "{part} is not reported: {found:?}");
+        assert!(doc.plain_text().contains(part), "{part} is not in the text");
+        assert!(doc.to_ir().metadata.text_truncated, "{part}");
+    }
+}

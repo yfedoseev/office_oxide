@@ -615,3 +615,66 @@ fn test_large_threaded_parts_paired_with_many_legacy_parts_cost_nothing_once_the
         "each further legacy part costs {large} bytes to open against two threaded parts of 5,000 messages, {small} against two of 20: the messages are grouped per pair"
     );
 }
+
+/// One sheet whose drawing places `anchors` pictures that all name the media
+/// part `xl/media/bad.png`: 1 MiB of zeros, deflated, with one byte of the
+/// compressed stream flipped at `damage` (not at all when `None`).
+fn pictures_of_one_damaged_image(anchors: usize, damage: Option<usize>) -> Vec<u8> {
+    let mut drawing = format!("<xdr:wsDr {XDR}>");
+    for _ in 0..anchors {
+        drawing.push_str(r#"<xdr:oneCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx="100" cy="100"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="p"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill><xdr:spPr/></xdr:pic><xdr:clientData/></xdr:oneCellAnchor>"#);
+    }
+    drawing.push_str("</xdr:wsDr>");
+    let mut bytes = workbook(
+        1,
+        &one_cell(r#"<drawing r:id="rId1"/>"#),
+        &format!(r#"<Relationship Id="rId1" Type="{R}/drawing" Target="../drawings/drawing1.xml"/>"#),
+        &[
+            ("xl/drawings/drawing1.xml", drawing.into_bytes()),
+            (
+                "xl/drawings/_rels/drawing1.xml.rels",
+                format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/image" Target="../media/bad.png"/></Relationships>"#).into_bytes(),
+            ),
+            ("xl/media/bad.png", vec![0u8; 1 << 20]),
+        ],
+    );
+    if let Some(at) = damage {
+        // The local header: 30 bytes, the name, an extra field.
+        let name = b"xl/media/bad.png";
+        let header = bytes.windows(name.len()).position(|w| w == name).unwrap() - 30;
+        let extra = u16::from_le_bytes([bytes[header + 28], bytes[header + 29]]) as usize;
+        bytes[header + 30 + name.len() + extra + at] ^= 0x5A;
+    }
+    bytes
+}
+
+#[test]
+fn test_a_damaged_picture_named_by_many_anchors_is_read_once_and_reported_once() {
+    let _g = serial();
+    // Damage the stream where the read fails (a checksum mismatch alone
+    // keeps the bytes).
+    let damage = (3..60)
+        .find(|&at| {
+            let doc = open(pictures_of_one_damaged_image(1, Some(at)));
+            doc.as_xlsx()
+                .unwrap()
+                .unreadable_parts
+                .iter()
+                .any(|(p, _)| p.contains("bad.png"))
+        })
+        .expect("a damage that makes the read fail");
+    let by = |anchors| {
+        let bytes = pictures_of_one_damaged_image(anchors, Some(damage));
+        let (doc, used) = bytes_during(|| open(bytes));
+        let parts = doc.as_xlsx().unwrap().unreadable_parts.clone();
+        drop(doc);
+        (used, parts)
+    };
+    let (one, _) = by(1);
+    let (many, parts) = by(200);
+    assert!(
+        many < one + (1 << 20),
+        "200 anchors naming a damaged picture take {many} bytes to open, one anchor {one}: the read is repeated"
+    );
+    assert_eq!(parts.iter().filter(|(p, _)| p.contains("bad.png")).count(), 1, "{parts:?}");
+}
