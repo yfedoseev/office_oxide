@@ -487,7 +487,7 @@ fn markdown_blocks_inner(
                 let effective = ctx
                     .styles
                     .map(|sheet| {
-                        sheet.effective_paragraph_properties_in(
+                        sheet.effective_paragraph_flags_in(
                             ctx.table.map(|l| &l.paragraph),
                             p.properties.as_ref(),
                         )

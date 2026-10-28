@@ -517,6 +517,11 @@ pub(crate) fn parse_border_edge(e: &BytesStart) -> BorderEdge {
     edge
 }
 
+/// What one tab stop adds to the serialised IR, at most: the stop's position,
+/// alignment and leader, `{"position_twips":-2147483648,"alignment":
+/// "Decimal","leader":"MiddleDot"}`.
+const TAB_STOP_IR_CHARS: usize = 80;
+
 fn text_len(s: &Option<String>) -> usize {
     s.as_deref().map_or(0, str::len)
 }
@@ -633,6 +638,86 @@ impl RunProperties {
 }
 
 impl ParagraphProperties {
+    /// The characters of text this set owns on the heap, which a clone of it
+    /// copies, and which the IR holds again: the tab stops (counted at what
+    /// each adds to the serialised IR), border and shading names, the
+    /// paragraph mark's run properties and a section's references. A style
+    /// stores them once and every paragraph that overlays the style copies
+    /// them.
+    pub(crate) fn heap_chars(&self) -> usize {
+        let edge = |e: &Option<BorderEdge>| {
+            e.as_ref()
+                .map_or(0, |e| text_len(&e.style) + text_len(&e.color))
+        };
+        let borders = self.borders.as_deref().map_or(0, |b| {
+            edge(&b.top) + edge(&b.bottom) + edge(&b.left) + edge(&b.right) + edge(&b.between)
+        });
+        let shading = self
+            .shading
+            .as_deref()
+            .map_or(0, |s| text_len(&s.fill) + text_len(&s.color) + text_len(&s.pattern));
+        let section = self.section_properties.as_deref().map_or(0, |s| {
+            let refs = |r: &[super::HeaderFooterRef]| {
+                r.iter()
+                    .map(|r| r.relationship_id.len() + 16)
+                    .sum::<usize>()
+            };
+            let note = |n: &Option<super::NoteProperties>| {
+                n.as_ref().map_or(0, |n| {
+                    text_len(&n.position) + text_len(&n.number_format) + text_len(&n.restart)
+                })
+            };
+            refs(&s.header_refs)
+                + refs(&s.footer_refs)
+                + s.column_layout.as_ref().map_or(0, |c| c.widths.len() * 4)
+                + s.page_numbering.as_ref().map_or(0, |p| text_len(&p.format))
+                + note(&s.footnote_properties)
+                + note(&s.endnote_properties)
+        });
+        let tabs: usize = self
+            .tabs
+            .iter()
+            .map(|t| TAB_STOP_IR_CHARS + t.alignment.len() + text_len(&t.leader))
+            .sum();
+        text_len(&self.style_id)
+            + self
+                .run_properties
+                .as_deref()
+                .map_or(0, RunProperties::heap_chars)
+            + borders
+            + shading
+            + section
+            + tabs
+    }
+
+    /// A copy without the text [`Self::heap_chars`] counts and without the
+    /// tab stops: every flag, indent and spacing is kept. The fold of a style
+    /// chain for a consumer that reads only those, and what a conversion
+    /// falls back to once its text budget cannot take another copy.
+    pub(crate) fn clone_light(&self) -> Self {
+        Self {
+            style_id: None,
+            justification: self.justification,
+            indent: self.indent.clone(),
+            spacing: self.spacing.clone(),
+            numbering_ref: self.numbering_ref.clone(),
+            outline_level: self.outline_level,
+            run_properties: self
+                .run_properties
+                .as_deref()
+                .map(|r| Box::new(r.clone_light())),
+            frame_position: self.frame_position,
+            section_properties: None,
+            has_bottom_border: self.has_bottom_border,
+            borders: None,
+            keep_next: self.keep_next,
+            keep_lines: self.keep_lines,
+            page_break_before: self.page_break_before,
+            shading: None,
+            tabs: Vec::new(),
+        }
+    }
+
     /// Overlay `src` on top of `self`. See [`RunProperties::overlay`].
     ///
     /// `run_properties` is merged recursively rather than replaced, so a

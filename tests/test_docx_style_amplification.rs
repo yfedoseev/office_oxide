@@ -213,3 +213,44 @@ fn test_small_style_font_name_is_kept_on_every_run() {
     assert!(names.iter().all(|n| *n == Some("Arial")));
     assert!(!ir.metadata.text_truncated);
 }
+
+fn tab_styles(tabs: usize) -> String {
+    let mut t = String::from("<w:pPr><w:tabs>");
+    for i in 0..tabs {
+        t.push_str(&format!(r#"<w:tab w:val="left" w:pos="{}"/>"#, i + 1));
+    }
+    t.push_str("</w:tabs></w:pPr>");
+    format!(
+        r#"<w:styles {NS}><w:style w:type="paragraph" w:styleId="s"><w:name w:val="S"/>{t}</w:style></w:styles>"#
+    )
+}
+
+fn styled_body(n: usize) -> String {
+    r#"<w:p><w:pPr><w:pStyle w:val="s"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>"#.repeat(n)
+}
+
+#[test]
+fn test_style_tab_stop_copies_per_paragraph_are_charged() {
+    limits();
+    let ir = to_ir(docx(&styled_body(USERS), Some(&tab_styles(1_000)), None));
+    let paras = paragraphs(&ir);
+    assert_eq!(paras.len(), USERS, "the paragraphs themselves stay");
+    let tabs: usize = paras.iter().map(|p| p.tabs.len()).sum();
+    assert!(tabs > 0, "the budget holds a few copies");
+    // Every tab stop serialises to at least 64 characters.
+    assert!(
+        tabs * 64 <= TEXT_BUDGET,
+        "{tabs} tab stops were copied against a budget of {TEXT_BUDGET} characters"
+    );
+    assert_reported(&ir);
+}
+
+#[test]
+fn test_few_style_tab_stops_are_kept_on_every_paragraph() {
+    limits();
+    let ir = to_ir(docx(&styled_body(USERS), Some(&tab_styles(3)), None));
+    let paras = paragraphs(&ir);
+    assert_eq!(paras.len(), USERS);
+    assert!(paras.iter().all(|p| p.tabs.len() == 3));
+    assert!(!ir.metadata.text_truncated);
+}

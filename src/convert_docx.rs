@@ -152,7 +152,15 @@ impl<'a, 'd> Cx<'a, 'd> {
                 b
             },
         };
-        let mut out = (*base).clone();
+        // The fold's tab stops and names are copied for this paragraph, and
+        // the IR holds the tab stops again; once the budget cannot take them
+        // the paragraph keeps the rest of its formatting without them, and
+        // the conversion says so.
+        let mut out = if crate::limits::charge_copied_text(base.heap_chars()) {
+            (*base).clone()
+        } else {
+            base.clone_light()
+        };
         if let Some(d) = direct {
             out.overlay(d);
         }

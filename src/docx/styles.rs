@@ -382,6 +382,24 @@ impl StyleSheet {
         out
     }
 
+    /// [`Self::effective_paragraph_properties_in`] without the tab stops and
+    /// text: the flags, indents, spacing and numbering only, for a consumer
+    /// that folds the chain for every paragraph and reads nothing else. A
+    /// style stores its tab stops once and the full fold copies them for
+    /// every level of the chain and every paragraph; this one never does.
+    pub(crate) fn effective_paragraph_flags_in(
+        &self,
+        table: Option<&ParagraphProperties>,
+        direct: Option<&ParagraphProperties>,
+    ) -> ParagraphProperties {
+        let mut out =
+            self.paragraph_style_base_with(true, table, direct.and_then(|d| d.style_id.as_deref()));
+        if let Some(d) = direct {
+            out.overlay(&d.clone_light());
+        }
+        out
+    }
+
     /// Everything a paragraph inherits before its own `w:pPr`: document
     /// defaults, the table layer, then the paragraph style chain.
     pub(crate) fn paragraph_style_base(
@@ -389,18 +407,37 @@ impl StyleSheet {
         table: Option<&ParagraphProperties>,
         paragraph_style_id: Option<&str>,
     ) -> ParagraphProperties {
+        self.paragraph_style_base_with(false, table, paragraph_style_id)
+    }
+
+    /// [`Self::paragraph_style_base`], with `light` leaving out the tab stops
+    /// and text of every layer (see [`ParagraphProperties::clone_light`]).
+    fn paragraph_style_base_with(
+        &self,
+        light: bool,
+        table: Option<&ParagraphProperties>,
+        paragraph_style_id: Option<&str>,
+    ) -> ParagraphProperties {
+        let layer = |out: &mut ParagraphProperties, pp: &ParagraphProperties| {
+            if light {
+                out.overlay(&pp.clone_light());
+            } else {
+                out.overlay(pp);
+            }
+        };
         let mut out = self
             .doc_defaults
             .as_ref()
-            .and_then(|d| d.paragraph_properties.clone())
+            .and_then(|d| d.paragraph_properties.as_ref())
+            .map(|pp| if light { pp.clone_light() } else { pp.clone() })
             .unwrap_or_default();
         if let Some(t) = table {
-            out.overlay(t);
+            layer(&mut out, t);
         }
         if let Some(pid) = paragraph_style_id {
             for style in self.chain(pid) {
                 if let Some(pp) = style.paragraph_properties.as_ref() {
-                    out.overlay(pp);
+                    layer(&mut out, pp);
                 }
             }
         }

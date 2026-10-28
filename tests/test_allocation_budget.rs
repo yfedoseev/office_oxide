@@ -724,3 +724,29 @@ fn test_docx_markdown_does_not_copy_a_huge_style_face_name_per_run() {
         "{bytes} bytes requested rendering {PARAS} runs under a style with a 1 MiB face name"
     );
 }
+
+/// A style's tab stops, folded into the effective formatting of each
+/// paragraph to find its numbering, used to be copied once per paragraph.
+#[test]
+fn test_docx_markdown_does_not_copy_a_styles_tab_stops_per_paragraph() {
+    let _serial = serial();
+    const PARAS: usize = 200;
+    let mut style = String::from("<w:pPr><w:tabs>");
+    for i in 0..20_000 {
+        style.push_str(&format!(r#"<w:tab w:val="left" w:pos="{}"/>"#, i + 1));
+    }
+    style.push_str("</w:tabs></w:pPr>");
+    let doc = office_oxide::Document::from_reader(
+        Cursor::new(docx_with_style_inner(&style, PARAS)),
+        office_oxide::DocumentFormat::Docx,
+    )
+    .unwrap();
+    let (md, bytes) = bytes_during(|| doc.to_markdown());
+    assert!(md.contains("**x**"));
+    // One copy of 20,000 tab stops is about 1 MiB; the old fold made one per
+    // paragraph (200 MiB).
+    assert!(
+        bytes < 8 << 20,
+        "{bytes} bytes requested rendering {PARAS} paragraphs under a style with 20,000 tab stops"
+    );
+}
