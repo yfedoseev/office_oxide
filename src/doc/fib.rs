@@ -14,9 +14,6 @@ pub struct Fib {
     /// every compressed run was decoded as CP1252 regardless of the
     /// document's actual authoring locale.
     pub lid: u16,
-    /// FibBase `chs` (absolute offset 0x0014) is 0x0100: the document was
-    /// saved with a Macintosh character set, so its 8-bit text is Mac Roman.
-    pub mac_charset: bool,
     /// Which table stream to use: true = "1Table", false = "0Table".
     pub use_table1: bool,
     /// Offset of the CLX (piece table) in the Table stream.
@@ -118,17 +115,6 @@ pub struct Fib {
 }
 
 impl Fib {
-    /// The language ID that selects how compressed (8-bit) text is decoded:
-    /// the document's own `lid`, or [`MAC_TEXT`](super::codepage::MAC_TEXT) for a
-    /// Macintosh character set.
-    pub fn text_lid(&self) -> u16 {
-        if self.mac_charset {
-            super::codepage::MAC_TEXT
-        } else {
-            self.lid
-        }
-    }
-
     /// Parse the FIB from the WordDocument stream.
     pub fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < 68 {
@@ -159,8 +145,6 @@ impl Fib {
         // FibBase.lid, absolute offset 0x06 (u16 LE) — verified against
         // FibBase's field layout (wIdent, nFib, unused, lid, ...).
         let lid = u16::from_le_bytes([data[0x06], data[0x07]]);
-        // FibBase.chs, absolute offset 0x14 (u16 LE): 0x0100 = Macintosh.
-        let mac_charset = u16::from_le_bytes([data[0x14], data[0x15]]) == 0x0100;
 
         // Flags at offset 0x0A (u16): [MS-DOC] §2.5.1 FibBase.
         //   bit 8  = fEncrypted
@@ -331,7 +315,6 @@ impl Fib {
 
         Ok(Self {
             lid,
-            mac_charset,
             use_table1,
             clx_offset,
             clx_size,
@@ -462,19 +445,20 @@ mod tests {
         assert!(Fib::parse(&data).is_err());
     }
 
-    /// FibBase `chs` (absolute offset 0x0014): 0x0100 marks a Macintosh
-    /// character set, so the document's 8-bit text is Mac Roman whatever its
-    /// language. `envr` alone (offset 0x0013) does not: files saved on a Mac
-    /// with an ANSI character set carry it too.
+    /// FibBase `chs` (offset 0x0014) = 0x0100 marks a Macintosh character set
+    /// in a Word 6/95 file, whose 8-bit text is then Mac Roman. A Word 97+
+    /// file stores compressed text as Windows-1252 whatever `chs` says (real
+    /// files written with the marker carry accents and ellipses in 1252), so
+    /// the marker must not change how the language alone selects the codepage.
     #[test]
-    fn test_macintosh_charset_selects_the_text_encoding() {
+    fn test_a_macintosh_charset_marker_does_not_change_word97_text_decoding() {
         let mut data = build_minimal_fib();
         data[0x06..0x08].copy_from_slice(&0x040Cu16.to_le_bytes()); // French
-        assert_eq!(Fib::parse(&data).unwrap().text_lid(), 0x040C);
-        data[0x13] = 1; // envr
-        assert_eq!(Fib::parse(&data).unwrap().text_lid(), 0x040C);
+        data[0x12] = 1; // envr
         data[0x14..0x16].copy_from_slice(&0x0100u16.to_le_bytes());
-        assert_eq!(Fib::parse(&data).unwrap().text_lid(), super::super::codepage::MAC_TEXT);
+        let fib = Fib::parse(&data).unwrap();
+        assert_eq!(fib.lid, 0x040C);
+        assert_eq!(super::super::codepage::codepage_for_lid(fib.lid), 1252);
     }
 
     #[test]

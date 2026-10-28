@@ -69,6 +69,9 @@ pub(super) struct Word6Fib {
     /// `wIdent`: `0xA5DC` for Windows, `0xA697..=0xA699` for the Macintosh variants.
     pub wident: u16,
     pub lid: u16,
+    /// FibBase `chs` (offset 0x0014) is 0x0100: the file was saved with a
+    /// Macintosh character set, so its 8-bit text is Mac Roman.
+    pub mac_charset: bool,
     pub complex: bool,
     /// `fExtChar`: the text is stored in two-byte code units (UTF-16LE)
     /// rather than one byte per character — the Far East and Macintosh
@@ -98,6 +101,19 @@ pub(super) struct Word6Fib {
     pub lcb_plcf_sed: u32,
 }
 
+impl Word6Fib {
+    /// The language ID that selects how 8-bit text is decoded: the file's own
+    /// `lid`, or [`MAC_TEXT`](super::codepage::MAC_TEXT) for a Macintosh
+    /// character set.
+    pub(super) fn text_lid(&self) -> u16 {
+        if self.mac_charset {
+            super::codepage::MAC_TEXT
+        } else {
+            self.lid
+        }
+    }
+}
+
 const FIB_LEN: usize = 0x168;
 
 pub(super) fn parse_fib(data: &[u8]) -> Result<Word6Fib> {
@@ -123,6 +139,7 @@ pub(super) fn parse_fib(data: &[u8]) -> Result<Word6Fib> {
     Ok(Word6Fib {
         wident: u16_at(0x00),
         lid: u16_at(0x06),
+        mac_charset: u16_at(0x14) == 0x0100,
         complex: flags & 0x0004 != 0,
         ext_char: flags & 0x1000 != 0,
         fc_min: u32_at(0x18),
@@ -243,7 +260,7 @@ pub(super) fn stories(
             continue;
         }
         let end = cp.saturating_add(len).min(covered);
-        let raw = extract_text_range(word_doc, pieces, cp, end, fib.lid);
+        let raw = extract_text_range(word_doc, pieces, cp, end, fib.text_lid());
         if i == 0 {
             main = sanitize_text(&raw);
         } else if !sanitize_text(&raw).trim().is_empty() {
@@ -339,6 +356,26 @@ mod tests {
         assert!(fib.ext_char);
         let table = pieces(&doc, &fib).unwrap();
         assert_eq!(stories(&doc, &fib, &table).0, "Mac Word\n");
+    }
+
+    /// `FibBase.chs` = 0x0100 marks a Macintosh character set: the 8-bit text is
+    /// Mac Roman, in which 0xD5 is the right single quote and 0x8E is e-acute
+    /// (Windows-1252 reads them as `Õ` and `Ž`).
+    #[test]
+    fn test_macintosh_charset_text_is_decoded_as_mac_roman() {
+        let text = b"l\xD5auteur, strat\x8Egie\r";
+        for (chs, expected) in [
+            (0x0100u16, "l\u{2019}auteur, strat\u{e9}gie\n"),
+            (0, "l\u{d5}auteur, strat\u{17d}gie\n"),
+        ] {
+            let mut doc =
+                fib_bytes(false, text.len() as u32, 0x300, 0x300 + text.len() as u32, (0, 0));
+            doc[0x14..0x16].copy_from_slice(&chs.to_le_bytes());
+            doc.extend_from_slice(text);
+            let fib = parse_fib(&doc).unwrap();
+            let table = pieces(&doc, &fib).unwrap();
+            assert_eq!(stories(&doc, &fib, &table).0, expected, "chs {chs:#06x}");
+        }
     }
 
     /// A Word 2.0 file is the FIB and the text with no container: the

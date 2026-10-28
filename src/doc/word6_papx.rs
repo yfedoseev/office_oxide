@@ -684,6 +684,7 @@ mod tests {
         Word6Fib {
             wident: 0xA5DC,
             lid: 0x0409,
+            mac_charset: false,
             complex: false,
             ext_char: false,
             fc_min: 0x300,

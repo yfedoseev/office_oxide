@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A `.doc` saved with a Macintosh character set is decoded as Mac Roman.** The reader chose the codepage from the language ID alone, so a curly quote (0xD5) or an accented letter came out as `Õ` or `Ž`; antiword and catdoc decode them. The marker is `FibBase.chs` = 0x0100.
+- **A Word 6/95 `.doc` saved with a Macintosh character set is decoded as Mac Roman.** The reader chose the codepage from the language ID alone, so a curly quote (0xD5) or an accented letter came out as `Õ` or `Ž`; antiword decodes them. The marker is `FibBase.chs` = 0x0100. Word 97 and later files keep Windows-1252: they store compressed text that way even when they carry the marker.
 
 - **A `.xls` formula cell whose text result follows its array, shared-formula or data-table record keeps that text.** The result was forgotten on any record other than `STRING`, so such a cell came out empty although xlrd, calamine and xls2csv return the text.
 
