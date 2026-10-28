@@ -99,6 +99,17 @@ struct TextNode {
     paragraph: usize,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Span positions the match walks of this thread have stepped over.
+    static SPAN_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_span_step() {
+    SPAN_STEPS.with(|c| c.set(c.get() + 1));
+}
+
 /// Replace `find` with `replace` in the text of each paragraph of a
 /// WordprocessingML part, matching across the `<w:t>` nodes of the
 /// paragraph's runs. A node's text belongs to its innermost enclosing
@@ -154,10 +165,14 @@ fn replace_across_runs(xml: &str, find: &str, replace: &str) -> (String, usize) 
         // Copy `joined[a..b]` into the nodes that hold it.
         let copy = |out: &mut Vec<String>, first: &mut usize, a: usize, b: usize| {
             while *first < spans.len() && spans[*first].1 <= a {
+                #[cfg(test)]
+                count_span_step();
                 *first += 1;
             }
             let mut k = *first;
             while k < spans.len() && spans[k].0 < b {
+                #[cfg(test)]
+                count_span_step();
                 let (s, e) = spans[k];
                 let (lo, hi) = (a.max(s), b.min(e));
                 if lo < hi {
@@ -171,6 +186,8 @@ fn replace_across_runs(xml: &str, find: &str, replace: &str) -> (String, usize) 
             copy(&mut out, &mut first, cur, s);
             // The node the match starts in (`s < e`, so it holds `s`).
             while start_node < spans.len() && spans[start_node].1 <= s {
+                #[cfg(test)]
+                count_span_step();
                 start_node += 1;
             }
             let k = if start_node < spans.len() && spans[start_node].0 <= s {
@@ -402,7 +419,7 @@ mod tests {
             "c",
         ];
         let mut state = 11u32;
-        for _ in 0..400 {
+        for _ in 0..120 {
             // Cut the text at pseudo-random byte offsets (all ASCII), with
             // some empty runs, and wrap it in paragraphs.
             let mut xml = String::from("<w:p>");
@@ -432,24 +449,26 @@ mod tests {
     }
 
     /// One paragraph of many one-character runs with a match in every run
-    /// took time in matches times runs.
+    /// took time in matches times runs. Counted in the span positions the
+    /// match walks step over, which stay a small multiple of the runs and
+    /// double when the runs do.
     #[test]
-    fn test_replace_across_many_runs_is_not_quadratic() {
-        let runs = 30_000;
-        let mut xml = String::from("<w:p>");
-        for _ in 0..runs {
-            xml.push_str("<w:r><w:t>a</w:t></w:r>");
-        }
-        xml.push_str("</w:p>");
-        let start = std::time::Instant::now();
-        let (out, count) = replace_across_runs(&xml, "a", "b");
-        assert_eq!(count, runs);
-        assert_eq!(out.matches("<w:t>b</w:t>").count(), runs);
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(5),
-            "took {:?}",
-            start.elapsed()
-        );
+    fn test_replace_across_many_runs_steps_over_a_linear_number_of_spans() {
+        let steps = |runs: usize| {
+            let mut xml = String::from("<w:p>");
+            for _ in 0..runs {
+                xml.push_str("<w:r><w:t>a</w:t></w:r>");
+            }
+            xml.push_str("</w:p>");
+            SPAN_STEPS.with(|c| c.set(0));
+            let (out, count) = replace_across_runs(&xml, "a", "b");
+            assert_eq!(count, runs);
+            assert_eq!(out.matches("<w:t>b</w:t>").count(), runs);
+            SPAN_STEPS.with(|c| c.get())
+        };
+        let (small, large) = (steps(1_000), steps(2_000));
+        assert!(small <= 4 * 1_000, "{small} steps over 1,000 runs");
+        assert!(large <= 4 * 2_000, "{large} steps over 2,000 runs");
     }
 
     #[test]

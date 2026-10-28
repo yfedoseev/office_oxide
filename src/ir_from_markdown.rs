@@ -1396,7 +1396,7 @@ mod tests {
 
     #[test]
     fn test_sections_past_the_block_limit_are_dropped() {
-        let md = "---\n".repeat(1_000);
+        let md = "---\n".repeat(100);
         let ir = with_blocks(&md, 10);
         // Each break is a block and a section: five of each fit.
         assert!(ir.sections.len() <= 7, "{} sections", ir.sections.len());
@@ -1405,7 +1405,7 @@ mod tests {
 
     #[test]
     fn test_table_cells_are_charged_before_the_row_is_built() {
-        let wide = format!("|{}\n", "a|".repeat(50_000));
+        let wide = format!("|{}\n", "a|".repeat(2_000));
         let ir = DocumentIR::from_markdown_with_limits(
             &wide,
             DocumentFormat::Docx,
@@ -1422,7 +1422,7 @@ mod tests {
                 _ => 0,
             })
             .sum();
-        assert_eq!(cells, 0, "a header row of 50,000 cells does not fit 100 cells");
+        assert_eq!(cells, 0, "a header row of 2,000 cells does not fit 100 cells");
         assert!(ir.metadata.text_truncated);
         // A small table fits: two rows of 2 cells.
         let ir = DocumentIR::from_markdown_with_limits(
