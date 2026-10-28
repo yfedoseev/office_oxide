@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-10-29
+
 ### Fixed
 
 - **A `.docx` or `.pptx` whose package-level or main-part relationships part the zip cannot decode opens again, with the loss reported.** A damaged `_rels/.rels`, `word/_rels/document.xml.rels` or `ppt/_rels/presentation.xml.rels` (an unsupported compression method, an encrypted entry) was read as an empty set of relationships and the document opened; an earlier change in this release made such a document refuse to open. It opens as it always did (the main part is found through `[Content_Types].xml`), and the part is listed in `unreadable_parts`, in the metadata warnings and in the text, with `text_truncated` set. Editing such a document is still refused, because saving it would write out a package without its relationships.

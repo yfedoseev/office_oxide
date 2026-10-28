@@ -227,7 +227,7 @@ dependencies = [
 
 [[package]]
 name = "office_oxide"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "atoi_simd",
  "encoding_rs",

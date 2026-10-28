@@ -71,7 +71,7 @@ let ir = doc.to_ir(); // Format-agnostic intermediate representation
 
 ```toml
 [dependencies]
-office_oxide = "0.1.15"
+office_oxide = "0.1.16"
 ```
 
 ### JavaScript / WASM
@@ -322,7 +322,7 @@ Wheels available for Linux, macOS, and Windows. Python 3.10–3.14.
 
 ```toml
 [dependencies]
-office_oxide = "0.1.15"
+office_oxide = "0.1.16"
 ```
 
 ### JavaScript/WASM

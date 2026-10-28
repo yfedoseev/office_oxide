@@ -348,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "office_oxide"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "atoi_simd",
  "encoding_rs",
@@ -369,7 +369,7 @@ dependencies = [
 
 [[package]]
 name = "office_oxide_cli"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "clap",
  "libc",
@@ -379,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "office_oxide_mcp"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "office_oxide",
  "serde_json",
