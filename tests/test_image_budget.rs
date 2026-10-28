@@ -280,3 +280,96 @@ fn test_pptx_shared_notes_made_of_link_targets_stay_bounded() {
     assert_eq!(with_notes, 1, "copies are charged by what they hold, not by their visible text");
     assert!(ir.metadata.text_truncated);
 }
+
+/// An OLE object's preview picture is a picture: frames that share one image
+/// part share its bytes in the reader and are charged to the image budget
+/// where the IR copies them.
+#[test]
+fn test_pptx_ole_previews_sharing_one_image_stop_copying_at_the_budget() {
+    limits();
+    let frame = |i: usize| {
+        format!(
+            r#"<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="{id}" name="O{i}"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="0" y="0"/><a:ext cx="100" cy="100"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/presentationml/2006/ole"><p:oleObj name="W" r:id="rId9" progId="Excel.Sheet.12"><p:embed/><p:pic><p:nvPicPr><p:cNvPr id="0" name=""/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId1"/></p:blipFill><p:spPr/></p:pic></p:oleObj></a:graphicData></a:graphic></p:graphicFrame>"#,
+            id = i + 2
+        )
+    };
+    let frames: String = (0..50).map(frame).collect();
+    let slide = format!(
+        r#"<p:sld xmlns:p="{PML}" xmlns:a="{DML}" xmlns:r="{REL}"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>{frames}</p:spTree></p:cSld></p:sld>"#
+    );
+    let ct = r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/><Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/></Types>"#;
+    let bytes = zip_of(vec![
+        ("[Content_Types].xml".to_string(), ct.as_bytes().to_vec()),
+        (
+            "_rels/.rels".to_string(),
+            rels(&[("rId1", "officeDocument", "ppt/presentation.xml")]).into_bytes(),
+        ),
+        (
+            "ppt/presentation.xml".to_string(),
+            format!(r#"<p:presentation xmlns:p="{PML}" xmlns:r="{REL}"><p:sldIdLst><p:sldId id="256" r:id="rId2"/></p:sldIdLst><p:sldSz cx="9144000" cy="6858000"/></p:presentation>"#)
+                .into_bytes(),
+        ),
+        (
+            "ppt/_rels/presentation.xml.rels".to_string(),
+            rels(&[("rId2", "slide", "slides/slide1.xml")]).into_bytes(),
+        ),
+        ("ppt/slides/slide1.xml".to_string(), slide.into_bytes()),
+        (
+            "ppt/slides/_rels/slide1.xml.rels".to_string(),
+            rels(&[
+                ("rId1", "image", "../media/img.png"),
+                ("rId9", "package", "../embeddings/o.xlsx"),
+            ])
+            .into_bytes(),
+        ),
+        ("ppt/media/img.png".to_string(), image()),
+        ("ppt/embeddings/o.xlsx".to_string(), b"PK".to_vec()),
+    ]);
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Pptx).unwrap();
+    // The reader keeps the preview bytes once.
+    let p = doc.as_pptx().expect("a pptx");
+    let mut previews = Vec::new();
+    for shape in &p.slides[0].shapes {
+        let office_oxide::pptx::Shape::GraphicFrame(gf) = shape else {
+            panic!("a graphic frame")
+        };
+        let office_oxide::pptx::GraphicContent::OleObject(ole) = &gf.content else {
+            panic!("an OLE object")
+        };
+        previews.push(ole.preview_data.clone().expect("a preview"));
+    }
+    assert_eq!(previews.len(), 50);
+    assert!(
+        previews
+            .iter()
+            .all(|d| std::sync::Arc::ptr_eq(d, &previews[0]))
+    );
+
+    let ir = doc.to_ir();
+    fn walk(elements: &[Element], with_data: &mut usize, total: &mut usize) {
+        for e in elements {
+            match e {
+                Element::Image(i) => {
+                    *total += 1;
+                    *with_data += usize::from(i.data.is_some());
+                },
+                Element::TextBox(t) => walk(&t.content, with_data, total),
+                _ => {},
+            }
+        }
+    }
+    let (mut with_data, mut total) = (0, 0);
+    for s in &ir.sections {
+        walk(&s.elements, &mut with_data, &mut total);
+    }
+    assert_eq!(total, 50, "every preview keeps its place");
+    assert_eq!(with_data, 2, "two copies fit the budget");
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("image bytes")),
+        "{:?}",
+        ir.metadata.warnings
+    );
+}

@@ -103,7 +103,7 @@ pub struct OleObject {
     pub rel_id: Option<String>,
     /// Bytes of the preview picture PowerPoint draws in place of the
     /// object, when the file carries one.
-    pub preview_data: Option<Vec<u8>>,
+    pub preview_data: Option<std::sync::Arc<[u8]>>,
     /// Format of `preview_data` (e.g. `"png"`, `"emf"`).
     pub preview_format: Option<String>,
 }

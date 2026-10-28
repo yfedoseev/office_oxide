@@ -754,7 +754,7 @@ fn parse_ole_graphic_data(
                         if let Some((bytes, ext)) =
                             read_blip_embed_attr(e)?.and_then(|rid| media.get(&rid))
                         {
-                            ole.preview_data = Some(bytes.to_vec());
+                            ole.preview_data = Some(std::sync::Arc::clone(bytes));
                             ole.preview_format = Some(ext.clone());
                         }
                     },

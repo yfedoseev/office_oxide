@@ -467,14 +467,18 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
             // An OLE object is shown as its preview picture. It used to fall
             // through as an unknown graphic, losing the preview.
             crate::pptx::GraphicContent::OleObject(ref ole) => {
-                if let Some(ref data) = ole.preview_data {
+                if let Some(ref shared) = ole.preview_data {
+                    // Frames share the preview's bytes; each IR image owns a
+                    // copy, charged to the image-byte budget like a picture's.
+                    let data =
+                        crate::limits::charge_image_bytes(shared.len()).then(|| shared.to_vec());
                     let (display_w, display_h) = gf
                         .position
                         .as_ref()
                         .map(|p| (Some(p.cx.max(0) as u64), Some(p.cy.max(0) as u64)))
                         .unwrap_or((None, None));
                     let img = Element::Image(Image {
-                        data: Some(data.clone()),
+                        data,
                         format: ole
                             .preview_format
                             .as_deref()
