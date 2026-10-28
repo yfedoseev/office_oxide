@@ -980,3 +980,35 @@ fn test_an_ordinary_number_format_code_is_still_reported_on_each_cell() {
     assert_eq!(ir_number_formats(&ir), vec!["0.00"; 5]);
     assert!(ir.metadata.warnings.is_empty(), "{:?}", ir.metadata.warnings);
 }
+
+#[test]
+fn test_rich_text_runs_longer_than_the_cell_text_shown_are_charged_in_full() {
+    set_budgets();
+    // The cell's displayed text stops at 32 KB, but its spans are built from
+    // the runs: two 40,000-character runs, named by 20 cells.
+    let mut sst = format!(r#"<sst xmlns="{NS}" count="20" uniqueCount="1"><si>"#);
+    for _ in 0..2 {
+        sst.push_str(&format!(r#"<r><rPr><b/></rPr><t>{}</t></r>"#, "y".repeat(40_000)));
+    }
+    sst.push_str("</si></sst>");
+    let mut sheet = format!(r#"<worksheet xmlns="{NS}"><sheetData>"#);
+    for r in 1..=20 {
+        sheet.push_str(&format!(r#"<row r="{r}"><c r="A{r}" t="s"><v>0</v></c></row>"#));
+    }
+    sheet.push_str("</sheetData></worksheet>");
+    let bytes = package(
+        r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#,
+        &format!(
+            r#"{}<Relationship Id="rId9" Type="{R}/sharedStrings" Target="sharedStrings.xml"/>"#,
+            worksheet_rel("rId1", "worksheets/sheet1.xml")
+        ),
+        &[
+            ("xl/worksheets/sheet1.xml", sheet.into_bytes()),
+            ("xl/sharedStrings.xml", sst.into_bytes()),
+        ],
+    );
+    let ir = open(bytes).unwrap().to_ir();
+    let held: usize = serde_json::to_string(&ir).unwrap().matches('y').count();
+    assert!(held <= TEXT_BUDGET, "{held} characters of run text in the IR");
+    assert!(ir.metadata.text_truncated);
+}

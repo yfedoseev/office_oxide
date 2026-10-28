@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The text of a rich-text cell's runs is charged in full.** The charge for a rich-text cell's spans left out the runs' own text, and the displayed cell text it was counted against stops at 32 KB, so a shared string of runs holding far more could put more text in the IR than the budget allowed. Each run's text is now charged with its span.
+
 - **The "pictures not shown" notice of an `.xlsx` is given once.** Once the picture budget (`limits::set_max_image_bytes`) was spent, the notice was appended to every later sheet, including sheets without pictures. It now appears on the sheet whose pictures spent the budget, and a `Metadata::warnings` entry names the limit.
 
 - **A custom number-format code is no longer copied into every cell that uses it.** The code was cloned onto each numeric cell's IR entry: a 1 MB `formatCode` used by 300 cells in a 3 KB `.xlsx` took 297 MB in `to_ir`. A code longer than 255 characters, Excel's own limit, is now left off the IR cells (they keep `number_format_id` and their values) and a `Metadata::warnings` entry says so; ordinary codes are listed exactly as before. The same file also made the format parser overflow its counter of decimal placeholders (a panic in debug builds, a wrong count in release); it now saturates.

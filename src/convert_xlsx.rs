@@ -864,14 +864,16 @@ fn rich_runs_of(
     }
 }
 
-/// What the IR's spans for `runs` cost beyond the runs' text: each run becomes
-/// a `TextSpan` of its own, with its own copy of the font name. The runs are
+/// What the IR's spans for `runs` cost: each run becomes a `TextSpan` of its
+/// own, with its own copy of the run's text (the displayed cell text stops at
+/// 32 KB, the runs do not) and of the font name. The runs are
 /// stored once, so without this a string of thousands of runs named by
 /// thousands of cells is a span per run per cell for free.
 fn rich_span_chars(runs: &[crate::xlsx::shared_strings::RichTextRun]) -> usize {
     runs.iter().fold(0usize, |total, r| {
         total
             .saturating_add(std::mem::size_of::<TextSpan>())
+            .saturating_add(r.text.len())
             .saturating_add(r.font_name.as_ref().map_or(0, String::len))
     })
 }
