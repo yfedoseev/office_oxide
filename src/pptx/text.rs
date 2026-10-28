@@ -4,6 +4,21 @@ use super::shape::{
 };
 
 impl PptxDocument {
+    /// What was lost to the parts that could not be read, one warning for
+    /// each part listed and one for the rest, as `Metadata::warnings` lists
+    /// them and as every rendering writes them. Empty when every part read.
+    pub(crate) fn unreadable_warnings(&self) -> Vec<String> {
+        self.unreadable_parts
+            .iter()
+            .map(|(part, err)| format!("skipped unreadable part {part}: {err}"))
+            .chain(
+                (self.unreadable_parts_omitted > 0).then(|| {
+                    crate::core::unreadable::omitted_warning(self.unreadable_parts_omitted)
+                }),
+            )
+            .collect()
+    }
+
     /// Extract plain text from the entire presentation.
     ///
     /// Shapes are spatially sorted (top-to-bottom, left-to-right) per slide.
@@ -31,6 +46,15 @@ impl PptxDocument {
         }
         if budget.exhausted() {
             parts.push(budget.notice());
+        }
+        // The parts that could not be read, charged to the budget before
+        // the budget's own notice is read.
+        let unreadable = crate::core::unreadable::report_lines(
+            &self.unreadable_warnings(),
+            crate::core::unreadable::ReportTarget::Plain,
+        );
+        if !unreadable.is_empty() {
+            parts.push(unreadable.join("\n"));
         }
         // Chart and SmartArt text is shared by the frames that name it and
         // copied into the output once per frame; past the copied-text budget
@@ -121,6 +145,14 @@ impl PptxDocument {
         }
         if budget.exhausted() {
             parts.push(budget.notice());
+        }
+        // The parts that could not be read, as in plain_text().
+        let unreadable = crate::core::unreadable::report_lines(
+            &self.unreadable_warnings(),
+            crate::core::unreadable::ReportTarget::Markdown,
+        );
+        if !unreadable.is_empty() {
+            parts.push(unreadable.join("\n\n"));
         }
         // A picture's link target is copied into the output once per picture;
         // past the copied-text budget the picture is named without it.

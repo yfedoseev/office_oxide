@@ -186,6 +186,26 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         }
     }
 
+    // The parts that could not be read end the last section, one paragraph
+    // each, as a spreadsheet's report does; charged to the text budget before
+    // the budget's notice is read below.
+    let unreadable_warnings = doc.unreadable_warnings();
+    let unreadable_lines = crate::core::unreadable::report_ir_lines(&unreadable_warnings);
+    if !unreadable_lines.is_empty() {
+        if sections.is_empty() {
+            sections.push(Section::default());
+        }
+        if let Some(last) = sections.last_mut() {
+            last.elements
+                .extend(unreadable_lines.into_iter().map(|line| {
+                    Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan::plain(line))],
+                        ..Default::default()
+                    })
+                }));
+        }
+    }
+
     // Read after every conversion above: links and notes are charged too.
     let copied_text_notice = crate::limits::copied_text_notice();
     let mut ir = DocumentIR {
@@ -216,16 +236,7 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
     };
     // Every part the reader skipped, by name and reason, as the DOCX
     // conversion lists them.
-    ir.metadata.warnings.extend(
-        doc.unreadable_parts
-            .iter()
-            .map(|(part, err)| format!("skipped unreadable part {part}: {err}")),
-    );
-    if doc.unreadable_parts_omitted > 0 {
-        ir.metadata
-            .warnings
-            .push(crate::core::unreadable::omitted_warning(doc.unreadable_parts_omitted));
-    }
+    ir.metadata.warnings.extend(unreadable_warnings);
     ir.metadata.warnings.extend(copied_text_notice);
     ir.metadata
         .warnings

@@ -13,6 +13,21 @@ use super::table::Table;
 // ---------------------------------------------------------------------------
 
 impl DocxDocument {
+    /// What was lost to the parts that could not be read, one warning for
+    /// each part listed and one for the rest, as `Metadata::warnings` lists
+    /// them and as every rendering writes them. Empty when every part read.
+    pub(crate) fn unreadable_warnings(&self) -> Vec<String> {
+        self.unreadable_parts
+            .iter()
+            .map(|p| format!("skipped unreadable part {p}"))
+            .chain(
+                (self.unreadable_parts_omitted > 0).then(|| {
+                    crate::core::unreadable::omitted_warning(self.unreadable_parts_omitted)
+                }),
+            )
+            .collect()
+    }
+
     /// Extract all text as a plain string. Paragraphs are separated by newlines.
     ///
     /// Headers and footers are included, matching `to_markdown` and the IR
@@ -64,6 +79,16 @@ impl DocxDocument {
         // Trim trailing newlines
         while out.ends_with('\n') {
             out.pop();
+        }
+        // The parts that could not be read are listed first: the report is
+        // charged to the budget before the budget's own notice is read.
+        let unreadable = crate::core::unreadable::report_lines(
+            &self.unreadable_warnings(),
+            crate::core::unreadable::ReportTarget::Plain,
+        );
+        if !unreadable.is_empty() {
+            out.push_str("\n\n");
+            out.push_str(&unreadable.join("\n"));
         }
         // A chart's text is stored once and written once per drawing that
         // names it; when the copies outgrew the text budget the drawings past
@@ -139,6 +164,15 @@ impl DocxDocument {
 
         while out.ends_with('\n') {
             out.pop();
+        }
+        // The parts that could not be read, as in plain_text().
+        let unreadable = crate::core::unreadable::report_lines(
+            &self.unreadable_warnings(),
+            crate::core::unreadable::ReportTarget::Markdown,
+        );
+        if !unreadable.is_empty() {
+            out.push_str("\n\n");
+            out.push_str(&unreadable.join("\n\n"));
         }
         // A link target is shared in the document and copied into the output
         // once per link; when the copies outgrew the text budget the links

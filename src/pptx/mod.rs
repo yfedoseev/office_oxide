@@ -49,7 +49,7 @@ use std::io::{Read, Seek};
 use std::path::Path;
 
 use crate::core::opc::OpcReader;
-use crate::core::relationships::{Relationships, rel_types};
+use crate::core::relationships::{Relationships, TargetMode, rel_types};
 use crate::core::theme::Theme;
 use log::debug;
 
@@ -182,6 +182,8 @@ impl PptxDocument {
         // the whole presentation, but it is reported.
         let theme = pres_rels
             .first_by_type(rel_types::THEME)
+            // A relationship to a place outside the package is not a part.
+            .filter(|rel| rel.target_mode == TargetMode::Internal)
             .and_then(|rel| match main_part.resolve_relative(&rel.target) {
                 Ok(pn) => Some(pn),
                 Err(e) => {
@@ -357,6 +359,7 @@ impl PptxDocument {
             // relationships.
             let layout_index = slide_rels
                 .first_by_type(rel_types::SLIDE_LAYOUT)
+                .filter(|rel| rel.target_mode == TargetMode::Internal)
                 .and_then(|rel| match part_name.resolve_relative(&rel.target) {
                     Ok(layout_part) => Some(layout_part),
                     Err(e) => {
@@ -368,6 +371,8 @@ impl PptxDocument {
 
             let notes = match slide_rels.first_by_type(rel_types::NOTES_SLIDE) {
                 None => None,
+                // Outside the package: not a part.
+                Some(notes_rel) if notes_rel.target_mode == TargetMode::External => None,
                 Some(notes_rel) => match part_name.resolve_relative(&notes_rel.target) {
                     Err(e) => {
                         parts.unreadable.record(&notes_rel.target, &e);
@@ -421,7 +426,9 @@ impl PptxDocument {
             let comment_parts: Vec<_> = slide_rels
                 .all()
                 .iter()
-                .filter(|rel| rel.rel_type.ends_with("/comments"))
+                .filter(|rel| {
+                    rel.rel_type.ends_with("/comments") && rel.target_mode == TargetMode::Internal
+                })
                 .filter_map(|rel| match part_name.resolve_relative(&rel.target) {
                     Ok(pn) => Some(pn),
                     Err(e) => {
@@ -526,7 +533,12 @@ impl PptxDocument {
             slides.push(slide);
         }
         if !slides.is_empty() && slides.iter().all(|s| s.parse_error.is_some()) {
-            let (part, err) = unreadable_parts.first().cloned().unwrap_or_default();
+            // Name a slide: another part (a theme met first) did not decide
+            // that no slide could be read.
+            let (part, err) = slides
+                .iter()
+                .find_map(|s| s.parse_error.as_ref().map(|e| (s.name.clone(), e.clone())))
+                .unwrap_or_default();
             return Err(crate::core::Error::MalformedXml(format!(
                 "no slide could be read; {part}: {err}"
             ))
@@ -742,6 +754,7 @@ impl PartCache {
         let rels = self.rels_or_record(opc, part);
         let master_index = rels
             .first_by_type(rel_types::SLIDE_MASTER)
+            .filter(|rel| rel.target_mode == TargetMode::Internal)
             .and_then(|rel| match part.resolve_relative(&rel.target) {
                 Ok(mp) => Some(mp),
                 Err(e) => {
@@ -885,6 +898,9 @@ impl PartCache {
         for rel in rels.all() {
             let is_chart = rel.rel_type == rel_types::CHART;
             if !is_chart && rel.rel_type != rel_types::DIAGRAM_DATA {
+                continue;
+            }
+            if rel.target_mode == TargetMode::External {
                 continue;
             }
             let target = match source.resolve_relative(&rel.target) {
