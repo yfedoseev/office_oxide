@@ -75,6 +75,12 @@ impl ReportList {
     }
 }
 
+/// Whether a relationship names a part of the package: a target outside it
+/// ([ECMA-376] Part 2 §9.3.2, `TargetMode="External"`) is never looked up in it.
+pub(super) fn is_internal(rel: &crate::core::relationships::Relationship) -> bool {
+    rel.target_mode != crate::core::relationships::TargetMode::External
+}
+
 /// A drawing part, parsed: the pictures and text shapes its anchors place.
 pub(super) struct SharedDrawing {
     pub(super) pictures: Arc<[WorksheetPicture]>,
@@ -116,7 +122,9 @@ impl SharedParts {
         sheet_path: &str,
         sheet_rels: &Relationships,
     ) -> Option<Arc<SharedDrawing>> {
-        let rel = sheet_rels.first_by_type(rel_types::DRAWING)?;
+        let rel = sheet_rels
+            .first_by_type(rel_types::DRAWING)
+            .filter(|rel| is_internal(rel))?;
         let drawing_path = resolve_relative_zip_path(sheet_path, &rel.target);
         let key = part_key(entries, &drawing_path);
         if let Some(hit) = self.drawings.get(&key) {
@@ -142,9 +150,11 @@ impl SharedParts {
     ) -> (Arc<[SheetComment]>, bool) {
         let legacy_path = sheet_rels
             .first_by_type(rel_types::COMMENTS)
+            .filter(|rel| is_internal(rel))
             .map(|rel| resolve_relative_zip_path(sheet_path, &rel.target));
         let threaded_path = sheet_rels
             .first_by_type(rel_types::THREADED_COMMENTS)
+            .filter(|rel| is_internal(rel))
             .map(|rel| resolve_relative_zip_path(sheet_path, &rel.target));
         let legacy_key = legacy_path.as_deref().map(|p| part_key(entries, p));
         let threaded_key = threaded_path.as_deref().map(|p| part_key(entries, p));
@@ -217,7 +227,11 @@ impl SharedParts {
         );
         let mut charts: Vec<String> = Vec::new();
         let mut listed = std::collections::HashSet::new();
-        for drawing in sheet_rels.get_by_type(rel_types::DRAWING) {
+        for drawing in sheet_rels
+            .get_by_type(rel_types::DRAWING)
+            .into_iter()
+            .filter(|rel| is_internal(rel))
+        {
             let drawing_path = resolve_relative_zip_path(sheet_path, &drawing.target);
             let key = part_key(entries, &drawing_path);
             let named = match self.drawing_charts.get(&key) {
@@ -232,6 +246,7 @@ impl SharedParts {
                     let named: Arc<[String]> = drawing_rels
                         .get_by_type(rel_types::CHART)
                         .into_iter()
+                        .filter(|rel| is_internal(rel))
                         .map(|chart| resolve_relative_zip_path(&drawing_path, &chart.target))
                         .collect();
                     self.drawing_charts.insert(key, named.clone());
@@ -297,6 +312,10 @@ pub(super) fn read_reporting<R: Read + Seek>(
 ) -> Option<Vec<u8>> {
     match XlsxDocument::read_xml_entry(archive, entries, path) {
         Ok(data) => Some(data),
+        // A relationship to a part the package lacks is dangling, which is
+        // not a part that cannot be read: only a part that is there and
+        // cannot be read or parsed is reported.
+        Err(crate::core::Error::MissingPart(_)) => None,
         Err(e) => {
             log::warn!("xlsx: part {path} unreadable: {e}");
             unreadable.record(entries, path, &e.to_string());

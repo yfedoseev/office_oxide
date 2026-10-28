@@ -260,15 +260,8 @@ fn test_parts_that_cannot_be_read_or_parsed_are_reported_not_swallowed() {
                 )],
             ),
         ),
-        // Parts that are named and not in the package.
-        (
-            "gone.xml",
-            sheet_with(
-                r#"<drawing r:id="r1"/>"#,
-                &rel("r1", "drawing", "../drawings/gone.xml"),
-                vec![],
-            ),
-        ),
+        // A part that is named, present and not an image is a damaged part;
+        // one that is named and absent is below.
         (
             "gone.png",
             sheet_with(
@@ -344,4 +337,75 @@ fn test_a_chart_named_by_another_spelling_is_not_read_twice() {
             .count(),
         1
     );
+}
+
+/// The relationship of `kind` to `target`, internal or external.
+fn rel_to(kind: &str, target: &str, external: bool) -> String {
+    let mode = if external {
+        r#" TargetMode="External""#
+    } else {
+        ""
+    };
+    format!(r#"<Relationship Id="r1" Type="{R}/{kind}" Target="{target}"{mode}/>"#)
+}
+
+fn assert_silent(label: &str, bytes: Vec<u8>) {
+    let doc = open(bytes);
+    assert_eq!(reported(&doc), Vec::<String>::new(), "{label}");
+    let ir = doc.to_ir();
+    assert!(!ir.metadata.text_truncated, "{label}: {:?}", ir.metadata.warnings);
+    assert!(ir.metadata.warnings.is_empty(), "{label}: {:?}", ir.metadata.warnings);
+    assert!(!doc.plain_text().contains("skipped"), "{label}");
+}
+
+/// An optional part a relationship names but the package lacks is a dangling
+/// reference, as it always was: nothing is reported. Only a part that exists
+/// and cannot be read or parsed is.
+#[test]
+fn test_a_relationship_to_an_absent_optional_part_is_not_reported() {
+    let _g = LimitScope::new();
+    let drawing = r#"<drawing r:id="r1"/>"#;
+    let table = r#"<tableParts count="1"><tablePart r:id="r1"/></tableParts>"#;
+    for (label, tail, rels) in [
+        ("drawing", drawing, rel_to("drawing", "../drawings/gone.xml", false)),
+        ("table", table, rel_to("table", "../tables/gone.xml", false)),
+        ("comments", "", rel_to("comments", "../gone.xml", false)),
+        (
+            "threaded",
+            "",
+            rel_to("threadedComment", "../threadedComments/gone.xml", false).replace(
+                &format!("{R}/threadedComment"),
+                "http://schemas.microsoft.com/office/2017/10/relationships/threadedComment",
+            ),
+        ),
+        ("pivot", "", rel_to("pivotTable", "../pivotTables/gone.xml", false)),
+    ] {
+        assert_silent(label, sheet_with(tail, &rels, vec![]));
+    }
+}
+
+/// A target outside the package is never looked up in it, whatever part of
+/// the package happens to share its name.
+#[test]
+fn test_an_external_target_is_not_looked_up_in_the_package() {
+    let _g = LimitScope::new();
+    for (label, tail, rels, name) in [
+        (
+            "drawing",
+            r#"<drawing r:id="r1"/>"#,
+            rel_to("drawing", "../d.xml", true),
+            "xl/d.xml",
+        ),
+        (
+            "table",
+            r#"<tableParts count="1"><tablePart r:id="r1"/></tableParts>"#,
+            rel_to("table", "../d.xml", true),
+            "xl/d.xml",
+        ),
+        ("comments", "", rel_to("comments", "../d.xml", true), "xl/d.xml"),
+        ("pivot", "", rel_to("pivotTable", "../d.xml", true), "xl/d.xml"),
+    ] {
+        // The name is a part that would be reported were it read.
+        assert_silent(label, sheet_with(tail, &rels, vec![(name.into(), "<broken".into())]));
+    }
 }

@@ -961,12 +961,20 @@ fn read_tables_and_pivots<R: Read + Seek>(
     Vec<std::sync::Arc<worksheet::SheetPivotTable>>,
 ) {
     let mut tables = Vec::new();
-    for rel in ws_rels.get_by_type(TABLE_REL) {
+    for rel in ws_rels
+        .get_by_type(TABLE_REL)
+        .into_iter()
+        .filter(|rel| shared_parts::is_internal(rel))
+    {
         let path = resolve_relative_zip_path(sheet_path, &rel.target);
         tables.extend(shared.table(archive, entries, &path));
     }
     let mut pivots = Vec::new();
-    for rel in ws_rels.get_by_type(PIVOT_TABLE_REL) {
+    for rel in ws_rels
+        .get_by_type(PIVOT_TABLE_REL)
+        .into_iter()
+        .filter(|rel| shared_parts::is_internal(rel))
+    {
         let path = resolve_relative_zip_path(sheet_path, &rel.target);
         // A pivot table part several sheets name is read once, with the
         // cache it points at: it is the same pivot wherever it is named.
@@ -1011,7 +1019,10 @@ fn read_pivot_table<R: Read + Seek>(
         worksheet::parse_pivot_table_part,
     )?;
     let pivot_rels = read_rels_reporting(archive, entries, &sheet_rels_path(path), unreadable);
-    if let Some(cache) = pivot_rels.first_by_type(PIVOT_CACHE_DEFINITION_REL) {
+    if let Some(cache) = pivot_rels
+        .first_by_type(PIVOT_CACHE_DEFINITION_REL)
+        .filter(|rel| shared_parts::is_internal(rel))
+    {
         let cache_path = resolve_relative_zip_path(path, &cache.target);
         if let Some(cache) =
             pivot_cache(archive, entries, &cache_path, workbook, pivot_ctx, budget, unreadable)
@@ -1118,7 +1129,8 @@ fn read_pivot_cache_data<R: Read + Seek>(
         .records_rel_id
         .as_deref()
         .and_then(|id| rels.get_by_id(id))
-        .or_else(|| rels.first_by_type(PIVOT_CACHE_RECORDS_REL))?;
+        .or_else(|| rels.first_by_type(PIVOT_CACHE_RECORDS_REL))
+        .filter(|rel| shared_parts::is_internal(rel))?;
     let records_path = resolve_relative_zip_path(cache_path, &rel.target);
     let records = shared_parts::read_reporting(archive, entries, &records_path, unreadable)?;
     let (fields, fields_truncated) = match worksheet::parse_pivot_cache_fields(definition, budget) {
