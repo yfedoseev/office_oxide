@@ -24,35 +24,54 @@ use super::{
 use crate::core::opc;
 use crate::core::relationships::{Relationships, rel_types};
 
-/// Most relationship parts recorded as unreadable; the rest are counted.
-pub(super) const MAX_UNREADABLE_PARTS: usize = 100;
-/// Longest part name or reason kept in a record, in characters: both can
-/// echo values the file controls.
+/// Most reports kept in a [`ReportList`]; the rest are counted.
+pub(super) const MAX_REPORTS: usize = 100;
+/// Longest name or reason kept in a report, in characters: both can echo
+/// values the file controls.
 const MAX_REPORT_CHARS: usize = 256;
 
-/// The relationship parts that could not be read: each part once, at most
-/// [`MAX_UNREADABLE_PARTS`] kept, and the number of the rest.
+/// What could not be read, as `(name, reason)`: each item once, at most
+/// [`MAX_REPORTS`] kept, each name and reason cut to a fixed length, and the
+/// number of the rest. One sink for the relationship and other parts that
+/// could not be read and for the sheets that could not, so that however many
+/// the file names, and however long it makes their names, what is kept (and
+/// every renderer echoes) is bounded.
 #[derive(Default)]
-pub(crate) struct UnreadableParts {
+pub(crate) struct ReportList {
     pub(super) listed: Vec<(String, String)>,
     pub(super) omitted: usize,
-    seen: std::collections::HashSet<String>,
+    /// Hashes of the parts recorded, so that the names of parts the file
+    /// makes up (a missing part has none but its path) are not all kept.
+    seen: std::collections::HashSet<u64>,
 }
 
-impl UnreadableParts {
+impl ReportList {
     /// Record that the part at `path` could not be read, for `reason`. A part
     /// already recorded (by the zip entry its path resolves to) is not
-    /// recorded again.
+    /// recorded again, whether or not it was kept.
     pub(super) fn record(&mut self, entries: &opc::ZipEntryIndex, path: &str, reason: &str) {
-        if !self.seen.insert(part_key(entries, path)) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        part_key(entries, path).hash(&mut hasher);
+        if !self.seen.insert(hasher.finish()) {
             return;
         }
-        if self.listed.len() >= MAX_UNREADABLE_PARTS {
+        self.push(path, reason);
+    }
+
+    /// Record that the item `name` could not be read, for `reason`. Every
+    /// call is one item: two sheets of the same name are two.
+    pub(super) fn record_item(&mut self, name: &str, reason: &str) {
+        self.push(name, reason);
+    }
+
+    fn push(&mut self, name: &str, reason: &str) {
+        if self.listed.len() >= MAX_REPORTS {
             self.omitted += 1;
             return;
         }
         let cut = |s: &str| s.chars().take(MAX_REPORT_CHARS).collect::<String>();
-        self.listed.push((cut(path), cut(reason)));
+        self.listed.push((cut(name), cut(reason)));
     }
 }
 
@@ -81,7 +100,7 @@ pub(super) struct SharedParts {
     drawing_charts: HashMap<String, Arc<[String]>>,
     /// Relationship parts met on the way that could not be read, as
     /// `(part, reason)`.
-    pub(super) unreadable: UnreadableParts,
+    pub(super) unreadable: ReportList,
 }
 
 impl SharedParts {
@@ -274,7 +293,7 @@ fn read_drawing<R: Read + Seek>(
     entries: &opc::ZipEntryIndex,
     media: &mut MediaCache,
     drawing_path: &str,
-    unreadable: &mut UnreadableParts,
+    unreadable: &mut ReportList,
 ) -> Option<SharedDrawing> {
     let drawing_xml = match XlsxDocument::read_xml_entry(archive, entries, drawing_path) {
         Ok(d) => d,

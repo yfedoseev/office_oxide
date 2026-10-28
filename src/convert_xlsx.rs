@@ -92,6 +92,8 @@ pub(crate) struct SheetConverter<'d> {
     // Whether the section just built was cut for any reason of its own.
     item_truncated: bool,
     warnings: Vec<String>,
+    // The reports of what could not be read, once first asked for.
+    reports: Option<Vec<crate::xlsx::text::ReportNotice>>,
 }
 
 impl<'d> SheetConverter<'d> {
@@ -127,6 +129,7 @@ impl<'d> SheetConverter<'d> {
             omitted: false,
             item_truncated: false,
             warnings: Vec::new(),
+            reports: None,
         }
     }
 
@@ -1002,22 +1005,62 @@ impl<'d> SheetConverter<'d> {
         })
     }
 
-    /// The section for the unreadable sheet `index`: the notice, so the loss
-    /// is visible in every projection of the IR.
-    pub(crate) fn unreadable_section(&mut self, index: usize) -> Option<Section> {
-        let (name, err) = self.doc.unreadable_sheets.get(index)?;
+    /// How many sections report what could not be read (see
+    /// [`Self::unreadable_section`]).
+    pub(crate) fn unreadable_count(&mut self) -> usize {
+        self.reports
+            .get_or_insert_with(|| self.doc.report_notices())
+            .len()
+    }
+
+    /// The section for the report `index` of what could not be read (an
+    /// unreadable sheet, the sheets and parts left unlisted, the unreadable
+    /// parts), and the warnings it carries: the notice, so the loss is
+    /// visible in every projection of the IR. The notice is charged to the
+    /// text budget before it is copied; one the budget cannot pay for is
+    /// left out, with the budget's notice in its place, and the metadata
+    /// still lists it.
+    pub(crate) fn unreadable_section(&mut self, index: usize) -> Option<(Section, Vec<String>)> {
+        let notices = self
+            .reports
+            .get_or_insert_with(|| self.doc.report_notices());
+        let notice = notices.get(index)?;
         self.unreadable = true;
         self.item_truncated = true;
-        Some(Section {
-            title: Some(name.clone()),
-            elements: vec![Element::Paragraph(Paragraph {
-                content: vec![InlineContent::Text(TextSpan::plain(
-                    crate::xlsx::text::unreadable_notice(name, err),
-                ))],
-                ..Default::default()
-            })],
+        let was_spent = self.budget.exhausted();
+        if !self.budget.charge(notice.chars()) {
+            // Said once, in the content, unless something already said it.
+            return (!was_spent).then(|| {
+                (
+                    Section {
+                        title: Some("Output truncated".to_string()),
+                        elements: vec![Element::Paragraph(Paragraph {
+                            content: vec![InlineContent::Text(TextSpan::plain(
+                                self.budget.notice(),
+                            ))],
+                            ..Default::default()
+                        })],
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )
+            });
+        }
+        let section = Section {
+            title: Some(notice.title.clone()),
+            elements: notice
+                .lines
+                .iter()
+                .map(|line| {
+                    Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan::plain(line.clone()))],
+                        ..Default::default()
+                    })
+                })
+                .collect(),
             ..Default::default()
-        })
+        };
+        Some((section, notice.warnings.clone()))
     }
 
     /// The document's metadata as of the sections built so far: the
@@ -1065,21 +1108,13 @@ impl<'d> SheetConverter<'d> {
                 Some(&doc.package_properties),
             )
         };
-        // Relationship parts that could not be read: the sheet, drawing or
+        // Sheets and parts that could not be read: the sheet, drawing or
         // pivot they belong to lacks what they name.
-        metadata.text_truncated |=
-            !doc.unreadable_parts.is_empty() || doc.unreadable_parts_omitted > 0;
-        metadata.warnings.extend(
-            doc.unreadable_parts
-                .iter()
-                .map(|(part, err)| format!("skipped unreadable part {part}: {err}")),
-        );
-        if doc.unreadable_parts_omitted > 0 {
-            metadata.warnings.push(format!(
-                "and {} more unreadable parts not listed",
-                doc.unreadable_parts_omitted
-            ));
-        }
+        let notices = doc.report_notices();
+        metadata.text_truncated |= !notices.is_empty();
+        metadata
+            .warnings
+            .extend(notices.into_iter().flat_map(|n| n.warnings));
         metadata.warnings.extend(self.warnings.iter().cloned());
         metadata.warnings.extend(self.end_warnings());
         metadata
@@ -1173,10 +1208,20 @@ impl<'d> SheetIrs<'d> {
     }
 
     fn item(&mut self, section: Section, end_before: Vec<String>) -> SheetIr {
+        self.item_with(section, end_before, Vec::new())
+    }
+
+    fn item_with(
+        &mut self,
+        section: Section,
+        end_before: Vec<String>,
+        extra: Vec<String>,
+    ) -> SheetIr {
         if self.first_title.is_none() {
             self.first_title = section.title.clone();
         }
         let mut warnings = self.converter.warnings()[self.warnings_reported..].to_vec();
+        warnings.extend(extra);
         self.warnings_reported = self.converter.warnings().len();
         for w in self.converter.end_warnings() {
             if !end_before.contains(&w) {
@@ -1231,9 +1276,12 @@ impl Iterator for SheetIrs<'_> {
                 },
                 Stage::Unreadable(i) => {
                     self.stage = Stage::Unreadable(i + 1);
-                    match self.converter.unreadable_section(i) {
-                        Some(section) => return Some(self.item(section, end_before)),
-                        None => self.stage = Stage::Done,
+                    if i >= self.converter.unreadable_count() {
+                        self.stage = Stage::Done;
+                        continue;
+                    }
+                    if let Some((section, extra)) = self.converter.unreadable_section(i) {
+                        return Some(self.item_with(section, end_before, extra));
                     }
                 },
                 Stage::Done => return None,
@@ -1278,8 +1326,12 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     }
     sections.extend(converter.chart_section());
     sections.extend(converter.pivot_section());
-    for index in 0..doc.unreadable_sheets.len() {
-        sections.extend(converter.unreadable_section(index));
+    for index in 0..converter.unreadable_count() {
+        sections.extend(
+            converter
+                .unreadable_section(index)
+                .map(|(section, _)| section),
+        );
     }
     let metadata = converter.metadata(sections.first().and_then(|s| s.title.clone()));
     DocumentIR { metadata, sections }

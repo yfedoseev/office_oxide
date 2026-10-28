@@ -1,0 +1,173 @@
+//! What an `.xlsx` reader could not read is reported, in every rendering and
+//! in the metadata, and the report is bounded: a workbook that lists many
+//! sheets naming one part, with long names, must not be echoed in full by
+//! every renderer.
+//!
+//! The limits are process-global, so every test holds the `LimitScope`.
+
+use std::io::{Cursor, Write};
+
+use office_oxide::limits::{max_text_chars, set_max_text_chars};
+use office_oxide::{Document, DocumentFormat};
+
+mod common;
+use common::LimitScope;
+
+const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const REL_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+
+fn zip_of(parts: Vec<(String, String)>) -> Vec<u8> {
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts: zip::write::FileOptions<'_, '_, ()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (name, data) in parts {
+        zip.start_file(name, opts).unwrap();
+        zip.write_all(data.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+fn fixed_parts(workbook: String, wb_rels: String) -> Vec<(String, String)> {
+    vec![
+        (
+            "[Content_Types].xml".into(),
+            r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#.into(),
+        ),
+        (
+            "_rels/.rels".into(),
+            format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#),
+        ),
+        ("xl/workbook.xml".into(), workbook),
+        ("xl/_rels/workbook.xml.rels".into(), wb_rels),
+    ]
+}
+
+const SHEET: &str = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>7</v></c></row></sheetData></worksheet>"#;
+
+/// `sheets` entries of `name_len` characters that all name the one sheet
+/// part: the first reads it, the others are unreadable (the part is the
+/// content of the first).
+fn duplicate_sheets(sheets: usize, name_len: usize) -> Vec<u8> {
+    let long = "n".repeat(name_len);
+    let mut names = String::new();
+    for i in 0..sheets {
+        names.push_str(&format!(r#"<sheet name="{i}{long}" sheetId="{}" r:id="rId1"/>"#, i + 1));
+    }
+    let mut parts = fixed_parts(
+        format!(r#"<workbook xmlns="{NS}" xmlns:r="{R}"><sheets>{names}</sheets></workbook>"#),
+        format!(
+            r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#
+        ),
+    );
+    parts.push(("xl/worksheets/sheet1.xml".into(), SHEET.into()));
+    zip_of(parts)
+}
+
+/// One sheet whose relationships part is not XML.
+fn unreadable_sheet_rels() -> Vec<u8> {
+    let mut parts = fixed_parts(
+        format!(
+            r#"<workbook xmlns="{NS}" xmlns:r="{R}"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#
+        ),
+        format!(
+            r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#
+        ),
+    );
+    parts.push(("xl/worksheets/sheet1.xml".into(), SHEET.into()));
+    parts.push(("xl/worksheets/_rels/sheet1.xml.rels".into(), "<Relationships".into()));
+    zip_of(parts)
+}
+
+fn open(bytes: Vec<u8>) -> Document {
+    Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx).unwrap()
+}
+
+/// Every rendering of `doc`, by name.
+fn renderings(doc: &Document) -> Vec<(&'static str, String)> {
+    let mut streamed = Vec::new();
+    doc.write_markdown_with(Default::default(), &mut streamed)
+        .unwrap();
+    let mut written = Vec::new();
+    doc.write_plain_text(&mut written).unwrap();
+    vec![
+        ("plain_text", doc.plain_text()),
+        ("to_markdown", doc.to_markdown()),
+        ("to_html", doc.to_html()),
+        ("to_markdown_with", doc.to_markdown_with(Default::default())),
+        ("write_markdown_with", String::from_utf8(streamed).unwrap()),
+        ("write_plain_text", String::from_utf8(written).unwrap()),
+        ("ir_json", serde_json::to_string(&doc.to_ir()).unwrap()),
+        ("ir_sections_json", serde_json::to_string(&doc.to_ir().sections).unwrap()),
+    ]
+}
+
+#[test]
+fn test_unreadable_sheets_are_capped_cut_and_counted_in_every_rendering() {
+    let _g = LimitScope::new();
+    let doc = open(duplicate_sheets(300, 5_000));
+    let xlsx = doc.as_xlsx().unwrap();
+    // The first entry reads the part; the 299 others are unreadable.
+    assert_eq!(xlsx.unreadable_sheets.len(), 100);
+    assert_eq!(xlsx.unreadable_sheets_omitted, 199);
+    for (name, reason) in &xlsx.unreadable_sheets {
+        assert!(name.chars().count() <= 256 && reason.chars().count() <= 256);
+    }
+    for (what, out) in renderings(&doc) {
+        assert!(out.len() < 300_000, "{what}: {} bytes for 299 unreadable sheets", out.len());
+        assert!(out.contains("199 more unreadable sheets not listed"), "{what}");
+    }
+    let ir = doc.to_ir();
+    assert!(ir.metadata.text_truncated);
+    assert!(ir.metadata.warnings.len() < 250, "{}", ir.metadata.warnings.len());
+}
+
+#[test]
+fn test_unreadable_sheet_notices_are_charged_to_the_text_budget() {
+    let mut limits = LimitScope::new();
+    limits.set(max_text_chars, set_max_text_chars, 3_000);
+    let doc = open(duplicate_sheets(300, 200));
+    for (what, out) in renderings(&doc) {
+        // 100 listed sheets would be about 40,000 characters. (The metadata
+        // warnings, which `ir_json` includes, are bounded by the cap alone.)
+        if what == "ir_json" {
+            continue;
+        }
+        assert!(
+            out.len() < 12_000,
+            "{what}: {} bytes against a 3,000 character budget",
+            out.len()
+        );
+        assert!(out.contains("output truncated"), "{what}: {out}");
+    }
+    assert!(doc.to_ir().metadata.text_truncated);
+}
+
+#[test]
+fn test_an_unreadable_part_is_reported_in_every_rendering() {
+    let _g = LimitScope::new();
+    let doc = open(unreadable_sheet_rels());
+    for (what, out) in renderings(&doc) {
+        assert!(
+            out.contains("sheet1.xml.rels"),
+            "{what} says nothing of the unreadable part: {out}"
+        );
+        assert!(out.contains('7'), "{what} lost the cell");
+    }
+    assert!(doc.to_ir().metadata.text_truncated);
+}
+
+#[test]
+fn test_a_caller_who_drops_each_sheet_ir_still_learns_of_an_unreadable_part() {
+    let _g = LimitScope::new();
+    let doc = open(unreadable_sheet_rels());
+    let xlsx = doc.as_xlsx().unwrap();
+    let mut warnings = Vec::new();
+    let mut truncated = false;
+    for sheet in xlsx.sheets_ir() {
+        truncated |= sheet.text_truncated;
+        warnings.extend(sheet.warnings);
+    }
+    assert!(truncated);
+    assert!(warnings.iter().any(|w| w.contains("sheet1.xml.rels")), "{warnings:?}");
+}
