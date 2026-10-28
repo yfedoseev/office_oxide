@@ -42,11 +42,19 @@ const MAX_SIGNATURE_SCAN: usize = 4096;
 /// Cap on one shape fragment's decompressed size. Real fragments are a
 /// couple of KB; the cap keeps a crafted package from turning extraction
 /// into a decompression bomb.
-const MAX_SHAPE_XML_BYTES: u64 = 1 << 20;
+const MAX_SHAPE_XML_BYTES: u64 = 64 * 1024;
 
 /// Cap on downrev packages read per slide. Real decks carry a handful per
 /// slide; the cap bounds the work a crafted record tree can force.
 const MAX_DOWNREV_PACKAGES: usize = 256;
+
+/// Total packages extracted across the whole file. Bounds the total work
+/// regardless of how many slides carry packages.
+const DOWNREV_MAX_PACKAGES_PER_FILE: usize = 1024;
+
+/// Total decompressed shape-XML bytes across the whole file. Bounds the
+/// time spent decompressing/parsing even when many distinct packages exist.
+const DOWNREV_MAX_BYTES_PER_FILE: u64 = 4 * 1024 * 1024;
 
 /// The ZIP entry holding a shape's DrawingML fragment.
 const SHAPE_XML_ENTRY: &str = "drs/shapexml.xml";
@@ -68,7 +76,39 @@ const OPID_ID_MASK: u16 = 0x3FFF;
 /// Paragraphs already present in `runs` (a legacy text atom keeps several
 /// paragraphs in one run, split at `\r` / soft returns) are not repeated:
 /// a shape WPS wrote both ways must not surface its text twice.
-pub fn append_slide_downrev(slide_children: &[u8], runs: &mut Vec<TextRun>) {
+pub struct DownrevBudget {
+    /// Packages still allowed across the whole file.
+    packages_remaining: usize,
+    /// Decompressed shape-XML bytes still allowed across the whole file.
+    bytes_remaining: u64,
+    /// Packages still allowed on the current slide (reset per slide).
+    slide_packages_remaining: usize,
+    /// Hash of every distinct package already paid for, so an identical
+    /// package repeated across records or slides is decompressed only once.
+    seen_packages: HashSet<u64>,
+}
+
+impl DownrevBudget {
+    /// A fresh, full budget for one file.
+    pub fn new() -> Self {
+        DownrevBudget {
+            packages_remaining: DOWNREV_MAX_PACKAGES_PER_FILE,
+            bytes_remaining: DOWNREV_MAX_BYTES_PER_FILE,
+            slide_packages_remaining: MAX_DOWNREV_PACKAGES,
+            seen_packages: HashSet::new(),
+        }
+    }
+}
+
+pub fn append_slide_downrev(
+    slide_children: &[u8],
+    runs: &mut Vec<TextRun>,
+    budget: &mut DownrevBudget,
+) {
+    // Each slide gets its own per-slide allowance; the per-file budgets are
+    // shared across slides via budget.
+    budget.slide_packages_remaining = MAX_DOWNREV_PACKAGES;
+
     let mut seen: HashSet<String> = HashSet::new();
     for run in runs.iter() {
         for para in run.text.split(['\r', '\n', '\u{b}']) {
@@ -78,7 +118,10 @@ pub fn append_slide_downrev(slide_children: &[u8], runs: &mut Vec<TextRun>) {
             }
         }
     }
-    for text in collect_downrev_texts(slide_children) {
+    for text in collect_downrev_texts(slide_children, budget) {
+        if !text_has_alnum(&text) {
+            continue;
+        }
         if seen.insert(text.clone()) {
             runs.push(TextRun {
                 text_type: TextType::Other,
@@ -93,11 +136,10 @@ pub fn append_slide_downrev(slide_children: &[u8], runs: &mut Vec<TextRun>) {
 /// the record subtree, in document order. At most
 /// [`MAX_DOWNREV_PACKAGES`] packages are read; a crafted record tree cannot
 /// force more work than that.
-fn collect_downrev_texts(data: &[u8]) -> Vec<String> {
+fn collect_downrev_texts(data: &[u8], budget: &mut DownrevBudget) -> Vec<String> {
     let mut texts = Vec::new();
     let mut seen = HashSet::new();
-    let mut budget = MAX_DOWNREV_PACKAGES;
-    walk_records(data, 0, &mut texts, &mut seen, &mut budget);
+    walk_records(data, 0, &mut texts, &mut seen, budget);
     texts
 }
 
@@ -106,13 +148,16 @@ fn walk_records(
     depth: usize,
     texts: &mut Vec<String>,
     seen: &mut HashSet<String>,
-    budget: &mut usize,
+    budget: &mut DownrevBudget,
 ) {
     if depth > MAX_CARRIER_DEPTH {
         return;
     }
     for rec in RecordIter::new(data) {
-        if *budget == 0 {
+        if budget.packages_remaining == 0
+            || budget.slide_packages_remaining == 0
+            || budget.bytes_remaining == 0
+        {
             return;
         }
         let Ok(rec) = rec else { break };
@@ -121,8 +166,7 @@ fn walk_records(
             // it would read a nested package through the container and past
             // whatever length the carrier declared. Walk into it instead.
             walk_records(&rec.data, depth + 1, texts, seen, budget);
-        } else if let Some(xml) = shape_xml_in_payload(&rec.data) {
-            *budget -= 1;
+        } else if let Some(xml) = shape_xml_in_payload(&rec.data, budget) {
             for text in shape_xml_paragraphs(&xml) {
                 if !text.is_empty() && seen.insert(text.clone()) {
                     texts.push(text);
@@ -174,24 +218,48 @@ fn metro_blob_package(payload: &[u8]) -> Option<&[u8]> {
 /// falls back to scanning for a ZIP local-header signature, which may sit
 /// behind a small WPS header and is therefore located by scan rather than
 /// assumed at offset 0.
-fn shape_xml_in_payload(payload: &[u8]) -> Option<String> {
-    if let Some(package) = metro_blob_package(payload) {
-        return read_shape_xml(package);
+fn shape_xml_in_payload(payload: &[u8], budget: &mut DownrevBudget) -> Option<String> {
+    if budget.packages_remaining == 0
+        || budget.slide_packages_remaining == 0
+        || budget.bytes_remaining == 0
+    {
+        return None;
     }
-    let start = find_zip_signature(payload)?;
-    read_shape_xml(&payload[start..])
+
+    let package: &[u8] = if let Some(package) = metro_blob_package(payload) {
+        package
+    } else {
+        let start = find_zip_signature(payload)?;
+        &payload[start..]
+    };
+
+    // Read each distinct package at most once. Identical packages (repeated
+    // across records or slides) hash equal and are skipped here, so their
+    // decompression/parse cost is paid only once.
+    let package_hash = hash_bytes(package);
+    if !budget.seen_packages.insert(package_hash) {
+        return None;
+    }
+
+    let limit = MAX_SHAPE_XML_BYTES.min(budget.bytes_remaining);
+    let xml = read_shape_xml(package, limit)?;
+    let read = xml.len() as u64;
+    if read == 0 {
+        return None;
+    }
+    budget.packages_remaining -= 1;
+    budget.slide_packages_remaining -= 1;
+    budget.bytes_remaining -= read;
+    Some(xml)
 }
 
 /// The `drs/shapexml.xml` content of a self-contained package, with the
 /// decompressed size capped at [`MAX_SHAPE_XML_BYTES`].
-fn read_shape_xml(package: &[u8]) -> Option<String> {
+fn read_shape_xml(package: &[u8], limit: u64) -> Option<String> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(package)).ok()?;
     let entry = archive.by_name(SHAPE_XML_ENTRY).ok()?;
     let mut xml = String::new();
-    entry
-        .take(MAX_SHAPE_XML_BYTES)
-        .read_to_string(&mut xml)
-        .ok()?;
+    entry.take(limit).read_to_string(&mut xml).ok()?;
     Some(xml)
 }
 
@@ -209,6 +277,24 @@ fn find_zip_signature(payload: &[u8]) -> Option<usize> {
 /// [`crate::core::xml::make_fast_reader]`): a paragraph's words are split
 /// across runs at arbitrary points, so `"Hello "` + `"world"` must not
 /// collapse to `"Helloworld"`.
+/// True when s contains at least one alphanumeric character (letter or
+/// digit, including non-ASCII letters such as CJK).
+fn text_has_alnum(s: &str) -> bool {
+    s.chars().any(|c| c.is_alphanumeric())
+}
+
+/// FNV-1a 64-bit hash of bytes, used only to de-duplicate packages. A
+/// collision would merely skip an otherwise-distinct package, which is an
+/// acceptable trade for avoiding a full-content comparison each time.
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 fn shape_xml_paragraphs(xml: &str) -> Vec<String> {
     use crate::core::xml::read_text_content_fast;
 
@@ -415,7 +501,8 @@ mod tests {
         let dup = carrier_record(r#"<p:sp><a:p><a:r><a:t>Shape text</a:t></a:r></a:p></p:sp>"#);
         let slide = container(0x03EE, &[record(0x03EF, 0, &[0u8; 8]), good, dup]);
         let mut runs = Vec::new();
-        append_slide_downrev(&slide, &mut runs);
+        let mut budget = DownrevBudget::new();
+        append_slide_downrev(&slide, &mut runs, &mut budget);
         assert_eq!(runs.len(), 1, "duplicate packages collapse: {runs:?}");
         assert_eq!(runs[0].text, "Shape text");
         assert_eq!(runs[0].text_type, TextType::Other);
@@ -430,7 +517,8 @@ mod tests {
         };
         let slide = container(0x03EE, &[record(0x03EF, 0, &[0u8; 8]), broken]);
         let mut runs = Vec::new();
-        append_slide_downrev(&slide, &mut runs);
+        let mut budget = DownrevBudget::new();
+        append_slide_downrev(&slide, &mut runs, &mut budget);
         assert!(runs.is_empty(), "malformed package is skipped: {runs:?}");
     }
 
@@ -441,7 +529,7 @@ mod tests {
         // package is not carved around by scanning past the declaration.
         let payload = carrier_short_length(SAMPLE_XML, 8);
         assert!(
-            shape_xml_in_payload(&payload).is_none(),
+            shape_xml_in_payload(&payload, &mut DownrevBudget::new()).is_none(),
             "a corrupt (short) declared length must not be carved around"
         );
     }
@@ -453,7 +541,7 @@ mod tests {
         // signature scan stops at the first ZIP and reads the wrong one; a
         // property-table walk skips the decoy and reads the real package.
         let payload = carrier_with_decoy(SAMPLE_XML);
-        let xml = shape_xml_in_payload(&payload)
+        let xml = shape_xml_in_payload(&payload, &mut DownrevBudget::new())
             .expect("the real package must be read past the decoy package");
         assert!(xml.contains("Real package text"), "the real package's text must surface: {xml}");
         assert!(
@@ -469,7 +557,7 @@ mod tests {
         // through the signature-scan fallback.
         let payload = degenerate_carrier(SAMPLE_XML);
         assert!(
-            shape_xml_in_payload(&payload).is_some(),
+            shape_xml_in_payload(&payload, &mut DownrevBudget::new()).is_some(),
             "a non-property-table carrier must still be read by the scan"
         );
     }
@@ -480,7 +568,7 @@ mod tests {
         // so the walk finds no package and the scan fallback applies.
         let payload = carrier_without_complex_bit(SAMPLE_XML);
         assert!(
-            shape_xml_in_payload(&payload).is_some(),
+            shape_xml_in_payload(&payload, &mut DownrevBudget::new()).is_some(),
             "a metroBlob opid without the complex bit must fall back to the scan"
         );
     }
@@ -492,7 +580,7 @@ mod tests {
         // still recovers the package.
         let payload = carrier_over_long_length(SAMPLE_XML, 64);
         assert!(
-            shape_xml_in_payload(&payload).is_some(),
+            shape_xml_in_payload(&payload, &mut DownrevBudget::new()).is_some(),
             "an over-long declared length must not panic and must fall back"
         );
     }
@@ -508,7 +596,8 @@ mod tests {
             .collect();
         let slide = container(0x03EE, &carriers);
         let mut runs = Vec::new();
-        append_slide_downrev(&slide, &mut runs);
+        let mut budget = DownrevBudget::new();
+        append_slide_downrev(&slide, &mut runs, &mut budget);
         assert!(
             runs.iter().any(|r| r.text == "Text 0"),
             "the first package must be read: {runs:?}"
@@ -536,12 +625,148 @@ mod tests {
             .collect();
         let slide = container(0x03EE, &carriers);
         let mut runs = Vec::new();
-        append_slide_downrev(&slide, &mut runs);
+        let mut budget = DownrevBudget::new();
+        append_slide_downrev(&slide, &mut runs, &mut budget);
         for i in 0..MAX_DOWNREV_PACKAGES {
             assert!(
                 runs.iter().any(|r| r.text == format!("Text {i}")),
                 "package {i} must be read at the cap boundary: {runs:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_append_slide_downrev_skips_placeholder_only_packages() {
+        // Empty legacy text, but the package only carries placeholder runs
+        // (letters replaced by _); nothing must be added (#478).
+        let slide = container(
+            0x03EE,
+            &[record(0x03EF, 0, &[0u8; 8]), carrier(r#"<p:sp><a:p><a:r><a:t>___ _______</a:t></a:r></a:p></p:sp>"#)],
+        );
+        let mut runs = Vec::new();
+        let mut budget = DownrevBudget::new();
+        append_slide_downrev(&slide, &mut runs, &mut budget);
+        assert!(
+            runs.is_empty(),
+            "placeholder-only package adds nothing: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn test_append_slide_downrev_enforces_per_file_package_budget() {
+        // Five pathological slides of 256 distinct packages each: the per-file
+        // package budget (1024) bounds the total, so only the first four
+        // slides contribute (1024 packages) and the fifth adds nothing.
+        let mut budget = DownrevBudget::new();
+        let mut total = 0usize;
+        for s in 0..5u32 {
+            let mut children: Vec<Vec<u8>> = vec![record(0x03EF, 0, &[0u8; 8])];
+            for i in 0..256u32 {
+                let xml = format!(
+                    "<p:sp><a:p><a:r><a:t>File text s{i} slide{s}</a:t></a:r></a:p></p:sp>"
+                );
+                children.push(record(0x03EF, 0, &carrier(&xml)));
+            }
+            let slide = container(0x03EE, &children);
+            let mut runs = Vec::new();
+            append_slide_downrev(&slide, &mut runs, &mut budget);
+            total += runs.len();
+        }
+        assert_eq!(
+            total, DOWNREV_MAX_PACKAGES_PER_FILE,
+            "per-file package budget bounds work across slides"
+        );
+        assert_eq!(budget.packages_remaining, 0, "package budget fully consumed");
+    }
+
+    #[test]
+    fn test_append_slide_downrev_enforces_per_file_byte_budget() {
+        // One hundred ~64 KiB fragments: the 4 MiB per-file byte budget bounds
+        // how many can be decompressed, well before all 100 are read.
+        let mut children: Vec<Vec<u8>> = vec![record(0x03EF, 0, &[0u8; 8])];
+        for i in 0..100u32 {
+            let bulk = "A".repeat(64 * 1024 - 64);
+            let xml = format!("<p:sp><a:p><a:r><a:t>{i}{bulk}</a:t></a:r></a:p></p:sp>");
+            children.push(record(0x03EF, 0, &carrier(&xml)));
+        }
+        let slide = container(0x03EE, &children);
+        let mut runs = Vec::new();
+        let mut budget = DownrevBudget::new();
+        append_slide_downrev(&slide, &mut runs, &mut budget);
+        assert!(
+            runs.len() < 100,
+            "per-file byte budget bounds the run count: {}",
+            runs.len()
+        );
+        assert!(
+            budget.bytes_remaining <= MAX_SHAPE_XML_BYTES,
+            "byte budget consumed: {}",
+            budget.bytes_remaining
+        );
+        for r in &runs {
+            assert!(
+                r.text.len() <= MAX_SHAPE_XML_BYTES as usize,
+                "every fragment stays within the per-fragment cap"
+            );
+        }
+    }
+
+    #[test]
+    fn test_append_slide_downrev_enforces_per_fragment_byte_cap() {
+        // A single fragment far larger than the per-fragment cap must be
+        // truncated (not decompressed in full), yet still yield its leading
+        // text rather than panicking or returning nothing.
+        let bulk = "A".repeat(200 * 1024);
+        let xml = format!("<p:sp><a:p><a:r><a:t>{bulk}</a:t></a:r></a:p></p:sp>");
+        let slide = container(
+            0x03EE,
+            &[
+                record(0x03EF, 0, &[0u8; 8]),
+                record(0x03EF, 0, &carrier(&xml)),
+            ],
+        );
+        let mut runs = Vec::new();
+        let mut budget = DownrevBudget::new();
+        append_slide_downrev(&slide, &mut runs, &mut budget);
+        assert_eq!(runs.len(), 1, "one (truncated) fragment");
+        assert!(
+            runs[0].text.len() <= MAX_SHAPE_XML_BYTES as usize,
+            "fragment truncated to the cap: {}",
+            runs[0].text.len()
+        );
+        assert!(
+            !runs[0].text.is_empty(),
+            "truncated fragment still yields text"
+        );
+    }
+
+    #[test]
+    fn test_append_slide_downrev_dedups_identical_package_across_slides() {
+        // The same package carried on two different slides must be extracted
+        // only once: seen_packages lives in the per-file budget and is
+        // shared across slides, so the decompression/parse cost is paid once
+        // even when many slides repeat one package (#478).
+        let xml = "<p:sp><a:p><a:r><a:t>Shared text</a:t></a:r></a:p></p:sp>";
+        let payload = carrier(xml);
+        let slide1 = container(0x03EE, &[record(0x03EF, 0, &payload)]);
+        let slide2 = container(0x03EE, &[record(0x03EF, 0, &payload)]);
+        let mut budget = DownrevBudget::new();
+        let mut runs1 = Vec::new();
+        append_slide_downrev(&slide1, &mut runs1, &mut budget);
+        let mut runs2 = Vec::new();
+        append_slide_downrev(&slide2, &mut runs2, &mut budget);
+        assert!(
+            runs1.iter().any(|r| r.text.contains("Shared text")),
+            "first slide extracts the shared package"
+        );
+        assert!(
+            !runs2.iter().any(|r| r.text.contains("Shared text")),
+            "identical package on a later slide is read once, not re-added"
+        );
+        assert_eq!(
+            runs1.len() + runs2.len(),
+            1,
+            "the shared package contributes exactly one run across slides"
+        );
     }
 }
