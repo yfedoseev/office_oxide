@@ -91,17 +91,24 @@ pub fn set_max_text_chars(chars: usize) {
     MAX_TEXT_CHARS.store(chars, Ordering::Relaxed);
 }
 
-/// The default per-document allowance of empty grid slots: 32 Mi.
+/// The default per-document allowance of empty grid slots: 8 Mi.
 ///
 /// A legacy `.xls` sheet is stored as rows that run to their last used
 /// column, so one number in column 255 of each of 65,535 rows costs 256
 /// slots per row: 16.7M slots from 65,535 records, and six such sheets
-/// made a 7 MB file allocate 2.6 GB. Only the *empty* slots that pad a
-/// row out to its last cell are charged, never the cells themselves, so a
-/// dense 65,536 x 256 sheet (which carries 16.7M cells and a file to
-/// match) costs nothing, and one sheet with a cell in the last column of
-/// every row still fits.
-pub const DEFAULT_MAX_GRID_PADDING_CELLS: usize = 32 << 20;
+/// made a 7 MB file allocate 2.6 GB. Each slot is a `CellValue` and an
+/// `XF` index in the sheet, and converting the sheet to the IR adds a table
+/// cell for it, about 70 bytes in all: the earlier 32 Mi allowance let that
+/// file reach 0.9 GB on open and 2.1 GB in `to_ir`; 8 Mi bounds both near a
+/// quarter of that. Only the *empty* slots that pad a row out to its last
+/// cell are charged, never the cells themselves, so a dense 65,536 x 256
+/// sheet (which carries 16.7M cells and a file to match) costs nothing, and
+/// a sheet whose rows reach their last column with up to about 32,000 rows
+/// of nothing in between still fits. A workbook that needs more is cut at
+/// the row that does not fit, loudly; processes that read such workbooks
+/// raise the allowance with
+/// [the setter](crate::limits::set_max_grid_padding_cells).
+pub const DEFAULT_MAX_GRID_PADDING_CELLS: usize = 8 << 20;
 
 static MAX_GRID_PADDING_CELLS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_GRID_PADDING_CELLS);
 
