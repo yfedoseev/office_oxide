@@ -80,6 +80,41 @@ pub(crate) fn omitted_warning(omitted: usize) -> String {
     format!("and {omitted} more unreadable parts not listed")
 }
 
+/// The in-band lines that report unreadable parts in the text of a document
+/// (plain text, Markdown, and the last section of the IR), one for each
+/// warning of `warnings` and each bracketed as a spreadsheet's notice is.
+///
+/// The warnings are the bounded record's (at most [`MAX_UNREADABLE_PARTS`]
+/// entries and the count of the rest, each part and reason cut at
+/// [`MAX_REPORT_CHARS`]); the lines are charged to the copied-text budget the
+/// running conversion holds before any is written. When the budget cannot pay
+/// for them none is written, and the budget's own notice (which the caller
+/// appends after this) says so. A document that lost no part has no
+/// warnings, hence no lines.
+pub(crate) fn report_lines(warnings: &[String]) -> Vec<String> {
+    if warnings.is_empty() {
+        return Vec::new();
+    }
+    let chars = warnings
+        .iter()
+        .fold(0usize, |n, w| n.saturating_add(w.len()).saturating_add(3));
+    if !crate::limits::charge_copied_text(chars) {
+        return Vec::new();
+    }
+    warnings.iter().map(|w| format!("[{w}]")).collect()
+}
+
+/// [`report_lines`] for the content of an IR, which has no budget notice
+/// after it: where the budget cannot pay for the report, the budget's own
+/// notice stands in its place.
+pub(crate) fn report_ir_lines(warnings: &[String]) -> Vec<String> {
+    let lines = report_lines(warnings);
+    if lines.is_empty() && !warnings.is_empty() {
+        return crate::limits::copied_text_notice().into_iter().collect();
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

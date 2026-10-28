@@ -489,6 +489,26 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
         }));
     }
 
+    // The parts that could not be read end the last section, one paragraph
+    // each, as a spreadsheet's report does; charged to the text budget before
+    // the budget's notice is read below.
+    let unreadable_warnings = doc.unreadable_warnings();
+    let unreadable_lines = crate::core::unreadable::report_ir_lines(&unreadable_warnings);
+    if !unreadable_lines.is_empty() {
+        if ir_sections.is_empty() {
+            ir_sections.push(Section::default());
+        }
+        if let Some(last) = ir_sections.last_mut() {
+            last.elements
+                .extend(unreadable_lines.into_iter().map(|line| {
+                    Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan::plain(line))],
+                        ..Default::default()
+                    })
+                }));
+        }
+    }
+
     // Real document metadata beats a title guessed from the first heading,
     // but the guess stays as the fallback for files with no core properties.
     let cp = doc.core_properties.as_ref();
@@ -516,13 +536,8 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
                 || copied_text_notice.is_some()
                 || doc.link_notice.is_some()
                 || image_cut.is_some(),
-            warnings: doc
-                .unreadable_parts
-                .iter()
-                .map(|p| format!("skipped unreadable part {p}"))
-                .chain((doc.unreadable_parts_omitted > 0).then(|| {
-                    crate::core::unreadable::omitted_warning(doc.unreadable_parts_omitted)
-                }))
+            warnings: unreadable_warnings
+                .into_iter()
                 .chain(copied_text_notice)
                 .chain(doc.link_notice.clone())
                 .chain(image_cut)

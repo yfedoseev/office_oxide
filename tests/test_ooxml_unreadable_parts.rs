@@ -373,3 +373,110 @@ fn test_a_theme_part_that_is_not_well_formed_is_reported_and_the_file_still_open
         doc.unreadable_parts
     );
 }
+
+/// Every rendering of `doc`: plain text, Markdown, HTML and the Markdown and
+/// HTML of its IR.
+fn renderings(bytes: &[u8], format: DocumentFormat) -> Vec<(&'static str, String)> {
+    let doc = Document::from_reader(Cursor::new(bytes.to_vec()), format).unwrap();
+    let ir = doc.to_ir();
+    vec![
+        ("plain_text", doc.plain_text()),
+        ("to_markdown", doc.to_markdown()),
+        ("to_html", doc.to_html()),
+        ("ir plain", ir.plain_text()),
+        ("ir markdown", ir.to_markdown()),
+        ("ir html", ir.to_html()),
+    ]
+}
+
+#[test]
+fn test_a_docx_header_that_cannot_be_read_is_reported_in_every_rendering() {
+    let _limits = common::default_limits();
+    let bad = docx_with_headers(1, 1, &malformed_header());
+    let good = docx_with_headers(1, 1, &format!(r#"<w:hdr xmlns:w="{WML}"/>"#));
+    for (what, text) in renderings(&bad, DocumentFormat::Docx) {
+        assert!(
+            text.contains("skipped unreadable part /word/header0.xml"),
+            "{what} does not report the lost header: {text}"
+        );
+    }
+    for (what, text) in renderings(&good, DocumentFormat::Docx) {
+        assert!(!text.contains("unreadable"), "{what} reports a loss on a good file: {text}");
+    }
+    // The notice is all a lost part adds: the rest reads as the good file.
+    let good_plain = Document::from_reader(Cursor::new(good), DocumentFormat::Docx)
+        .unwrap()
+        .plain_text();
+    let bad_plain = Document::from_reader(Cursor::new(bad), DocumentFormat::Docx)
+        .unwrap()
+        .plain_text();
+    assert_eq!(bad_plain.split("\n\n[skipped").next().unwrap(), good_plain);
+}
+
+#[test]
+fn test_a_deck_part_that_cannot_be_read_is_reported_in_every_rendering() {
+    let _limits = common::default_limits();
+    let bad = pptx_with_notes(2, 1, None);
+    for (what, text) in renderings(&bad, DocumentFormat::Pptx) {
+        assert!(
+            text.contains("skipped unreadable part /ppt/notesSlides/notes0.xml"),
+            "{what} does not report the lost notes: {text}"
+        );
+    }
+    // A deck whose parts all read has no report.
+    let mut parts = Vec::new();
+    let mut archive = zip::ZipArchive::new(Cursor::new(bad)).unwrap();
+    for i in 0..archive.len() {
+        let mut f = archive.by_index(i).unwrap();
+        let name = f.name().unwrap().to_string();
+        let mut body = String::new();
+        f.read_to_string(&mut body).unwrap();
+        if name == "ppt/notesSlides/notes0.xml" {
+            body = format!(r#"<p:notes xmlns:p="{PML}" xmlns:a="{DML}"><p:cSld/></p:notes>"#);
+        }
+        parts.push((name, body));
+    }
+    for (what, text) in renderings(&zip_of(parts), DocumentFormat::Pptx) {
+        assert!(!text.contains("unreadable"), "{what} reports a loss on a good file: {text}");
+    }
+}
+
+#[test]
+fn test_the_report_in_the_text_is_bounded_to_the_list_and_the_count() {
+    let _limits = common::default_limits();
+    let docx = docx_with_headers(250, 250, &malformed_header());
+    let pptx = pptx_with_notes(250, 250, None);
+    for (bytes, format) in [(docx, DocumentFormat::Docx), (pptx, DocumentFormat::Pptx)] {
+        for (what, text) in renderings(&bytes, format) {
+            assert_eq!(text.matches("skipped unreadable part").count(), 100, "{what}");
+            assert!(text.contains("and 150 more unreadable parts not listed"), "{what}");
+        }
+    }
+}
+
+#[test]
+fn test_a_report_the_text_budget_cannot_pay_for_is_left_out_and_the_budget_says_so() {
+    let mut scope = LimitScope::new();
+    scope.set(
+        office_oxide::limits::max_text_chars,
+        office_oxide::limits::set_max_text_chars,
+        40,
+    );
+    let docx = docx_with_headers(1, 1, &malformed_header());
+    let pptx = pptx_with_notes(1, 1, None);
+    for (bytes, format) in [(docx, DocumentFormat::Docx), (pptx, DocumentFormat::Pptx)] {
+        let doc = Document::from_reader(Cursor::new(bytes), format).unwrap();
+        let ir = doc.to_ir();
+        for (what, text) in [
+            ("plain_text", doc.plain_text()),
+            ("to_markdown", doc.to_markdown()),
+            ("ir markdown", ir.to_markdown()),
+        ] {
+            assert!(!text.contains("skipped unreadable part"), "{what}: {text}");
+            assert!(text.contains("output truncated"), "{what}: {text}");
+        }
+        // The metadata still lists what was lost.
+        assert!(ir.metadata.text_truncated);
+        assert_eq!(skipped_warnings(&ir), 1);
+    }
+}
