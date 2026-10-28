@@ -7,7 +7,7 @@
 //! cells rendered to 393 MB; the same string from a million rows would be
 //! 32 GB from a 300 KB file. Every reader and converter that can copy
 //! stored text charges the characters it emits against one per-document
-//! budget ([`max_text_chars`]) and stops, loudly, when it is spent: the
+//! budget ([`limits::max_text_chars`]) and stops, loudly, when it is spent: the
 //! XLSX text rendering and IR converter, the legacy `.xls` reader (which
 //! materialises each referencing cell's copy at open), the legacy `.doc`
 //! piece table and its header, footer and comment stories, the legacy `.ppt`
@@ -18,22 +18,22 @@
 //! `ZipSecureFile.setMaxTextSize`.
 //!
 //! The text budget is one of several, each for the thing that multiplies:
-//! pictures ([`max_image_bytes`], [`max_total_image_bytes`] and, for the
+//! pictures ([`limits::max_image_bytes`], [`limits::max_total_image_bytes`] and, for the
 //! compressed metafiles of the legacy formats,
-//! [`max_inflated_image_bytes`]); the empty slots and table cells that pad
-//! the rows of a sparse sheet ([`max_grid_padding_cells`] and
-//! [`max_sheet_grid_padding_cells`] for `.xls`, [`max_ir_padding_bytes`] and
-//! [`max_sheet_ir_padding_bytes`] for the IR); the blocks, list items and
-//! table cells of parsed Markdown ([`max_markdown_elements`],
-//! [`max_markdown_list_items`], [`max_markdown_table_cells`]); and the
-//! sheets and table cells a writer will write ([`max_write_sheets`],
-//! [`max_write_table_cells`]).
+//! [`limits::max_inflated_image_bytes`]); the empty slots and table cells that pad
+//! the rows of a sparse sheet ([`limits::max_grid_padding_cells`] and
+//! [`limits::max_sheet_grid_padding_cells`] for `.xls`, [`limits::max_ir_padding_bytes`] and
+//! [`limits::max_sheet_ir_padding_bytes`] for the IR); the blocks, list items and
+//! table cells of parsed Markdown ([`limits::max_markdown_elements`],
+//! [`limits::max_markdown_list_items`], [`limits::max_markdown_table_cells`]); and the
+//! sheets and table cells a writer will write ([`limits::max_write_sheets`],
+//! [`limits::max_write_table_cells`]).
 //!
 //! A package embedded in a `.docx` is opened to read its text, and may embed
 //! packages of its own. What they cost is charged to the one document that
-//! holds them: how deep they nest ([`max_embedded_depth`]), how many are
-//! opened ([`max_embedded_packages`]) and the bytes they take
-//! ([`max_embedded_bytes`]), with their text counted against the text budget.
+//! holds them: how deep they nest ([`limits::max_embedded_depth`]), how many are
+//! opened ([`limits::max_embedded_packages`]) and the bytes they take
+//! ([`limits::max_embedded_bytes`]), with their text counted against the text budget.
 //!
 //! The default keeps every genuine workbook this crate has been tested
 //! against (the largest, 181 MB of cell text, with room to spare) and

@@ -29,10 +29,10 @@ struct Follower {
     cell: usize,
 }
 
-/// What [`SharedFormulas::resolve`] could not give a formula to.
+/// What `SharedFormulas::resolve` could not give a formula to.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SharedFormulaLoss {
-    /// Masters longer than [`MAX_FORMULA_CHARS`], and followers of such
+    /// Masters longer than `MAX_FORMULA_CHARS`, and followers of such
     /// groups, plus followers past the document's text budget. Their cells
     /// keep their values and have no formula.
     pub dropped: usize,
@@ -43,7 +43,7 @@ pub struct SharedFormulaLoss {
 ///
 /// Parsing only records them. A follower stores its own copy of the master's
 /// formula, so a long master shared by many cells multiplies; the copies are
-/// made afterwards by [`resolve`](Self::resolve), one sheet at a time in the
+/// made afterwards by `resolve`, one sheet at a time in the
 /// workbook's order, against one document-wide budget. Sheets are parsed on
 /// several threads, and charging as they went would make which sheet loses
 /// its formulas depend on scheduling.
@@ -76,7 +76,7 @@ impl SharedFormulas {
     }
 
     /// Record a group's master cell and its formula text. A master longer
-    /// than [`MAX_FORMULA_CHARS`] (Excel's own limit, ECMA-376 §18.17) is
+    /// than `MAX_FORMULA_CHARS` (Excel's own limit, ECMA-376 §18.17) is
     /// refused, as is its group: it cannot come from a spreadsheet
     /// application, and the text is copied into every follower. Returns
     /// `false` for a refused master, whose cell then has no formula.
@@ -94,7 +94,7 @@ impl SharedFormulas {
     }
 
     /// Record a follower cell (`<f t="shared" si="N"/>`) at the current
-    /// position; its formula is written by [`resolve`](Self::resolve).
+    /// position; its formula is written by `resolve`.
     pub fn follower(&mut self, si: u32, at: &CellRef) {
         self.followers.push(Follower {
             si,
