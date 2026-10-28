@@ -561,3 +561,164 @@ fn test_a_part_name_the_file_shapes_stays_one_inert_line_in_every_rendering() {
         }
     }
 }
+
+/// A deck whose parts all read (`pptx_with_notes` with a good notes part), with
+/// `edit` applied to each part as `(name, body)`.
+fn clean_deck(edit: impl Fn(&str, String) -> String) -> Vec<u8> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(pptx_with_notes(1, 1, None))).unwrap();
+    let mut parts = Vec::new();
+    for i in 0..archive.len() {
+        let mut f = archive.by_index(i).unwrap();
+        let name = f.name().unwrap().to_string();
+        let mut body = String::new();
+        f.read_to_string(&mut body).unwrap();
+        if name == "ppt/notesSlides/notes0.xml" {
+            body = format!(r#"<p:notes xmlns:p="{PML}" xmlns:a="{DML}"><p:cSld/></p:notes>"#);
+        }
+        let body = edit(&name, body);
+        parts.push((name, body));
+    }
+    zip_of(parts)
+}
+
+fn add_rel(body: String, rel: &str) -> String {
+    body.replace("</Relationships>", &format!("{rel}</Relationships>"))
+}
+
+/// Nothing was lost, and nothing says so.
+fn assert_nothing_reported(bytes: Vec<u8>, format: DocumentFormat) {
+    let doc = Document::from_reader(Cursor::new(bytes), format).unwrap();
+    let ir = doc.to_ir();
+    assert!(!ir.metadata.text_truncated, "{:?}", ir.metadata.warnings);
+    assert!(
+        !ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("unreadable")),
+        "{:?}",
+        ir.metadata.warnings
+    );
+    assert!(!doc.plain_text().contains("unreadable"));
+}
+
+/// A relationship marked external names a place outside the package, whatever
+/// its target looks like: here a target that, read as a part name, is a part
+/// the package holds and cannot read. It is not that part, so nothing is lost.
+#[test]
+fn test_a_deck_relationship_to_an_external_target_is_not_read_as_a_part() {
+    let _limits = common::default_limits();
+    let bad = "/ppt/ext/bad.xml";
+    for (part, rel) in [
+        ("ppt/slides/_rels/slide0.xml.rels", "comments"),
+        ("ppt/slides/_rels/slide0.xml.rels", "slideLayout"),
+        ("ppt/_rels/presentation.xml.rels", "theme"),
+    ] {
+        let bytes = clean_deck(|name, body| {
+            if name == "ppt/ext/bad.xml" {
+                return "<broken".to_string();
+            }
+            if name == part {
+                return add_rel(
+                    body,
+                    &format!(
+                        r#"<Relationship Id="rId8" Type="{REL}/{rel}" Target="{bad}" TargetMode="External"/>"#
+                    ),
+                );
+            }
+            body
+        });
+        // The part is in the package to be read, were the target taken for it.
+        let mut parts = zip_entries(&bytes);
+        parts.push(("ppt/ext/bad.xml".into(), "<broken".into()));
+        assert_nothing_reported(zip_of(parts), DocumentFormat::Pptx);
+    }
+    // The notes relationship itself pointing outside the package.
+    let mut parts = zip_entries(&clean_deck(|name, body| {
+        if name == "ppt/slides/_rels/slide0.xml.rels" {
+            body.replace(
+                r#"Target="../notesSlides/notes0.xml""#,
+                &format!(r#"Target="{bad}" TargetMode="External""#),
+            )
+        } else {
+            body
+        }
+    }));
+    parts.push(("ppt/ext/bad.xml".into(), "<broken".into()));
+    assert_nothing_reported(zip_of(parts), DocumentFormat::Pptx);
+}
+
+/// A chart relationship marked external is not read as the part its target
+/// spells: the package is read as if it were not there.
+#[test]
+fn test_a_deck_chart_relationship_to_an_external_target_is_not_read() {
+    let _limits = common::default_limits();
+    let with = |rel: &str| {
+        let mut parts = zip_entries(&clean_deck(|name, body| {
+            if name == "ppt/slides/_rels/slide0.xml.rels" {
+                add_rel(body, rel)
+            } else {
+                body
+            }
+        }));
+        parts.push(("ppt/ext/chart.xml".into(), " ".repeat(200_000)));
+        let read = Rc::new(std::cell::Cell::new(0));
+        PptxDocument::from_reader(Counting {
+            inner: Cursor::new(zip_of(parts)),
+            read: read.clone(),
+        })
+        .unwrap();
+        read.get()
+    };
+    let internal = with(&format!(
+        r#"<Relationship Id="rId8" Type="{REL}/chart" Target="/ppt/ext/chart.xml"/>"#
+    ));
+    let external = with(&format!(
+        r#"<Relationship Id="rId8" Type="{REL}/chart" Target="/ppt/ext/chart.xml" TargetMode="External"/>"#
+    ));
+    assert!(
+        internal >= external + 200_000,
+        "{internal} bytes read with the part named, {external} without"
+    );
+}
+
+/// The entries of a zip, as `(name, body)`.
+fn zip_entries(bytes: &[u8]) -> Vec<(String, String)> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes.to_vec())).unwrap();
+    let mut parts = Vec::new();
+    for i in 0..archive.len() {
+        let mut f = archive.by_index(i).unwrap();
+        let name = f.name().unwrap().to_string();
+        let mut body = String::new();
+        f.read_to_string(&mut body).unwrap();
+        parts.push((name, body));
+    }
+    parts
+}
+
+#[test]
+fn test_a_dangling_numbering_relationship_is_not_a_lost_part() {
+    let _limits = common::default_limits();
+    let mut archive = zip::ZipArchive::new(Cursor::new(docx_with_headers(
+        1,
+        1,
+        &format!(r#"<w:hdr xmlns:w="{WML}"/>"#),
+    )))
+    .unwrap();
+    let mut parts = Vec::new();
+    for i in 0..archive.len() {
+        let mut f = archive.by_index(i).unwrap();
+        let name = f.name().unwrap().to_string();
+        let mut body = String::new();
+        f.read_to_string(&mut body).unwrap();
+        if name == "word/_rels/document.xml.rels" {
+            body = add_rel(
+                body,
+                &format!(
+                    r#"<Relationship Id="rId90" Type="{REL}/numbering" Target="numbering.xml"/>"#
+                ),
+            );
+        }
+        parts.push((name, body));
+    }
+    assert_nothing_reported(zip_of(parts), DocumentFormat::Docx);
+}

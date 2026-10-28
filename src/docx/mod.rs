@@ -278,16 +278,25 @@ impl DocxDocument {
         };
 
         // Parse numbering (optional — some files reference it but don't include it)
-        let numbering = if let Some(rel) = doc_rels.first_by_type(rel_types::NUMBERING) {
+        let numbering = if let Some(rel) = doc_rels.first_by_type(rel_types::NUMBERING)
+            // A relationship to a place outside the package is not a part.
+            .filter(|rel| rel.target_mode == TargetMode::Internal)
+        {
             let part_name = main_part.resolve_relative(&rel.target)?;
-            match opc.read_part(&part_name) {
-                Ok(data) => Some(NumberingDefinitions::parse(&data)?),
-                // Numbering is optional, so the document opens without it;
-                // the list markers lost are reported.
-                Err(e) => {
-                    skip_unreadable(part_name.as_str(), &e);
-                    None
-                },
+            // A relationship to a part the package does not hold is the
+            // feature absent, as for the theme, charts and pictures.
+            if !opc.has_part(&part_name) {
+                None
+            } else {
+                match opc.read_part(&part_name) {
+                    Ok(data) => Some(NumberingDefinitions::parse(&data)?),
+                    // Numbering is optional, so the document opens without it;
+                    // the list markers lost are reported.
+                    Err(e) => {
+                        skip_unreadable(part_name.as_str(), &e);
+                        None
+                    },
+                }
             }
         } else {
             None
