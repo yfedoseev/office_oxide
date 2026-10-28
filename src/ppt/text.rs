@@ -394,6 +394,7 @@ fn extract_slides_via_persist(
     let mut slide_offsets: std::collections::HashSet<Option<usize>> =
         std::collections::HashSet::new();
     let mut aliased_entries = 0usize;
+    let mut claims = ContainerClaims::default();
     let mut slides_cut_by_budget = false;
     for entry in slide_list_entries(&slide_list) {
         if !slide_offsets.insert(dir.resolve(entry.persist_id_ref)) {
@@ -409,6 +410,7 @@ fn extract_slides_via_persist(
             &hyperlinks,
             &ole_objects,
             &mut text_budget,
+            &mut claims,
         );
         let hf_texts = links
             .headers_footers
@@ -461,6 +463,7 @@ fn extract_slides_via_persist(
                 &hyperlinks,
                 &ole_objects,
                 &mut text_budget,
+                &mut claims,
             ) else {
                 continue;
             };
@@ -530,6 +533,12 @@ fn extract_slides_via_persist(
         notices.push(format!(
             "{aliased_entries} slide-list entries name a slide or notes page that an earlier \
              entry already names, or name none; they were left out"
+        ));
+    }
+    if claims.refused > 0 {
+        notices.push(format!(
+            "{} slide or notes containers overlap an earlier one; they were left out",
+            claims.refused
         ));
     }
     if slides_cut_by_budget || text_budget.exhausted() {
@@ -923,8 +932,12 @@ fn resolve_notes(
     hyperlinks: &HashMap<u32, String>,
     ole_objects: &HashMap<u32, OleObjectInfo>,
     budget: &mut crate::limits::TextBudget,
+    claims: &mut ContainerClaims,
 ) -> Option<(Vec<TextRun>, Option<u32>)> {
     let offset = dir.resolve(persist_id_ref)?;
+    if !claims.claim(stream, offset, RT_NOTES) {
+        return None;
+    }
     let children = bounded_container_children(stream, offset, RT_NOTES)?;
     let slide_id_ref = RecordIter::new(&children)
         .filter_map(Result::ok)
@@ -953,6 +966,57 @@ fn resolve_notes(
     Some((runs, slide_id_ref))
 }
 
+/// The byte ranges of the `Slide` and `Notes` containers read so far.
+///
+/// The persist directory can map any number of ids to offsets inside one
+/// another, so that each of thousands of "slides" is a container that covers
+/// most of the stream. Every one is then parsed and copied in full, and the
+/// text budget does not slow that down when the containers hold no text. A
+/// genuine deck's containers are disjoint, so one that overlaps an earlier
+/// one is left out; the work of reading all of them is then at most the
+/// stream's length.
+#[derive(Default)]
+struct ContainerClaims {
+    /// `start -> end` of each accepted container, disjoint.
+    ranges: std::collections::BTreeMap<usize, usize>,
+    /// Containers refused for overlapping an accepted one.
+    refused: usize,
+}
+
+impl ContainerClaims {
+    /// Claim the container of type `rec_type` at `offset`. `false` when it
+    /// overlaps one already claimed (or is not that container at all, in
+    /// which case nothing is claimed and the caller finds that out itself).
+    fn claim(&mut self, stream: &[u8], offset: usize, rec_type: u16) -> bool {
+        let Some(header) = stream
+            .get(offset..offset.saturating_add(8))
+            .and_then(|b| RecordHeader::parse(b).ok())
+        else {
+            return true;
+        };
+        if header.rec_type != rec_type || !header.is_container() {
+            return true;
+        }
+        let end = offset
+            .saturating_add(8)
+            .saturating_add(header.rec_len as usize)
+            .min(stream.len());
+        // The nearest accepted range starting before `end` is the only one
+        // that can reach back over `offset`: the ranges are disjoint.
+        let overlaps = self
+            .ranges
+            .range(..end)
+            .next_back()
+            .is_some_and(|(_, &other_end)| other_end > offset);
+        if overlaps {
+            self.refused += 1;
+            return false;
+        }
+        self.ranges.insert(offset, end);
+        true
+    }
+}
+
 /// Resolve one slide's shape text: locate its `Slide` container via the
 /// persist directory and walk its shape tree, resolving any
 /// `OutlineTextRefAtom` references against `outline_texts`. Also returns
@@ -971,6 +1035,7 @@ fn resolve_slide(
     hyperlinks: &HashMap<u32, String>,
     ole_objects: &HashMap<u32, OleObjectInfo>,
     budget: &mut crate::limits::TextBudget,
+    claims: &mut ContainerClaims,
 ) -> (SlideText, SlideLinks) {
     let mut text_runs = Vec::new();
     let mut tables = Vec::new();
@@ -980,7 +1045,10 @@ fn resolve_slide(
     let mut notes_id_ref = None;
     let mut headers_footers = None;
     let mut master = None;
-    if let Some(offset) = dir.resolve(persist_id_ref) {
+    if let Some(offset) = dir
+        .resolve(persist_id_ref)
+        .filter(|&o| claims.claim(stream, o, RT_SLIDE))
+    {
         if let Some(children) = bounded_container_children(stream, offset, RT_SLIDE) {
             master = slide_master_ref(&children);
             headers_footers = find_child(&children, RT_HEADER_FOOTER, HF_INSTANCE_SLIDES)
@@ -4064,6 +4132,65 @@ mod tests {
         let edit_offset = stream.len() as u32;
         stream.extend(user_edit_atom_bytes(0, pd_offset, 1));
         (stream, current_user_bytes(edit_offset))
+    }
+
+    /// Slide containers the persist directory places inside one another are
+    /// read once, as the outermost: each nested one would otherwise be parsed
+    /// and copied in full for its own entry, and a stream of nested
+    /// containers costs its length once per entry.
+    #[test]
+    fn test_slide_containers_nested_in_one_another_are_read_once() {
+        let nested = 50u32;
+        let prefix = {
+            let mut c = slide_atom_following(0, false);
+            c.extend(other_text_shape("OUTER", None));
+            c
+        };
+        let inners: Vec<Vec<u8>> = (0..nested)
+            .map(|i| {
+                let mut c = slide_atom_following(0, false);
+                c.extend(other_text_shape(&format!("INNER {i}"), None));
+                make_container(RT_SLIDE, 0, &c)
+            })
+            .collect();
+        let outer = make_container(RT_SLIDE, 0, &[prefix.clone(), inners.concat()].concat());
+        let ids: Vec<u32> = (2..3 + nested).collect();
+        let entries: Vec<u8> = ids
+            .iter()
+            .map(|&id| slide_persist_atom_bytes(id, 256 + id))
+            .collect::<Vec<_>>()
+            .concat();
+        let doc = make_container(RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES, &entries);
+        let mut stream = make_container(RT_DOCUMENT, 0, &doc);
+        let outer_offset = stream.len() as u32;
+        stream.extend(&outer);
+        let mut dir = vec![(1u32, 0u32), (2, outer_offset)];
+        let mut at = outer_offset + 8 + prefix.len() as u32;
+        for (i, inner) in inners.iter().enumerate() {
+            dir.push((3 + i as u32, at));
+            at += inner.len() as u32;
+        }
+        let pd_offset = stream.len() as u32;
+        stream.extend(persist_directory_bytes(&dir));
+        let edit_offset = stream.len() as u32;
+        stream.extend(user_edit_atom_bytes(0, pd_offset, 1));
+        let cu = current_user_bytes(edit_offset);
+
+        let deck = extract_deck_text(&stream, Some(&cu));
+        // The outer container is read (its own walk may reach its nested
+        // records); each nested container's own entry is left out rather
+        // than read again.
+        assert!(deck.slides[0].text_runs.iter().any(|r| r.text == "OUTER"));
+        for (i, slide) in deck.slides.iter().enumerate().skip(1) {
+            assert!(slide.text_runs.is_empty(), "entry {i} read a nested container");
+        }
+        assert!(
+            deck.notices
+                .iter()
+                .any(|n| n.contains("50 slide or notes containers overlap")),
+            "{:?}",
+            deck.notices
+        );
     }
 
     /// A deck-level footer is copied onto every slide, so it is charged for
