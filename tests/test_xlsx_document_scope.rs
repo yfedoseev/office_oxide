@@ -2,30 +2,26 @@
 //! spent it is cut and says so; the sheets after it are still converted, each
 //! within what is left, and none disappears without a notice that names it.
 //!
-//! Limits are process-global, so every test holds [`serial`] and sets its own.
+//! Limits are process-global, so every test holds the `LimitScope` of [`serial`],
+//! sets its own through it, and has the defaults back when it ends.
 
 use std::io::{Cursor, Write};
 
 use office_oxide::ir::{Element, Section};
+use office_oxide::limits::{
+    max_ir_padding_bytes, max_text_chars, set_max_ir_padding_bytes, set_max_text_chars,
+};
 use office_oxide::{Document, DocumentFormat};
+
+mod common;
+use common::LimitScope;
 
 const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const REL_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let guard = SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    office_oxide::limits::set_max_text_chars(office_oxide::limits::DEFAULT_MAX_TEXT_CHARS);
-    office_oxide::limits::set_max_ir_padding_bytes(
-        office_oxide::limits::DEFAULT_MAX_IR_PADDING_BYTES,
-    );
-    office_oxide::limits::set_max_sheet_ir_padding_bytes(
-        office_oxide::limits::DEFAULT_MAX_SHEET_IR_PADDING_BYTES,
-    );
-    guard
+fn serial() -> LimitScope {
+    LimitScope::new()
 }
 
 fn cell_bytes() -> usize {
@@ -115,8 +111,8 @@ fn big_dense_padded() -> Vec<u8> {
 
 #[test]
 fn test_a_sheet_after_the_one_that_spent_the_padding_allowance_is_still_converted() {
-    let _g = serial();
-    office_oxide::limits::set_max_ir_padding_bytes(1_680 * cell_bytes());
+    let mut limits = serial();
+    limits.set(max_ir_padding_bytes, set_max_ir_padding_bytes, 1_680 * cell_bytes());
     let ir = open(big_dense_padded()).to_ir();
     let titles: Vec<_> = ir
         .sections
@@ -162,8 +158,8 @@ fn test_a_sheet_after_the_one_that_spent_the_padding_allowance_is_still_converte
 
 #[test]
 fn test_every_renderer_agrees_the_dense_sheet_is_whole() {
-    let _g = serial();
-    office_oxide::limits::set_max_ir_padding_bytes(1_680 * cell_bytes());
+    let mut limits = serial();
+    limits.set(max_ir_padding_bytes, set_max_ir_padding_bytes, 1_680 * cell_bytes());
     let doc = open(big_dense_padded());
     for (name, out) in [
         ("plain_text", doc.plain_text()),
@@ -176,10 +172,10 @@ fn test_every_renderer_agrees_the_dense_sheet_is_whole() {
 
 #[test]
 fn test_sheets_left_out_by_the_text_budget_are_named() {
-    let _g = serial();
+    let mut limits = serial();
     // Four sheets of 40 rows against a budget the first spends and the second
     // runs out in.
-    office_oxide::limits::set_max_text_chars(300);
+    limits.set(max_text_chars, set_max_text_chars, 300);
     let doc = open(package(&[
         ("One", sheet("a", 40, "B")),
         ("Two", sheet("b", 40, "B")),
@@ -207,5 +203,4 @@ fn test_sheets_left_out_by_the_text_budget_are_named() {
         .map(|i| text_of(&i.section))
         .collect::<String>();
     assert!(all.contains("Three") && all.contains("Four"), "sheets_ir drops them silently");
-    office_oxide::limits::set_max_text_chars(office_oxide::limits::DEFAULT_MAX_TEXT_CHARS);
 }

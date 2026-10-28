@@ -75,12 +75,11 @@ static GLOBAL: Counting = Counting;
 
 /// The counter is process-wide, so a test allocating on another thread
 /// during a measurement is charged to it. Every test holds this for its
-/// whole body.
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// whole body. It is also the exclusive lock on the process-wide limits, so a
+/// limit a test sets through it is back at its default when the test ends,
+/// however it ends.
+fn serial() -> common::LimitScope {
+    common::LimitScope::new()
 }
 
 fn allocations_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
@@ -837,7 +836,7 @@ fn test_docx_open_does_not_copy_a_charts_text_per_drawing() {
 /// build them. The charge makes the first few fit and leaves the rest out.
 #[test]
 fn test_docx_to_ir_does_not_keep_a_table_styles_face_name_per_table() {
-    let _serial = serial();
+    let mut serial = serial();
     const TABLES: usize = 300;
     let name = "F".repeat(1 << 20);
     let styles = format!(
@@ -868,9 +867,12 @@ fn test_docx_to_ir_does_not_keep_a_table_styles_face_name_per_table() {
         office_oxide::Document::from_reader(Cursor::new(bytes), office_oxide::DocumentFormat::Docx)
             .unwrap();
     // A small text budget stands in for the default one.
-    office_oxide::limits::set_max_text_chars(8 << 20);
+    serial.set(
+        office_oxide::limits::max_text_chars,
+        office_oxide::limits::set_max_text_chars,
+        8 << 20,
+    );
     let (ir, peak) = peak_during(|| doc.to_ir());
-    office_oxide::limits::set_max_text_chars(office_oxide::limits::DEFAULT_MAX_TEXT_CHARS);
     assert!(ir.metadata.text_truncated);
     // The budget (8 Mi) holds a handful of copies; one kept per table would
     // be 300 MiB.

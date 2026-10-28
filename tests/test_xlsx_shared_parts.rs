@@ -9,12 +9,17 @@
 //! requested by the opening thread are compared between one sheet and many.
 //!
 //! The counter is a global allocator and the limits are process-global, so
-//! this file is its own test binary and every test holds [`serial`].
+//! this file is its own test binary and every test holds the
+//! `LimitScope` of [`serial`].
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{Cursor, Write};
 
+use office_oxide::limits::{max_text_chars, set_max_text_chars};
 use office_oxide::{Document, DocumentFormat};
+
+mod common;
+use common::LimitScope;
 
 struct Counting;
 
@@ -54,20 +59,10 @@ fn bytes_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
     (out, BYTES.load(std::sync::atomic::Ordering::Relaxed) - before)
 }
 
-/// Holds the process-global limits at their defaults for one test.
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let guard = SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    office_oxide::limits::set_max_text_chars(office_oxide::limits::DEFAULT_MAX_TEXT_CHARS);
-    office_oxide::limits::set_max_ir_padding_bytes(
-        office_oxide::limits::DEFAULT_MAX_IR_PADDING_BYTES,
-    );
-    office_oxide::limits::set_max_sheet_ir_padding_bytes(
-        office_oxide::limits::DEFAULT_MAX_SHEET_IR_PADDING_BYTES,
-    );
-    guard
+/// Holds the process-global limits, at their defaults, for one test; a limit
+/// the test sets through it is back at its default when the test ends.
+fn serial() -> LimitScope {
+    LimitScope::new()
 }
 
 const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
@@ -313,11 +308,11 @@ fn ir_chars(ir: &office_oxide::ir::DocumentIR) -> usize {
 
 #[test]
 fn test_each_sheets_use_of_a_shared_drawing_is_charged_to_the_text_budget() {
-    let _g = serial();
+    let mut limits = serial();
+    limits.set(max_text_chars, set_max_text_chars, 150_000);
     // 20 sheets x 300 anchors x 200 characters is 1.2 million characters of
     // alternative text; the budget holds 150,000.
     for shapes in [false, true] {
-        office_oxide::limits::set_max_text_chars(150_000);
         let doc = open(shared_drawing(20, 300, 200, shapes, true));
         let ir = doc.to_ir();
         assert!(ir.metadata.text_truncated, "shapes={shapes}: the cut is not flagged");
@@ -340,7 +335,6 @@ fn test_each_sheets_use_of_a_shared_drawing_is_charged_to_the_text_budget() {
             .sum();
         assert!(total < 1_000_000, "shapes={shapes}: sheets_ir yields {total} characters");
     }
-    office_oxide::limits::set_max_text_chars(office_oxide::limits::DEFAULT_MAX_TEXT_CHARS);
 }
 
 #[test]
@@ -357,21 +351,20 @@ fn test_a_workbook_within_the_budget_keeps_every_picture_and_shape() {
 
 #[test]
 fn test_each_sheets_use_of_shared_comments_is_charged_to_the_text_budget() {
-    let _g = serial();
-    office_oxide::limits::set_max_text_chars(150_000);
+    let mut limits = serial();
+    limits.set(max_text_chars, set_max_text_chars, 150_000);
     let doc = open(shared_comments(20, 300, 200, true));
     let ir = doc.to_ir();
     assert!(ir.metadata.text_truncated);
     assert!(ir_chars(&ir) < 1_000_000, "{}", ir_chars(&ir));
-    office_oxide::limits::set_max_text_chars(office_oxide::limits::DEFAULT_MAX_TEXT_CHARS);
 }
 
 #[test]
 fn test_a_comment_of_one_character_is_charged_as_the_note_that_holds_it() {
-    let _g = serial();
+    let mut limits = serial();
+    limits.set(max_text_chars, set_max_text_chars, 150_000);
     // 20 sheets x 300 one-character comments: the characters alone are far
     // inside the budget, the notes that hold them are not.
-    office_oxide::limits::set_max_text_chars(150_000);
     let doc = open(shared_comments(20, 300, 1, true));
     let ir = doc.to_ir();
     assert!(ir.metadata.text_truncated, "{:?}", ir.metadata.warnings);
@@ -383,7 +376,6 @@ fn test_a_comment_of_one_character_is_charged_as_the_note_that_holds_it() {
     // The direct renderers agree on the cut.
     assert!(doc.plain_text().contains("truncated"));
     assert!(doc.to_markdown().contains("truncated"));
-    office_oxide::limits::set_max_text_chars(office_oxide::limits::DEFAULT_MAX_TEXT_CHARS);
 }
 
 /// `sheets` chartsheets that display one chart whose title is `len`
@@ -422,7 +414,7 @@ fn shared_chartsheets(sheets: usize, len: usize, linked: bool) -> Vec<u8> {
 
 #[test]
 fn test_a_chart_displayed_by_many_chartsheets_is_read_once_and_charged() {
-    let _g = serial();
+    let mut limits = serial();
     // A chartsheet's chart is read for the sheet, so the part is in the
     // package either way and only the cost of many sheets over one is
     // compared: the sheets' own cost, from a chart of ten characters, and
@@ -436,12 +428,11 @@ fn test_a_chart_displayed_by_many_chartsheets_is_read_once_and_charged() {
         "30 chartsheets add {added} bytes to opening over one, {per_sheets} without the chart: the chart is read per sheet"
     );
     // 20 sheets of a 20,000-character title against a budget of 150,000.
-    office_oxide::limits::set_max_text_chars(150_000);
+    limits.set(max_text_chars, set_max_text_chars, 150_000);
     let doc = open(shared_chartsheets(20, 20_000, true));
     let ir = doc.to_ir();
     assert!(ir.metadata.text_truncated, "{:?}", ir.metadata.warnings);
     assert!(ir_chars(&ir) < 400_000, "{}", ir_chars(&ir));
     assert!(doc.plain_text().len() < 400_000);
     assert!(doc.to_markdown().len() < 400_000);
-    office_oxide::limits::set_max_text_chars(office_oxide::limits::DEFAULT_MAX_TEXT_CHARS);
 }
