@@ -425,15 +425,21 @@ impl DocxDocument {
                                 return Ok(None);
                             },
                         };
-                        if let Ok(hf_rels) = opc.read_rels_for(&part_name) {
-                            resolve_hyperlinks(&mut content, &hf_rels, &links);
-                            qualify_part_images(
-                                &mut content,
-                                &part_name,
-                                &hf_rels,
-                                &mut opc,
-                                &mut part_images,
-                            );
+                        // A relationships part that cannot be read leaves the
+                        // part without its links and images; the part is
+                        // kept, and the loss is reported.
+                        match opc.read_rels_for(&part_name) {
+                            Ok(hf_rels) => {
+                                resolve_hyperlinks(&mut content, &hf_rels, &links);
+                                qualify_part_images(
+                                    &mut content,
+                                    &part_name,
+                                    &hf_rels,
+                                    &mut opc,
+                                    &mut part_images,
+                                );
+                            },
+                            Err(e) => skip_unreadable(&part_name.rels_path(), &e),
                         }
                         headers_footers.push(HeaderFooter {
                             hf_type: hf_ref.hf_type,
@@ -517,17 +523,22 @@ impl DocxDocument {
             // `_rels`, not `document.xml.rels`. Resolving against the
             // document's relationships left the raw `rIdN` string as the
             // "URL" for every note hyperlink.
-            if let Ok(note_rels) = opc.read_rels_for(&part) {
-                for n in &mut notes {
-                    resolve_hyperlinks(&mut n.content, &note_rels, &links);
-                    qualify_part_images(
-                        &mut n.content,
-                        &part,
-                        &note_rels,
-                        &mut opc,
-                        &mut part_images,
-                    );
-                }
+            match opc.read_rels_for(&part) {
+                Ok(note_rels) => {
+                    for n in &mut notes {
+                        resolve_hyperlinks(&mut n.content, &note_rels, &links);
+                        qualify_part_images(
+                            &mut n.content,
+                            &part,
+                            &note_rels,
+                            &mut opc,
+                            &mut part_images,
+                        );
+                    }
+                },
+                // The notes are kept without their links and images; the
+                // loss is reported.
+                Err(e) => skip_unreadable(&part.rels_path(), &e),
             }
             notes
         };
