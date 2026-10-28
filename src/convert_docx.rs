@@ -1553,9 +1553,12 @@ fn convert_run_content(
     // `crate::core::units::HalfPoint::from_word_sz`).
     let push_text = |text: &str, content: &mut Vec<InlineContent>| {
         eff.for_each_script_segment(text, ascii, |piece, face| {
-            // Each span owns its link, so the URL is charged before it is
-            // copied; once the budget is spent the text stays, unlinked.
-            let link = link.filter(|(url, _)| crate::limits::charge_copied_text(url.len()));
+            // Each span owns its link, so the URL and the hover text are
+            // charged before they are copied; once the budget is spent the
+            // text stays, unlinked.
+            let link = link.filter(|(url, tip)| {
+                crate::limits::charge_copied_text(url.len() + tip.map_or(0, str::len))
+            });
             content.push(InlineContent::Text(TextSpan {
                 text: piece.to_string(),
                 bold,

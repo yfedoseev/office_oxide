@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `.docx` hyperlink's hover text is charged with its target.** Each IR span inside a hyperlink received its own copy of the link's `w:tooltip` without counting it: one 20 KB tooltip over forty runs made 800 KB of IR. The tooltip is now charged to the text budget together with the URL before either is copied; past the budget the text stays unlinked and the usual truncation flag and warning are set.
+
 - **A picture's link target is charged where `.pptx` Markdown copies it.** `PptxDocument::to_markdown` wrote a linked picture's target once per picture without counting it, so the only bound was the slide's whole-output budget, which dropped the entire slide: forty pictures linked to one long target lost the slide's text too. The target is now charged to the text budget before it is copied; past it the pictures are named without their target, the rest of the slide stays, and the output ends with the truncation notice.
 
 - **A `.pptx` OLE object's preview picture is shared and charged to the image budget.** Each `p:oleObj` frame copied its fallback picture's bytes at open and again into the IR, outside the image budget: 50 frames over one image made 50 copies and no warning. `OleObject::preview_data` is now an `Arc<[u8]>` shared with the picture part, and the IR image copy is charged like any picture's (past the budget the image keeps its place without bytes, and the usual warning is added).

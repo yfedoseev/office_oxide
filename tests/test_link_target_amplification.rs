@@ -72,6 +72,10 @@ fn docx(target: &str, links: usize, fragments: bool) -> Vec<u8> {
             r#"<w:p><w:hyperlink r:id="rId1"{anchor}><w:r><w:t>link{i}</w:t></w:r></w:hyperlink></w:p>"#
         ));
     }
+    docx_with_body(&body, target)
+}
+
+fn docx_with_body(body: &str, target: &str) -> Vec<u8> {
     zip_of(vec![
         ("[Content_Types].xml".to_string(), r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.to_string()),
         ("_rels/.rels".to_string(), rels(&[("rId1", "officeDocument", "word/document.xml", false)])),
@@ -344,5 +348,40 @@ fn test_pptx_markdown_copies_of_a_picture_link_target_are_charged_and_cut_off_lo
     assert!(md.contains("character budget"), "the cut-off is reported");
     for i in 0..LINKS {
         assert!(md.contains(&format!("pic{i}")), "pic{i} lost");
+    }
+}
+
+/// One hyperlink with a long tooltip and many runs: each span owns a copy of
+/// the tooltip, which is charged along with the link.
+#[test]
+fn test_docx_tooltip_copies_are_charged_with_the_link() {
+    limits();
+    let tip = "t".repeat(20_000);
+    let runs: String = (0..LINKS)
+        .map(|i| format!(r#"<w:r><w:t>run{i} </w:t></w:r>"#))
+        .collect();
+    let body =
+        format!(r#"<w:p><w:hyperlink r:id="rId1" w:tooltip="{tip}">{runs}</w:hyperlink></w:p>"#);
+    let bytes = docx_with_body(&body, "https://example.com/");
+    let ir = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    let mut tip_bytes = 0;
+    for s in &ir.sections {
+        for e in &s.elements {
+            if let Element::Paragraph(p) = e {
+                for c in &p.content {
+                    if let InlineContent::Text(t) = c {
+                        tip_bytes += t.hyperlink_tooltip.as_ref().map_or(0, String::len);
+                    }
+                }
+            }
+        }
+    }
+    assert!(tip_bytes > 0 && tip_bytes <= TEXT_BUDGET, "{tip_bytes} tooltip bytes");
+    assert_budget_notice(&ir);
+    let text = ir.plain_text();
+    for i in 0..LINKS {
+        assert!(text.contains(&format!("run{i}")), "run{i} lost");
     }
 }
