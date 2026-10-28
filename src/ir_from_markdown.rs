@@ -443,11 +443,57 @@ fn border_line(size_eighths_pt: u32) -> BorderLine {
     }
 }
 
+/// Finds the next occurrence of one marker, remembering the last answer.
+///
+/// The inline parser looks for a closing marker from every opener, so an
+/// input of many openers and no closer rescanned the rest of the line each
+/// time. The first occurrence at or after `from` is `hit` (or there is none),
+/// which is also the first occurrence at or after any later start up to
+/// `hit`, so a search that starts inside the remembered range is answered
+/// without scanning. Starts only move forward, so the scans of one marker
+/// cover disjoint stretches of the text and the whole parse is linear.
+struct NextMarker {
+    needle: &'static str,
+    from: usize,
+    hit: Option<usize>,
+    primed: bool,
+}
+
+impl NextMarker {
+    const fn new(needle: &'static str) -> Self {
+        Self {
+            needle,
+            from: 0,
+            hit: None,
+            primed: false,
+        }
+    }
+
+    /// The byte offset in `text` of the first `needle` at or after `start`.
+    fn find(&mut self, text: &str, start: usize) -> Option<usize> {
+        if self.primed && start >= self.from && self.hit.is_none_or(|h| h >= start) {
+            return self.hit;
+        }
+        self.primed = true;
+        self.from = start;
+        self.hit = text[start..].find(self.needle).map(|p| start + p);
+        self.hit
+    }
+}
+
 fn parse_inline(text: &str) -> Vec<InlineContent> {
     let mut out: Vec<InlineContent> = Vec::new();
     let bytes = text.as_bytes();
     let len = text.len();
     let mut plain_start = 0usize;
+    let mut star2 = NextMarker::new("**");
+    let mut under2 = NextMarker::new("__");
+    let mut star1 = NextMarker::new("*");
+    let mut under1 = NextMarker::new("_");
+    let mut tilde2 = NextMarker::new("~~");
+    let mut tick = NextMarker::new("`");
+    let mut close_bracket = NextMarker::new("]");
+    let mut close_paren = NextMarker::new(")");
 
     macro_rules! flush_plain {
         ($end:expr) => {
@@ -467,8 +513,13 @@ fn parse_inline(text: &str) -> Vec<InlineContent> {
             && ((bytes[i] == b'*' && bytes[i + 1] == b'*')
                 || (bytes[i] == b'_' && bytes[i + 1] == b'_'))
         {
-            let marker = &text[i..i + 2];
-            if let Some(end) = text[i + 2..].find(marker) {
+            let found = if bytes[i] == b'*' {
+                star2.find(text, i + 2)
+            } else {
+                under2.find(text, i + 2)
+            };
+            if let Some(close) = found {
+                let end = close - (i + 2);
                 flush_plain!(i);
                 let inner = &text[i + 2..i + 2 + end];
                 out.push(InlineContent::Text(TextSpan {
@@ -484,8 +535,13 @@ fn parse_inline(text: &str) -> Vec<InlineContent> {
 
         // Italic: *text* or _text_
         if (bytes[i] == b'*' || bytes[i] == b'_') && i + 1 < len && bytes[i + 1] != bytes[i] {
-            let marker = &text[i..i + 1];
-            if let Some(end) = text[i + 1..].find(marker) {
+            let found = if bytes[i] == b'*' {
+                star1.find(text, i + 1)
+            } else {
+                under1.find(text, i + 1)
+            };
+            if let Some(close) = found {
+                let end = close - (i + 1);
                 flush_plain!(i);
                 let inner = &text[i + 1..i + 1 + end];
                 out.push(InlineContent::Text(TextSpan {
@@ -501,7 +557,8 @@ fn parse_inline(text: &str) -> Vec<InlineContent> {
 
         // Strikethrough: ~~text~~
         if i + 1 < len && bytes[i] == b'~' && bytes[i + 1] == b'~' {
-            if let Some(end) = text[i + 2..].find("~~") {
+            if let Some(close) = tilde2.find(text, i + 2) {
+                let end = close - (i + 2);
                 flush_plain!(i);
                 let inner = &text[i + 2..i + 2 + end];
                 out.push(InlineContent::Text(TextSpan {
@@ -517,7 +574,8 @@ fn parse_inline(text: &str) -> Vec<InlineContent> {
 
         // Inline code: `code` — strip backticks, treat as plain
         if bytes[i] == b'`' {
-            if let Some(end) = text[i + 1..].find('`') {
+            if let Some(close) = tick.find(text, i + 1) {
+                let end = close - (i + 1);
                 flush_plain!(i);
                 let inner = &text[i + 1..i + 1 + end];
                 out.push(InlineContent::Text(TextSpan::plain(inner)));
@@ -529,10 +587,12 @@ fn parse_inline(text: &str) -> Vec<InlineContent> {
 
         // Markdown link: [text](url)
         if bytes[i] == b'[' {
-            if let Some(bracket_end) = text[i + 1..].find(']') {
+            if let Some(close) = close_bracket.find(text, i + 1) {
+                let bracket_end = close - (i + 1);
                 let after_bracket = i + 1 + bracket_end + 1;
                 if after_bracket < len && bytes[after_bracket] == b'(' {
-                    if let Some(paren_end) = text[after_bracket + 1..].find(')') {
+                    if let Some(close) = close_paren.find(text, after_bracket + 1) {
+                        let paren_end = close - (after_bracket + 1);
                         flush_plain!(i);
                         let link_text = &text[i + 1..i + 1 + bracket_end];
                         let url = &text[after_bracket + 1..after_bracket + 1 + paren_end];
@@ -670,6 +730,180 @@ fn strip_list_marker(line: &str) -> &str {
 mod tests {
     use super::*;
     use crate::format::DocumentFormat;
+
+    /// The quadratic parser `parse_inline` replaced, kept as the reference
+    /// its output must equal.
+    fn parse_inline_reference(text: &str) -> Vec<InlineContent> {
+        let mut out: Vec<InlineContent> = Vec::new();
+        let bytes = text.as_bytes();
+        let len = text.len();
+        let mut plain_start = 0usize;
+
+        macro_rules! flush_plain {
+            ($end:expr) => {
+                if plain_start < $end {
+                    let t = &text[plain_start..$end];
+                    if !t.is_empty() {
+                        out.push(InlineContent::Text(TextSpan::plain(t)));
+                    }
+                }
+            };
+        }
+
+        let mut i = 0usize;
+        while i < len {
+            // Bold: **text** or __text__
+            if i + 1 < len
+                && ((bytes[i] == b'*' && bytes[i + 1] == b'*')
+                    || (bytes[i] == b'_' && bytes[i + 1] == b'_'))
+            {
+                let marker = &text[i..i + 2];
+                if let Some(end) = text[i + 2..].find(marker) {
+                    flush_plain!(i);
+                    let inner = &text[i + 2..i + 2 + end];
+                    out.push(InlineContent::Text(TextSpan {
+                        text: inner.to_string(),
+                        bold: true,
+                        ..Default::default()
+                    }));
+                    i += 2 + end + 2;
+                    plain_start = i;
+                    continue;
+                }
+            }
+
+            // Italic: *text* or _text_
+            if (bytes[i] == b'*' || bytes[i] == b'_') && i + 1 < len && bytes[i + 1] != bytes[i] {
+                let marker = &text[i..i + 1];
+                if let Some(end) = text[i + 1..].find(marker) {
+                    flush_plain!(i);
+                    let inner = &text[i + 1..i + 1 + end];
+                    out.push(InlineContent::Text(TextSpan {
+                        text: inner.to_string(),
+                        italic: true,
+                        ..Default::default()
+                    }));
+                    i += 1 + end + 1;
+                    plain_start = i;
+                    continue;
+                }
+            }
+
+            // Strikethrough: ~~text~~
+            if i + 1 < len && bytes[i] == b'~' && bytes[i + 1] == b'~' {
+                if let Some(end) = text[i + 2..].find("~~") {
+                    flush_plain!(i);
+                    let inner = &text[i + 2..i + 2 + end];
+                    out.push(InlineContent::Text(TextSpan {
+                        text: inner.to_string(),
+                        strikethrough: true,
+                        ..Default::default()
+                    }));
+                    i += 2 + end + 2;
+                    plain_start = i;
+                    continue;
+                }
+            }
+
+            // Inline code: `code` — strip backticks, treat as plain
+            if bytes[i] == b'`' {
+                if let Some(end) = text[i + 1..].find('`') {
+                    flush_plain!(i);
+                    let inner = &text[i + 1..i + 1 + end];
+                    out.push(InlineContent::Text(TextSpan::plain(inner)));
+                    i += 1 + end + 1;
+                    plain_start = i;
+                    continue;
+                }
+            }
+
+            // Markdown link: [text](url)
+            if bytes[i] == b'[' {
+                if let Some(bracket_end) = text[i + 1..].find(']') {
+                    let after_bracket = i + 1 + bracket_end + 1;
+                    if after_bracket < len && bytes[after_bracket] == b'(' {
+                        if let Some(paren_end) = text[after_bracket + 1..].find(')') {
+                            flush_plain!(i);
+                            let link_text = &text[i + 1..i + 1 + bracket_end];
+                            let url = &text[after_bracket + 1..after_bracket + 1 + paren_end];
+                            out.push(InlineContent::Text(TextSpan {
+                                text: link_text.to_string(),
+                                hyperlink: Some(url.to_string()),
+                                ..Default::default()
+                            }));
+                            i = after_bracket + 1 + paren_end + 1;
+                            plain_start = i;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            i += text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        }
+
+        flush_plain!(len);
+
+        out
+    }
+
+    /// Every string over the characters the inline parser reacts to, up to
+    /// length 8, parses exactly as it did when each opener rescanned the line.
+    #[test]
+    fn test_inline_parse_equals_the_reference_on_all_short_strings() {
+        let alphabet = ['*', '_', '~', '`', '[', ']', '(', ')', 'a', 'é'];
+        let mut buf: Vec<usize> = Vec::new();
+        fn walk(alphabet: &[char], buf: &mut Vec<usize>, max: usize, check: &mut dyn FnMut(&str)) {
+            let s: String = buf.iter().map(|&k| alphabet[k]).collect();
+            check(&s);
+            if buf.len() == max {
+                return;
+            }
+            for k in 0..alphabet.len() {
+                buf.push(k);
+                walk(alphabet, buf, max, check);
+                buf.pop();
+            }
+        }
+        let mut checked = 0usize;
+        walk(&alphabet, &mut buf, 5, &mut |s| {
+            assert_eq!(parse_inline(s), parse_inline_reference(s), "input {s:?}");
+            checked += 1;
+        });
+        // Longer strings from a small alphabet that exercises every marker.
+        let small = ['*', '_', '~', '`', '[', ']', '(', ')'];
+        let mut state = 7u32;
+        for _ in 0..20_000 {
+            let mut s = String::new();
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            for _ in 0..(state >> 28) as usize + 4 {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                s.push(small[(state >> 16) as usize % small.len()]);
+                if state & 0x100 != 0 {
+                    s.push('x');
+                }
+            }
+            assert_eq!(parse_inline(&s), parse_inline_reference(&s), "input {s:?}");
+        }
+        assert!(checked > 100_000);
+    }
+
+    /// An opener with no closer, repeated, used to rescan the rest of the
+    /// line for each one.
+    #[test]
+    fn test_inline_parse_of_unclosed_openers_is_linear() {
+        let start = std::time::Instant::now();
+        for unit in ["[", "[](", "**", "__", "~~", "`", "*a", "_a", "[a]", "[a]("] {
+            let text = unit.repeat(60_000 / unit.len());
+            let out = parse_inline(&text);
+            assert!(!out.is_empty(), "{unit:?}");
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            start.elapsed()
+        );
+    }
 
     #[test]
     fn test_parse_heading_paragraph() {
