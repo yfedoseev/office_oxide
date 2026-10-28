@@ -742,15 +742,15 @@ pub fn set_max_markdown_list_items(items: usize) {
 /// [`max_markdown_list_items`] and [`max_markdown_table_cells`].
 pub const DEFAULT_MAX_MARKDOWN_ELEMENTS: usize = 100_000;
 
-/// The default most table cells one Markdown document may parse into: 250,000.
+/// The default most table cells one Markdown document may parse into: 150,000.
 ///
-/// A cell is about 1.2 KB of IR (measured: a table of 25,000 cells held
-/// 29 MB more than its text), so the default keeps the cells of one document
-/// near 300 MB, and equals the most cells a writer will write
-/// ([`DEFAULT_MAX_WRITE_TABLE_CELLS`]). A table of 1,000 rows by 25 columns
-/// is a tenth of it. Past it the rows that do not fit are dropped, with a
+/// A cell is about 1.2 KB of IR whether it is in a header row or a body row
+/// (measured: peak memory of 118 MB for a 100,000-column header row, 292 MB
+/// for 250,000), so the default keeps the cells of one document near 180 MB;
+/// with the block limit's own bound the IR of a parse stays under about
+/// 350 MB. A table of 1,000 rows by 25 columns is a sixth of it. Past it the rows that do not fit are dropped, with a
 /// notice, and the rest of the document is read.
-pub const DEFAULT_MAX_MARKDOWN_TABLE_CELLS: usize = 250_000;
+pub const DEFAULT_MAX_MARKDOWN_TABLE_CELLS: usize = 150_000;
 
 static MAX_MARKDOWN_TABLE_CELLS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_MARKDOWN_TABLE_CELLS);
 

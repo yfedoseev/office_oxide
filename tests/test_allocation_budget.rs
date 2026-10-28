@@ -673,3 +673,23 @@ fn test_docx_to_ir_does_not_copy_a_huge_style_name_per_paragraph() {
         "{bytes} bytes requested converting {PARAS} paragraphs that share a 1 MiB style name"
     );
 }
+
+/// A header cell costs no more than a body cell: one row of as many columns
+/// as the default cell limit allows, parsed from Markdown, stays within the
+/// memory the limit was sized for (about 1.2 KB a cell; asserted at 2 KB of
+/// requested bytes, which also counts what was freed on the way).
+#[test]
+fn test_a_markdown_header_row_at_the_cell_limit_stays_within_its_memory_bound() {
+    let _serial = serial();
+    let cells = office_oxide::limits::max_markdown_table_cells();
+    let md = format!("|{}\n|{}\n", "h|".repeat(cells), "-|".repeat(cells));
+    let (ir, bytes) = bytes_during(|| {
+        office_oxide::DocumentIR::from_markdown(&md, office_oxide::DocumentFormat::Docx)
+    });
+    assert!(!ir.metadata.text_truncated, "the row at the limit is kept whole");
+    assert!(bytes < cells * 2_048, "{} bytes requested for {cells} header cells", bytes);
+    // One column more than the limit is cut, loudly.
+    let md = format!("|{}\n", "h|".repeat(cells + 1));
+    let ir = office_oxide::DocumentIR::from_markdown(&md, office_oxide::DocumentFormat::Docx);
+    assert!(ir.metadata.text_truncated);
+}
