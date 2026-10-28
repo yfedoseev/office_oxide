@@ -211,8 +211,20 @@ impl BlipDiagnostics {
 /// regular metafile is not refused for being small.
 const METAFILE_FREE_INFLATION: u64 = 1 << 20;
 
+/// Why a compressed metafile was not inflated. The first two have already
+/// been counted in [`BlipDiagnostics`] and logged where they were found.
+#[derive(Debug, PartialEq, Eq)]
+enum InflateFailure {
+    /// The declared size is implausible for the stored length.
+    Implausible,
+    /// The document's inflation allowance is spent.
+    OverBudget,
+    /// The stream is not valid zlib.
+    NotZlib,
+}
+
 /// Inflate a zlib-compressed metafile, reading at most `cb_size` bytes
-/// (the header's declared uncompressed size), itself capped. `None` when
+/// (the header's declared uncompressed size), itself capped. Fails when
 /// the stream is not valid zlib, when the declared size is implausible for
 /// the stored length, or when the document's inflation allowance is spent.
 ///
@@ -223,7 +235,7 @@ fn inflate_metafile(
     cb_size: u32,
     budget: &mut InflateBudget,
     diag: &mut BlipDiagnostics,
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, InflateFailure> {
     use std::io::Read;
     let limit = u64::from(cb_size).min(MAX_INFLATED_METAFILE);
     let plausible = (compressed.len() as u64)
@@ -235,7 +247,7 @@ fn inflate_metafile(
             "office art: compressed picture declares {limit} bytes from {} stored; skipped",
             compressed.len()
         );
-        return None;
+        return Err(InflateFailure::Implausible);
     }
     if !budget.reserve(limit) {
         diag.over_budget += 1;
@@ -243,15 +255,15 @@ fn inflate_metafile(
             "office art: compressed picture of {limit} bytes exceeds the document's \
              inflated-image allowance (office_oxide::limits::set_max_inflated_image_bytes); skipped"
         );
-        return None;
+        return Err(InflateFailure::OverBudget);
     }
     let mut out = Vec::with_capacity((limit as usize).min(compressed.len().saturating_mul(4)));
     let read = flate2::read::ZlibDecoder::new(compressed)
         .take(limit)
         .read_to_end(&mut out);
     budget.release(limit - out.len() as u64);
-    read.ok()?;
-    Some(out)
+    read.map_err(|_| InflateFailure::NotZlib)?;
+    Ok(out)
 }
 
 /// `OfficeArtFBSE` ("File BLIP Store Entry", [MS-ODRAW] §2.2.32):
@@ -293,11 +305,13 @@ pub(crate) fn extract_one_blip(
         let payload = &data[header_end..data_end];
         match header[METAFILE_COMPRESSION_OFFSET] {
             MSO_COMPRESSION_DEFLATE => match inflate_metafile(payload, cb_size, budget, diag) {
-                Some(v) => v,
-                None => {
+                Ok(v) => v,
+                Err(InflateFailure::NotZlib) => {
                     log::warn!("office art: compressed {format:?} picture is not valid zlib");
                     return None;
                 },
+                // Already counted and logged, with the reason, where it was found.
+                Err(InflateFailure::Implausible | InflateFailure::OverBudget) => return None,
             },
             MSO_COMPRESSION_NONE => payload.to_vec(),
             other => {
@@ -679,6 +693,36 @@ pub(crate) mod tests {
         stream[payload_at] ^= 0xFF;
         stream[payload_at + 1] ^= 0xFF;
         assert!(extract_blip_images(&stream).is_empty());
+    }
+
+    /// Only a stream that is not zlib is reported as "not valid zlib": a
+    /// picture left out for an implausible declared size or for the document's
+    /// allowance says so itself, and is not misreported as corrupt.
+    #[test]
+    fn test_inflate_failures_are_told_apart() {
+        let stored = zlib(&vec![0u8; 4096]);
+        let mut budget = InflateBudget::with_limit(u64::MAX);
+        let mut diag = BlipDiagnostics::default();
+        assert_eq!(
+            inflate_metafile(&stored, u32::MAX, &mut budget, &mut diag),
+            Err(InflateFailure::Implausible)
+        );
+        let mut spent = InflateBudget::with_limit(10);
+        assert_eq!(
+            inflate_metafile(&stored, 4096, &mut spent, &mut diag),
+            Err(InflateFailure::OverBudget)
+        );
+        let mut garbage = stored.clone();
+        garbage[0] ^= 0xFF;
+        garbage[1] ^= 0xFF;
+        assert_eq!(
+            inflate_metafile(&garbage, 4096, &mut budget, &mut diag),
+            Err(InflateFailure::NotZlib)
+        );
+        assert_eq!(
+            inflate_metafile(&stored, 4096, &mut budget, &mut diag).map(|v| v.len()),
+            Ok(4096)
+        );
     }
 
     /// Inflation stops at the header's declared uncompressed size.
