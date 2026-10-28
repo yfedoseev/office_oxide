@@ -14,7 +14,7 @@
 
 pub use crate::cfb::blip::BlipFormat as ImageFormat;
 pub use crate::cfb::blip::BlipImage as DocImage;
-use crate::cfb::blip::extract_one_blip;
+use crate::cfb::blip::{BlipDiagnostics, extract_one_blip};
 use crate::limits::InflateBudget;
 
 /// Extract images from a DOC Data stream by scanning for BLIP record signatures.
@@ -22,10 +22,21 @@ use crate::limits::InflateBudget;
 /// The stream's compressed metafiles share the document's allowance of
 /// inflated image bytes (`limits::set_max_inflated_image_bytes`).
 pub fn extract_images(data: &[u8]) -> Vec<DocImage> {
-    extract_images_within(data, &mut InflateBudget::new())
+    extract_images_diagnosed(data).0
 }
 
-fn extract_images_within(data: &[u8], budget: &mut InflateBudget) -> Vec<DocImage> {
+/// [`extract_images`], also reporting what was left out because of a limit.
+pub(crate) fn extract_images_diagnosed(data: &[u8]) -> (Vec<DocImage>, BlipDiagnostics) {
+    let mut diag = BlipDiagnostics::default();
+    let images = extract_images_within(data, &mut InflateBudget::new(), &mut diag);
+    (images, diag)
+}
+
+fn extract_images_within(
+    data: &[u8],
+    budget: &mut InflateBudget,
+    diag: &mut BlipDiagnostics,
+) -> Vec<DocImage> {
     let mut images = Vec::new();
     let mut pos = 0;
 
@@ -49,7 +60,7 @@ fn extract_images_within(data: &[u8], budget: &mut InflateBudget) -> Vec<DocImag
             // runs that only look like a record header, applied to the
             // decoded image rather than to still-compressed bytes.
             if let Some(mut img) =
-                extract_one_blip(data, rec_type, inst, data_start, data_end, budget)
+                extract_one_blip(data, rec_type, inst, data_start, data_end, budget, diag)
             {
                 if has_valid_signature(rec_type, &img.data) {
                     img.index = images.len();
@@ -280,7 +291,10 @@ mod tests {
         record.extend(body);
         let data: Vec<u8> = (0..4).flat_map(|_| record.clone()).collect();
         let mut budget = InflateBudget::with_limit(5 << 19);
-        assert_eq!(extract_images_within(&data, &mut budget).len(), 2);
+        assert_eq!(
+            extract_images_within(&data, &mut budget, &mut BlipDiagnostics::default()).len(),
+            2
+        );
     }
 
     /// A `PICF` + WMF picture (Word 6.0/95, or a non-shape picture in a

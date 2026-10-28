@@ -202,9 +202,14 @@ impl GridBudget {
         }
     }
 
-    /// Charge `slots` empty slots. Returns `false` — once, and thereafter —
-    /// when the allowance is spent; the caller stops building rows.
+    /// Charge `slots` empty slots. Returns `false` when they do not fit, and
+    /// for every nonzero charge once the allowance is spent; the caller stops
+    /// building rows. A charge of zero always succeeds: a row that needs no
+    /// padding costs nothing, however much of the allowance is gone.
     pub(crate) fn charge(&mut self, slots: usize) -> bool {
+        if slots == 0 {
+            return true;
+        }
         if self.exhausted {
             return false;
         }

@@ -166,11 +166,14 @@ pub fn extract_deck_text(stream: &[u8], current_user: Option<&[u8]>) -> DeckText
 fn extract_deck_text_with_budget(
     stream: &[u8],
     current_user: Option<&[u8]>,
-    text_budget: crate::limits::TextBudget,
+    mut text_budget: crate::limits::TextBudget,
 ) -> DeckText {
+    // One budget for the whole deck: the paths below run one after another
+    // over the same stream, and what an earlier one spent is not available
+    // to the next.
     let mut resolved = DeckText::default();
     if let Some(dir) = persist::build(stream, current_user) {
-        if let Some(deck) = extract_slides_via_persist(stream, &dir, text_budget) {
+        if let Some(deck) = extract_slides_via_persist(stream, &dir, &mut text_budget) {
             // A resolved-but-entirely-textless result is ambiguous: it's the
             // correct answer for a genuinely text-free deck (image-only
             // slides, or slides whose only text is on their master), but
@@ -185,7 +188,10 @@ fn extract_deck_text_with_budget(
             resolved = deck;
         }
     }
-    let slides = extract_slides_without_persist(stream);
+    let slides = extract_slides_without_persist(stream, &mut text_budget);
+    if text_budget.exhausted() && !resolved.notices.contains(&text_budget.notice()) {
+        resolved.notices.push(text_budget.notice());
+    }
     DeckText {
         slides: if slides.is_empty() {
             resolved.slides
@@ -202,7 +208,10 @@ fn extract_deck_text_with_budget(
 /// The slide-text heuristics used when the persist directory yields no
 /// text: the slide list's inline text cache, then every `Slide` container
 /// in the stream, then every text atom outside the masters and notes.
-fn extract_slides_without_persist(stream: &[u8]) -> Vec<SlideText> {
+fn extract_slides_without_persist(
+    stream: &[u8],
+    budget: &mut crate::limits::TextBudget,
+) -> Vec<SlideText> {
     // A best-effort fallback scope for the weaker paths below, which have
     // no persist-resolved DocumentContainer to search within at all.
     let stream_wide_hyperlinks = parse_ex_hyperlinks(stream);
@@ -228,6 +237,7 @@ fn extract_slides_without_persist(stream: &[u8]) -> Vec<SlideText> {
         &stream_wide_hyperlinks,
         &stream_wide_ole_objects,
         &mut slides,
+        budget,
     );
     if slides.iter().any(|s| !s.text_runs.is_empty()) {
         return slides;
@@ -265,7 +275,7 @@ fn extract_slides_without_persist(stream: &[u8]) -> Vec<SlideText> {
         &mut tables,
         &mut image_refs,
         &mut ole_object_refs,
-        &mut crate::limits::TextBudget::new(),
+        budget,
     );
     runs.retain(|r| !is_field_placeholder_only(&r.text));
     if runs.is_empty() && tables.is_empty() && image_refs.is_empty() {
@@ -288,12 +298,18 @@ fn collect_slide_containers(
     hyperlinks: &HashMap<u32, String>,
     ole_objects: &HashMap<u32, OleObjectInfo>,
     out: &mut Vec<SlideText>,
+    budget: &mut crate::limits::TextBudget,
 ) {
     if depth > MAX_SHAPE_DEPTH {
         return;
     }
     for rec in RecordIter::new(data) {
         let Ok(rec) = rec else { break };
+        // Slides past the document's text budget are left out, not listed
+        // empty.
+        if budget.exhausted() {
+            return;
+        }
         if rec.header.rec_type == RT_SLIDE {
             let mut runs = Vec::new();
             let mut tables = Vec::new();
@@ -311,7 +327,7 @@ fn collect_slide_containers(
                 &mut tables,
                 &mut image_refs,
                 &mut ole_object_refs,
-                &mut crate::limits::TextBudget::new(),
+                budget,
             );
             runs.retain(|r| !is_field_placeholder_only(&r.text));
             let hidden = slide_is_hidden(&rec.data);
@@ -325,7 +341,7 @@ fn collect_slide_containers(
             continue;
         }
         if rec.header.is_container() {
-            collect_slide_containers(&rec.data, depth + 1, hyperlinks, ole_objects, out);
+            collect_slide_containers(&rec.data, depth + 1, hyperlinks, ole_objects, out, budget);
         }
     }
 }
@@ -355,7 +371,7 @@ fn is_field_placeholder_only(text: &str) -> bool {
 fn extract_slides_via_persist(
     stream: &[u8],
     dir: &PersistDirectory,
-    mut text_budget: crate::limits::TextBudget,
+    text_budget: &mut crate::limits::TextBudget,
 ) -> Option<DeckText> {
     let doc_offset = dir.resolve(dir.doc_persist_id)?;
     let doc_children = bounded_container_children(stream, doc_offset, RT_DOCUMENT)?;
@@ -394,9 +410,23 @@ fn extract_slides_via_persist(
     let mut slide_offsets: std::collections::HashSet<Option<usize>> =
         std::collections::HashSet::new();
     let mut aliased_entries = 0usize;
-    let mut claims = ContainerClaims::default();
+    let slide_entries = slide_list_entries(&slide_list);
+    let notes_entries = find_child(&doc_children, RT_SLIDE_LIST_WITH_TEXT, SLWT_NOTES)
+        .map(|list| slide_list_entries(&list));
+    let claims = ContainerClaims::plan(
+        stream,
+        slide_entries
+            .iter()
+            .filter_map(|e| Some((dir.resolve(e.persist_id_ref)?, RT_SLIDE)))
+            .chain(
+                notes_entries
+                    .iter()
+                    .flatten()
+                    .filter_map(|e| Some((dir.resolve(e.persist_id_ref)?, RT_NOTES))),
+            ),
+    );
     let mut slides_cut_by_budget = false;
-    for entry in slide_list_entries(&slide_list) {
+    for entry in slide_entries {
         if !slide_offsets.insert(dir.resolve(entry.persist_id_ref)) {
             aliased_entries += 1;
             continue;
@@ -409,8 +439,8 @@ fn extract_slides_via_persist(
             &entry.outline_texts,
             &hyperlinks,
             &ole_objects,
-            &mut text_budget,
-            &mut claims,
+            text_budget,
+            &claims,
         );
         let hf_texts = links
             .headers_footers
@@ -444,11 +474,11 @@ fn extract_slides_via_persist(
     // the notes entry's `SlidePersistAtom.slideId`, [MS-PPT]
     // `NotesIdRef`), and each notes page names its slide through
     // `NotesAtom.slideIdRef` — used when the slide's reference is absent.
-    if let Some(notes_list) = find_child(&doc_children, RT_SLIDE_LIST_WITH_TEXT, SLWT_NOTES) {
+    if let Some(notes_entries) = notes_entries {
         let mut by_notes_id: HashMap<u32, Vec<TextRun>> = HashMap::new();
         let mut by_slide_id: HashMap<u32, Vec<TextRun>> = HashMap::new();
         let mut notes_offsets: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        for entry in slide_list_entries(&notes_list) {
+        for entry in notes_entries {
             if let Some(offset) = dir.resolve(entry.persist_id_ref) {
                 if !notes_offsets.insert(offset) {
                     aliased_entries += 1;
@@ -462,8 +492,8 @@ fn extract_slides_via_persist(
                 &entry.outline_texts,
                 &hyperlinks,
                 &ole_objects,
-                &mut text_budget,
-                &mut claims,
+                text_budget,
+                &claims,
             ) else {
                 continue;
             };
@@ -495,6 +525,7 @@ fn extract_slides_via_persist(
         master_refs.iter().copied(),
         &hyperlinks,
         &ole_objects,
+        text_budget,
     );
     // The notes/handout header and footer print on every notes page and
     // handout through the Notes and Handout Masters when shown. They are
@@ -620,6 +651,7 @@ fn master_static_text(
     slide_masters: impl Iterator<Item = (u32, bool)>,
     hyperlinks: &HashMap<u32, String>,
     ole_objects: &HashMap<u32, OleObjectInfo>,
+    budget: &mut crate::limits::TextBudget,
 ) -> Vec<TextRun> {
     let mut visited = std::collections::HashSet::new();
     let mut runs = Vec::new();
@@ -640,7 +672,7 @@ fn master_static_text(
                 },
                 None => break,
             };
-            collect_master_static_runs(&children, 0, hyperlinks, ole_objects, &mut runs);
+            collect_master_static_runs(&children, 0, hyperlinks, ole_objects, &mut runs, budget);
         }
     }
     let mut seen = std::collections::HashSet::new();
@@ -676,6 +708,7 @@ fn collect_master_static_runs(
     hyperlinks: &HashMap<u32, String>,
     ole_objects: &HashMap<u32, OleObjectInfo>,
     out: &mut Vec<TextRun>,
+    budget: &mut crate::limits::TextBudget,
 ) {
     if depth > MAX_SHAPE_DEPTH {
         return;
@@ -701,7 +734,7 @@ fn collect_master_static_runs(
                 &mut tables,
                 &mut Vec::new(),
                 &mut Vec::new(),
-                &mut crate::limits::TextBudget::new(),
+                budget,
             );
             let table_runs = tables.into_iter().flat_map(|t| t.rows).flatten().flatten();
             out.extend(runs.into_iter().chain(table_runs).filter(|r| {
@@ -710,7 +743,7 @@ fn collect_master_static_runs(
                     && !is_field_placeholder_only(&r.text)
             }));
         } else if rec.header.is_container() {
-            collect_master_static_runs(&rec.data, depth + 1, hyperlinks, ole_objects, out);
+            collect_master_static_runs(&rec.data, depth + 1, hyperlinks, ole_objects, out, budget);
         }
     }
 }
@@ -932,10 +965,10 @@ fn resolve_notes(
     hyperlinks: &HashMap<u32, String>,
     ole_objects: &HashMap<u32, OleObjectInfo>,
     budget: &mut crate::limits::TextBudget,
-    claims: &mut ContainerClaims,
+    claims: &ContainerClaims,
 ) -> Option<(Vec<TextRun>, Option<u32>)> {
     let offset = dir.resolve(persist_id_ref)?;
-    if !claims.claim(stream, offset, RT_NOTES) {
+    if !claims.claim(offset) {
         return None;
     }
     let children = bounded_container_children(stream, offset, RT_NOTES)?;
@@ -966,54 +999,69 @@ fn resolve_notes(
     Some((runs, slide_id_ref))
 }
 
-/// The byte ranges of the `Slide` and `Notes` containers read so far.
+/// Which `Slide` and `Notes` containers may be read.
 ///
 /// The persist directory can map any number of ids to offsets inside one
 /// another, so that each of thousands of "slides" is a container that covers
 /// most of the stream. Every one is then parsed and copied in full, and the
 /// text budget does not slow that down when the containers hold no text. A
-/// genuine deck's containers are disjoint, so one that overlaps an earlier
-/// one is left out; the work of reading all of them is then at most the
-/// stream's length.
+/// genuine deck's containers are disjoint, so the ranges are decided once,
+/// before any is read, from every container the slide and notes lists name:
+/// scanning them by start offset, widest first at equal starts, one that
+/// begins inside an accepted one is refused. The outermost container of each
+/// overlapping group wins whatever order the lists name them in, and the
+/// work of reading all that are accepted is at most the stream's length.
 #[derive(Default)]
 struct ContainerClaims {
-    /// `start -> end` of each accepted container, disjoint.
-    ranges: std::collections::BTreeMap<usize, usize>,
-    /// Containers refused for overlapping an accepted one.
+    /// Start offsets of the containers refused for overlapping an accepted
+    /// one.
+    refused_at: std::collections::HashSet<usize>,
+    /// Containers refused, counted once however many entries name them.
     refused: usize,
 }
 
 impl ContainerClaims {
-    /// Claim the container of type `rec_type` at `offset`. `false` when it
-    /// overlaps one already claimed (or is not that container at all, in
-    /// which case nothing is claimed and the caller finds that out itself).
-    fn claim(&mut self, stream: &[u8], offset: usize, rec_type: u16) -> bool {
-        let Some(header) = stream
-            .get(offset..offset.saturating_add(8))
-            .and_then(|b| RecordHeader::parse(b).ok())
-        else {
-            return true;
-        };
-        if header.rec_type != rec_type || !header.is_container() {
-            return true;
+    /// Decide among the containers at `candidates` (offset and the record
+    /// type the list expects there). An offset that is not a container of
+    /// that type is not a claim at all: the caller finds that out itself.
+    fn plan(stream: &[u8], candidates: impl Iterator<Item = (usize, u16)>) -> Self {
+        let mut ranges: Vec<(usize, usize)> = candidates
+            .filter_map(|(offset, rec_type)| {
+                let header = stream
+                    .get(offset..offset.saturating_add(8))
+                    .and_then(|b| RecordHeader::parse(b).ok())?;
+                if header.rec_type != rec_type || !header.is_container() {
+                    return None;
+                }
+                let end = offset
+                    .saturating_add(8)
+                    .saturating_add(header.rec_len as usize)
+                    .min(stream.len());
+                Some((offset, end))
+            })
+            .collect();
+        ranges.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        ranges.dedup_by_key(|r| r.0);
+        let mut claims = Self::default();
+        // Accepted ranges are disjoint and in start order, so only the last
+        // one's end can reach over the next start.
+        let mut accepted_end = 0usize;
+        for (start, end) in ranges {
+            if start < accepted_end {
+                claims.refused_at.insert(start);
+                claims.refused += 1;
+            } else {
+                accepted_end = end;
+            }
         }
-        let end = offset
-            .saturating_add(8)
-            .saturating_add(header.rec_len as usize)
-            .min(stream.len());
-        // The nearest accepted range starting before `end` is the only one
-        // that can reach back over `offset`: the ranges are disjoint.
-        let overlaps = self
-            .ranges
-            .range(..end)
-            .next_back()
-            .is_some_and(|(_, &other_end)| other_end > offset);
-        if overlaps {
-            self.refused += 1;
-            return false;
-        }
-        self.ranges.insert(offset, end);
-        true
+        claims
+    }
+
+    /// `false` when the container at `offset` was refused by [`plan`].
+    ///
+    /// [`plan`]: Self::plan
+    fn claim(&self, offset: usize) -> bool {
+        !self.refused_at.contains(&offset)
     }
 }
 
@@ -1035,7 +1083,7 @@ fn resolve_slide(
     hyperlinks: &HashMap<u32, String>,
     ole_objects: &HashMap<u32, OleObjectInfo>,
     budget: &mut crate::limits::TextBudget,
-    claims: &mut ContainerClaims,
+    claims: &ContainerClaims,
 ) -> (SlideText, SlideLinks) {
     let mut text_runs = Vec::new();
     let mut tables = Vec::new();
@@ -1045,10 +1093,7 @@ fn resolve_slide(
     let mut notes_id_ref = None;
     let mut headers_footers = None;
     let mut master = None;
-    if let Some(offset) = dir
-        .resolve(persist_id_ref)
-        .filter(|&o| claims.claim(stream, o, RT_SLIDE))
-    {
+    if let Some(offset) = dir.resolve(persist_id_ref).filter(|&o| claims.claim(o)) {
         if let Some(children) = bounded_container_children(stream, offset, RT_SLIDE) {
             master = slide_master_ref(&children);
             headers_footers = find_child(&children, RT_HEADER_FOOTER, HF_INSTANCE_SLIDES)
@@ -4134,13 +4179,10 @@ mod tests {
         (stream, current_user_bytes(edit_offset))
     }
 
-    /// Slide containers the persist directory places inside one another are
-    /// read once, as the outermost: each nested one would otherwise be parsed
-    /// and copied in full for its own entry, and a stream of nested
-    /// containers costs its length once per entry.
-    #[test]
-    fn test_slide_containers_nested_in_one_another_are_read_once() {
-        let nested = 50u32;
+    /// A deck of one outer `Slide` container holding `nested` inner ones, each
+    /// named by its own list entry. The outer one is entry 0 of the persist
+    /// directory's order; `inner_first` lists the inner entries ahead of it.
+    fn deck_with_nested_slides(nested: u32, inner_first: bool) -> (Vec<u8>, Vec<u8>) {
         let prefix = {
             let mut c = slide_atom_following(0, false);
             c.extend(other_text_shape("OUTER", None));
@@ -4154,7 +4196,10 @@ mod tests {
             })
             .collect();
         let outer = make_container(RT_SLIDE, 0, &[prefix.clone(), inners.concat()].concat());
-        let ids: Vec<u32> = (2..3 + nested).collect();
+        let mut ids: Vec<u32> = (2..3 + nested).collect();
+        if inner_first {
+            ids.reverse();
+        }
         let entries: Vec<u8> = ids
             .iter()
             .map(|&id| slide_persist_atom_bytes(id, 256 + id))
@@ -4174,23 +4219,50 @@ mod tests {
         stream.extend(persist_directory_bytes(&dir));
         let edit_offset = stream.len() as u32;
         stream.extend(user_edit_atom_bytes(0, pd_offset, 1));
-        let cu = current_user_bytes(edit_offset);
+        (stream, current_user_bytes(edit_offset))
+    }
 
-        let deck = extract_deck_text(&stream, Some(&cu));
-        // The outer container is read (its own walk may reach its nested
-        // records); each nested container's own entry is left out rather
-        // than read again.
-        assert!(deck.slides[0].text_runs.iter().any(|r| r.text == "OUTER"));
-        for (i, slide) in deck.slides.iter().enumerate().skip(1) {
-            assert!(slide.text_runs.is_empty(), "entry {i} read a nested container");
-        }
-        assert!(
-            deck.notices
+    /// Slide containers the persist directory places inside one another are
+    /// read once, as the outermost, whichever order the list names them in:
+    /// each nested one would otherwise be parsed and copied in full for its
+    /// own entry, and a stream of nested containers costs its length once
+    /// per entry.
+    #[test]
+    fn test_slide_containers_nested_in_one_another_are_read_once() {
+        let mut first_order: Option<Vec<String>> = None;
+        for inner_first in [false, true] {
+            let (stream, cu) = deck_with_nested_slides(50, inner_first);
+            let deck = extract_deck_text(&stream, Some(&cu));
+            // The outer container is read (its own walk may reach its nested
+            // records); each nested container's own entry is left out rather
+            // than read again.
+            let read: Vec<&SlideText> = deck
+                .slides
                 .iter()
-                .any(|n| n.contains("50 slide or notes containers overlap")),
-            "{:?}",
-            deck.notices
-        );
+                .filter(|s| !s.text_runs.is_empty())
+                .collect();
+            assert_eq!(read.len(), 1, "inner_first={inner_first}: {} slides read", read.len());
+            assert!(
+                read[0].text_runs.iter().any(|r| r.text == "OUTER"),
+                "inner_first={inner_first}: the outermost container wins"
+            );
+            let texts: Vec<&str> = read[0].text_runs.iter().map(|r| r.text.as_str()).collect();
+            match &first_order {
+                None => first_order = Some(texts.iter().map(|t| t.to_string()).collect()),
+                Some(first) => assert_eq!(
+                    first.iter().map(String::as_str).collect::<Vec<_>>(),
+                    texts,
+                    "the same container is read whichever order the list names them in"
+                ),
+            }
+            assert!(
+                deck.notices
+                    .iter()
+                    .any(|n| n.contains("50 slide or notes containers overlap")),
+                "inner_first={inner_first}: {:?}",
+                deck.notices
+            );
+        }
     }
 
     /// A deck-level footer is copied onto every slide, so it is charged for
@@ -4216,6 +4288,67 @@ mod tests {
         assert!(total <= 2_000, "{total} characters under a 2,000 budget");
         assert!(cut.slides.len() < 40);
         assert!(!cut.notices.is_empty());
+    }
+
+    /// With no usable persist directory the weaker paths read every `Slide`
+    /// container in the stream. They share the deck's one text budget, so
+    /// many containers under a small budget stop short of all of them rather
+    /// than each starting with a full allowance.
+    #[test]
+    fn test_fallback_slide_containers_share_one_text_budget() {
+        let stream: Vec<u8> = (0..40)
+            .flat_map(|i| {
+                let mut c = slide_atom_following(0, false);
+                c.extend(other_text_shape(&format!("{i:03}{}", "s".repeat(997)), None));
+                make_container(RT_SLIDE, 0, &c)
+            })
+            .collect();
+        let whole = extract_deck_text(&stream, None);
+        assert_eq!(whole.slides.len(), 40);
+        assert!(whole.notices.is_empty());
+
+        let cut = extract_deck_text_with_budget(
+            &stream,
+            None,
+            crate::limits::TextBudget::with_limit(5_000),
+        );
+        let total: usize = cut
+            .slides
+            .iter()
+            .flat_map(|s| &s.text_runs)
+            .map(|r| r.text.len())
+            .sum();
+        assert!(total <= 5_000, "{total} characters under a 5,000 budget");
+        assert!(cut.slides.len() < 40, "{} slides", cut.slides.len());
+        assert!(
+            cut.notices
+                .iter()
+                .any(|n| n.contains("5000 character budget")),
+            "{:?}",
+            cut.notices
+        );
+    }
+
+    /// The master walk's text counts against the deck's budget, not against a
+    /// fresh one per shape.
+    #[test]
+    fn test_master_static_text_is_charged_to_the_deck_budget() {
+        let shapes: Vec<u8> = (0..200)
+            .flat_map(|i| other_text_shape(&format!("{i:03}{}", "m".repeat(97)), None))
+            .collect();
+        let mut out = Vec::new();
+        let mut budget = crate::limits::TextBudget::with_limit(1_000);
+        collect_master_static_runs(
+            &shapes,
+            0,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut out,
+            &mut budget,
+        );
+        let total: usize = out.iter().map(|r| r.text.len()).sum();
+        assert!(total <= 1_000, "{total} characters under a 1,000 budget");
+        assert!(budget.exhausted());
     }
 
     /// Entries that name no slide are one empty placeholder, not one slide

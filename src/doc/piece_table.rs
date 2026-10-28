@@ -1475,9 +1475,11 @@ mod multi_piece_tests {
         assert!(err.to_string().contains("overlap"), "{err}");
     }
 
-    /// Distinct pieces, and pieces that reuse some bytes, are accepted whole.
+    /// Control, not a regression test: it passes without the bound as well.
+    /// It pins that distinct pieces, and pieces that reuse a few bytes, are
+    /// accepted whole, so the bound above cannot start refusing real files.
     #[test]
-    fn test_pieces_over_distinct_or_slightly_shared_bytes_are_kept() {
+    fn test_control_pieces_over_distinct_or_slightly_shared_bytes_are_kept() {
         let stream = vec![b'A'; 4000];
         let mut pieces = vec![
             compressed_piece(0, 2000, 0),

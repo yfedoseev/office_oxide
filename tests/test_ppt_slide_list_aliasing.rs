@@ -93,10 +93,15 @@ fn test_ppt_list_entries_aliasing_one_slide_yield_it_once() {
     );
 }
 
+/// Control, not a regression test: it passes without the bounds as well. It
+/// pins that an ordinary one-slide deck is not reported truncated and carries
+/// no warning, so the bounds above cannot start firing on ordinary input.
 #[test]
-fn test_ppt_a_single_entry_is_untouched() {
+fn test_control_ppt_a_single_entry_is_untouched() {
     let doc = Document::from_reader(Cursor::new(aliased_deck(1, 50)), DocumentFormat::Ppt)
         .expect("opens");
-    assert_eq!(doc.to_ir().sections.len(), 1);
-    assert!(!doc.to_ir().metadata.text_truncated);
+    let ir = doc.to_ir();
+    assert_eq!(ir.sections.len(), 1);
+    assert!(!ir.metadata.text_truncated);
+    assert!(ir.metadata.warnings.is_empty(), "{:?}", ir.metadata.warnings);
 }

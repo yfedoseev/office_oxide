@@ -155,10 +155,58 @@ pub(crate) fn metafile_header_size(rec_type: u16) -> usize {
 }
 
 /// The most a compressed metafile may claim to inflate to, relative to the
-/// bytes it is stored in, beyond [`METAFILE_FREE_INFLATION`]. Deflate itself
-/// cannot exceed about 1,030:1, and genuine metafiles stay far below 100:1;
-/// a header that claims more is a size amplifier, not a picture.
-const MAX_INFLATION_RATIO: u64 = 100;
+/// bytes it is stored in, beyond [`METAFILE_FREE_INFLATION`]. A deflate
+/// stream ([RFC 1951] §3.2.5) spends at least one bit on the length symbol
+/// and one on the distance symbol of a 258-byte match, so it cannot exceed
+/// 258 / (2/8) = 1,032:1: a header that claims more is a size amplifier, not
+/// a picture. The bound is the format's own, so a legitimate flat-colour
+/// bitmap (an 8 MB frame is about 8 KB stored) is never refused for its
+/// ratio; what bounds the memory is the per-picture hard cap and the
+/// per-document [`InflateBudget`].
+///
+/// [RFC 1951]: https://www.rfc-editor.org/rfc/rfc1951
+const MAX_INFLATION_RATIO: u64 = 1032;
+
+/// What a document's picture scan left out because of a limit, so the
+/// reader can say so in `Metadata::warnings`: pictures are decoded lazily,
+/// after the document is open.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BlipDiagnostics {
+    /// Compressed pictures whose declared size is implausible for their
+    /// stored length.
+    implausible: usize,
+    /// Compressed pictures that did not fit the document's inflation
+    /// allowance.
+    over_budget: usize,
+}
+
+impl BlipDiagnostics {
+    /// `true` when a picture was left out because of a limit.
+    pub(crate) fn limit_hit(&self) -> bool {
+        self.implausible > 0 || self.over_budget > 0
+    }
+
+    /// One warning per kind of skip, with the number skipped.
+    pub(crate) fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.implausible > 0 {
+            out.push(format!(
+                "{} compressed picture(s) left out: the declared uncompressed size is more \
+                 than a deflate stream of the stored length can hold",
+                self.implausible
+            ));
+        }
+        if self.over_budget > 0 {
+            out.push(format!(
+                "{} compressed picture(s) left out: the document's pictures exceed the {} byte \
+                 inflation allowance (office_oxide::limits::set_max_inflated_image_bytes)",
+                self.over_budget,
+                crate::limits::max_inflated_image_bytes()
+            ));
+        }
+        out
+    }
+}
 /// Declared size always accepted whatever the ratio, so a tiny, highly
 /// regular metafile is not refused for being small.
 const METAFILE_FREE_INFLATION: u64 = 1 << 20;
@@ -174,6 +222,7 @@ fn inflate_metafile(
     compressed: &[u8],
     cb_size: u32,
     budget: &mut InflateBudget,
+    diag: &mut BlipDiagnostics,
 ) -> Option<Vec<u8>> {
     use std::io::Read;
     let limit = u64::from(cb_size).min(MAX_INFLATED_METAFILE);
@@ -181,6 +230,7 @@ fn inflate_metafile(
         .saturating_mul(MAX_INFLATION_RATIO)
         .saturating_add(METAFILE_FREE_INFLATION);
     if limit > plausible {
+        diag.implausible += 1;
         log::warn!(
             "office art: compressed picture declares {limit} bytes from {} stored; skipped",
             compressed.len()
@@ -188,6 +238,7 @@ fn inflate_metafile(
         return None;
     }
     if !budget.reserve(limit) {
+        diag.over_budget += 1;
         log::warn!(
             "office art: compressed picture of {limit} bytes exceeds the document's \
              inflated-image allowance (office_oxide::limits::set_max_inflated_image_bytes); skipped"
@@ -224,6 +275,7 @@ pub(crate) fn extract_one_blip(
     data_start: usize,
     data_end: usize,
     budget: &mut InflateBudget,
+    diag: &mut BlipDiagnostics,
 ) -> Option<BlipImage> {
     let format = BlipFormat::from_record_type(rec_type);
     if !format.is_image() {
@@ -240,7 +292,7 @@ pub(crate) fn extract_one_blip(
         let cb_size = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
         let payload = &data[header_end..data_end];
         match header[METAFILE_COMPRESSION_OFFSET] {
-            MSO_COMPRESSION_DEFLATE => match inflate_metafile(payload, cb_size, budget) {
+            MSO_COMPRESSION_DEFLATE => match inflate_metafile(payload, cb_size, budget, diag) {
                 Some(v) => v,
                 None => {
                     log::warn!("office art: compressed {format:?} picture is not valid zlib");
@@ -283,11 +335,23 @@ pub(crate) fn extract_one_blip(
 /// a picture that does not fit is left out. A document has one such stream,
 /// so the allowance is the document's.
 pub fn extract_blip_images(data: &[u8]) -> Vec<BlipImage> {
-    extract_blip_images_within(data, &mut InflateBudget::new())
+    extract_blip_images_diagnosed(data).0
+}
+
+/// [`extract_blip_images`], also reporting what was left out because of a
+/// limit.
+pub(crate) fn extract_blip_images_diagnosed(data: &[u8]) -> (Vec<BlipImage>, BlipDiagnostics) {
+    let mut diag = BlipDiagnostics::default();
+    let images = extract_blip_images_within(data, &mut InflateBudget::new(), &mut diag);
+    (images, diag)
 }
 
 /// [`extract_blip_images`] against an explicit allowance.
-fn extract_blip_images_within(data: &[u8], budget: &mut InflateBudget) -> Vec<BlipImage> {
+fn extract_blip_images_within(
+    data: &[u8],
+    budget: &mut InflateBudget,
+    diag: &mut BlipDiagnostics,
+) -> Vec<BlipImage> {
     let mut images = Vec::new();
     let mut pos = 0;
     let mut slot_index = 0usize;
@@ -326,9 +390,15 @@ fn extract_blip_images_within(data: &[u8], budget: &mut InflateBudget) -> Vec<Bl
                     let e_inst = e_ver_inst >> 4;
                     let e_data_start = embedded_start + 8;
                     let e_data_end = (e_data_start + e_rec_len).min(data_end);
-                    if let Some(mut img) =
-                        extract_one_blip(data, e_rec_type, e_inst, e_data_start, e_data_end, budget)
-                    {
+                    if let Some(mut img) = extract_one_blip(
+                        data,
+                        e_rec_type,
+                        e_inst,
+                        e_data_start,
+                        e_data_end,
+                        budget,
+                        diag,
+                    ) {
                         img.index = slot_index;
                         images.push(img);
                     }
@@ -337,7 +407,7 @@ fn extract_blip_images_within(data: &[u8], budget: &mut InflateBudget) -> Vec<Bl
             slot_index += 1;
             pos = data_end;
         } else if let Some(mut img) =
-            extract_one_blip(data, rec_type, inst, data_start, data_end, budget)
+            extract_one_blip(data, rec_type, inst, data_start, data_end, budget, diag)
         {
             img.index = slot_index;
             images.push(img);
@@ -358,7 +428,7 @@ fn extract_blip_images_within(data: &[u8], budget: &mut InflateBudget) -> Vec<Bl
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn make_blip(rec_type: u16, inst: u16, image_data: &[u8]) -> Vec<u8> {
@@ -525,7 +595,7 @@ mod tests {
     }
 
     /// zlib-compress `raw` (what Office writes into a compressed metafile).
-    fn zlib(raw: &[u8]) -> Vec<u8> {
+    pub(crate) fn zlib(raw: &[u8]) -> Vec<u8> {
         use std::io::Write;
         let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         enc.write_all(raw).unwrap();
@@ -535,7 +605,12 @@ mod tests {
     /// An `OfficeArtBlipEMF`/`WMF`/`PICT` record: `rh`, one UID, the
     /// 34-byte `OfficeArtMetafileHeader` ([MS-ODRAW] §2.2.31) and the
     /// payload, compressed when `compressed` is set.
-    fn make_metafile_blip(rec_type: u16, inst: u16, raw: &[u8], compressed: bool) -> Vec<u8> {
+    pub(crate) fn make_metafile_blip(
+        rec_type: u16,
+        inst: u16,
+        raw: &[u8],
+        compressed: bool,
+    ) -> Vec<u8> {
         let payload = if compressed { zlib(raw) } else { raw.to_vec() };
         let mut mf = Vec::new();
         mf.extend_from_slice(&(raw.len() as u32).to_le_bytes()); // cbSize
@@ -635,7 +710,8 @@ mod tests {
         // 1 MiB each: regular enough to be a few KiB stored.
         let stream = zero_metafiles(4, 1 << 20);
         let mut budget = InflateBudget::with_limit(5 << 19);
-        let images = extract_blip_images_within(&stream, &mut budget);
+        let images =
+            extract_blip_images_within(&stream, &mut budget, &mut BlipDiagnostics::default());
         assert_eq!(images.len(), 2, "two fit in 2.5 MiB, the third does not");
         assert!(images.iter().all(|i| i.data.len() == 1 << 20));
         // Only what is left can be reserved afterwards.
@@ -643,17 +719,56 @@ mod tests {
         assert!(!budget.reserve(1));
     }
 
-    /// A declared size that is wildly larger than the stored bytes could be
-    /// is refused before anything is inflated or reserved.
+    /// A declared size that is far larger than a deflate stream of the stored
+    /// length can hold is refused before anything is inflated or reserved,
+    /// and counted so the reader can say so.
     #[test]
     fn test_implausible_declared_size_is_refused_without_inflating() {
         let raw = vec![0u8; 16 << 20];
+        let mut stream = make_metafile_blip(0xF01A, 0x3D4, &raw, true);
+        let stored = zlib(&raw).len() as u64;
+        // cbSize claims 64 MiB for a stream that stores 16 MiB of zeros.
+        let cb_at = 8 + 16;
+        stream[cb_at..cb_at + 4].copy_from_slice(&(64u32 << 20).to_le_bytes());
+        assert!(64u64 << 20 > stored * MAX_INFLATION_RATIO + METAFILE_FREE_INFLATION);
+        let mut budget = InflateBudget::with_limit(u64::MAX);
+        let mut diag = BlipDiagnostics::default();
+        assert!(extract_blip_images_within(&stream, &mut budget, &mut diag).is_empty());
+        assert!(budget.reserve(u64::MAX), "a refused picture reserves nothing");
+        assert!(diag.limit_hit());
+        assert_eq!(diag.warnings().len(), 1);
+    }
+
+    /// A flat-colour 1920 x 1080 x 32 bpp bitmap is 8.3 MB stored in about
+    /// 8 KB, a ratio near 1000:1 that deflate itself reaches. It is a
+    /// picture, not an amplifier, and is kept.
+    #[test]
+    fn test_flat_colour_bitmap_at_the_deflate_ratio_is_kept() {
+        let raw = vec![0u8; 1920 * 1080 * 4];
         let stream = make_metafile_blip(0xF01A, 0x3D4, &raw, true);
         let stored = zlib(&raw).len() as u64;
-        assert!(16u64 << 20 > stored * MAX_INFLATION_RATIO + METAFILE_FREE_INFLATION);
-        let mut budget = InflateBudget::with_limit(u64::MAX);
-        assert!(extract_blip_images_within(&stream, &mut budget).is_empty());
-        assert!(budget.reserve(u64::MAX), "a refused picture reserves nothing");
+        assert!(raw.len() as u64 / stored > 900, "ratio {}", raw.len() as u64 / stored);
+        let mut diag = BlipDiagnostics::default();
+        let images = extract_blip_images_within(&stream, &mut InflateBudget::new(), &mut diag);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data.len(), raw.len());
+        assert!(!diag.limit_hit());
+    }
+
+    /// A picture that does not fit the document's allowance is counted, with
+    /// a warning that names the limit.
+    #[test]
+    fn test_pictures_past_the_allowance_are_counted() {
+        let stream = zero_metafiles(4, 1 << 20);
+        let mut diag = BlipDiagnostics::default();
+        let images =
+            extract_blip_images_within(&stream, &mut InflateBudget::with_limit(5 << 19), &mut diag);
+        assert_eq!(images.len(), 2);
+        assert!(diag.limit_hit());
+        let warnings = diag.warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with("2 compressed picture(s) left out"), "{warnings:?}");
+        assert!(warnings[0].contains("set_max_inflated_image_bytes"));
     }
 
     /// A picture whose stream ends early hands back what it did not use.
@@ -664,7 +779,10 @@ mod tests {
         let cb_at = 8 + 16;
         stream[cb_at..cb_at + 4].copy_from_slice(&1000u32.to_le_bytes());
         let mut budget = InflateBudget::with_limit(5000);
-        assert_eq!(extract_blip_images_within(&stream, &mut budget).len(), 1);
+        assert_eq!(
+            extract_blip_images_within(&stream, &mut budget, &mut BlipDiagnostics::default()).len(),
+            1
+        );
         assert!(budget.reserve(4000), "only the 1000 inflated bytes were spent");
         assert!(!budget.reserve(1));
     }

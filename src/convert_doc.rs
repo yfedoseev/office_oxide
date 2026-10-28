@@ -151,10 +151,12 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     let hfs = doc.header_footers();
     // Every section gets its own copy of the stories it shows, so a document
     // of thousands of sections multiplies one header into thousands. The
-    // text of each copy is charged to what is left of the document's text
-    // budget before it is made; the section that does not fit, and those
-    // after it, get no header or footer.
+    // first copy of a story is the text the piece table already charged to
+    // the document's budget; each further copy of the same story is charged
+    // to what is left of it before it is made, and the section that does not
+    // fit, and those after it, get no header or footer.
     let mut hf_budget = doc.text_budget();
+    let mut first_copies: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut headers_cut = false;
     let mut sections: Vec<Section> = section_bodies
         .into_iter()
@@ -177,6 +179,8 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
                 let size: usize = stories
                     .iter()
                     .filter_map(|s| s.as_deref())
+                    // A story seen for the first time is already paid for.
+                    .filter(|s| !first_copies.insert(s.as_ptr() as usize))
                     .map(str::len)
                     .sum();
                 if !hf_budget.charge(size) {
@@ -304,6 +308,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // document was silently dropped on conversion even though the bytes
     // were already in hand.
     crate::convert_xls::append_legacy_images(&mut sections, doc.images());
+    warnings.extend(doc.image_warnings());
 
     // Embedded OLE objects — at minimum, recognize each
     // object exists and surface its identity, even without extracting
@@ -344,7 +349,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             created: summary.and_then(|s| s.created.clone()),
             modified: summary.and_then(|s| s.modified.clone()),
             has_macros: doc.has_macros(),
-            text_truncated: !doc.text_complete() || headers_cut,
+            text_truncated: !doc.text_complete() || headers_cut || doc.images_left_out(),
             warnings,
             ..crate::core::core_properties::legacy_metadata_extras(summary)
         },
