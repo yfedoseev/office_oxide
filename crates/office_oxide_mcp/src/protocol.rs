@@ -489,6 +489,29 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A test that fails inside the scope still puts the budgets back, and
+    /// the lock it held is usable afterwards, so one failing test cannot
+    /// leave its limits behind for the others.
+    #[test]
+    fn test_budget_scope_restores_the_limits_when_the_test_inside_it_panics() {
+        let _defaults = default_limits();
+        let before =
+            (office_oxide::limits::max_text_chars(), office_oxide::limits::max_image_bytes());
+        drop(_defaults);
+        let panicked = std::panic::catch_unwind(|| {
+            let _scope = BudgetScope::bound_to(123, 45);
+            assert_eq!(office_oxide::limits::max_text_chars(), 123);
+            assert_eq!(office_oxide::limits::max_image_bytes(), 45);
+            panic!("an assertion inside the scope fails");
+        });
+        assert!(panicked.is_err());
+        let _defaults = default_limits();
+        assert_eq!(
+            (office_oxide::limits::max_text_chars(), office_oxide::limits::max_image_bytes()),
+            before
+        );
+    }
+
     /// The README documented `extract` as DOCX/XLSX/PPTX-only with three
     /// formats, omitted `replace_text`, and promised a file size `info` did
     /// not return; the tool descriptions said DOCX/XLSX/PPTX too. The CLI
