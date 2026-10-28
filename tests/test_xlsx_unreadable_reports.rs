@@ -409,3 +409,113 @@ fn test_an_external_target_is_not_looked_up_in_the_package() {
         assert_silent(label, sheet_with(tail, &rels, vec![(name.into(), "<broken".into())]));
     }
 }
+
+/// A name that would be markup, a link, an image or a heading if written as it is.
+const HOSTILE: &str = "x](http:evil)<img src=x onerror=1>`\n\n# Heading";
+const HOSTILE_XML: &str = "x](http:evil)&lt;img src=x onerror=1&gt;`&#10;&#10;# Heading";
+
+/// Every string in the part of the IR that reports losses (the sections after
+/// the sheet's own).
+fn report_strings(doc: &Document) -> Vec<String> {
+    fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(a) => a.iter().for_each(|v| walk(v, out)),
+            serde_json::Value::Object(o) => o.values().for_each(|v| walk(v, out)),
+            _ => {},
+        }
+    }
+    let mut out = Vec::new();
+    for section in doc.to_ir().sections.iter().skip(1) {
+        walk(&serde_json::to_value(section).unwrap(), &mut out);
+    }
+    out
+}
+
+/// What the file says about a sheet or part is echoed in the notices, and
+/// stays one inert line in every rendering: not a heading, a link or markup.
+#[test]
+fn test_names_echoed_in_the_notices_are_inert_in_every_rendering() {
+    let _g = LimitScope::new();
+    let mut parts = fixed_parts(
+        format!(
+            r#"<workbook xmlns="{NS}" xmlns:r="{R}"><sheets><sheet name="S" sheetId="1" r:id="rId1"/><sheet name="{HOSTILE_XML}" sheetId="2" r:id="rId1"/></sheets></workbook>"#
+        ),
+        format!(
+            r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#
+        ),
+    );
+    parts.push((
+        "xl/worksheets/sheet1.xml".into(),
+        SHEET
+            .replace("</worksheet>", r#"<legacyDrawing r:id="r1"/></worksheet>"#)
+            .replace("<worksheet ", &format!(r#"<worksheet xmlns:r="{R}" "#)),
+    ));
+    parts.push((
+        "xl/worksheets/_rels/sheet1.xml.rels".into(),
+        format!(
+            r#"<Relationships xmlns="{REL_NS}"><Relationship Id="r1" Type="{R}/comments" Target="../{HOSTILE_XML}.xml"/></Relationships>"#
+        ),
+    ));
+    parts.push((format!("xl/{HOSTILE}.xml"), "<comments".into()));
+    let doc = open(zip_of(parts));
+    let xlsx = doc.as_xlsx().unwrap();
+    assert!(!xlsx.unreadable_sheets.is_empty() && !xlsx.unreadable_parts.is_empty());
+    for (what, out) in renderings(&doc) {
+        if what.starts_with("ir_") {
+            continue;
+        }
+        for line in out.lines() {
+            assert!(!line.starts_with("# Heading"), "{what}: a heading from a name: {out}");
+            assert!(!line.starts_with("## x]"), "{what}: a heading from a name: {out}");
+        }
+        if what.contains("markdown") {
+            assert_eq!(
+                out.matches("](http:evil)").count(),
+                out.matches("\\](http:evil)").count(),
+                "{what}: a link from a name: {out}"
+            );
+            let tags = out.matches("<img").count();
+            assert_eq!(tags, out.matches("\\<img").count(), "{what}: markup from a name: {out}");
+        }
+        if what == "to_html" {
+            assert!(!out.contains("<img"), "{what}: markup from a name: {out}");
+        }
+    }
+    for s in report_strings(&doc) {
+        assert!(!s.chars().any(char::is_control), "a control character in the IR: {s:?}");
+    }
+    // The metadata keeps the bounded text as it is.
+    let ir = doc.to_ir();
+    assert!(
+        ir.metadata.warnings.iter().any(|w| w.contains("evil")),
+        "{:?}",
+        ir.metadata.warnings
+    );
+}
+
+/// A notice the text budget cannot pay is replaced by the budget's notice in
+/// the content, and its warning still reaches a caller who drops each sheet.
+#[test]
+fn test_a_notice_the_budget_cannot_pay_keeps_its_warning_in_the_streamed_sheet() {
+    let mut limits = LimitScope::new();
+    limits.set(max_text_chars, set_max_text_chars, 3_000);
+    let doc = open(duplicate_sheets(300, 200));
+    let xlsx = doc.as_xlsx().unwrap();
+    let mut warnings = Vec::new();
+    for sheet in xlsx.sheets_ir() {
+        warnings.extend(sheet.warnings);
+    }
+    let sheets = warnings
+        .iter()
+        .filter(|w| w.starts_with("skipped unreadable sheet"))
+        .count();
+    assert_eq!(sheets, xlsx.unreadable_sheets.len(), "{} warnings", warnings.len());
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("199 more unreadable sheets")),
+        "{}",
+        warnings.len()
+    );
+}

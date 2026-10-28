@@ -988,7 +988,23 @@ fn csv_escape(field: &str) -> String {
 /// The line every renderer emits for a sheet that could not be read, so
 /// a workbook missing a sheet never passes for a complete one.
 pub(crate) fn unreadable_notice(name: &str, err: &str) -> String {
-    format!("[unreadable sheet {name:?}: {err}]")
+    inert(&format!("[unreadable sheet {name:?}: {err}]"))
+}
+
+/// `s` as one line: every control character, and the Unicode line and
+/// paragraph separators, become a space. A notice echoes names and reasons
+/// the file controls, and one that could end its line could start another
+/// (a heading, a list item) in any rendering.
+pub(crate) fn inert(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// What could not be read, as every renderer reports it: one entry for each
@@ -997,8 +1013,8 @@ pub(crate) fn unreadable_notice(name: &str, err: &str) -> String {
 /// parts). They are bounded (see [`XlsxDocument::unreadable_sheets`]), cut and
 /// charged to the text budget by every renderer before it writes them.
 pub(crate) struct ReportNotice {
-    /// The heading of the entry's section: the sheet's name, or what the
-    /// entry lists.
+    /// The heading of the entry's section: a fixed label, never text from the
+    /// file.
     pub(crate) title: String,
     /// The in-band lines, each a bracketed notice.
     pub(crate) lines: Vec<String>,
@@ -1007,11 +1023,13 @@ pub(crate) struct ReportNotice {
 }
 
 impl ReportNotice {
-    /// What the entry costs to write: its heading and lines.
+    /// What the entry costs to write, in characters like the rest of the
+    /// text budget: its heading and lines. (Each is cut at 256 characters
+    /// and there are at most 201 of them, so counting is bounded.)
     pub(crate) fn chars(&self) -> usize {
-        self.lines
-            .iter()
-            .fold(self.title.len(), |n, l| n.saturating_add(l.len()).saturating_add(4))
+        self.lines.iter().fold(self.title.chars().count(), |n, l| {
+            n.saturating_add(l.chars().count()).saturating_add(4)
+        })
     }
 }
 
@@ -1023,7 +1041,9 @@ impl XlsxDocument {
             .unreadable_sheets
             .iter()
             .map(|(name, err)| ReportNotice {
-                title: name.clone(),
+                // The name is in the line, where every rendering writes it as
+                // text; a heading would write it as markup.
+                title: "Unreadable sheet".to_string(),
                 lines: vec![unreadable_notice(name, err)],
                 warnings: vec![format!("skipped unreadable sheet {name:?}: {err}")],
             })
@@ -1051,7 +1071,7 @@ impl XlsxDocument {
             }
             out.push(ReportNotice {
                 title: "Unreadable parts".to_string(),
-                lines: warnings.iter().map(|w| format!("[{w}]")).collect(),
+                lines: warnings.iter().map(|w| inert(&format!("[{w}]"))).collect(),
                 warnings,
             });
         }
@@ -1080,7 +1100,12 @@ fn write_report_notices<W: Write + ?Sized>(
         }
         if markdown {
             begin(out)?;
-            write!(out, "## {}\n\n{}", n.title, n.lines.join("\n\n"))?;
+            let lines: Vec<String> = n
+                .lines
+                .iter()
+                .map(|l| crate::core::markdown::escape_text(l))
+                .collect();
+            write!(out, "## {}\n\n{}", n.title, lines.join("\n\n"))?;
         } else {
             for line in &n.lines {
                 begin(out)?;
