@@ -971,14 +971,22 @@ fn render_table_markdown(table: &Table) -> String {
     // a cell only continues spans: it holds no text and no cell's own
     // position, and writing it just widens the table (a Word 6/95 table whose
     // rows each have their own boundaries came out 28 columns wide for 14
-    // cells). Only those columns are left out.
-    let keep: Vec<usize> = (0..col_count)
-        .filter(|&c| {
-            grid.iter()
-                .any(|row| row.get(c).is_some_and(Option::is_some))
-        })
-        .collect();
-    let col_count = keep.len();
+    // cells). Only those columns are left out. A table past the layout bound
+    // comes back ragged, with each row holding only its own cells; it is
+    // written as before, so the work stays linear in the cells it holds.
+    let laid_out = grid.iter().all(|row| row.len() == col_count);
+    let keep: Vec<usize> = if laid_out {
+        let mut starts = vec![false; col_count];
+        for row in &grid {
+            for (c, slot) in row.iter().enumerate() {
+                starts[c] |= slot.is_some();
+            }
+        }
+        (0..col_count).filter(|&c| starts[c]).collect()
+    } else {
+        Vec::new()
+    };
+    let col_count = if laid_out { keep.len() } else { col_count };
     if col_count == 0 {
         return String::new();
     }
@@ -987,7 +995,12 @@ fn render_table_markdown(table: &Table) -> String {
 
     let write_row = |cells: &[Option<&TableCell>], out: &mut String| {
         out.push('|');
-        for slot in keep.iter().map(|&c| cells.get(c).copied().flatten()) {
+        let slots: Box<dyn Iterator<Item = Option<&TableCell>>> = if laid_out {
+            Box::new(keep.iter().map(|&c| cells[c]))
+        } else {
+            Box::new(cells.iter().take(col_count).copied())
+        };
+        for slot in slots {
             out.push(' ');
             out.push_str(&slot.map(render_cell_markdown).unwrap_or_default());
             out.push_str(" |");
@@ -1785,6 +1798,19 @@ mod tests {
         }
         let widths: Vec<_> = md.lines().map(|l| l.matches('|').count()).collect();
         assert!(widths.windows(2).all(|w| w[0] == w[1]), "ragged: {md}");
+    }
+
+    /// A table past the layout bound is written row by row from its own
+    /// cells: the work and the output stay linear in the cells it holds, not
+    /// rows times the widest row.
+    #[test]
+    fn test_markdown_table_past_the_layout_bound_is_not_padded_per_row() {
+        let wide: Vec<TableCell> = (0..60_000).map(|_| cell("w")).collect();
+        let mut rows = vec![wide];
+        rows.extend((0..3_000).map(|_| vec![cell("n")]));
+        let md = table_of(rows).to_markdown();
+        assert!(md.len() < 2_000_000, "{} bytes", md.len());
+        assert_eq!(md.lines().filter(|l| *l == "| n |").count(), 3_000);
     }
 
     #[test]
