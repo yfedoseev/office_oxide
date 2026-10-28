@@ -29,7 +29,7 @@ impl XlsxDocument {
 }
 
 /// What an unused column of a Markdown table row costs: `" | "`.
-const MARKDOWN_PAD_CHARS: usize = 3;
+pub(crate) const MARKDOWN_PAD_CHARS: usize = 3;
 
 /// The line every renderer gives a sheet whose threaded comments stopped at
 /// the document's text budget.
@@ -879,6 +879,8 @@ mod tests {
             rows: Vec::new(),
             merged_cells: Vec::new(),
             hyperlinks: Vec::new(),
+            hyperlinks_dropped: 0,
+            formulas_dropped: 0,
             page_setup: None,
             images: Vec::new(),
             comments: Vec::new(),
@@ -956,6 +958,8 @@ mod tests {
             }],
             merged_cells: Vec::new(),
             hyperlinks: Vec::new(),
+            hyperlinks_dropped: 0,
+            formulas_dropped: 0,
             page_setup: None,
             images: Vec::new(),
             comments: Vec::new(),

@@ -239,6 +239,95 @@ impl GridBudget {
     }
 }
 
+/// The default allowance of memory for the empty table cells that pad the
+/// rows of an `.xlsx` sheet in the IR: 512 MiB.
+///
+/// A spreadsheet's IR table is as wide as the sheet, so a row with cells at
+/// `A` and `CV` is laid out with 98 empty table cells between them, each a
+/// `TableCell` and its paragraph element, about 600 bytes. They are charged
+/// at that size, apart from the text budget (which is also charged 3
+/// characters a cell, as Markdown charges an absent column): at the default a
+/// sheet may hold about 900,000 of them, enough for a multi-sheet export of
+/// a hundred sparse columns and several thousand rows.
+pub const DEFAULT_MAX_IR_PADDING_BYTES: usize = 512 << 20;
+
+static MAX_IR_PADDING_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_IR_PADDING_BYTES);
+
+/// The per-document allowance of bytes for the empty cells padding the rows
+/// of a spreadsheet's IR.
+pub fn max_ir_padding_bytes() -> usize {
+    MAX_IR_PADDING_BYTES.load(Ordering::Relaxed)
+}
+
+/// Set the empty-cell padding allowance for every document converted
+/// afterwards. `usize::MAX` disables the bound.
+pub fn set_max_ir_padding_bytes(bytes: usize) {
+    MAX_IR_PADDING_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// A document's remaining allowance of bytes for IR padding cells.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IrPaddingBudget {
+    total: usize,
+    remaining: usize,
+    exhausted: bool,
+}
+
+impl IrPaddingBudget {
+    pub(crate) fn new() -> Self {
+        Self::with_limit(max_ir_padding_bytes())
+    }
+
+    pub(crate) fn with_limit(total: usize) -> Self {
+        Self {
+            total,
+            remaining: total,
+            exhausted: false,
+        }
+    }
+
+    /// What one empty table cell holds in the IR: the cell and the element of
+    /// its paragraph.
+    pub(crate) fn cell_bytes() -> usize {
+        std::mem::size_of::<crate::ir::TableCell>() + std::mem::size_of::<crate::ir::Element>()
+    }
+
+    /// Charge `cells` empty cells. `false` — from the first refusal on —
+    /// when the allowance is spent; the caller stops building rows.
+    pub(crate) fn charge_cells(&mut self, cells: usize) -> bool {
+        if self.exhausted {
+            return false;
+        }
+        match cells
+            .checked_mul(Self::cell_bytes())
+            .and_then(|bytes| self.remaining.checked_sub(bytes))
+        {
+            Some(rest) => {
+                self.remaining = rest;
+                true
+            },
+            None => {
+                self.remaining = 0;
+                self.exhausted = true;
+                false
+            },
+        }
+    }
+
+    pub(crate) fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    pub(crate) fn notice(&self) -> String {
+        format!(
+            "[workbook truncated: its rows are padded to the sheet's width with more than {} \
+             bytes of empty table cells (office_oxide::limits::set_max_ir_padding_bytes) — \
+             later rows are missing]",
+            self.total
+        )
+    }
+}
+
 /// The default budget for picture bytes in the IR: 1 GiB.
 pub const DEFAULT_MAX_IMAGE_BYTES: usize = 1 << 30;
 
@@ -255,40 +344,6 @@ pub fn max_image_bytes() -> usize {
 /// `usize::MAX` disables the bound.
 pub fn set_max_image_bytes(bytes: usize) {
     MAX_IMAGE_BYTES.store(bytes, Ordering::Relaxed);
-}
-
-/// A text budget shared by every worksheet of one document, which are parsed
-/// on several threads: each charge comes off one document-wide total, so the
-/// limit is per document however many sheets there are.
-#[derive(Debug, Clone)]
-pub(crate) struct SharedTextBudget {
-    total: usize,
-    remaining: std::sync::Arc<AtomicUsize>,
-}
-
-impl SharedTextBudget {
-    /// A fresh budget at the configured limit.
-    pub(crate) fn new() -> Self {
-        Self::with_limit(max_text_chars())
-    }
-
-    pub(crate) fn with_limit(total: usize) -> Self {
-        Self {
-            total,
-            remaining: std::sync::Arc::new(AtomicUsize::new(total)),
-        }
-    }
-
-    /// Charge `chars`; `false` when the document's total would be exceeded.
-    pub(crate) fn charge(&self, chars: usize) -> bool {
-        self.remaining
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |r| r.checked_sub(chars))
-            .is_ok()
-    }
-
-    pub(crate) fn limit(&self) -> usize {
-        self.total
-    }
 }
 
 thread_local! {
@@ -462,10 +517,23 @@ pub(crate) const MAX_STYLE_NAME_CHARS: usize = 255;
 /// cell that follows it, so a longer one is refused.
 pub(crate) const MAX_FORMULA_CHARS: usize = 8192;
 
-/// What one empty table cell in the IR counts for against the text budget:
-/// its allocation is a few hundred bytes, where a character of text is one,
-/// so the default budget admits about four million of them.
-pub(crate) const EMPTY_TABLE_CELL_CHARS: usize = 64;
+/// The longest hyperlink target kept, in characters: Excel's own limit for a
+/// hyperlink address (2,083, the length Internet Explorer accepts for a URL).
+///
+/// A relationship's target is stored once and named by every `<hyperlink>`
+/// that uses it, so a megabyte target multiplies by the link count into the
+/// reader's maps, the IR and every rendering. A longer one cannot come from a
+/// spreadsheet application: the links that name it are left out, reported.
+pub(crate) const MAX_HYPERLINK_TARGET_CHARS: usize = 2083;
+
+/// The longest number-format code listed on an IR cell, in characters:
+/// Excel's own limit for a custom format (255).
+///
+/// A format code is stored once in the stylesheet and listed on every numeric
+/// cell that uses the style, so a megabyte code would be a megabyte per cell.
+/// A longer code cannot come from a spreadsheet application; the cells keep
+/// their format id and their values, and the code is left off, reported.
+pub(crate) const MAX_NUMBER_FORMAT_CHARS: usize = 255;
 
 #[cfg(test)]
 thread_local! {
@@ -531,6 +599,16 @@ mod tests {
         assert!(b.exhausted());
         assert!(!b.charge(0), "spent stays spent");
         assert!(b.notice().contains("10 character budget"));
+    }
+
+    #[test]
+    fn test_ir_padding_is_charged_at_the_size_of_the_cells_it_makes() {
+        let mut b = IrPaddingBudget::with_limit(IrPaddingBudget::cell_bytes() * 10);
+        assert!(b.charge_cells(10));
+        assert!(!b.charge_cells(1));
+        assert!(b.exhausted());
+        assert!(b.notice().contains("empty table cells"));
+        assert!(!IrPaddingBudget::with_limit(usize::MAX).charge_cells(usize::MAX));
     }
 
     #[test]

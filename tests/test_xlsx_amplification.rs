@@ -11,32 +11,20 @@
 
 use std::io::{Cursor, Write};
 
-use office_oxide::core::Error as CoreError;
 use office_oxide::limits::set_max_text_chars;
-use office_oxide::xlsx::XlsxError;
-use office_oxide::{Document, DocumentFormat, OfficeError};
-
-/// The message of a refusal for exceeding a resource bound, or `None` when
-/// `result` is not one. A worksheet that exceeds a bound is unreadable, and a
-/// workbook with no readable sheet is refused with that sheet's reason.
-fn limit_message<T>(result: &office_oxide::Result<T>) -> Option<String> {
-    match result {
-        Err(OfficeError::Core(CoreError::PackageLimit(m))) => Some(m.clone()),
-        Err(OfficeError::Core(CoreError::MalformedXml(m)))
-        | Err(OfficeError::Xlsx(XlsxError::Core(CoreError::MalformedXml(m))))
-            if m.contains("package limit exceeded") =>
-        {
-            Some(m.clone())
-        },
-        _ => None,
-    }
-}
+use office_oxide::{Document, DocumentFormat};
 
 /// The text budget every test here runs under.
 const TEXT_BUDGET: usize = 60_000;
 
 fn set_budgets() {
     set_max_text_chars(TEXT_BUDGET);
+    // About a thousand empty cells: five rows of the 200-column sheets below.
+    office_oxide::limits::set_max_ir_padding_bytes(
+        1_000
+            * (std::mem::size_of::<office_oxide::ir::TableCell>()
+                + std::mem::size_of::<office_oxide::ir::Element>()),
+    );
 }
 
 const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
@@ -103,24 +91,54 @@ fn shared_formula_workbook(master_len: usize, followers: usize) -> Vec<u8> {
     )
 }
 
+/// The sheet's cells in column B that still have a formula, and how many
+/// have a value.
+fn formula_and_value_counts(ws: &office_oxide::xlsx::Worksheet) -> (usize, usize) {
+    let cells = ws.rows.iter().flat_map(|r| &r.cells);
+    (
+        cells.clone().filter(|c| c.formula.is_some()).count(),
+        cells
+            .filter(|c| !matches!(c.value, office_oxide::xlsx::CellValue::Empty))
+            .count(),
+    )
+}
+
 #[test]
 fn test_shared_formula_master_copied_into_many_followers_is_bounded() {
     set_budgets();
     // 4,000 characters (under the 8,192 limit) copied into 100 followers is
-    // 400,000 characters against a 60,000 budget.
-    let result = open(shared_formula_workbook(4_000, 100));
-    let message = limit_message(&result).unwrap_or_else(|| {
-        panic!("expected a package limit error, got {:?}", result.as_ref().map(|_| ()))
-    });
-    assert!(message.contains("shared group 0"), "{message}");
+    // 400,000 characters against a 60,000 budget: the followers that fit keep
+    // their formula, the others keep their cell and value without one.
+    let doc = open(shared_formula_workbook(4_000, 100)).expect("the sheet stays readable");
+    let ws = &doc.as_xlsx().unwrap().worksheets[0];
+    let (formulas, values) = formula_and_value_counts(ws);
+    assert_eq!(values, 101, "every cell keeps its value");
+    assert!(formulas > 1 && formulas < 20, "{formulas} cells kept a formula");
+    assert_eq!(ws.formulas_dropped, 101 - formulas);
+    let ir = doc.to_ir();
+    assert!(ir.metadata.text_truncated, "the loss is not flagged");
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("shared formula"))
+    );
 }
 
 #[test]
-fn test_shared_formula_master_over_excel_limit_is_refused() {
+fn test_shared_formula_master_over_excel_limit_is_dropped_but_the_cell_is_kept() {
     set_budgets();
-    let result = open(shared_formula_workbook(9_000, 1));
-    let message = limit_message(&result).expect("a package limit error");
-    assert!(message.contains("8192"), "{message}");
+    let doc = open(shared_formula_workbook(9_000, 1)).expect("the sheet stays readable");
+    let ws = &doc.as_xlsx().unwrap().worksheets[0];
+    assert_eq!(formula_and_value_counts(ws), (0, 2));
+    assert_eq!(ws.formulas_dropped, 2, "the master and its follower");
+    assert!(
+        doc.to_ir()
+            .metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("8192"))
+    );
 }
 
 #[test]
@@ -194,7 +212,16 @@ fn test_ir_table_rows_padded_to_the_sheet_width_are_bounded() {
     assert!(cells < 2_000, "{cells} table cells were built from a 3 KB workbook");
     assert!(ir.metadata.text_truncated, "the truncation is not flagged");
     let html = doc.to_html();
-    assert!(html.contains("character budget"), "HTML carries no truncation notice");
+    assert!(html.contains("empty table cells"), "HTML names no cause");
+    assert!(!html.contains("character budget"), "the cause is not the text budget");
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("empty table cells")),
+        "no warning: {:?}",
+        ir.metadata.warnings
+    );
 }
 
 #[test]
@@ -246,13 +273,25 @@ fn test_shared_formula_budget_is_per_document_not_per_sheet() {
         parts.push((format!("xl/worksheets/sheet{i}.xml"), sheet.clone().into_bytes()));
     }
     let parts: Vec<(&str, Vec<u8>)> = parts.iter().map(|(n, d)| (n.as_str(), d.clone())).collect();
-    let doc = open(package(&sheets, &rels, &parts)).unwrap();
-    let text = doc.plain_text();
-    assert!(
-        text.contains("unreadable sheet"),
-        "the sheets past the document total are reported"
-    );
-    assert!(text.contains("S1"), "the sheets within it are read");
+    // Whichever order the sheets are parsed in, the first sheets keep their
+    // formulas and the last lose them.
+    let bytes = package(&sheets, &rels, &parts);
+    let dropped = |bytes: &[u8]| -> Vec<usize> {
+        let doc = open(bytes.to_vec()).expect("no sheet is unreadable");
+        doc.as_xlsx()
+            .unwrap()
+            .worksheets
+            .iter()
+            .map(|w| w.formulas_dropped)
+            .collect()
+    };
+    let first = dropped(&bytes);
+    assert_eq!(first.len(), 6, "every sheet is read");
+    assert_eq!(&first[..2], &[0, 0], "{first:?}");
+    assert_eq!(first[5], 20, "{first:?}");
+    for _ in 0..5 {
+        assert_eq!(dropped(&bytes), first, "the outcome depends on scheduling");
+    }
 }
 
 #[test]
@@ -302,6 +341,12 @@ const IMAGE_BUDGET: usize = 10_000;
 /// A sheet whose one drawing anchors the same `media_len`-byte picture
 /// `anchors` times.
 fn picture_fan_out_workbook(anchors: usize, media_len: usize) -> Vec<u8> {
+    picture_workbook(anchors, media_len, 0)
+}
+
+/// [`picture_fan_out_workbook`] followed by `plain_sheets` sheets with one
+/// number each and no drawing.
+fn picture_workbook(anchors: usize, media_len: usize, plain_sheets: usize) -> Vec<u8> {
     let mut drawing = String::from(
         r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">"#,
     );
@@ -315,10 +360,21 @@ fn picture_fan_out_workbook(anchors: usize, media_len: usize) -> Vec<u8> {
     let sheet = format!(
         r#"<worksheet xmlns="{NS}" xmlns:r="{R}"><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><drawing r:id="rId1"/></worksheet>"#
     );
-    package(
-        r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#,
-        &worksheet_rel("rId1", "worksheets/sheet1.xml"),
-        &[
+    let mut sheets = String::from(r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#);
+    let mut rels = worksheet_rel("rId1", "worksheets/sheet1.xml");
+    let mut parts = Vec::new();
+    for i in 0..plain_sheets {
+        let n = i + 2;
+        sheets.push_str(&format!(r#"<sheet name="P{n}" sheetId="{n}" r:id="rId{n}"/>"#));
+        rels.push_str(&worksheet_rel(&format!("rId{n}"), &format!("worksheets/sheet{n}.xml")));
+        parts.push((
+            format!("xl/worksheets/sheet{n}.xml"),
+            format!(r#"<worksheet xmlns="{NS}"><sheetData><row r="1"><c r="A1"><v>{n}</v></c></row></sheetData></worksheet>"#).into_bytes(),
+        ));
+    }
+    let mut parts: Vec<(&str, Vec<u8>)> =
+        parts.iter().map(|(n, d)| (n.as_str(), d.clone())).collect();
+    parts.extend([
             ("xl/worksheets/sheet1.xml", sheet.into_bytes()),
             (
                 "xl/worksheets/_rels/sheet1.xml.rels",
@@ -330,8 +386,8 @@ fn picture_fan_out_workbook(anchors: usize, media_len: usize) -> Vec<u8> {
                 format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/image" Target="../media/image1.png"/></Relationships>"#).into_bytes(),
             ),
             ("xl/media/image1.png", vec![7u8; media_len]),
-        ],
-    )
+    ]);
+    package(&sheets, &rels, &parts)
 }
 
 fn ir_image_count(ir: &office_oxide::DocumentIR) -> usize {
@@ -365,6 +421,26 @@ fn test_one_picture_drawn_from_many_anchors_shares_its_bytes_and_is_bounded_in_t
     assert_eq!(ir_image_count(&ir), 10, "pictures past the budget are left out");
     assert!(ir.metadata.text_truncated);
     assert!(ir.plain_text().contains("picture budget"));
+}
+
+#[test]
+fn test_the_picture_notice_is_given_once_not_on_every_later_sheet() {
+    set_budgets();
+    office_oxide::limits::set_max_image_bytes(IMAGE_BUDGET);
+    // The first sheet spends the picture budget; the two sheets after it have
+    // no pictures and nothing to be told about.
+    let doc = open(picture_workbook(100, 1_000, 2)).unwrap();
+    let ir = doc.to_ir();
+    let notices = ir.plain_text().matches("picture budget").count();
+    assert_eq!(notices, 1, "the notice appears {notices} times");
+    let warnings = ir
+        .metadata
+        .warnings
+        .iter()
+        .filter(|w| w.contains("pictures were left out"))
+        .count();
+    assert_eq!(warnings, 1, "{:?}", ir.metadata.warnings);
+    assert!(doc.plain_text().contains("P3"), "the later sheets are kept");
 }
 
 #[test]
@@ -685,4 +761,314 @@ fn test_one_sheet_part_under_several_spellings_is_still_read_once() {
     let xlsx = doc.as_xlsx().unwrap();
     assert_eq!(xlsx.worksheets.len(), 1, "the part is parsed once");
     assert_eq!(xlsx.unreadable_sheets.len(), spellings.len() - 1);
+}
+
+/// One sheet of `links` numeric cells (A1, A2, ...), each hyperlinked
+/// through one relationship whose external target is `target_len`
+/// characters long.
+fn hyperlink_fan_out_workbook(links: usize, target_len: usize) -> Vec<u8> {
+    let mut sheet = format!(r#"<worksheet xmlns="{NS}" xmlns:r="{R}"><sheetData>"#);
+    for r in 1..=links {
+        sheet.push_str(&format!(r#"<row r="{r}"><c r="A{r}"><v>{r}</v></c></row>"#));
+    }
+    sheet.push_str("</sheetData><hyperlinks>");
+    for r in 1..=links {
+        sheet.push_str(&format!(r#"<hyperlink ref="A{r}" r:id="rId1"/>"#));
+    }
+    sheet.push_str("</hyperlinks></worksheet>");
+    let target = format!("http://example.com/{}", "a".repeat(target_len));
+    package(
+        r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#,
+        &worksheet_rel("rId1", "worksheets/sheet1.xml"),
+        &[
+            ("xl/worksheets/sheet1.xml", sheet.into_bytes()),
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels",
+                format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/hyperlink" Target="{target}" TargetMode="External"/></Relationships>"#).into_bytes(),
+            ),
+        ],
+    )
+}
+
+/// Bytes of hyperlink target held by the IR's text spans, and how many spans
+/// carry one.
+fn ir_hyperlinks(ir: &office_oxide::DocumentIR) -> (usize, usize) {
+    use office_oxide::ir::{Element, InlineContent};
+    let (mut bytes, mut count) = (0, 0);
+    let mut paragraph = |content: &[InlineContent]| {
+        for c in content {
+            if let InlineContent::Text(span) = c {
+                if let Some(h) = &span.hyperlink {
+                    bytes += h.len();
+                    count += 1;
+                }
+            }
+        }
+    };
+    for e in ir.sections.iter().flat_map(|s| &s.elements) {
+        match e {
+            Element::Paragraph(p) => paragraph(&p.content),
+            Element::Table(t) => {
+                for cell in t.rows.iter().flat_map(|r| &r.cells) {
+                    for el in &cell.content {
+                        if let Element::Paragraph(p) = el {
+                            paragraph(&p.content);
+                        }
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+    (bytes, count)
+}
+
+#[test]
+fn test_a_hyperlink_target_longer_than_excels_limit_is_dropped_and_reported() {
+    set_budgets();
+    // Excel stores at most 2,083 characters of a hyperlink address; a
+    // 1 MB target cannot come from it and was copied onto every link.
+    let doc = open(hyperlink_fan_out_workbook(40, 100_000)).unwrap();
+    let ir = doc.to_ir();
+    assert_eq!(ir_hyperlinks(&ir), (0, 0), "an over-long target was copied into the IR");
+    let text = doc.plain_text();
+    assert!(text.contains("40"), "the cells stay: {text}");
+    assert!(
+        ir.metadata.warnings.iter().any(|w| w.contains("hyperlink")),
+        "no warning: {:?}",
+        ir.metadata.warnings
+    );
+}
+
+#[test]
+fn test_one_hyperlink_target_on_many_cells_is_charged_to_the_text_budget() {
+    set_budgets();
+    // 2,000 characters on each of 100 cells is 200,000 against a 60,000
+    // budget.
+    let doc = open(hyperlink_fan_out_workbook(100, 2_000)).unwrap();
+    let ir = doc.to_ir();
+    let (bytes, count) = ir_hyperlinks(&ir);
+    assert!(count > 0, "the links that fit are kept");
+    assert!(bytes <= TEXT_BUDGET, "{bytes} bytes of hyperlink in the IR");
+    assert!(ir.metadata.text_truncated, "the truncation is not flagged");
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("character budget"))
+    );
+}
+
+#[test]
+fn test_a_few_ordinary_hyperlinks_are_unaffected() {
+    set_budgets();
+    let doc = open(hyperlink_fan_out_workbook(3, 40)).unwrap();
+    let ir = doc.to_ir();
+    assert_eq!(ir_hyperlinks(&ir).1, 3);
+    assert!(!ir.metadata.text_truncated);
+    assert!(ir.metadata.warnings.is_empty(), "{:?}", ir.metadata.warnings);
+}
+
+/// One shared string of `runs` one-character rich-text runs (each with its
+/// own font), named by `cells` cells in column A.
+fn rich_text_fan_out_workbook(runs: usize, cells: usize) -> Vec<u8> {
+    let mut sst = format!(r#"<sst xmlns="{NS}" count="{cells}" uniqueCount="1"><si>"#);
+    for _ in 0..runs {
+        sst.push_str(r#"<r><rPr><b/><rFont val="Arial"/><sz val="11"/></rPr><t>x</t></r>"#);
+    }
+    sst.push_str("</si></sst>");
+    let mut sheet = format!(r#"<worksheet xmlns="{NS}"><sheetData>"#);
+    for r in 1..=cells {
+        sheet.push_str(&format!(r#"<row r="{r}"><c r="A{r}" t="s"><v>0</v></c></row>"#));
+    }
+    sheet.push_str("</sheetData></worksheet>");
+    package(
+        r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#,
+        &format!(
+            r#"{}<Relationship Id="rId9" Type="{R}/sharedStrings" Target="sharedStrings.xml"/>"#,
+            worksheet_rel("rId1", "worksheets/sheet1.xml")
+        ),
+        &[
+            ("xl/worksheets/sheet1.xml", sheet.into_bytes()),
+            ("xl/sharedStrings.xml", sst.into_bytes()),
+        ],
+    )
+}
+
+/// How many text spans the IR holds in table cells and paragraphs.
+fn ir_span_count(ir: &office_oxide::DocumentIR) -> usize {
+    use office_oxide::ir::{Element, InlineContent};
+    let count = |content: &[InlineContent]| {
+        content
+            .iter()
+            .filter(|c| matches!(c, InlineContent::Text(_)))
+            .count()
+    };
+    let mut total = 0;
+    for e in ir.sections.iter().flat_map(|s| &s.elements) {
+        match e {
+            Element::Paragraph(p) => total += count(&p.content),
+            Element::Table(t) => {
+                for el in t
+                    .rows
+                    .iter()
+                    .flat_map(|r| &r.cells)
+                    .flat_map(|c| &c.content)
+                {
+                    if let Element::Paragraph(p) = el {
+                        total += count(&p.content);
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+    total
+}
+
+#[test]
+fn test_rich_text_runs_of_one_shared_string_are_charged_for_every_cell_that_names_it() {
+    set_budgets();
+    // 100 runs of one character each in 50 cells: 5,000 characters of text,
+    // but 5,000 spans of a few hundred bytes each against a 60,000 budget.
+    let doc = open(rich_text_fan_out_workbook(100, 50)).unwrap();
+    let ir = doc.to_ir();
+    let spans = ir_span_count(&ir);
+    assert!(spans > 0, "the cells that fit are kept");
+    assert!(spans < 1_000, "{spans} spans were built from a 3 KB workbook");
+    assert!(ir.metadata.text_truncated, "the truncation is not flagged");
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("character budget"))
+    );
+}
+
+#[test]
+fn test_a_few_rich_text_cells_are_unaffected() {
+    set_budgets();
+    let doc = open(rich_text_fan_out_workbook(3, 5)).unwrap();
+    let ir = doc.to_ir();
+    assert_eq!(ir_span_count(&ir), 15);
+    assert!(!ir.metadata.text_truncated);
+}
+
+/// `cells` numeric cells in column A, all in a style whose number format code
+/// is `code`.
+fn number_format_workbook(code: &str, cells: usize) -> Vec<u8> {
+    let styles = format!(
+        r#"<styleSheet xmlns="{NS}"><numFmts count="1"><numFmt numFmtId="164" formatCode="{code}"/></numFmts><fonts count="1"><font/></fonts><fills count="1"><fill/></fills><borders count="1"><border/></borders><cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="164" applyNumberFormat="1"/></cellXfs></styleSheet>"#
+    );
+    let mut sheet = format!(r#"<worksheet xmlns="{NS}"><sheetData>"#);
+    for r in 1..=cells {
+        sheet.push_str(&format!(r#"<row r="{r}"><c r="A{r}" s="1"><v>{r}</v></c></row>"#));
+    }
+    sheet.push_str("</sheetData></worksheet>");
+    package(
+        r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#,
+        &worksheet_rel("rId1", "worksheets/sheet1.xml"),
+        &[
+            ("xl/worksheets/sheet1.xml", sheet.into_bytes()),
+            ("xl/styles.xml", styles.into_bytes()),
+        ],
+    )
+}
+
+/// The number-format code of every table cell in the IR that has one.
+fn ir_number_formats(ir: &office_oxide::DocumentIR) -> Vec<String> {
+    use office_oxide::ir::Element;
+    ir.sections
+        .iter()
+        .flat_map(|s| &s.elements)
+        .filter_map(|e| match e {
+            Element::Table(t) => Some(t),
+            _ => None,
+        })
+        .flat_map(|t| t.rows.iter().flat_map(|r| &r.cells))
+        .filter_map(|c| c.number_format.clone())
+        .collect()
+}
+
+#[test]
+fn test_a_number_format_code_longer_than_excels_limit_is_not_copied_into_every_cell() {
+    set_budgets();
+    // Excel accepts at most 255 characters of format code; a 100,000
+    // character one was copied into every cell that used it.
+    let code = format!("0.{}", "0".repeat(100_000));
+    let doc = open(number_format_workbook(&code, 40)).unwrap();
+    let ir = doc.to_ir();
+    let copied: usize = ir_number_formats(&ir).iter().map(String::len).sum();
+    assert_eq!(copied, 0, "{copied} bytes of format code were copied into the IR");
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("number format")),
+        "no warning: {:?}",
+        ir.metadata.warnings
+    );
+    assert!(doc.plain_text().contains("40"), "the cells keep their values");
+}
+
+#[test]
+fn test_an_ordinary_number_format_code_is_still_reported_on_each_cell() {
+    set_budgets();
+    let doc = open(number_format_workbook("0.00", 5)).unwrap();
+    let ir = doc.to_ir();
+    assert_eq!(ir_number_formats(&ir), vec!["0.00"; 5]);
+    assert!(ir.metadata.warnings.is_empty(), "{:?}", ir.metadata.warnings);
+}
+
+#[test]
+fn test_rich_text_runs_longer_than_the_cell_text_shown_are_charged_in_full() {
+    set_budgets();
+    // The cell's displayed text stops at 32 KB, but its spans are built from
+    // the runs: two 40,000-character runs, named by 20 cells.
+    let mut sst = format!(r#"<sst xmlns="{NS}" count="20" uniqueCount="1"><si>"#);
+    for _ in 0..2 {
+        sst.push_str(&format!(r#"<r><rPr><b/></rPr><t>{}</t></r>"#, "y".repeat(40_000)));
+    }
+    sst.push_str("</si></sst>");
+    let mut sheet = format!(r#"<worksheet xmlns="{NS}"><sheetData>"#);
+    for r in 1..=20 {
+        sheet.push_str(&format!(r#"<row r="{r}"><c r="A{r}" t="s"><v>0</v></c></row>"#));
+    }
+    sheet.push_str("</sheetData></worksheet>");
+    let bytes = package(
+        r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#,
+        &format!(
+            r#"{}<Relationship Id="rId9" Type="{R}/sharedStrings" Target="sharedStrings.xml"/>"#,
+            worksheet_rel("rId1", "worksheets/sheet1.xml")
+        ),
+        &[
+            ("xl/worksheets/sheet1.xml", sheet.into_bytes()),
+            ("xl/sharedStrings.xml", sst.into_bytes()),
+        ],
+    );
+    let ir = open(bytes).unwrap().to_ir();
+    let held: usize = serde_json::to_string(&ir).unwrap().matches('y').count();
+    assert!(held <= TEXT_BUDGET, "{held} characters of run text in the IR");
+    assert!(ir.metadata.text_truncated);
+}
+
+#[test]
+fn test_hyperlinks_over_one_relationship_share_one_target_allocation() {
+    use office_oxide::xlsx::HyperlinkTarget;
+    set_budgets();
+    let doc = open(hyperlink_fan_out_workbook(100, 2_000)).unwrap();
+    let links = &doc.as_xlsx().unwrap().worksheets[0].hyperlinks;
+    assert_eq!(links.len(), 100);
+    let targets: Vec<_> = links
+        .iter()
+        .map(|l| match &l.target {
+            HyperlinkTarget::External(t) => t.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert!(
+        targets
+            .iter()
+            .all(|t| std::sync::Arc::ptr_eq(t, &targets[0]))
+    );
 }

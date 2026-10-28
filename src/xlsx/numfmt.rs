@@ -462,7 +462,7 @@ impl CompiledSection {
                 '0' => {
                     in_num_part = true;
                     if in_decimal {
-                        decimal_zeros += 1;
+                        decimal_zeros = decimal_zeros.saturating_add(1);
                     } else {
                         has_forced_integer_digit = true;
                     }

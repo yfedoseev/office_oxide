@@ -45,10 +45,22 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     // budget is still laid out, and its padding is still paid for.
     let mut image_budget = crate::limits::TextBudget::with_limit(crate::limits::max_image_bytes());
     let mut comments_truncated = false;
-    let mut padding_budget = crate::limits::TextBudget::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut format_code_omitted = false;
+    // The picture notice belongs to the sheet whose pictures spent the budget.
+    let mut image_notice_given = false;
+    let mut formulas_truncated = false;
+    let mut padding_notice_given = false;
+    let mut padding_budget = crate::limits::IrPaddingBudget::new();
+    // Padding is also paid for in characters, 3 an empty cell as Markdown
+    // pays for an absent column, from a budget of its own: the cells' text
+    // has spent the text budget by the time the rows are laid out, and the
+    // rows whose text fit must not be lost for it. Lowering the text limit
+    // still lowers this one.
+    let mut padding_chars = crate::limits::TextBudget::new();
 
     for (ws_idx, ws) in doc.worksheets.iter().enumerate() {
-        if budget.exhausted() || padding_budget.exhausted() {
+        if budget.exhausted() || padding_budget.exhausted() || padding_chars.exhausted() {
             break;
         }
         // First pass: parse all rows into `CellData` — the rendered display
@@ -62,7 +74,10 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         // every clickable cell in a workbook lost its target — DOCX and
         // PPTX both emit links. Index by (row, col) for O(1) lookup.
         // The value is the target and its hover text (`@tooltip`).
-        let links: std::collections::HashMap<(u32, u32), (String, Option<String>)> = ws
+        // Targets and hover text are shared from here to the cells; the IR
+        // owns a copy per span, which is charged to the budget below.
+        type Link = (std::sync::Arc<str>, Option<std::sync::Arc<str>>);
+        let links: std::collections::HashMap<(u32, u32), Link> = ws
             .hyperlinks
             .iter()
             .filter_map(|h| {
@@ -70,11 +85,11 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 let target = match &h.target {
                     crate::xlsx::HyperlinkTarget::External(u) => u.clone(),
                     crate::xlsx::HyperlinkTarget::Internal(loc) if !loc.is_empty() => {
-                        format!("#{loc}")
+                        std::sync::Arc::from(format!("#{loc}"))
                     },
                     crate::xlsx::HyperlinkTarget::Internal(_) => return None,
                 };
-                Some(((r.row, r.col), (target, h.tooltip.clone())))
+                Some(((r.row, r.col), (target, h.tooltip.as_deref().map(std::sync::Arc::from))))
             })
             .collect();
 
@@ -119,9 +134,24 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             for cell in &row.cells {
                 buf.clear();
                 formatter.write(cell, &mut buf);
-                // A row keeps the cells that fit the budget; the sheet
+                let link = links.get(&(cell.reference.row, cell.reference.col));
+                // The cell's text, and the hyperlink target and hover text
+                // each span of it will carry, are paid for before any is
+                // made. A row keeps the cells that fit the budget; the sheet
                 // ends after it.
-                if !budget.charge(buf.len()) {
+                // A rich-text cell has one span per run, each with its own
+                // copy of the link and its own formatting.
+                let rich_runs = rich_runs_of(doc, cell);
+                let runs = rich_runs.as_deref().filter(|r| !r.is_empty());
+                let link_chars = link
+                    .map_or(0, |(target, tip)| target.len() + tip.as_ref().map_or(0, |t| t.len()))
+                    .saturating_mul(runs.map_or(1, <[_]>::len));
+                let run_chars = runs.map_or(0, rich_span_chars);
+                if !budget.charge(
+                    buf.len()
+                        .saturating_add(link_chars)
+                        .saturating_add(run_chars),
+                ) {
                     break;
                 }
                 let text = if buf.is_empty() {
@@ -130,19 +160,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                     std::mem::take(&mut buf)
                 };
                 let (data_type, raw_number, number_format, number_format_id) =
-                    cell_semantics(doc, cell, &date_indices);
-                let rich_runs = match &cell.value {
-                    crate::xlsx::cell::CellValue::SharedString(idx) => doc
-                        .shared_strings
-                        .get_shared(*idx)
-                        .and_then(|s| s.rich_text.clone()),
-                    // An inline (`t="inlineStr"`) string cell carries its
-                    // own rich runs directly on the raw `Cell`, not via
-                    // the shared string table.
-                    crate::xlsx::cell::CellValue::String(_) => cell.rich_runs.clone(),
-                    _ => None,
-                };
-                let link = links.get(&(cell.reference.row, cell.reference.col));
+                    cell_semantics(doc, cell, &date_indices, &mut format_code_omitted);
                 cells.push(CellData {
                     col: cell.reference.col,
                     hyperlink: link.map(|(target, _)| target.clone()),
@@ -310,9 +328,14 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 // are charged to the budget, which ends the table at the row
                 // that spends it: a sheet with cells at A1 and XFD1 and a
                 // thousand rows between would otherwise be 16 million cells.
-                let padding = grid_width.saturating_sub(cells.len());
-                if !padding_budget
-                    .charge(padding.saturating_mul(crate::limits::EMPTY_TABLE_CELL_CHARS))
+                // The empty cells made are those of the grid's columns no cell
+                // of the row occupies (cells may share a column or arrive out
+                // of order). They are paid for as memory, and as characters
+                // too, as Markdown pays for an absent column.
+                let padding = grid_width.saturating_sub(distinct_columns(cells));
+                if !padding_budget.charge_cells(padding)
+                    || !padding_chars
+                        .charge(padding.saturating_mul(crate::xlsx::text::MARKDOWN_PAD_CHARS))
                 {
                     break;
                 }
@@ -512,7 +535,8 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 ..Default::default()
             }));
         }
-        if image_budget.exhausted() {
+        if image_budget.exhausted() && !image_notice_given {
+            image_notice_given = true;
             combined.push(Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain(format!(
                     "[some pictures not shown: together they exceed the {} byte picture budget \
@@ -522,9 +546,38 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 ..Default::default()
             }));
         }
-        if budget.exhausted() || padding_budget.exhausted() {
+        if ws.formulas_dropped > 0 {
+            formulas_truncated = true;
+            warnings.push(format!(
+                "sheet {:?}: {} shared formula(s) left out: a master longer than {} characters, or \
+                 copies past the character budget (office_oxide::limits::set_max_text_chars); \
+                 the cells keep their values",
+                ws.name,
+                ws.formulas_dropped,
+                crate::limits::MAX_FORMULA_CHARS
+            ));
+        }
+        if ws.hyperlinks_dropped > 0 {
+            warnings.push(format!(
+                "sheet {:?}: {} hyperlink(s) left out: their target is longer than {} characters",
+                ws.name,
+                ws.hyperlinks_dropped,
+                crate::limits::MAX_HYPERLINK_TARGET_CHARS
+            ));
+        }
+        if budget.exhausted() {
             combined.push(Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain(budget.notice()))],
+                ..Default::default()
+            }));
+        }
+        if (padding_budget.exhausted() || padding_chars.exhausted()) && !padding_notice_given {
+            padding_notice_given = true;
+            combined.push(Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(padding_notice(
+                    &padding_budget,
+                    &padding_chars,
+                )))],
                 ..Default::default()
             }));
         }
@@ -697,7 +750,27 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         .filter(|t| !t.is_empty())
         .or_else(|| sections.first().and_then(|s| s.title.clone()));
 
-    DocumentIR {
+    if budget.exhausted() {
+        warnings.push(budget.notice());
+    }
+    if padding_budget.exhausted() || padding_chars.exhausted() {
+        warnings.push(padding_notice(&padding_budget, &padding_chars));
+    }
+    if image_budget.exhausted() {
+        warnings.push(format!(
+            "some pictures were left out: the document's pictures exceed the {} byte budget \
+             (office_oxide::limits::set_max_image_bytes)",
+            image_budget.limit()
+        ));
+    }
+    if format_code_omitted {
+        warnings.push(format!(
+            "some cells' number format code is longer than {} characters and is not listed on \
+             them (they keep their format id and values)",
+            crate::limits::MAX_NUMBER_FORMAT_CHARS
+        ));
+    }
+    let mut ir = DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Xlsx,
             title,
@@ -715,7 +788,9 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 || pivot_truncated
                 || budget.exhausted()
                 || padding_budget.exhausted()
+                || padding_chars.exhausted()
                 || comments_truncated
+                || formulas_truncated
                 || image_budget.exhausted(),
             defined_names: doc
                 .workbook
@@ -735,7 +810,9 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             )
         },
         sections,
-    }
+    };
+    ir.metadata.warnings.extend(warnings);
+    ir
 }
 
 /// Give each merge anchor in `tcells` (one per grid column of sheet row
@@ -798,6 +875,30 @@ fn cell_is_blank(cell: &TableCell) -> bool {
     })
 }
 
+/// The notice for padding that ran out: the memory allowance when that is
+/// what was spent, otherwise the character budget.
+fn padding_notice(
+    memory: &crate::limits::IrPaddingBudget,
+    chars: &crate::limits::TextBudget,
+) -> String {
+    if memory.exhausted() {
+        memory.notice()
+    } else {
+        chars.notice()
+    }
+}
+
+/// How many different columns the cells of a row occupy.
+fn distinct_columns(cells: &[CellData]) -> usize {
+    if cells.windows(2).all(|w| w[0].col < w[1].col) {
+        return cells.len();
+    }
+    let mut cols: Vec<u32> = cells.iter().map(|cd| cd.col).collect();
+    cols.sort_unstable();
+    cols.dedup();
+    cols.len()
+}
+
 fn empty_cell() -> TableCell {
     TableCell {
         content: vec![Element::Paragraph(Paragraph::default())],
@@ -807,13 +908,46 @@ fn empty_cell() -> TableCell {
     }
 }
 
+/// The rich-text runs `cell` carries: those of its shared string, or its own
+/// inline ones. Shared, not copied: a shared string names the same runs from
+/// every cell that uses it.
+fn rich_runs_of(
+    doc: &crate::xlsx::XlsxDocument,
+    cell: &crate::xlsx::Cell,
+) -> Option<std::sync::Arc<[crate::xlsx::shared_strings::RichTextRun]>> {
+    match &cell.value {
+        crate::xlsx::cell::CellValue::SharedString(idx) => doc
+            .shared_strings
+            .get_shared(*idx)
+            .and_then(|s| s.rich_text.clone()),
+        // An inline (`t="inlineStr"`) string cell carries its own rich runs
+        // directly on the raw `Cell`, not via the shared string table.
+        crate::xlsx::cell::CellValue::String(_) => cell.rich_runs.clone(),
+        _ => None,
+    }
+}
+
+/// What the IR's spans for `runs` cost: each run becomes a `TextSpan` of its
+/// own, with its own copy of the run's text (the displayed cell text stops at
+/// 32 KB, the runs do not) and of the font name. The runs are
+/// stored once, so without this a string of thousands of runs named by
+/// thousands of cells is a span per run per cell for free.
+fn rich_span_chars(runs: &[crate::xlsx::shared_strings::RichTextRun]) -> usize {
+    runs.iter().fold(0usize, |total, r| {
+        total
+            .saturating_add(std::mem::size_of::<TextSpan>())
+            .saturating_add(r.text.len())
+            .saturating_add(r.font_name.as_ref().map_or(0, String::len))
+    })
+}
+
 /// Build the styled span for a cell: display text, the cell font's size and
 /// weight from the workbook stylesheet, and the sheet's hyperlink target if
 /// the cell has one.
 fn cell_span(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> TextSpan {
     let mut span = TextSpan::plain(display_text(cd).to_string());
-    span.hyperlink = cd.hyperlink.clone();
-    span.hyperlink_tooltip = cd.hyperlink_tooltip.clone();
+    span.hyperlink = cd.hyperlink.as_deref().map(str::to_string);
+    span.hyperlink_tooltip = cd.hyperlink_tooltip.as_deref().map(str::to_string);
     let Some(font) = cd.style_index.and_then(|idx| font_for(doc, idx)) else {
         return span;
     };
@@ -842,8 +976,8 @@ fn cell_spans(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> Vec<InlineConte
     runs.iter()
         .map(|r| {
             let mut span = TextSpan::plain(r.text.clone());
-            span.hyperlink = cd.hyperlink.clone();
-            span.hyperlink_tooltip = cd.hyperlink_tooltip.clone();
+            span.hyperlink = cd.hyperlink.as_deref().map(str::to_string);
+            span.hyperlink_tooltip = cd.hyperlink_tooltip.as_deref().map(str::to_string);
             span.bold = r.bold.unwrap_or(false);
             span.italic = r.italic.unwrap_or(false);
             if let Some(size_pt) = r.font_size {
@@ -872,9 +1006,9 @@ struct CellData {
     /// one column left and filed it under the wrong header.
     col: u32,
     /// Hyperlink target for this cell, when the sheet declares one.
-    hyperlink: Option<String>,
+    hyperlink: Option<std::sync::Arc<str>>,
     /// That hyperlink's hover text (`hyperlink/@tooltip`).
-    hyperlink_tooltip: Option<String>,
+    hyperlink_tooltip: Option<std::sync::Arc<str>>,
     /// Rendered display string (same text `write_cell_value_fast` produces).
     text: String,
     /// Cell format index (`s` attribute) — used for prose-mode font recovery.
@@ -894,7 +1028,7 @@ struct CellData {
     /// string with `<r><rPr>…</rPr><t>…</t></r>` sub-runs (e.g. a bold
     /// superscript footnote marker within otherwise-plain text). `None`
     /// for a plain (non-rich) string or any non-string cell.
-    rich_runs: Option<Vec<crate::xlsx::shared_strings::RichTextRun>>,
+    rich_runs: Option<std::sync::Arc<[crate::xlsx::shared_strings::RichTextRun]>>,
 }
 
 /// The text a cell should show when it has no cached value: `=formula`
@@ -927,6 +1061,7 @@ fn cell_semantics(
     doc: &crate::xlsx::XlsxDocument,
     cell: &crate::xlsx::Cell,
     date_indices: &std::collections::HashSet<u32>,
+    format_code_omitted: &mut bool,
 ) -> (Option<CellDataType>, Option<f64>, Option<String>, Option<u32>) {
     use crate::xlsx::CellValue;
 
@@ -939,13 +1074,24 @@ fn cell_semantics(
         .style_index
         .and_then(|idx| doc.styles.as_ref()?.number_format_id_for(idx))
         .filter(|&id| id != 0);
-    let fmt_str = cell
+    let declared = cell
         .style_index
-        .and_then(|idx| doc.styles.as_ref()?.number_format_for(idx))
-        .map(|s| s.to_string())
-        .or_else(|| {
+        .and_then(|idx| doc.styles.as_ref()?.number_format_for(idx));
+    let max = crate::limits::MAX_NUMBER_FORMAT_CHARS;
+    // The code is copied onto every cell of the style, so one longer than
+    // Excel allows is left off rather than multiplied (and is never copied
+    // to be measured). A character is at most four bytes, so only a short
+    // code is counted.
+    let fmt_str = match declared {
+        Some(code) if code.len() > max * 4 || code.chars().count() > max => {
+            *format_code_omitted = true;
+            None
+        },
+        Some(code) => Some(code.to_string()),
+        None => {
             fmt_id.and_then(|id| crate::xlsx::numfmt::builtin_format_code(id).map(str::to_string))
-        });
+        },
+    };
 
     let (data_type, raw_number) = match &cell.value {
         CellValue::Empty => unreachable!("handled above"),

@@ -20,6 +20,15 @@ pub struct Worksheet {
     pub merged_cells: Vec<String>,
     /// Hyperlinks defined on this sheet.
     pub hyperlinks: Vec<HyperlinkInfo>,
+    /// Formulas left out: a shared-formula master longer than Excel allows (8,192
+    /// characters), the cells that follow it, and followers whose copies of
+    /// the master would pass the document's text budget
+    /// ([`crate::limits::set_max_text_chars`]). The cells keep their values.
+    pub formulas_dropped: usize,
+    /// Hyperlinks left out because their relationship's target is longer than
+    /// [`crate::limits::MAX_HYPERLINK_TARGET_CHARS`] (2,083 characters, Excel's
+    /// own limit).
+    pub hyperlinks_dropped: usize,
     /// Per-sheet page geometry parsed from `<pageMargins>` + `<pageSetup>`.
     pub page_setup: Option<PageSetup>,
     /// Pictures anchored on this worksheet via `xl/drawings/drawingN.xml`.
@@ -832,8 +841,8 @@ pub struct HyperlinkInfo {
 /// Hyperlink target type.
 #[derive(Debug, Clone)]
 pub enum HyperlinkTarget {
-    /// External URL.
-    External(String),
+    /// External URL, shared by every link that names the same relationship.
+    External(std::sync::Arc<str>),
     /// Internal sheet/cell location.
     Internal(String),
 }
@@ -848,6 +857,8 @@ impl Worksheet {
             rows: Vec::new(),
             merged_cells: Vec::new(),
             hyperlinks: Vec::new(),
+            hyperlinks_dropped: 0,
+            formulas_dropped: 0,
             page_setup: None,
             images: Vec::new(),
             comments: Vec::new(),
@@ -870,17 +881,22 @@ impl Worksheet {
         name: String,
         rels: &crate::core::relationships::Relationships,
     ) -> crate::core::Result<Self> {
-        Self::parse_within(xml_data, name, rels, crate::limits::SharedTextBudget::new())
+        let (mut ws, shared) = Self::parse_unresolved(xml_data, name, rels)?;
+        ws.formulas_dropped = shared
+            .resolve(&mut ws.rows, &mut crate::limits::TextBudget::new())
+            .dropped;
+        Ok(ws)
     }
 
-    /// [`Self::parse`] with the translated shared-formula text charged to
-    /// `formulas`, the budget of the whole document rather than of this sheet.
-    pub(crate) fn parse_within(
+    /// [`Self::parse`] without writing the formulas of shared-formula
+    /// followers, which the caller does with [`SharedFormulas::resolve`] once
+    /// all sheets are read so that one document-wide budget is spent in
+    /// sheet order whatever order the sheets were parsed in.
+    pub(crate) fn parse_unresolved(
         xml_data: &[u8],
         name: String,
         rels: &crate::core::relationships::Relationships,
-        formulas: crate::limits::SharedTextBudget,
-    ) -> crate::core::Result<Self> {
+    ) -> crate::core::Result<(Self, SharedFormulas)> {
         // Use plain Reader (not NsReader) for performance — worksheet XML is always
         // in the SML namespace, so namespace resolution is unnecessary overhead.
         // This is the hot path: worksheets can have thousands of cells.
@@ -889,13 +905,14 @@ impl Worksheet {
         let mut rows = Vec::new();
         let mut merged_cells = Vec::new();
         let mut hyperlinks = Vec::new();
+        let mut link_targets = LinkTargets::default();
         // Page setup is collected lazily because <pageMargins> and
         // <pageSetup> arrive as separate sibling elements and either may
         // appear without the other. We materialize the IR value at the
         // end iff at least one was seen.
         let mut margins_in: Option<PageMarginsIn> = None;
         let mut page_setup_raw: Option<PageSetupRaw> = None;
-        let mut shared = SharedFormulas::with_budget(formulas);
+        let mut shared = SharedFormulas::default();
         let mut conditional_formats = Vec::new();
         let mut data_validations = Vec::new();
         let mut header_footer = SheetHeaderFooter::default();
@@ -912,6 +929,7 @@ impl Worksheet {
                         // previous row (ECMA-376 18.3.1.73); some writers omit
                         // it throughout the sheet.
                         let implied = rows.last().map_or(1, |r: &Row| r.index + 1);
+                        shared.at_position(rows.len(), 0);
                         rows.push(parse_row_fast(&mut reader, e, implied, &mut shared)?);
                     },
                     "mergeCell" => {
@@ -921,7 +939,7 @@ impl Worksheet {
                         reader.read_to_end(e.to_end().name())?;
                     },
                     "hyperlink" => {
-                        if let Some(hl) = parse_hyperlink(e, rels)? {
+                        if let Some(hl) = parse_hyperlink(e, rels, &mut link_targets)? {
                             hyperlinks.push(hl);
                         }
                         reader.read_to_end(e.to_end().name())?;
@@ -955,7 +973,7 @@ impl Worksheet {
                         }
                     },
                     "hyperlink" => {
-                        if let Some(hl) = parse_hyperlink(e, rels)? {
+                        if let Some(hl) = parse_hyperlink(e, rels, &mut link_targets)? {
                             hyperlinks.push(hl);
                         }
                     },
@@ -974,22 +992,7 @@ impl Worksheet {
 
         let page_setup = build_page_setup(margins_in, page_setup_raw);
 
-        // A shared group's master usually precedes its followers, but not
-        // always — calamine ships a fixture with the records reversed — so
-        // followers that arrived first are filled in now.
-        if shared.has_pending() {
-            for (at, formula) in shared.resolve_pending()? {
-                if let Some(cell) = rows
-                    .iter_mut()
-                    .find(|r| r.index == at.row + 1)
-                    .and_then(|r| r.cells.iter_mut().find(|c| c.reference == at))
-                {
-                    cell.formula = Some(formula);
-                }
-            }
-        }
-
-        Ok(Worksheet {
+        let ws = Worksheet {
             kind: crate::ir::SheetKind::Worksheet,
             chart_text: Vec::new(),
             state: super::SheetState::Visible,
@@ -1003,12 +1006,15 @@ impl Worksheet {
             rows,
             merged_cells,
             hyperlinks,
+            hyperlinks_dropped: link_targets.dropped,
+            formulas_dropped: 0,
             page_setup,
             images: Vec::new(),
             text_shapes: Vec::new(),
             conditional_formats,
             data_validations,
-        })
+        };
+        Ok((ws, shared))
     }
 }
 
@@ -1392,9 +1398,44 @@ fn build_page_setup(
     Some(ps)
 }
 
+/// The external targets of one sheet's hyperlinks, each read from its
+/// relationship once: every `<hyperlink>` naming the relationship shares the
+/// one allocation instead of copying the target.
+#[derive(Default)]
+struct LinkTargets {
+    /// Relationship id to its target, or `None` when the target is longer than
+    /// [`crate::limits::MAX_HYPERLINK_TARGET_CHARS`].
+    by_id: std::collections::HashMap<String, Option<std::sync::Arc<str>>>,
+    /// Links left out for naming an over-long target.
+    dropped: usize,
+}
+
+impl LinkTargets {
+    /// The shared target of relationship `rid`, or `None` when it is too long
+    /// (counted as a dropped link).
+    fn external(
+        &mut self,
+        rid: &str,
+        rel: &crate::core::relationships::Relationship,
+    ) -> Option<std::sync::Arc<str>> {
+        let target = self.by_id.entry(rid.to_string()).or_insert_with(|| {
+            let max = crate::limits::MAX_HYPERLINK_TARGET_CHARS;
+            // A character is at most four bytes, so a target of more than four
+            // times the limit in bytes is over it without being counted.
+            let too_long = rel.target.len() > max * 4 || rel.target.chars().count() > max;
+            (!too_long).then(|| std::sync::Arc::from(rel.target.as_str()))
+        });
+        if target.is_none() {
+            self.dropped += 1;
+        }
+        target.clone()
+    }
+}
+
 fn parse_hyperlink(
     e: &quick_xml::events::BytesStart,
     rels: &crate::core::relationships::Relationships,
+    targets: &mut LinkTargets,
 ) -> crate::core::Result<Option<HyperlinkInfo>> {
     let cell_ref = match xml::optional_attr_str(e, "ref")? {
         Some(v) => v.into_owned(),
@@ -1408,7 +1449,10 @@ fn parse_hyperlink(
 
     let target = if let Some(rid) = r_id {
         if let Some(rel) = rels.get_by_id(&rid) {
-            HyperlinkTarget::External(rel.target.clone())
+            match targets.external(&rid, rel) {
+                Some(target) => HyperlinkTarget::External(target),
+                None => return Ok(None),
+            }
         } else {
             return Ok(None);
         }
@@ -1444,6 +1488,7 @@ fn parse_row_fast(
         match reader.read_event()? {
             Event::Start(ref e) => {
                 if e.local_name().as_ref() == "c" {
+                    shared.at_position(shared.row(), cells.len());
                     let cell = parse_cell_fast(reader, e, index, next_col, shared)?;
                     next_col = cell.reference.col.saturating_add(1);
                     cells.push(cell);
@@ -1556,7 +1601,8 @@ fn parse_cell_fast(
     let mut raw_value: Option<String> = None;
     let mut number: Option<f64> = None;
     let mut formula: Option<String> = None;
-    let mut inline_rich_runs: Option<Vec<crate::xlsx::shared_strings::RichTextRun>> = None;
+    let mut inline_rich_runs: Option<std::sync::Arc<[crate::xlsx::shared_strings::RichTextRun]>> =
+        None;
 
     loop {
         match reader.read_event()? {
@@ -1578,15 +1624,16 @@ fn parse_cell_fast(
                     let si = shared_si(e)?;
                     let text = read_text_fast(reader)?;
                     // A shared group's master carries the text once, here.
-                    if let Some(si) = si {
-                        shared.add_master(si, reference.clone(), text.clone())?;
-                    }
-                    formula = Some(text);
+                    // One longer than Excel allows is refused, with its group:
+                    // the cell keeps its value and has no formula.
+                    let accepted =
+                        si.is_none_or(|si| shared.add_master(si, reference.clone(), &text));
+                    formula = accepted.then_some(text);
                 },
                 "is" => {
                     let (text, runs) = parse_inline_string_fast(reader)?;
                     raw_value = Some(text);
-                    inline_rich_runs = runs;
+                    inline_rich_runs = runs.map(Into::into);
                 },
                 _ => {
                     reader.read_to_end(e.to_end().name())?;
@@ -1597,10 +1644,9 @@ fn parse_cell_fast(
                 // its own, but its formula is the group master's translated
                 // by the row/column offset. Discarding it made a formula
                 // cell indistinguishable from one with no formula.
-                formula = match shared_si(e)? {
-                    Some(si) => shared.follower(si, &reference)?,
-                    None => None,
-                };
+                if let Some(si) = shared_si(e)? {
+                    shared.follower(si, &reference);
+                }
             },
             Event::End(ref e) if e.local_name().as_ref() == "c" => {
                 break;
