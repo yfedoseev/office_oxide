@@ -343,50 +343,95 @@ const HTML_SECTION_SEPARATOR: &str = "\n<hr />\n";
 /// Separates the Markdown of two sections.
 const MARKDOWN_SECTION_SEPARATOR: &str = "\n\n---\n\n";
 
-/// Render sections as an HTML fragment, each as soon as it is handed over and
-/// dropped once rendered: the output of `DocumentIR::to_html_with`, without
-/// the sections having to exist together.
-pub(crate) fn html_from_sections<S: std::borrow::Borrow<Section>>(
+/// Puts the thread's HTML options back to their defaults when dropped.
+struct HtmlOptionsReset;
+
+impl Drop for HtmlOptionsReset {
+    fn drop(&mut self) {
+        HTML_OPTIONS.with(|o| o.set(HtmlOptions::default()));
+    }
+}
+
+/// Puts the thread's Markdown options back to their defaults when dropped.
+struct MarkdownOptionsReset;
+
+impl Drop for MarkdownOptionsReset {
+    fn drop(&mut self) {
+        MARKDOWN_OPTIONS.with(|o| o.set(MarkdownOptions::default()));
+    }
+}
+
+/// Write sections as an HTML fragment, each as soon as it is handed over and
+/// dropped once written: the output of `DocumentIR::to_html_with`, without
+/// the sections having to exist together or the result in memory.
+pub(crate) fn write_html_sections<S: std::borrow::Borrow<Section>, W: std::fmt::Write + ?Sized>(
     sections: impl IntoIterator<Item = S>,
     options: HtmlOptions,
-) -> String {
-    let mut out = String::new();
+    out: &mut W,
+) -> std::fmt::Result {
+    let _reset = HtmlOptionsReset;
     HTML_OPTIONS.with(|o| o.set(options));
+    let mut first = true;
     for section in sections {
         let html = render_section_html(section.borrow());
         drop(section);
         if html.is_empty() {
             continue;
         }
-        if !out.is_empty() {
-            out.push_str(HTML_SECTION_SEPARATOR);
+        if !std::mem::take(&mut first) {
+            out.write_str(HTML_SECTION_SEPARATOR)?;
         }
-        out.push_str(&html);
+        out.write_str(&html)?;
     }
-    HTML_OPTIONS.with(|o| o.set(HtmlOptions::default()));
-    out
+    Ok(())
 }
 
-/// Render sections as Markdown, each as soon as it is handed over and
-/// dropped once rendered; see [`html_from_sections`].
-pub(crate) fn markdown_from_sections<S: std::borrow::Borrow<Section>>(
+/// Write sections as Markdown, each as soon as it is handed over and dropped
+/// once written; see [`write_html_sections`].
+pub(crate) fn write_markdown_sections<
+    S: std::borrow::Borrow<Section>,
+    W: std::fmt::Write + ?Sized,
+>(
     sections: impl IntoIterator<Item = S>,
     options: MarkdownOptions,
-) -> String {
-    let mut out = String::new();
+    out: &mut W,
+) -> std::fmt::Result {
+    let _reset = MarkdownOptionsReset;
     MARKDOWN_OPTIONS.with(|o| o.set(options));
+    let mut first = true;
     for section in sections {
         let md = render_section_markdown(section.borrow());
         drop(section);
         if md.is_empty() {
             continue;
         }
-        if !out.is_empty() {
-            out.push_str(MARKDOWN_SECTION_SEPARATOR);
+        if !std::mem::take(&mut first) {
+            out.write_str(MARKDOWN_SECTION_SEPARATOR)?;
         }
-        out.push_str(&md);
+        out.write_str(&md)?;
     }
-    MARKDOWN_OPTIONS.with(|o| o.set(MarkdownOptions::default()));
+    Ok(())
+}
+
+/// [`write_html_sections`] into a `String`.
+pub(crate) fn html_from_sections<S: std::borrow::Borrow<Section>>(
+    sections: impl IntoIterator<Item = S>,
+    options: HtmlOptions,
+) -> String {
+    let mut out = String::new();
+    // Writing to a `String` cannot fail.
+    let _ = write_html_sections(sections, options, &mut out);
+    out
+}
+
+/// [`write_markdown_sections`] into a `String`.
+pub(crate) fn markdown_from_sections<S: std::borrow::Borrow<Section>>(
+    sections: impl IntoIterator<Item = S>,
+    options: MarkdownOptions,
+) -> String {
+    let mut out = String::new();
+    // Writing to a `String` cannot fail.
+    let _ = write_markdown_sections(sections, options, &mut out);
     out
 }
 

@@ -1173,6 +1173,20 @@ fn test_the_sheet_by_sheet_path_matches_the_whole_document_one() {
             "{name}: metadata differs"
         );
 
+        // Written to a stream, each rendering is the string it would have been.
+        let streamed = |write: &dyn Fn(&mut Vec<u8>) -> std::io::Result<()>| {
+            let mut out = Vec::new();
+            write(&mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(streamed(&|o| doc.write_plain_text(o)), doc.plain_text(), "{name}: text");
+        assert_eq!(streamed(&|o| doc.write_markdown(o)), doc.to_markdown(), "{name}: Markdown");
+        assert_eq!(streamed(&|o| doc.write_html(o)), doc.to_html(), "{name}: written HTML");
+        assert_eq!(
+            streamed(&|o| doc.write_markdown_with(MarkdownOptions::default(), o)),
+            doc.to_markdown_with(MarkdownOptions::default()),
+            "{name}: written Markdown with options"
+        );
         assert_eq!(doc.to_html(), ir.to_html(), "{name}: HTML differs");
         let embed = MarkdownOptions {
             image_embed: ImageEmbed::Base64,

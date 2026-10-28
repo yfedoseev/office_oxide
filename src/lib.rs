@@ -74,6 +74,7 @@ pub mod ir_render;
 /// Resource limits for untrusted input (the per-document text budget and
 /// the package-wide entry-count and decompressed-size bounds).
 pub mod limits;
+mod stream;
 
 #[cfg(not(target_family = "wasm"))]
 pub mod ffi;
@@ -558,6 +559,66 @@ impl Document {
                 ir_render::html_from_sections(doc.sheets_ir().map(|s| s.section), options)
             },
             _ => self.to_ir().to_html_with(options),
+        }
+    }
+
+    /// Write [`Self::plain_text`] to `out`. A spreadsheet is written as it is
+    /// produced, so the text is never held in memory; the other formats
+    /// build it first.
+    pub fn write_plain_text<W: std::io::Write + ?Sized>(&self, out: &mut W) -> std::io::Result<()> {
+        match &self.inner {
+            DocumentInner::Xlsx(doc) => doc.write_plain_text(out),
+            _ => out.write_all(self.plain_text().as_bytes()),
+        }
+    }
+
+    /// Write [`Self::to_markdown`] to `out`. A spreadsheet is written as it is
+    /// produced, so the Markdown is never held in memory; the other formats
+    /// build it first.
+    pub fn write_markdown<W: std::io::Write + ?Sized>(&self, out: &mut W) -> std::io::Result<()> {
+        match &self.inner {
+            DocumentInner::Xlsx(doc) => doc.write_markdown(out),
+            _ => out.write_all(self.to_markdown().as_bytes()),
+        }
+    }
+
+    /// Write [`Self::to_markdown_with`] to `out`. A spreadsheet is converted
+    /// and written a sheet at a time; the other formats build it first.
+    pub fn write_markdown_with<W: std::io::Write + ?Sized>(
+        &self,
+        options: ir_render::MarkdownOptions,
+        out: &mut W,
+    ) -> std::io::Result<()> {
+        match &self.inner {
+            DocumentInner::Xlsx(doc) => stream::render_to_io(out, |sink| {
+                ir_render::write_markdown_sections(
+                    doc.sheets_ir().map(|s| s.section),
+                    options,
+                    sink,
+                )
+            }),
+            _ => out.write_all(self.to_ir().to_markdown_with(options).as_bytes()),
+        }
+    }
+
+    /// Write [`Self::to_html`] to `out`. A spreadsheet is converted and
+    /// written a sheet at a time; the other formats build it first.
+    pub fn write_html<W: std::io::Write + ?Sized>(&self, out: &mut W) -> std::io::Result<()> {
+        self.write_html_with(ir_render::HtmlOptions::default(), out)
+    }
+
+    /// Write [`Self::to_html_with`] to `out`. A spreadsheet is converted and
+    /// written a sheet at a time; the other formats build it first.
+    pub fn write_html_with<W: std::io::Write + ?Sized>(
+        &self,
+        options: ir_render::HtmlOptions,
+        out: &mut W,
+    ) -> std::io::Result<()> {
+        match &self.inner {
+            DocumentInner::Xlsx(doc) => stream::render_to_io(out, |sink| {
+                ir_render::write_html_sections(doc.sheets_ir().map(|s| s.section), options, sink)
+            }),
+            _ => out.write_all(self.to_ir().to_html_with(options).as_bytes()),
         }
     }
 
