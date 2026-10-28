@@ -83,8 +83,11 @@ pub struct DownrevBudget {
     bytes_remaining: u64,
     /// Packages still allowed on the current slide (reset per slide).
     slide_packages_remaining: usize,
-    /// Hash of every distinct package already paid for, so an identical
-    /// package repeated across records or slides is decompressed only once.
+    /// Hash of every distinct package already paid for on the *current* slide,
+    /// so an identical package repeated across records within a slide is
+    /// decompressed only once. Scoped per-slide (cleared at the start of each
+    /// `append_slide_downrev` call): a shape whose package recurs on a later
+    /// slide is a distinct shape and must keep its text there (R1 fix).
     seen_packages: HashSet<u64>,
 }
 
@@ -105,9 +108,12 @@ pub fn append_slide_downrev(
     runs: &mut Vec<TextRun>,
     budget: &mut DownrevBudget,
 ) {
-    // Each slide gets its own per-slide allowance; the per-file budgets are
-    // shared across slides via budget.
+    // Each slide gets its own per-slide allowance; the per-file budgets
+    // (packages / bytes) stay shared across slides via budget. Package
+    // de-duplication is scoped to the slide: a package that recurs on a later
+    // slide is a distinct shape and must keep its text there (R1 fix).
     budget.slide_packages_remaining = MAX_DOWNREV_PACKAGES;
+    budget.seen_packages.clear();
 
     let mut seen: HashSet<String> = HashSet::new();
     for run in runs.iter() {
@@ -748,7 +754,6 @@ mod tests {
     // `#[ignore]`d until `seen_packages` is scoped per-slide (review note R1).
     // Run with `cargo test -- --ignored` to see it fail.
     #[test]
-    #[ignore = "R1: cross-slide package dedup drops per-slide text; fix by scoping DownrevBudget::seen_packages per-slide"]
     fn test_append_slide_downrev_keeps_identical_package_text_on_each_slide() {
         let xml = "<p:sp><a:p><a:r><a:t>Shared heading</a:t></a:r></a:p></p:sp>";
         let payload = carrier(xml);

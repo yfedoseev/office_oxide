@@ -376,7 +376,6 @@ fn test_downrev_text_per_slide_through_public_api() {
 /// each slide is a distinct shape. The per-file `seen_packages` set currently
 /// drops it on the second slide. Run `cargo test -- --ignored` to see it fail.
 #[test]
-#[ignore = "R1: cross-slide package dedup drops per-slide text; fix by scoping DownrevBudget::seen_packages per-slide"]
 fn test_downrev_identical_package_kept_on_each_slide() {
     let xml = downrev_shape_xml(&["Shared heading"]);
     let grp = downrev_shape_group(&downrev_zip(&xml));
