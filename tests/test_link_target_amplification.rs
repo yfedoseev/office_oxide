@@ -247,6 +247,19 @@ fn test_docx_markdown_copies_of_a_link_target_are_charged_and_cut_off_loudly() {
 }
 
 #[test]
+fn test_docx_plain_text_reports_link_targets_cut_while_reading_as_markdown_does() {
+    let _limits = limits();
+    let bytes = docx(&url(TARGET_LEN), LINKS, true);
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
+    let text = doc.plain_text();
+    assert!(text.contains("hyperlink targets"), "the cut-off is reported: {}", text.len());
+    assert!(doc.to_markdown().contains("hyperlink targets"));
+    for i in 0..LINKS {
+        assert!(text.contains(&format!("link{i}")), "link{i} lost");
+    }
+}
+
+#[test]
 fn test_docx_fragment_copies_made_while_reading_are_charged() {
     let _limits = limits();
     let bytes = docx(&url(TARGET_LEN), LINKS, true);

@@ -67,8 +67,13 @@ impl DocxDocument {
         }
         // A chart's text is stored once and written once per drawing that
         // names it; when the copies outgrew the text budget the drawings past
-        // it were written without it, and the output says so.
-        if let Some(notice) = crate::limits::copied_text_notice() {
+        // it were written without it, and the output says so. So does a link
+        // whose target was cut while reading: the text has no targets, but
+        // every rendering of one document reports the same losses.
+        for notice in crate::limits::copied_text_notice()
+            .into_iter()
+            .chain(self.link_notice.clone())
+        {
             out.push_str("\n\n");
             out.push_str(&notice);
         }
