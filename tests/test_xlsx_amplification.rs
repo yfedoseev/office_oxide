@@ -302,6 +302,12 @@ const IMAGE_BUDGET: usize = 10_000;
 /// A sheet whose one drawing anchors the same `media_len`-byte picture
 /// `anchors` times.
 fn picture_fan_out_workbook(anchors: usize, media_len: usize) -> Vec<u8> {
+    picture_workbook(anchors, media_len, 0)
+}
+
+/// [`picture_fan_out_workbook`] followed by `plain_sheets` sheets with one
+/// number each and no drawing.
+fn picture_workbook(anchors: usize, media_len: usize, plain_sheets: usize) -> Vec<u8> {
     let mut drawing = String::from(
         r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">"#,
     );
@@ -315,10 +321,21 @@ fn picture_fan_out_workbook(anchors: usize, media_len: usize) -> Vec<u8> {
     let sheet = format!(
         r#"<worksheet xmlns="{NS}" xmlns:r="{R}"><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><drawing r:id="rId1"/></worksheet>"#
     );
-    package(
-        r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#,
-        &worksheet_rel("rId1", "worksheets/sheet1.xml"),
-        &[
+    let mut sheets = String::from(r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#);
+    let mut rels = worksheet_rel("rId1", "worksheets/sheet1.xml");
+    let mut parts = Vec::new();
+    for i in 0..plain_sheets {
+        let n = i + 2;
+        sheets.push_str(&format!(r#"<sheet name="P{n}" sheetId="{n}" r:id="rId{n}"/>"#));
+        rels.push_str(&worksheet_rel(&format!("rId{n}"), &format!("worksheets/sheet{n}.xml")));
+        parts.push((
+            format!("xl/worksheets/sheet{n}.xml"),
+            format!(r#"<worksheet xmlns="{NS}"><sheetData><row r="1"><c r="A1"><v>{n}</v></c></row></sheetData></worksheet>"#).into_bytes(),
+        ));
+    }
+    let mut parts: Vec<(&str, Vec<u8>)> =
+        parts.iter().map(|(n, d)| (n.as_str(), d.clone())).collect();
+    parts.extend([
             ("xl/worksheets/sheet1.xml", sheet.into_bytes()),
             (
                 "xl/worksheets/_rels/sheet1.xml.rels",
@@ -330,8 +347,8 @@ fn picture_fan_out_workbook(anchors: usize, media_len: usize) -> Vec<u8> {
                 format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/image" Target="../media/image1.png"/></Relationships>"#).into_bytes(),
             ),
             ("xl/media/image1.png", vec![7u8; media_len]),
-        ],
-    )
+    ]);
+    package(&sheets, &rels, &parts)
 }
 
 fn ir_image_count(ir: &office_oxide::DocumentIR) -> usize {
@@ -365,6 +382,26 @@ fn test_one_picture_drawn_from_many_anchors_shares_its_bytes_and_is_bounded_in_t
     assert_eq!(ir_image_count(&ir), 10, "pictures past the budget are left out");
     assert!(ir.metadata.text_truncated);
     assert!(ir.plain_text().contains("picture budget"));
+}
+
+#[test]
+fn test_the_picture_notice_is_given_once_not_on_every_later_sheet() {
+    set_budgets();
+    office_oxide::limits::set_max_image_bytes(IMAGE_BUDGET);
+    // The first sheet spends the picture budget; the two sheets after it have
+    // no pictures and nothing to be told about.
+    let doc = open(picture_workbook(100, 1_000, 2)).unwrap();
+    let ir = doc.to_ir();
+    let notices = ir.plain_text().matches("picture budget").count();
+    assert_eq!(notices, 1, "the notice appears {notices} times");
+    let warnings = ir
+        .metadata
+        .warnings
+        .iter()
+        .filter(|w| w.contains("pictures were left out"))
+        .count();
+    assert_eq!(warnings, 1, "{:?}", ir.metadata.warnings);
+    assert!(doc.plain_text().contains("P3"), "the later sheets are kept");
 }
 
 #[test]

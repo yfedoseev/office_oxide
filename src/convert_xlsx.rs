@@ -47,6 +47,8 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     let mut comments_truncated = false;
     let mut warnings: Vec<String> = Vec::new();
     let mut format_code_omitted = false;
+    // The picture notice belongs to the sheet whose pictures spent the budget.
+    let mut image_notice_given = false;
     let mut padding_budget = crate::limits::TextBudget::new();
 
     for (ws_idx, ws) in doc.worksheets.iter().enumerate() {
@@ -520,7 +522,8 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 ..Default::default()
             }));
         }
-        if image_budget.exhausted() {
+        if image_budget.exhausted() && !image_notice_given {
+            image_notice_given = true;
             combined.push(Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain(format!(
                     "[some pictures not shown: together they exceed the {} byte picture budget \
@@ -715,6 +718,13 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
 
     if budget.exhausted() {
         warnings.push(budget.notice());
+    }
+    if image_budget.exhausted() {
+        warnings.push(format!(
+            "some pictures were left out: the document's pictures exceed the {} byte budget \
+             (office_oxide::limits::set_max_image_bytes)",
+            image_budget.limit()
+        ));
     }
     if format_code_omitted {
         warnings.push(format!(
