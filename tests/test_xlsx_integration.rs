@@ -403,7 +403,7 @@ fn test_hyperlinks() {
     assert_eq!(hl1.tooltip.as_deref(), Some("Visit example"));
     match &hl1.target {
         office_oxide::xlsx::HyperlinkTarget::External(url) => {
-            assert_eq!(url, "https://example.com")
+            assert_eq!(&**url, "https://example.com")
         },
         _ => panic!("expected external hyperlink"),
     }

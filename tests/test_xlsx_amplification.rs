@@ -686,3 +686,109 @@ fn test_one_sheet_part_under_several_spellings_is_still_read_once() {
     assert_eq!(xlsx.worksheets.len(), 1, "the part is parsed once");
     assert_eq!(xlsx.unreadable_sheets.len(), spellings.len() - 1);
 }
+
+/// One sheet of `links` numeric cells (A1, A2, ...), each hyperlinked
+/// through one relationship whose external target is `target_len`
+/// characters long.
+fn hyperlink_fan_out_workbook(links: usize, target_len: usize) -> Vec<u8> {
+    let mut sheet = format!(r#"<worksheet xmlns="{NS}" xmlns:r="{R}"><sheetData>"#);
+    for r in 1..=links {
+        sheet.push_str(&format!(r#"<row r="{r}"><c r="A{r}"><v>{r}</v></c></row>"#));
+    }
+    sheet.push_str("</sheetData><hyperlinks>");
+    for r in 1..=links {
+        sheet.push_str(&format!(r#"<hyperlink ref="A{r}" r:id="rId1"/>"#));
+    }
+    sheet.push_str("</hyperlinks></worksheet>");
+    let target = format!("http://example.com/{}", "a".repeat(target_len));
+    package(
+        r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#,
+        &worksheet_rel("rId1", "worksheets/sheet1.xml"),
+        &[
+            ("xl/worksheets/sheet1.xml", sheet.into_bytes()),
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels",
+                format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/hyperlink" Target="{target}" TargetMode="External"/></Relationships>"#).into_bytes(),
+            ),
+        ],
+    )
+}
+
+/// Bytes of hyperlink target held by the IR's text spans, and how many spans
+/// carry one.
+fn ir_hyperlinks(ir: &office_oxide::DocumentIR) -> (usize, usize) {
+    use office_oxide::ir::{Element, InlineContent};
+    let (mut bytes, mut count) = (0, 0);
+    let mut paragraph = |content: &[InlineContent]| {
+        for c in content {
+            if let InlineContent::Text(span) = c {
+                if let Some(h) = &span.hyperlink {
+                    bytes += h.len();
+                    count += 1;
+                }
+            }
+        }
+    };
+    for e in ir.sections.iter().flat_map(|s| &s.elements) {
+        match e {
+            Element::Paragraph(p) => paragraph(&p.content),
+            Element::Table(t) => {
+                for cell in t.rows.iter().flat_map(|r| &r.cells) {
+                    for el in &cell.content {
+                        if let Element::Paragraph(p) = el {
+                            paragraph(&p.content);
+                        }
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+    (bytes, count)
+}
+
+#[test]
+fn test_a_hyperlink_target_longer_than_excels_limit_is_dropped_and_reported() {
+    set_budgets();
+    // Excel stores at most 2,083 characters of a hyperlink address; a
+    // 1 MB target cannot come from it and was copied onto every link.
+    let doc = open(hyperlink_fan_out_workbook(40, 100_000)).unwrap();
+    let ir = doc.to_ir();
+    assert_eq!(ir_hyperlinks(&ir), (0, 0), "an over-long target was copied into the IR");
+    let text = doc.plain_text();
+    assert!(text.contains("40"), "the cells stay: {text}");
+    assert!(
+        ir.metadata.warnings.iter().any(|w| w.contains("hyperlink")),
+        "no warning: {:?}",
+        ir.metadata.warnings
+    );
+}
+
+#[test]
+fn test_one_hyperlink_target_on_many_cells_is_charged_to_the_text_budget() {
+    set_budgets();
+    // 2,000 characters on each of 100 cells is 200,000 against a 60,000
+    // budget.
+    let doc = open(hyperlink_fan_out_workbook(100, 2_000)).unwrap();
+    let ir = doc.to_ir();
+    let (bytes, count) = ir_hyperlinks(&ir);
+    assert!(count > 0, "the links that fit are kept");
+    assert!(bytes <= TEXT_BUDGET, "{bytes} bytes of hyperlink in the IR");
+    assert!(ir.metadata.text_truncated, "the truncation is not flagged");
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("character budget"))
+    );
+}
+
+#[test]
+fn test_a_few_ordinary_hyperlinks_are_unaffected() {
+    set_budgets();
+    let doc = open(hyperlink_fan_out_workbook(3, 40)).unwrap();
+    let ir = doc.to_ir();
+    assert_eq!(ir_hyperlinks(&ir).1, 3);
+    assert!(!ir.metadata.text_truncated);
+    assert!(ir.metadata.warnings.is_empty(), "{:?}", ir.metadata.warnings);
+}

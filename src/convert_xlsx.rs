@@ -45,6 +45,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     // budget is still laid out, and its padding is still paid for.
     let mut image_budget = crate::limits::TextBudget::with_limit(crate::limits::max_image_bytes());
     let mut comments_truncated = false;
+    let mut warnings: Vec<String> = Vec::new();
     let mut padding_budget = crate::limits::TextBudget::new();
 
     for (ws_idx, ws) in doc.worksheets.iter().enumerate() {
@@ -62,7 +63,10 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         // every clickable cell in a workbook lost its target — DOCX and
         // PPTX both emit links. Index by (row, col) for O(1) lookup.
         // The value is the target and its hover text (`@tooltip`).
-        let links: std::collections::HashMap<(u32, u32), (String, Option<String>)> = ws
+        // Targets and hover text are shared from here to the cells; the IR
+        // owns a copy per span, which is charged to the budget below.
+        type Link = (std::sync::Arc<str>, Option<std::sync::Arc<str>>);
+        let links: std::collections::HashMap<(u32, u32), Link> = ws
             .hyperlinks
             .iter()
             .filter_map(|h| {
@@ -70,11 +74,11 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 let target = match &h.target {
                     crate::xlsx::HyperlinkTarget::External(u) => u.clone(),
                     crate::xlsx::HyperlinkTarget::Internal(loc) if !loc.is_empty() => {
-                        format!("#{loc}")
+                        std::sync::Arc::from(format!("#{loc}"))
                     },
                     crate::xlsx::HyperlinkTarget::Internal(_) => return None,
                 };
-                Some(((r.row, r.col), (target, h.tooltip.clone())))
+                Some(((r.row, r.col), (target, h.tooltip.as_deref().map(std::sync::Arc::from))))
             })
             .collect();
 
@@ -119,9 +123,17 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             for cell in &row.cells {
                 buf.clear();
                 formatter.write(cell, &mut buf);
-                // A row keeps the cells that fit the budget; the sheet
+                let link = links.get(&(cell.reference.row, cell.reference.col));
+                // The cell's text, and the hyperlink target and hover text
+                // each span of it will carry, are paid for before any is
+                // made. A row keeps the cells that fit the budget; the sheet
                 // ends after it.
-                if !budget.charge(buf.len()) {
+                // A rich-text cell has one span per run, each with its own
+                // copy of the link.
+                let link_chars = link
+                    .map_or(0, |(target, tip)| target.len() + tip.as_ref().map_or(0, |t| t.len()))
+                    .saturating_mul(rich_run_count(doc, cell).max(1));
+                if !budget.charge(buf.len().saturating_add(link_chars)) {
                     break;
                 }
                 let text = if buf.is_empty() {
@@ -142,7 +154,6 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                     crate::xlsx::cell::CellValue::String(_) => cell.rich_runs.clone(),
                     _ => None,
                 };
-                let link = links.get(&(cell.reference.row, cell.reference.col));
                 cells.push(CellData {
                     col: cell.reference.col,
                     hyperlink: link.map(|(target, _)| target.clone()),
@@ -522,6 +533,14 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 ..Default::default()
             }));
         }
+        if ws.hyperlinks_dropped > 0 {
+            warnings.push(format!(
+                "sheet {:?}: {} hyperlink(s) left out: their target is longer than {} characters",
+                ws.name,
+                ws.hyperlinks_dropped,
+                crate::limits::MAX_HYPERLINK_TARGET_CHARS
+            ));
+        }
         if budget.exhausted() || padding_budget.exhausted() {
             combined.push(Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain(budget.notice()))],
@@ -697,7 +716,10 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         .filter(|t| !t.is_empty())
         .or_else(|| sections.first().and_then(|s| s.title.clone()));
 
-    DocumentIR {
+    if budget.exhausted() {
+        warnings.push(budget.notice());
+    }
+    let mut ir = DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Xlsx,
             title,
@@ -735,7 +757,9 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             )
         },
         sections,
-    }
+    };
+    ir.metadata.warnings.extend(warnings);
+    ir
 }
 
 /// Give each merge anchor in `tcells` (one per grid column of sheet row
@@ -807,13 +831,27 @@ fn empty_cell() -> TableCell {
     }
 }
 
+/// How many rich-text runs `cell` carries: those of its shared string, or its
+/// own inline ones; zero for a plain value.
+fn rich_run_count(doc: &crate::xlsx::XlsxDocument, cell: &crate::xlsx::Cell) -> usize {
+    match &cell.value {
+        crate::xlsx::cell::CellValue::SharedString(idx) => doc
+            .shared_strings
+            .get_shared(*idx)
+            .and_then(|s| s.rich_text.as_ref())
+            .map_or(0, |runs| runs.len()),
+        crate::xlsx::cell::CellValue::String(_) => cell.rich_runs.as_ref().map_or(0, Vec::len),
+        _ => 0,
+    }
+}
+
 /// Build the styled span for a cell: display text, the cell font's size and
 /// weight from the workbook stylesheet, and the sheet's hyperlink target if
 /// the cell has one.
 fn cell_span(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> TextSpan {
     let mut span = TextSpan::plain(display_text(cd).to_string());
-    span.hyperlink = cd.hyperlink.clone();
-    span.hyperlink_tooltip = cd.hyperlink_tooltip.clone();
+    span.hyperlink = cd.hyperlink.as_deref().map(str::to_string);
+    span.hyperlink_tooltip = cd.hyperlink_tooltip.as_deref().map(str::to_string);
     let Some(font) = cd.style_index.and_then(|idx| font_for(doc, idx)) else {
         return span;
     };
@@ -842,8 +880,8 @@ fn cell_spans(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> Vec<InlineConte
     runs.iter()
         .map(|r| {
             let mut span = TextSpan::plain(r.text.clone());
-            span.hyperlink = cd.hyperlink.clone();
-            span.hyperlink_tooltip = cd.hyperlink_tooltip.clone();
+            span.hyperlink = cd.hyperlink.as_deref().map(str::to_string);
+            span.hyperlink_tooltip = cd.hyperlink_tooltip.as_deref().map(str::to_string);
             span.bold = r.bold.unwrap_or(false);
             span.italic = r.italic.unwrap_or(false);
             if let Some(size_pt) = r.font_size {
@@ -872,9 +910,9 @@ struct CellData {
     /// one column left and filed it under the wrong header.
     col: u32,
     /// Hyperlink target for this cell, when the sheet declares one.
-    hyperlink: Option<String>,
+    hyperlink: Option<std::sync::Arc<str>>,
     /// That hyperlink's hover text (`hyperlink/@tooltip`).
-    hyperlink_tooltip: Option<String>,
+    hyperlink_tooltip: Option<std::sync::Arc<str>>,
     /// Rendered display string (same text `write_cell_value_fast` produces).
     text: String,
     /// Cell format index (`s` attribute) — used for prose-mode font recovery.
