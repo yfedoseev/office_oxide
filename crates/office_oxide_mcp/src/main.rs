@@ -160,7 +160,6 @@ fn read_request_line<R: BufRead>(reader: &mut R, limit: usize) -> io::Result<Opt
 }
 
 fn main() {
-    protocol::bound_resource_budgets();
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
     let mut stdout = io::stdout();
