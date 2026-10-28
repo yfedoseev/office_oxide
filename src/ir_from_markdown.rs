@@ -611,8 +611,21 @@ impl NextMarker {
         self.primed = true;
         self.from = start;
         self.hit = text[start..].find(self.needle).map(|p| start + p);
+        #[cfg(test)]
+        count_scanned(self.hit.map_or(text.len(), |h| h + self.needle.len()) - start);
         self.hit
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes the inline marker searches of this thread have scanned.
+    static SCANNED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_scanned(bytes: usize) {
+    SCANNED_BYTES.with(|c| c.set(c.get() + bytes));
 }
 
 fn parse_inline(text: &str) -> Vec<InlineContent> {
@@ -1023,20 +1036,27 @@ mod tests {
     }
 
     /// An opener with no closer, repeated, used to rescan the rest of the
-    /// line for each one.
+    /// line for each one. Counted in bytes the marker searches scan rather
+    /// than in wall-clock time, so it holds on a loaded machine: the work
+    /// stays a small multiple of the input and does not grow faster than it.
     #[test]
-    fn test_inline_parse_of_unclosed_openers_is_linear() {
-        let start = std::time::Instant::now();
+    fn test_inline_parse_of_unclosed_openers_scans_a_linear_number_of_bytes() {
+        let scanned = |text: &str| {
+            SCANNED_BYTES.with(|c| c.set(0));
+            let out = parse_inline(text);
+            assert!(!out.is_empty());
+            SCANNED_BYTES.with(|c| c.get())
+        };
         for unit in ["[", "[](", "**", "__", "~~", "`", "*a", "_a", "[a]", "[a]("] {
-            let text = unit.repeat(60_000 / unit.len());
-            let out = parse_inline(&text);
-            assert!(!out.is_empty(), "{unit:?}");
+            let small = unit.repeat(2_000 / unit.len());
+            let large = unit.repeat(4_000 / unit.len());
+            let (n, n2) = (scanned(&small), scanned(&large));
+            assert!(n <= 4 * small.len(), "{unit:?}: scanned {n} bytes of {}", small.len());
+            assert!(
+                n2 <= 4 * large.len() && n2 <= 3 * n.max(large.len()),
+                "{unit:?}: doubling the input took the scan from {n} to {n2} bytes"
+            );
         }
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(5),
-            "took {:?}",
-            start.elapsed()
-        );
     }
 
     #[test]
