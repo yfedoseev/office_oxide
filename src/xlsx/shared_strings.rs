@@ -16,7 +16,7 @@ pub struct SharedString {
     /// Plain-text representation of the string.
     pub text: String,
     /// Rich-text runs, if this entry contains formatting.
-    pub rich_text: Option<Vec<RichTextRun>>,
+    pub rich_text: Option<std::sync::Arc<[RichTextRun]>>,
 }
 
 /// A run within a rich text shared string.
@@ -114,7 +114,7 @@ fn parse_si(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Shared
         let full_text = runs.iter().map(|r| r.text.as_str()).collect::<String>();
         Ok(SharedString {
             text: full_text,
-            rich_text: Some(runs),
+            rich_text: Some(runs.into()),
         })
     } else {
         Ok(SharedString {

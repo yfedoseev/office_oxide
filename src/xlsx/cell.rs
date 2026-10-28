@@ -114,7 +114,7 @@ pub struct Cell {
     /// table. The shared-string reader parses this but missed this
     /// structurally identical path entirely, so an inline rich-text
     /// cell's bold/italic/color/font was silently discarded.
-    pub rich_runs: Option<Vec<crate::xlsx::shared_strings::RichTextRun>>,
+    pub rich_runs: Option<std::sync::Arc<[crate::xlsx::shared_strings::RichTextRun]>>,
     /// The cell's `vm` attribute: a 1-based index into the workbook's
     /// `xl/metadata.xml` `<valueMetadata>` array. Excel 365's in-cell
     /// rich-value images (`=IMAGE(...)`/"Place in Cell") are stored as a

@@ -792,3 +792,88 @@ fn test_a_few_ordinary_hyperlinks_are_unaffected() {
     assert!(!ir.metadata.text_truncated);
     assert!(ir.metadata.warnings.is_empty(), "{:?}", ir.metadata.warnings);
 }
+
+/// One shared string of `runs` one-character rich-text runs (each with its
+/// own font), named by `cells` cells in column A.
+fn rich_text_fan_out_workbook(runs: usize, cells: usize) -> Vec<u8> {
+    let mut sst = format!(r#"<sst xmlns="{NS}" count="{cells}" uniqueCount="1"><si>"#);
+    for _ in 0..runs {
+        sst.push_str(r#"<r><rPr><b/><rFont val="Arial"/><sz val="11"/></rPr><t>x</t></r>"#);
+    }
+    sst.push_str("</si></sst>");
+    let mut sheet = format!(r#"<worksheet xmlns="{NS}"><sheetData>"#);
+    for r in 1..=cells {
+        sheet.push_str(&format!(r#"<row r="{r}"><c r="A{r}" t="s"><v>0</v></c></row>"#));
+    }
+    sheet.push_str("</sheetData></worksheet>");
+    package(
+        r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#,
+        &format!(
+            r#"{}<Relationship Id="rId9" Type="{R}/sharedStrings" Target="sharedStrings.xml"/>"#,
+            worksheet_rel("rId1", "worksheets/sheet1.xml")
+        ),
+        &[
+            ("xl/worksheets/sheet1.xml", sheet.into_bytes()),
+            ("xl/sharedStrings.xml", sst.into_bytes()),
+        ],
+    )
+}
+
+/// How many text spans the IR holds in table cells and paragraphs.
+fn ir_span_count(ir: &office_oxide::DocumentIR) -> usize {
+    use office_oxide::ir::{Element, InlineContent};
+    let count = |content: &[InlineContent]| {
+        content
+            .iter()
+            .filter(|c| matches!(c, InlineContent::Text(_)))
+            .count()
+    };
+    let mut total = 0;
+    for e in ir.sections.iter().flat_map(|s| &s.elements) {
+        match e {
+            Element::Paragraph(p) => total += count(&p.content),
+            Element::Table(t) => {
+                for el in t
+                    .rows
+                    .iter()
+                    .flat_map(|r| &r.cells)
+                    .flat_map(|c| &c.content)
+                {
+                    if let Element::Paragraph(p) = el {
+                        total += count(&p.content);
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+    total
+}
+
+#[test]
+fn test_rich_text_runs_of_one_shared_string_are_charged_for_every_cell_that_names_it() {
+    set_budgets();
+    // 100 runs of one character each in 50 cells: 5,000 characters of text,
+    // but 5,000 spans of a few hundred bytes each against a 60,000 budget.
+    let doc = open(rich_text_fan_out_workbook(100, 50)).unwrap();
+    let ir = doc.to_ir();
+    let spans = ir_span_count(&ir);
+    assert!(spans > 0, "the cells that fit are kept");
+    assert!(spans < 1_000, "{spans} spans were built from a 3 KB workbook");
+    assert!(ir.metadata.text_truncated, "the truncation is not flagged");
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("character budget"))
+    );
+}
+
+#[test]
+fn test_a_few_rich_text_cells_are_unaffected() {
+    set_budgets();
+    let doc = open(rich_text_fan_out_workbook(3, 5)).unwrap();
+    let ir = doc.to_ir();
+    assert_eq!(ir_span_count(&ir), 15);
+    assert!(!ir.metadata.text_truncated);
+}

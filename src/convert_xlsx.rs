@@ -129,11 +129,18 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 // made. A row keeps the cells that fit the budget; the sheet
                 // ends after it.
                 // A rich-text cell has one span per run, each with its own
-                // copy of the link.
+                // copy of the link and its own formatting.
+                let rich_runs = rich_runs_of(doc, cell);
+                let runs = rich_runs.as_deref().filter(|r| !r.is_empty());
                 let link_chars = link
                     .map_or(0, |(target, tip)| target.len() + tip.as_ref().map_or(0, |t| t.len()))
-                    .saturating_mul(rich_run_count(doc, cell).max(1));
-                if !budget.charge(buf.len().saturating_add(link_chars)) {
+                    .saturating_mul(runs.map_or(1, <[_]>::len));
+                let run_chars = runs.map_or(0, rich_span_chars);
+                if !budget.charge(
+                    buf.len()
+                        .saturating_add(link_chars)
+                        .saturating_add(run_chars),
+                ) {
                     break;
                 }
                 let text = if buf.is_empty() {
@@ -143,17 +150,6 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 };
                 let (data_type, raw_number, number_format, number_format_id) =
                     cell_semantics(doc, cell, &date_indices);
-                let rich_runs = match &cell.value {
-                    crate::xlsx::cell::CellValue::SharedString(idx) => doc
-                        .shared_strings
-                        .get_shared(*idx)
-                        .and_then(|s| s.rich_text.clone()),
-                    // An inline (`t="inlineStr"`) string cell carries its
-                    // own rich runs directly on the raw `Cell`, not via
-                    // the shared string table.
-                    crate::xlsx::cell::CellValue::String(_) => cell.rich_runs.clone(),
-                    _ => None,
-                };
                 cells.push(CellData {
                     col: cell.reference.col,
                     hyperlink: link.map(|(target, _)| target.clone()),
@@ -831,18 +827,35 @@ fn empty_cell() -> TableCell {
     }
 }
 
-/// How many rich-text runs `cell` carries: those of its shared string, or its
-/// own inline ones; zero for a plain value.
-fn rich_run_count(doc: &crate::xlsx::XlsxDocument, cell: &crate::xlsx::Cell) -> usize {
+/// The rich-text runs `cell` carries: those of its shared string, or its own
+/// inline ones. Shared, not copied: a shared string names the same runs from
+/// every cell that uses it.
+fn rich_runs_of(
+    doc: &crate::xlsx::XlsxDocument,
+    cell: &crate::xlsx::Cell,
+) -> Option<std::sync::Arc<[crate::xlsx::shared_strings::RichTextRun]>> {
     match &cell.value {
         crate::xlsx::cell::CellValue::SharedString(idx) => doc
             .shared_strings
             .get_shared(*idx)
-            .and_then(|s| s.rich_text.as_ref())
-            .map_or(0, |runs| runs.len()),
-        crate::xlsx::cell::CellValue::String(_) => cell.rich_runs.as_ref().map_or(0, Vec::len),
-        _ => 0,
+            .and_then(|s| s.rich_text.clone()),
+        // An inline (`t="inlineStr"`) string cell carries its own rich runs
+        // directly on the raw `Cell`, not via the shared string table.
+        crate::xlsx::cell::CellValue::String(_) => cell.rich_runs.clone(),
+        _ => None,
     }
+}
+
+/// What the IR's spans for `runs` cost beyond the runs' text: each run becomes
+/// a `TextSpan` of its own, with its own copy of the font name. The runs are
+/// stored once, so without this a string of thousands of runs named by
+/// thousands of cells is a span per run per cell for free.
+fn rich_span_chars(runs: &[crate::xlsx::shared_strings::RichTextRun]) -> usize {
+    runs.iter().fold(0usize, |total, r| {
+        total
+            .saturating_add(std::mem::size_of::<TextSpan>())
+            .saturating_add(r.font_name.as_ref().map_or(0, String::len))
+    })
 }
 
 /// Build the styled span for a cell: display text, the cell font's size and
@@ -932,7 +945,7 @@ struct CellData {
     /// string with `<r><rPr>…</rPr><t>…</t></r>` sub-runs (e.g. a bold
     /// superscript footnote marker within otherwise-plain text). `None`
     /// for a plain (non-rich) string or any non-string cell.
-    rich_runs: Option<Vec<crate::xlsx::shared_strings::RichTextRun>>,
+    rich_runs: Option<std::sync::Arc<[crate::xlsx::shared_strings::RichTextRun]>>,
 }
 
 /// The text a cell should show when it has no cached value: `=formula`

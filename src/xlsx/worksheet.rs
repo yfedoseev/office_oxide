@@ -1601,7 +1601,8 @@ fn parse_cell_fast(
     let mut raw_value: Option<String> = None;
     let mut number: Option<f64> = None;
     let mut formula: Option<String> = None;
-    let mut inline_rich_runs: Option<Vec<crate::xlsx::shared_strings::RichTextRun>> = None;
+    let mut inline_rich_runs: Option<std::sync::Arc<[crate::xlsx::shared_strings::RichTextRun]>> =
+        None;
 
     loop {
         match reader.read_event()? {
@@ -1631,7 +1632,7 @@ fn parse_cell_fast(
                 "is" => {
                     let (text, runs) = parse_inline_string_fast(reader)?;
                     raw_value = Some(text);
-                    inline_rich_runs = runs;
+                    inline_rich_runs = runs.map(Into::into);
                 },
                 _ => {
                     reader.read_to_end(e.to_end().name())?;
