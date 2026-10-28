@@ -740,13 +740,17 @@ mod tests {
         );
     }
 
+    // R1 (known bug, NOT yet fixed): `seen_packages` lives in the per-file
+    // budget and is shared across slides, so a package whose bytes recur on
+    // several slides contributes its text only on the first slide. Each slide
+    // is a distinct shape, so the text must appear on every slide that
+    // carries the package. This test asserts the correct behaviour and is
+    // `#[ignore]`d until `seen_packages` is scoped per-slide (review note R1).
+    // Run with `cargo test -- --ignored` to see it fail.
     #[test]
-    fn test_append_slide_downrev_dedups_identical_package_across_slides() {
-        // The same package carried on two different slides must be extracted
-        // only once: seen_packages lives in the per-file budget and is
-        // shared across slides, so the decompression/parse cost is paid once
-        // even when many slides repeat one package (#478).
-        let xml = "<p:sp><a:p><a:r><a:t>Shared text</a:t></a:r></a:p></p:sp>";
+    #[ignore = "R1: cross-slide package dedup drops per-slide text; fix by scoping DownrevBudget::seen_packages per-slide"]
+    fn test_append_slide_downrev_keeps_identical_package_text_on_each_slide() {
+        let xml = "<p:sp><a:p><a:r><a:t>Shared heading</a:t></a:r></a:p></p:sp>";
         let payload = carrier(xml);
         let slide1 = container(0x03EE, &[record(0x03EF, 0, &payload)]);
         let slide2 = container(0x03EE, &[record(0x03EF, 0, &payload)]);
@@ -756,17 +760,82 @@ mod tests {
         let mut runs2 = Vec::new();
         append_slide_downrev(&slide2, &mut runs2, &mut budget);
         assert!(
-            runs1.iter().any(|r| r.text.contains("Shared text")),
-            "first slide extracts the shared package"
+            runs1.iter().any(|r| r.text.contains("Shared heading")),
+            "slide 1 extracts the shared package"
         );
         assert!(
-            !runs2.iter().any(|r| r.text.contains("Shared text")),
-            "identical package on a later slide is read once, not re-added"
+            runs2.iter().any(|r| r.text.contains("Shared heading")),
+            "slide 2 must ALSO extract the shared package (R1: per-slide text)"
         );
         assert_eq!(
             runs1.len() + runs2.len(),
-            1,
-            "the shared package contributes exactly one run across slides"
+            2,
+            "the shared package contributes one run per slide"
         );
+    }
+
+    #[test]
+    fn test_append_slide_downrev_placeholder_packages_still_consume_budget() {
+        // G1: a package is decompressed (and its budget counted) before the
+        // `text_has_alnum` placeholder filter runs, so placeholder-only
+        // packages still spend the per-slide allowance and can starve real
+        // text on the same slide. Characterises current behaviour (see R4).
+        let mut children: Vec<Vec<u8>> = Vec::new();
+        for i in 0..256u32 {
+            // Distinct (varying length) non-alphanumeric payloads: each is a
+            // unique package, so each consumes one slice of the budget, yet
+            // every one is skipped by the placeholder filter.
+            let ph = format!(
+                "<p:sp><a:p><a:r><a:t>{}</a:t></a:r></a:p></p:sp>",
+                "_".repeat(3 + i as usize)
+            );
+            children.push(record(0x03EF, 0, &carrier(&ph)));
+        }
+        children.push(record(
+            0x03EF,
+            0,
+            &carrier("<p:sp><a:p><a:r><a:t>Real slide text</a:t></a:r></a:p></p:sp>"),
+        ));
+        let slide = container(0x03EE, &children);
+        let mut runs = Vec::new();
+        let mut budget = DownrevBudget::new();
+        append_slide_downrev(&slide, &mut runs, &mut budget);
+        assert!(
+            !runs.iter().any(|r| r.text.contains("Real slide text")),
+            "placeholder packages consumed the whole per-slide budget, starving real text (G1)"
+        );
+        assert_eq!(budget.slide_packages_remaining, 0, "per-slide budget fully spent");
+    }
+
+    #[test]
+    fn test_shape_xml_in_payload_does_not_consume_budget_for_repeated_package() {
+        // G2: an identical package seen again (same bytes) must not spend
+        // budget a second time — the hash-dedup early return happens before
+        // the counters are decremented.
+        let payload = carrier(SAMPLE_XML);
+        let mut budget = DownrevBudget::new();
+        let before = budget.packages_remaining;
+        let _ = shape_xml_in_payload(&payload, &mut budget);
+        let after_first = budget.packages_remaining;
+        let _ = shape_xml_in_payload(&payload, &mut budget);
+        let after_second = budget.packages_remaining;
+        assert_eq!(before - after_first, 1, "first encounter spends one package");
+        assert_eq!(after_first, after_second, "identical repeat spends nothing (G2)");
+    }
+
+    #[test]
+    fn test_read_shape_xml_truncates_oversized_fragment_without_panic() {
+        // G3: a fragment far larger than MAX_SHAPE_XML_BYTES is truncated at
+        // the cap; the fast reader still yields the leading text and never
+        // panics on a cut-off document.
+        let bulk = "A".repeat(200 * 1024);
+        let xml = format!("<p:sp><a:p><a:r><a:t>{bulk}</a:t></a:r></a:p></p:sp>");
+        let package = carrier(&xml);
+        let mut budget = DownrevBudget::new();
+        let out = shape_xml_in_payload(&package, &mut budget)
+            .expect("oversized fragment still reads");
+        assert!(out.len() <= MAX_SHAPE_XML_BYTES as usize, "truncated to the cap");
+        assert!(out.contains("AAAA"), "leading text survives truncation");
+        assert!(!out.is_empty(), "truncation still yields text");
     }
 }

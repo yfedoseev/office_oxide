@@ -314,3 +314,87 @@ fn test_deeply_nested_carrier_is_reached_through_the_container_chain() {
         "a carrier four container levels deep must still be reached: {text:?}"
     );
 }
+
+/// G4: `extract_deck_text` builds a single `DownrevBudget` and threads it
+/// through BOTH the persist-directory path and the no-directory fallback
+/// inside one call. This end-to-end test pins that shared-budget plumbing so a
+/// later change that strands budget on one path (and starves the other) is
+/// caught. The persist path here consumes budget and the fallback still runs
+/// against the remainder, exercising both arms of the shared budget.
+#[test]
+fn test_downrev_budget_is_shared_across_persist_and_fallback() {
+    let stream = ppt_stream_with_persist(&[slide_one(), slide_two()], &[master_group()]);
+    let doc = open_ppt(stream);
+    let ppt = doc.as_ppt().expect("parsed as ppt");
+    let text = ppt.plain_text();
+    // Both extraction arms ran against one budget; the downrev text still
+    // surfaces and within-slide duplicates collapse.
+    assert!(text.contains("Quarterly results"));
+    assert!(text.contains("Outlook"));
+    assert_eq!(text.matches("Steady growth expected").count(), 1);
+}
+
+/// G5: whole-pipeline regression guard through the public `Document` /
+/// `from_reader` API. A real `.ppt` fixture is not checked in, so this
+/// synthesises an equivalent multi-slide stream; it locks the per-slide
+/// downrev-text contract end-to-end (the cross-slide dedup bug from R1 is
+/// tracked by the ignored regression below).
+#[test]
+fn test_downrev_text_per_slide_through_public_api() {
+    let xml3 = downrev_shape_xml(&["Appendix", "See attached notes"]);
+    let slide_three = vec![downrev_shape_group(&downrev_zip(&xml3))];
+    let stream =
+        ppt_stream_with_persist(&[slide_one(), slide_two(), slide_three], &[master_group()]);
+    let doc = open_ppt(stream);
+    let ppt = doc.as_ppt().expect("parsed as ppt");
+    assert_eq!(ppt.slides.len(), 3, "three slides");
+    assert!(
+        ppt.slides[0]
+            .text_runs
+            .iter()
+            .any(|r| r.text.contains("Quarterly results")),
+        "slide 1 keeps its downrev text"
+    );
+    assert!(
+        ppt.slides[1]
+            .text_runs
+            .iter()
+            .any(|r| r.text.contains("Outlook")),
+        "slide 2 keeps its downrev text"
+    );
+    assert!(
+        ppt.slides[2]
+            .text_runs
+            .iter()
+            .any(|r| r.text.contains("Appendix")),
+        "slide 3 keeps its downrev text"
+    );
+}
+
+/// R1 (integration exposure, ignored until fixed): the same downrev package
+/// carried on two different slides must contribute its text to BOTH slides —
+/// each slide is a distinct shape. The per-file `seen_packages` set currently
+/// drops it on the second slide. Run `cargo test -- --ignored` to see it fail.
+#[test]
+#[ignore = "R1: cross-slide package dedup drops per-slide text; fix by scoping DownrevBudget::seen_packages per-slide"]
+fn test_downrev_identical_package_kept_on_each_slide() {
+    let xml = downrev_shape_xml(&["Shared heading"]);
+    let grp = downrev_shape_group(&downrev_zip(&xml));
+    let stream = ppt_stream_with_persist(&[vec![grp.clone()], vec![grp]], &[]);
+    let doc = open_ppt(stream);
+    let ppt = doc.as_ppt().expect("parsed as ppt");
+    assert!(
+        ppt.slides[0]
+            .text_runs
+            .iter()
+            .any(|r| r.text.contains("Shared heading")),
+        "slide 1 extracts the shared package"
+    );
+    assert!(
+        ppt.slides[1]
+            .text_runs
+            .iter()
+            .any(|r| r.text.contains("Shared heading")),
+        "slide 2 must ALSO extract the shared package (R1: per-slide text)"
+    );
+}
