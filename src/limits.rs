@@ -258,40 +258,6 @@ pub fn set_max_image_bytes(bytes: usize) {
     MAX_IMAGE_BYTES.store(bytes, Ordering::Relaxed);
 }
 
-/// A text budget shared by every worksheet of one document, which are parsed
-/// on several threads: each charge comes off one document-wide total, so the
-/// limit is per document however many sheets there are.
-#[derive(Debug, Clone)]
-pub(crate) struct SharedTextBudget {
-    total: usize,
-    remaining: std::sync::Arc<AtomicUsize>,
-}
-
-impl SharedTextBudget {
-    /// A fresh budget at the configured limit.
-    pub(crate) fn new() -> Self {
-        Self::with_limit(max_text_chars())
-    }
-
-    pub(crate) fn with_limit(total: usize) -> Self {
-        Self {
-            total,
-            remaining: std::sync::Arc::new(AtomicUsize::new(total)),
-        }
-    }
-
-    /// Charge `chars`; `false` when the document's total would be exceeded.
-    pub(crate) fn charge(&self, chars: usize) -> bool {
-        self.remaining
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |r| r.checked_sub(chars))
-            .is_ok()
-    }
-
-    pub(crate) fn limit(&self) -> usize {
-        self.total
-    }
-}
-
 thread_local! {
     /// Image bytes still available to the conversion running on this
     /// thread, and whether it ran out.

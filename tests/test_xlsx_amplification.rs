@@ -11,26 +11,8 @@
 
 use std::io::{Cursor, Write};
 
-use office_oxide::core::Error as CoreError;
 use office_oxide::limits::set_max_text_chars;
-use office_oxide::xlsx::XlsxError;
-use office_oxide::{Document, DocumentFormat, OfficeError};
-
-/// The message of a refusal for exceeding a resource bound, or `None` when
-/// `result` is not one. A worksheet that exceeds a bound is unreadable, and a
-/// workbook with no readable sheet is refused with that sheet's reason.
-fn limit_message<T>(result: &office_oxide::Result<T>) -> Option<String> {
-    match result {
-        Err(OfficeError::Core(CoreError::PackageLimit(m))) => Some(m.clone()),
-        Err(OfficeError::Core(CoreError::MalformedXml(m)))
-        | Err(OfficeError::Xlsx(XlsxError::Core(CoreError::MalformedXml(m))))
-            if m.contains("package limit exceeded") =>
-        {
-            Some(m.clone())
-        },
-        _ => None,
-    }
-}
+use office_oxide::{Document, DocumentFormat};
 
 /// The text budget every test here runs under.
 const TEXT_BUDGET: usize = 60_000;
@@ -105,24 +87,54 @@ fn shared_formula_workbook(master_len: usize, followers: usize) -> Vec<u8> {
     )
 }
 
+/// The sheet's cells in column B that still have a formula, and how many
+/// have a value.
+fn formula_and_value_counts(ws: &office_oxide::xlsx::Worksheet) -> (usize, usize) {
+    let cells = ws.rows.iter().flat_map(|r| &r.cells);
+    (
+        cells.clone().filter(|c| c.formula.is_some()).count(),
+        cells
+            .filter(|c| !matches!(c.value, office_oxide::xlsx::CellValue::Empty))
+            .count(),
+    )
+}
+
 #[test]
 fn test_shared_formula_master_copied_into_many_followers_is_bounded() {
     set_budgets();
     // 4,000 characters (under the 8,192 limit) copied into 100 followers is
-    // 400,000 characters against a 60,000 budget.
-    let result = open(shared_formula_workbook(4_000, 100));
-    let message = limit_message(&result).unwrap_or_else(|| {
-        panic!("expected a package limit error, got {:?}", result.as_ref().map(|_| ()))
-    });
-    assert!(message.contains("shared group 0"), "{message}");
+    // 400,000 characters against a 60,000 budget: the followers that fit keep
+    // their formula, the others keep their cell and value without one.
+    let doc = open(shared_formula_workbook(4_000, 100)).expect("the sheet stays readable");
+    let ws = &doc.as_xlsx().unwrap().worksheets[0];
+    let (formulas, values) = formula_and_value_counts(ws);
+    assert_eq!(values, 101, "every cell keeps its value");
+    assert!(formulas > 1 && formulas < 20, "{formulas} cells kept a formula");
+    assert_eq!(ws.formulas_dropped, 101 - formulas);
+    let ir = doc.to_ir();
+    assert!(ir.metadata.text_truncated, "the loss is not flagged");
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("shared formula"))
+    );
 }
 
 #[test]
-fn test_shared_formula_master_over_excel_limit_is_refused() {
+fn test_shared_formula_master_over_excel_limit_is_dropped_but_the_cell_is_kept() {
     set_budgets();
-    let result = open(shared_formula_workbook(9_000, 1));
-    let message = limit_message(&result).expect("a package limit error");
-    assert!(message.contains("8192"), "{message}");
+    let doc = open(shared_formula_workbook(9_000, 1)).expect("the sheet stays readable");
+    let ws = &doc.as_xlsx().unwrap().worksheets[0];
+    assert_eq!(formula_and_value_counts(ws), (0, 2));
+    assert_eq!(ws.formulas_dropped, 2, "the master and its follower");
+    assert!(
+        doc.to_ir()
+            .metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("8192"))
+    );
 }
 
 #[test]
@@ -257,13 +269,25 @@ fn test_shared_formula_budget_is_per_document_not_per_sheet() {
         parts.push((format!("xl/worksheets/sheet{i}.xml"), sheet.clone().into_bytes()));
     }
     let parts: Vec<(&str, Vec<u8>)> = parts.iter().map(|(n, d)| (n.as_str(), d.clone())).collect();
-    let doc = open(package(&sheets, &rels, &parts)).unwrap();
-    let text = doc.plain_text();
-    assert!(
-        text.contains("unreadable sheet"),
-        "the sheets past the document total are reported"
-    );
-    assert!(text.contains("S1"), "the sheets within it are read");
+    // Whichever order the sheets are parsed in, the first sheets keep their
+    // formulas and the last lose them.
+    let bytes = package(&sheets, &rels, &parts);
+    let dropped = |bytes: &[u8]| -> Vec<usize> {
+        let doc = open(bytes.to_vec()).expect("no sheet is unreadable");
+        doc.as_xlsx()
+            .unwrap()
+            .worksheets
+            .iter()
+            .map(|w| w.formulas_dropped)
+            .collect()
+    };
+    let first = dropped(&bytes);
+    assert_eq!(first.len(), 6, "every sheet is read");
+    assert_eq!(&first[..2], &[0, 0], "{first:?}");
+    assert_eq!(first[5], 20, "{first:?}");
+    for _ in 0..5 {
+        assert_eq!(dropped(&bytes), first, "the outcome depends on scheduling");
+    }
 }
 
 #[test]

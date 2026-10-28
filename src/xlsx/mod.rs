@@ -473,21 +473,22 @@ impl XlsxDocument {
 
         // Phase 2: parse worksheets (parallel when feature enabled). A
         // sheet whose part does not parse is recorded, not fatal. The
-        // translated shared-formula text of all sheets is charged to one
-        // document-wide budget.
-        let formula_budget = crate::limits::SharedTextBudget::new();
+        // shared-formula followers are written afterwards, in sheet order,
+        // against one document-wide budget.
         let parsed = crate::core::parallel::map_collect(
             bundles,
-            |b| -> Result<std::result::Result<Worksheet, (String, String)>> {
+            |b| -> Result<
+                std::result::Result<(Worksheet, shared_formula::SharedFormulas), (String, String)>,
+            > {
                 let name = b.name.clone();
                 if matches!(b.kind, crate::ir::SheetKind::Chart | crate::ir::SheetKind::Dialog) {
                     let mut ws = Worksheet::without_cells(b.name, b.kind);
                     ws.state = b.state;
                     ws.chart_text = b.chart_text;
-                    return Ok(Ok(ws));
+                    return Ok(Ok((ws, shared_formula::SharedFormulas::default())));
                 }
-                match Worksheet::parse_within(&b.data, b.name, &b.rels, formula_budget.clone()) {
-                    Ok(mut ws) => {
+                match Worksheet::parse_unresolved(&b.data, b.name, &b.rels) {
+                    Ok((mut ws, shared)) => {
                         ws.kind = b.kind;
                         ws.state = b.state;
                         ws.tables = b.tables;
@@ -496,7 +497,7 @@ impl XlsxDocument {
                         ws.text_shapes = b.text_shapes;
                         ws.comments = b.comments;
                         ws.comments_truncated = b.comments_truncated;
-                        Ok(Ok(ws))
+                        Ok(Ok((ws, shared)))
                     },
                     Err(e) => {
                         log::warn!("xlsx: sheet {name:?} is unreadable and skipped: {e}");
@@ -506,9 +507,20 @@ impl XlsxDocument {
             },
         )?;
         let mut worksheets = Vec::with_capacity(parsed.len());
+        let mut formula_budget = crate::limits::TextBudget::new();
         for p in parsed {
             match p {
-                Ok(ws) => worksheets.push(ws),
+                Ok((mut ws, shared)) => {
+                    ws.formulas_dropped = shared.resolve(&mut ws.rows, &mut formula_budget).dropped;
+                    if ws.formulas_dropped > 0 {
+                        log::warn!(
+                            "xlsx: sheet {:?}: {} shared formula(s) left out",
+                            ws.name,
+                            ws.formulas_dropped
+                        );
+                    }
+                    worksheets.push(ws);
+                },
                 Err(u) => unreadable_sheets.push(u),
             }
         }

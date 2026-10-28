@@ -9,114 +9,131 @@
 //! `Cell.formula = None` for every follower, making a formula cell
 //! indistinguishable from a cell with no formula at all.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::cell::CellRef;
-use crate::core::{Error, Result};
-use crate::limits::{MAX_FORMULA_CHARS, SharedTextBudget};
+use super::worksheet::Row;
+use crate::limits::{MAX_FORMULA_CHARS, TextBudget};
 
 /// Excel's grid limits (ECMA-376 §18.3.1.73 / §18.3.1.13).
 const MAX_COL: i64 = 16_383;
 const MAX_ROW: i64 = 1_048_575;
 
-/// Shared-formula masters collected while parsing one worksheet, keyed by
-/// the group's `si` index.
+/// A follower cell whose formula is still to be written: the group it names
+/// and where its cell sits in the sheet's rows.
 #[derive(Debug)]
-pub struct SharedFormulas {
-    masters: HashMap<u32, (CellRef, String)>,
-    /// Characters of translated follower text the whole document may hold. A
-    /// follower stores its own copy of the master's formula, so a long master
-    /// shared by many cells multiplies; every translation is charged here.
-    budget: SharedTextBudget,
-    /// Followers whose master hadn't been seen yet. A group's master
-    /// normally comes first, but not always — calamine ships a fixture with
-    /// the records deliberately reversed — so these are resolved in a second
-    /// pass once the whole sheet has been read.
-    pending: Vec<(u32, CellRef)>,
+struct Follower {
+    si: u32,
+    at: CellRef,
+    row: usize,
+    cell: usize,
 }
 
-impl Default for SharedFormulas {
-    fn default() -> Self {
-        Self::with_budget(SharedTextBudget::new())
-    }
+/// What [`SharedFormulas::resolve`] could not give a formula to.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SharedFormulaLoss {
+    /// Masters longer than [`MAX_FORMULA_CHARS`], and followers of such
+    /// groups, plus followers past the document's text budget. Their cells
+    /// keep their values and have no formula.
+    pub dropped: usize,
+}
+
+/// Shared-formula masters and followers collected while parsing one
+/// worksheet, keyed by the group's `si` index.
+///
+/// Parsing only records them. A follower stores its own copy of the master's
+/// formula, so a long master shared by many cells multiplies; the copies are
+/// made afterwards by [`resolve`](Self::resolve), one sheet at a time in the
+/// workbook's order, against one document-wide budget. Sheets are parsed on
+/// several threads, and charging as they went would make which sheet loses
+/// its formulas depend on scheduling.
+#[derive(Debug, Default)]
+pub struct SharedFormulas {
+    masters: HashMap<u32, (CellRef, String)>,
+    /// Groups whose master was refused for its length.
+    refused: HashSet<u32>,
+    /// Masters refused, counted once each.
+    refused_masters: usize,
+    /// Every follower in document order. A group's master normally comes
+    /// first, but not always — calamine ships a fixture with the records
+    /// deliberately reversed — so a follower is resolved only once the whole
+    /// sheet has been read.
+    followers: Vec<Follower>,
+    /// Where the cell being parsed will sit: `(row, cell)` indexes into the
+    /// sheet's rows.
+    cursor: (usize, usize),
 }
 
 impl SharedFormulas {
-    /// A collection whose follower translations are charged to `budget`.
-    pub(crate) fn with_budget(budget: SharedTextBudget) -> Self {
-        Self {
-            masters: HashMap::new(),
-            budget,
-            pending: Vec::new(),
-        }
+    /// The row index last given to [`at_position`](Self::at_position).
+    pub(crate) fn row(&self) -> usize {
+        self.cursor.0
+    }
+
+    /// Note that the next cell parsed is cell `cell` of row `row`.
+    pub(crate) fn at_position(&mut self, row: usize, cell: usize) {
+        self.cursor = (row, cell);
     }
 
     /// Record a group's master cell and its formula text. A master longer
     /// than [`MAX_FORMULA_CHARS`] (Excel's own limit, ECMA-376 §18.17) is
-    /// refused: it cannot come from a spreadsheet application, and the text
-    /// is copied into every follower.
-    pub fn add_master(&mut self, si: u32, at: CellRef, formula: String) -> Result<()> {
-        let chars = formula.chars().count();
-        if chars > MAX_FORMULA_CHARS {
-            return Err(Error::PackageLimit(format!(
-                "shared formula group {si} has a {chars}-character master; \
-                 the limit is {MAX_FORMULA_CHARS}"
-            )));
+    /// refused, as is its group: it cannot come from a spreadsheet
+    /// application, and the text is copied into every follower. Returns
+    /// `false` for a refused master, whose cell then has no formula.
+    pub fn add_master(&mut self, si: u32, at: CellRef, formula: &str) -> bool {
+        // A character is at most four bytes: only a short text is counted.
+        let too_long =
+            formula.len() > MAX_FORMULA_CHARS * 4 || formula.chars().count() > MAX_FORMULA_CHARS;
+        if too_long {
+            self.refused.insert(si);
+            self.refused_masters += 1;
+            return false;
         }
-        self.masters.insert(si, (at, formula));
-        Ok(())
+        self.masters.insert(si, (at, formula.to_string()));
+        true
     }
 
-    /// Charge one translated follower (its length in bytes, which bounds
-    /// its characters) to the worksheet's budget.
-    fn charge(&self, si: u32, formula: &str) -> Result<()> {
-        if self.budget.charge(formula.len()) {
-            Ok(())
-        } else {
-            Err(Error::PackageLimit(format!(
-                "the formulas of shared group {si}'s followers exceed the {} character \
-                 budget (office_oxide::limits::set_max_text_chars)",
-                self.budget.limit()
-            )))
-        }
+    /// Record a follower cell (`<f t="shared" si="N"/>`) at the current
+    /// position; its formula is written by [`resolve`](Self::resolve).
+    pub fn follower(&mut self, si: u32, at: &CellRef) {
+        self.followers.push(Follower {
+            si,
+            at: at.clone(),
+            row: self.cursor.0,
+            cell: self.cursor.1,
+        });
     }
 
-    /// Resolve a follower cell, or `None` if its master hasn't been seen
-    /// yet — in which case the follower is remembered for `resolve_pending`.
-    pub fn follower(&mut self, si: u32, at: &CellRef) -> Result<Option<String>> {
-        match self.masters.get(&si) {
-            Some((master_at, formula)) => {
-                let formula = translate(formula, master_at, at);
-                self.charge(si, &formula)?;
-                Ok(Some(formula))
-            },
-            None => {
-                self.pending.push((si, at.clone()));
-                Ok(None)
-            },
-        }
-    }
-
-    /// Whether any follower is still waiting on its master.
-    pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
-    }
-
-    /// Resolve every follower that was parsed before its master, as
-    /// `(cell_ref, formula_text)` pairs. Followers whose `si` never had a
-    /// master stay unresolved and are dropped.
-    pub fn resolve_pending(&mut self) -> Result<Vec<(CellRef, String)>> {
-        let pending = std::mem::take(&mut self.pending);
-        let mut out = Vec::new();
-        for (si, at) in pending {
-            let Some((master_at, formula)) = self.masters.get(&si) else {
+    /// Write every follower's formula into `rows`, charging each translated
+    /// text to `budget` before it is kept. A follower whose group has no
+    /// master stays without a formula, as before; one that does not fit the
+    /// budget, or whose master was refused, is counted in the result and
+    /// keeps its cell and value. Once the budget is spent no more is
+    /// translated.
+    pub(crate) fn resolve(self, rows: &mut [Row], budget: &mut TextBudget) -> SharedFormulaLoss {
+        let mut dropped = self.refused_masters;
+        for f in self.followers {
+            if self.refused.contains(&f.si) {
+                dropped += 1;
+                continue;
+            }
+            let Some((master_at, formula)) = self.masters.get(&f.si) else {
                 continue;
             };
-            let formula = translate(formula, master_at, &at);
-            self.charge(si, &formula)?;
-            out.push((at, formula));
+            if budget.exhausted() {
+                dropped += 1;
+                continue;
+            }
+            let text = translate(formula, master_at, &f.at);
+            if !budget.charge(text.len()) {
+                dropped += 1;
+                continue;
+            }
+            if let Some(cell) = rows.get_mut(f.row).and_then(|r| r.cells.get_mut(f.cell)) {
+                cell.formula = Some(text);
+            }
         }
-        Ok(out)
+        SharedFormulaLoss { dropped }
     }
 }
 
@@ -345,22 +362,73 @@ mod tests {
         assert_eq!(translate("A1", &r("B1"), &r("A1")), "#REF!");
     }
 
+    fn rows_of(refs: &[&str]) -> Vec<Row> {
+        refs.iter()
+            .enumerate()
+            .map(|(i, a)| Row {
+                index: i as u32 + 1,
+                cells: vec![crate::xlsx::Cell {
+                    reference: r(a),
+                    value: crate::xlsx::CellValue::Number(1.0),
+                    style_index: None,
+                    formula: None,
+                    vm: None,
+                    rich_runs: None,
+                }],
+            })
+            .collect()
+    }
+
     #[test]
     fn test_shared_formula_followers_before_master_resolve_in_second_pass() {
         let mut sf = SharedFormulas::default();
+        let mut rows = rows_of(&["B3", "B2"]);
         // Follower first — the master record comes later in the file.
-        assert_eq!(sf.follower(0, &r("B3")).unwrap(), None);
-        assert!(sf.has_pending());
-        sf.add_master(0, r("B2"), "A2".to_string()).unwrap();
-        assert_eq!(sf.resolve_pending().unwrap(), vec![(r("B3"), "A3".to_string())]);
-        // Once the master is known, followers resolve inline.
-        assert_eq!(sf.follower(0, &r("B4")).unwrap().as_deref(), Some("A4"));
+        sf.at_position(0, 0);
+        sf.follower(0, &r("B3"));
+        sf.at_position(1, 0);
+        assert!(sf.add_master(0, r("B2"), "A2"));
+        let loss = sf.resolve(&mut rows, &mut TextBudget::with_limit(100));
+        assert_eq!(loss.dropped, 0);
+        assert_eq!(rows[0].cells[0].formula.as_deref(), Some("A3"));
     }
 
     #[test]
     fn test_shared_formula_follower_without_any_master_is_dropped() {
         let mut sf = SharedFormulas::default();
-        assert_eq!(sf.follower(7, &r("B3")).unwrap(), None);
-        assert!(sf.resolve_pending().unwrap().is_empty());
+        let mut rows = rows_of(&["B3"]);
+        sf.at_position(0, 0);
+        sf.follower(7, &r("B3"));
+        let loss = sf.resolve(&mut rows, &mut TextBudget::with_limit(100));
+        assert_eq!(loss.dropped, 0, "an orphan is not a loss of a formula that existed");
+        assert_eq!(rows[0].cells[0].formula, None);
+    }
+
+    #[test]
+    fn test_followers_past_the_budget_keep_their_cells_and_are_counted() {
+        let mut sf = SharedFormulas::default();
+        let mut rows = rows_of(&["B2", "B3", "B4"]);
+        assert!(sf.add_master(0, r("B1"), "A1+A1"));
+        for i in 0..3 {
+            sf.at_position(i, 0);
+            sf.follower(0, &rows[i].cells[0].reference.clone());
+        }
+        // "A2+A2" is 5 bytes: two fit in 12, the third does not.
+        let loss = sf.resolve(&mut rows, &mut TextBudget::with_limit(12));
+        assert_eq!(loss.dropped, 1);
+        assert_eq!(rows[1].cells[0].formula.as_deref(), Some("A3+A3"));
+        assert_eq!(rows[2].cells[0].formula, None);
+    }
+
+    #[test]
+    fn test_a_master_over_excels_limit_drops_its_group_but_not_the_sheet() {
+        let mut sf = SharedFormulas::default();
+        let mut rows = rows_of(&["B2"]);
+        assert!(!sf.add_master(0, r("B1"), &format!("A1+{}", "1+".repeat(MAX_FORMULA_CHARS))));
+        sf.at_position(0, 0);
+        sf.follower(0, &r("B2"));
+        let loss = sf.resolve(&mut rows, &mut TextBudget::with_limit(1_000_000));
+        assert_eq!(loss.dropped, 2);
+        assert_eq!(rows[0].cells[0].formula, None);
     }
 }

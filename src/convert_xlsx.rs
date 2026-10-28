@@ -49,6 +49,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     let mut format_code_omitted = false;
     // The picture notice belongs to the sheet whose pictures spent the budget.
     let mut image_notice_given = false;
+    let mut formulas_truncated = false;
     let mut padding_notice_given = false;
     let mut padding_budget = crate::limits::GridBudget::new();
 
@@ -532,6 +533,17 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 ..Default::default()
             }));
         }
+        if ws.formulas_dropped > 0 {
+            formulas_truncated = true;
+            warnings.push(format!(
+                "sheet {:?}: {} shared formula(s) left out: a master longer than {} characters, or \
+                 copies past the character budget (office_oxide::limits::set_max_text_chars); \
+                 the cells keep their values",
+                ws.name,
+                ws.formulas_dropped,
+                crate::limits::MAX_FORMULA_CHARS
+            ));
+        }
         if ws.hyperlinks_dropped > 0 {
             warnings.push(format!(
                 "sheet {:?}: {} hyperlink(s) left out: their target is longer than {} characters",
@@ -763,6 +775,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 || budget.exhausted()
                 || padding_budget.exhausted()
                 || comments_truncated
+                || formulas_truncated
                 || image_budget.exhausted(),
             defined_names: doc
                 .workbook

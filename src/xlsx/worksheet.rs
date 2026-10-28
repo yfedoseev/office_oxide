@@ -20,6 +20,11 @@ pub struct Worksheet {
     pub merged_cells: Vec<String>,
     /// Hyperlinks defined on this sheet.
     pub hyperlinks: Vec<HyperlinkInfo>,
+    /// Formulas left out: a shared-formula master longer than Excel allows (8,192
+    /// characters), the cells that follow it, and followers whose copies of
+    /// the master would pass the document's text budget
+    /// ([`crate::limits::set_max_text_chars`]). The cells keep their values.
+    pub formulas_dropped: usize,
     /// Hyperlinks left out because their relationship's target is longer than
     /// [`crate::limits::MAX_HYPERLINK_TARGET_CHARS`] (2,083 characters, Excel's
     /// own limit).
@@ -853,6 +858,7 @@ impl Worksheet {
             merged_cells: Vec::new(),
             hyperlinks: Vec::new(),
             hyperlinks_dropped: 0,
+            formulas_dropped: 0,
             page_setup: None,
             images: Vec::new(),
             comments: Vec::new(),
@@ -875,17 +881,22 @@ impl Worksheet {
         name: String,
         rels: &crate::core::relationships::Relationships,
     ) -> crate::core::Result<Self> {
-        Self::parse_within(xml_data, name, rels, crate::limits::SharedTextBudget::new())
+        let (mut ws, shared) = Self::parse_unresolved(xml_data, name, rels)?;
+        ws.formulas_dropped = shared
+            .resolve(&mut ws.rows, &mut crate::limits::TextBudget::new())
+            .dropped;
+        Ok(ws)
     }
 
-    /// [`Self::parse`] with the translated shared-formula text charged to
-    /// `formulas`, the budget of the whole document rather than of this sheet.
-    pub(crate) fn parse_within(
+    /// [`Self::parse`] without writing the formulas of shared-formula
+    /// followers, which the caller does with [`SharedFormulas::resolve`] once
+    /// all sheets are read so that one document-wide budget is spent in
+    /// sheet order whatever order the sheets were parsed in.
+    pub(crate) fn parse_unresolved(
         xml_data: &[u8],
         name: String,
         rels: &crate::core::relationships::Relationships,
-        formulas: crate::limits::SharedTextBudget,
-    ) -> crate::core::Result<Self> {
+    ) -> crate::core::Result<(Self, SharedFormulas)> {
         // Use plain Reader (not NsReader) for performance — worksheet XML is always
         // in the SML namespace, so namespace resolution is unnecessary overhead.
         // This is the hot path: worksheets can have thousands of cells.
@@ -901,7 +912,7 @@ impl Worksheet {
         // end iff at least one was seen.
         let mut margins_in: Option<PageMarginsIn> = None;
         let mut page_setup_raw: Option<PageSetupRaw> = None;
-        let mut shared = SharedFormulas::with_budget(formulas);
+        let mut shared = SharedFormulas::default();
         let mut conditional_formats = Vec::new();
         let mut data_validations = Vec::new();
         let mut header_footer = SheetHeaderFooter::default();
@@ -918,6 +929,7 @@ impl Worksheet {
                         // previous row (ECMA-376 18.3.1.73); some writers omit
                         // it throughout the sheet.
                         let implied = rows.last().map_or(1, |r: &Row| r.index + 1);
+                        shared.at_position(rows.len(), 0);
                         rows.push(parse_row_fast(&mut reader, e, implied, &mut shared)?);
                     },
                     "mergeCell" => {
@@ -980,22 +992,7 @@ impl Worksheet {
 
         let page_setup = build_page_setup(margins_in, page_setup_raw);
 
-        // A shared group's master usually precedes its followers, but not
-        // always — calamine ships a fixture with the records reversed — so
-        // followers that arrived first are filled in now.
-        if shared.has_pending() {
-            for (at, formula) in shared.resolve_pending()? {
-                if let Some(cell) = rows
-                    .iter_mut()
-                    .find(|r| r.index == at.row + 1)
-                    .and_then(|r| r.cells.iter_mut().find(|c| c.reference == at))
-                {
-                    cell.formula = Some(formula);
-                }
-            }
-        }
-
-        Ok(Worksheet {
+        let ws = Worksheet {
             kind: crate::ir::SheetKind::Worksheet,
             chart_text: Vec::new(),
             state: super::SheetState::Visible,
@@ -1010,12 +1007,14 @@ impl Worksheet {
             merged_cells,
             hyperlinks,
             hyperlinks_dropped: link_targets.dropped,
+            formulas_dropped: 0,
             page_setup,
             images: Vec::new(),
             text_shapes: Vec::new(),
             conditional_formats,
             data_validations,
-        })
+        };
+        Ok((ws, shared))
     }
 }
 
@@ -1489,6 +1488,7 @@ fn parse_row_fast(
         match reader.read_event()? {
             Event::Start(ref e) => {
                 if e.local_name().as_ref() == "c" {
+                    shared.at_position(shared.row(), cells.len());
                     let cell = parse_cell_fast(reader, e, index, next_col, shared)?;
                     next_col = cell.reference.col.saturating_add(1);
                     cells.push(cell);
@@ -1624,10 +1624,11 @@ fn parse_cell_fast(
                     let si = shared_si(e)?;
                     let text = read_text_fast(reader)?;
                     // A shared group's master carries the text once, here.
-                    if let Some(si) = si {
-                        shared.add_master(si, reference.clone(), text.clone())?;
-                    }
-                    formula = Some(text);
+                    // One longer than Excel allows is refused, with its group:
+                    // the cell keeps its value and has no formula.
+                    let accepted =
+                        si.is_none_or(|si| shared.add_master(si, reference.clone(), &text));
+                    formula = accepted.then_some(text);
                 },
                 "is" => {
                     let (text, runs) = parse_inline_string_fast(reader)?;
@@ -1643,10 +1644,9 @@ fn parse_cell_fast(
                 // its own, but its formula is the group master's translated
                 // by the row/column offset. Discarding it made a formula
                 // cell indistinguishable from one with no formula.
-                formula = match shared_si(e)? {
-                    Some(si) => shared.follower(si, &reference)?,
-                    None => None,
-                };
+                if let Some(si) = shared_si(e)? {
+                    shared.follower(si, &reference);
+                }
             },
             Event::End(ref e) if e.local_name().as_ref() == "c" => {
                 break;
