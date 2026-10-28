@@ -9,7 +9,6 @@
 //! example) 12 embedded Excel workbooks showed no trace of any of them
 //! anywhere in the IR.
 
-use std::collections::HashMap;
 use std::io::{Read, Seek};
 
 use crate::cfb::{CfbReader, DirEntry, EntryType};
@@ -35,43 +34,40 @@ pub struct EmbeddedOleObject {
 /// expectations — this is a best-effort enhancement, never a hard
 /// requirement for reading the rest of the document.
 pub fn extract_ole_objects<R: Read + Seek>(reader: &CfbReader<R>) -> Vec<EmbeddedOleObject> {
-    classify_objects(reader.entries())
+    classify_objects(reader.entries(), MAX_ENTRIES_WALKED).0
 }
 
-/// The walk behind [`extract_ole_objects`], over a bare directory.
-fn classify_objects(entries: &[DirEntry]) -> Vec<EmbeddedOleObject> {
+/// The walk behind [`extract_ole_objects`], over a bare directory, with
+/// the per-walk cap as a parameter; also returns the entries the object
+/// walks took.
+fn classify_objects(entries: &[DirEntry], max_walk: usize) -> (Vec<EmbeddedOleObject>, usize) {
     if entries.is_empty() || entries[0].entry_type != EntryType::RootStorage {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
     let Some(pool_idx) = find_direct_child(entries, entries[0].child, "ObjectPool") else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let pool = &entries[pool_idx];
     if !matches!(pool.entry_type, EntryType::Storage | EntryType::RootStorage) {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
 
     let mut out = Vec::new();
-    // Many object storages can name the same child tree; classify each
-    // distinct tree once rather than walking it again for every object.
-    let mut classified: HashMap<u32, Option<String>> = HashMap::new();
-    for obj_idx in collect_children(entries, pool.child) {
+    // The pool listing and the object walks each share one visited set, so
+    // the pass is bounded by the directory, not by objects times entries.
+    let mut objects = Walker::new(entries, max_walk);
+    for obj_idx in Walker::new(entries, max_walk).collect(pool.child) {
         let obj = &entries[obj_idx];
         if obj.entry_type != EntryType::Storage {
             continue; // a stray non-storage entry directly under ObjectPool
         }
-        let description = classified.entry(obj.child).or_insert_with(|| {
-            let children = collect_children(entries, obj.child);
-            let names: Vec<&str> = children.iter().map(|&i| entries[i].name.as_str()).collect();
-            classify(&names)
-        });
-        if let Some(description) = description {
-            out.push(EmbeddedOleObject {
-                description: description.clone(),
-            });
+        let children = objects.collect(obj.child);
+        let names: Vec<&str> = children.iter().map(|&i| entries[i].name.as_str()).collect();
+        if let Some(description) = classify(&names) {
+            out.push(EmbeddedOleObject { description });
         }
     }
-    out
+    (out, objects.steps)
 }
 
 /// Classify one embedded object's storage by the well-known stream
@@ -122,25 +118,56 @@ fn find_direct_child(entries: &[DirEntry], root: u32, name: &str) -> Option<usiz
     None
 }
 
-/// All directory entry indices in the RB tree rooted at `root`,
-/// explicit-stack with a visited set for the same reason as
-/// [`find_direct_child`]: each entry appears once, so the walk is bounded
-/// by the directory however its pointers are wired.
-fn collect_children(entries: &[DirEntry], root: u32) -> Vec<usize> {
-    let mut out = Vec::new();
-    let mut stack = vec![root];
-    let mut seen = vec![false; entries.len()];
-    while let Some(node) = stack.pop() {
-        if node == NO_ENTRY || node as usize >= entries.len() || seen[node as usize] {
-            continue;
+/// Bound on how many directory entries one walk may take, whatever the
+/// directory's size. Well above any real document's embedded-object count.
+const MAX_ENTRIES_WALKED: usize = 50_000;
+
+/// Walks directory trees for one classification pass. The visited set is
+/// allocated once and shared by every walk of the pass, so an entry an
+/// earlier walk claimed is never walked again: the pass costs at most one
+/// step per directory entry however many objects name the same subtree or
+/// however the sibling pointers loop. Each single walk also stops at
+/// `max_walk` entries.
+struct Walker<'a> {
+    entries: &'a [DirEntry],
+    seen: Vec<bool>,
+    max_walk: usize,
+    /// Entries taken over every walk so far.
+    steps: usize,
+}
+
+impl<'a> Walker<'a> {
+    fn new(entries: &'a [DirEntry], max_walk: usize) -> Self {
+        Self {
+            entries,
+            seen: vec![false; entries.len()],
+            max_walk,
+            steps: 0,
         }
-        seen[node as usize] = true;
-        let entry = &entries[node as usize];
-        out.push(node as usize);
-        stack.push(entry.left_sibling);
-        stack.push(entry.right_sibling);
     }
-    out
+
+    /// The entry indices of the RB tree rooted at `root` that no earlier
+    /// walk of this pass has taken. Explicit stack: the tree comes from an
+    /// untrusted file and may be cyclic.
+    fn collect(&mut self, root: u32) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node == NO_ENTRY || node as usize >= self.entries.len() || self.seen[node as usize] {
+                continue;
+            }
+            if out.len() >= self.max_walk {
+                break;
+            }
+            self.seen[node as usize] = true;
+            self.steps += 1;
+            let entry = &self.entries[node as usize];
+            out.push(node as usize);
+            stack.push(entry.left_sibling);
+            stack.push(entry.right_sibling);
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -175,23 +202,13 @@ mod tests {
     #[test]
     fn test_finds_one_embedded_excel_workbook() {
         let entries = build_tree_with_one_excel_object();
-        // Exercise the free functions directly — CfbReader construction
-        // needs real sector data, which this test isn't building.
-        let pool_idx = find_direct_child(&entries, entries[0].child, "ObjectPool").unwrap();
-        let pool = &entries[pool_idx];
-        let mut out = Vec::new();
-        for obj_idx in collect_children(&entries, pool.child) {
-            let obj = &entries[obj_idx];
-            if obj.entry_type != EntryType::Storage {
-                continue;
-            }
-            let children = collect_children(&entries, obj.child);
-            let names: Vec<&str> = children.iter().map(|&i| entries[i].name.as_str()).collect();
-            if let Some(description) = classify(&names) {
-                out.push(description);
-            }
-        }
-        assert_eq!(out, vec!["Embedded Microsoft Excel Workbook".to_string()]);
+        let (out, _) = classify_objects(&entries, MAX_ENTRIES_WALKED);
+        assert_eq!(
+            out,
+            vec![EmbeddedOleObject {
+                description: "Embedded Microsoft Excel Workbook".to_string()
+            }]
+        );
     }
 
     #[test]
@@ -235,13 +252,13 @@ mod tests {
             // node 1's right sibling points back to itself.
             entry("Loop", EntryType::Storage, NO_ENTRY, NO_ENTRY, 1),
         ];
-        let out = collect_children(&entries, entries[0].child);
-        assert_eq!(out, vec![1], "a cyclic entry is reported once, not once per step");
+        let mut walker = Walker::new(&entries, MAX_ENTRIES_WALKED);
+        assert_eq!(walker.collect(entries[0].child), vec![1]);
+        assert_eq!(walker.steps, 1, "a cyclic entry is taken once, not once per step");
     }
 
-    /// Object storages whose sibling pointers loop on themselves, and a
-    /// pool of many such objects, cost a walk bounded by the directory
-    /// (every entry once), not by a per-walk step cap times the objects.
+    /// Object storages that loop on themselves and share one looping child
+    /// tree: the output is the one object and the walk takes each entry once.
     #[test]
     fn test_self_looping_object_pool_walks_each_entry_once() {
         let n: u32 = 200;
@@ -249,15 +266,61 @@ mod tests {
             entry("Root Entry", EntryType::RootStorage, 1, NO_ENTRY, NO_ENTRY),
             entry("ObjectPool", EntryType::Storage, 2, NO_ENTRY, NO_ENTRY),
         ];
-        // Objects 2..2+n: each is its own left and right sibling, and its
-        // child tree is the shared looping stream below.
         let stream = 2 + n;
         for i in 0..n {
             entries.push(entry(&format!("_{i}"), EntryType::Storage, stream, 2 + i, 2 + i));
         }
         entries.push(entry("Workbook", EntryType::Stream, NO_ENTRY, stream, stream));
-        let pool = collect_children(&entries, entries[1].child);
-        assert_eq!(pool.len(), 1, "the self-looping object is listed once");
-        assert_eq!(classify_objects(&entries).len(), 1);
+        let (out, steps) = classify_objects(&entries, 8);
+        assert_eq!(out.len(), 1);
+        assert!(steps <= entries.len(), "steps {steps} exceed the {} entries", entries.len());
+    }
+
+    /// Many object storages whose child links all land in one large
+    /// sibling chain: without a pass-wide visited set each walks the rest of
+    /// the chain (objects x entries); with one, the chain is walked once in
+    /// total and the work stays within the entry count, however small the
+    /// per-walk cap.
+    #[test]
+    fn test_many_objects_sharing_one_large_subtree_cost_one_walk() {
+        let objects: u32 = 400;
+        let chain: u32 = 400;
+        // Pool siblings: object i's right sibling is object i + 1.
+        let first_obj = 2;
+        let chain_start = first_obj + objects;
+        let mut entries = vec![
+            entry("Root Entry", EntryType::RootStorage, 1, NO_ENTRY, NO_ENTRY),
+            entry("ObjectPool", EntryType::Storage, first_obj, NO_ENTRY, NO_ENTRY),
+        ];
+        for i in 0..objects {
+            let right = if i + 1 < objects {
+                first_obj + i + 1
+            } else {
+                NO_ENTRY
+            };
+            // Every object's child is a different entry of the same chain.
+            entries.push(entry(
+                &format!("_{i}"),
+                EntryType::Storage,
+                chain_start + (i % chain),
+                NO_ENTRY,
+                right,
+            ));
+        }
+        for j in 0..chain {
+            let right = if j + 1 < chain {
+                chain_start + j + 1
+            } else {
+                NO_ENTRY
+            };
+            let name = if j == chain - 1 { "Workbook" } else { "x" };
+            entries.push(entry(name, EntryType::Stream, NO_ENTRY, NO_ENTRY, right));
+        }
+        let (out, steps) = classify_objects(&entries, 50);
+        assert!(
+            steps <= chain as usize,
+            "the shared chain was walked {steps} steps for {chain} entries"
+        );
+        assert!(out.len() <= 1, "an entry is claimed by one object only");
     }
 }
