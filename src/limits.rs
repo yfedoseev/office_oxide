@@ -503,6 +503,19 @@ pub(crate) fn image_budget_warning() -> Option<String> {
     })
 }
 
+/// The line a rendering of the IR shows when image bytes were left out, or
+/// `None` when the budget held. Said in the content itself because a
+/// Markdown or HTML rendering carries no metadata.
+pub(crate) fn image_budget_notice() -> Option<String> {
+    IMAGE_BUDGET.with(|b| b.get().1).then(|| {
+        format!(
+            "[some pictures not shown: together they exceed the {} byte picture budget \
+             (office_oxide::limits::set_max_image_bytes)]",
+            max_image_bytes()
+        )
+    })
+}
+
 /// The default most table cells one IR may hold when it is written to
 /// `.docx` or `.pptx`: 250,000.
 ///

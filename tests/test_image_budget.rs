@@ -236,8 +236,36 @@ fn test_pptx_pictures_sharing_one_image_stop_copying_at_the_budget() {
         ir.metadata
             .warnings
             .iter()
-            .any(|w| w.contains("image bytes"))
+            .any(|w| w.contains("image bytes") && w.contains("set_max_image_bytes"))
     );
+    // A cut is flagged, as the spreadsheet conversion flags it, and said in
+    // the content itself, where Markdown and HTML renderings show it.
+    assert!(ir.metadata.text_truncated, "pictures left out must set text_truncated");
+    fn notices(elements: &[Element]) -> usize {
+        elements
+            .iter()
+            .map(|e| match e {
+                Element::Paragraph(p) => p
+                    .content
+                    .iter()
+                    .filter(|c| {
+                        matches!(c, office_oxide::ir::InlineContent::Text(t)
+                            if t.text.contains("set_max_image_bytes"))
+                    })
+                    .count(),
+                _ => 0,
+            })
+            .sum()
+    }
+    let said: usize = ir.sections.iter().map(|s| notices(&s.elements)).sum();
+    assert_eq!(said, 1, "one in-band notice");
+    assert!(
+        ir.sections
+            .last()
+            .is_some_and(|s| notices(&s.elements) == 1),
+        "the notice closes the last slide"
+    );
+    assert!(ir.to_markdown().contains("set_max_image_bytes"));
 }
 
 /// Notes whose size is almost all link target, not visible text: the
