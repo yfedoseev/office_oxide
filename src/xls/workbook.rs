@@ -2367,7 +2367,7 @@ mod tests {
         assert!(worst <= 320 << 20, "{} MiB of padding at the default allowance", worst >> 20);
         // A dense sheet is free and one sheet's rows reaching column 255
         // over 32,000 rows still fit.
-        assert!(crate::limits::DEFAULT_MAX_GRID_PADDING_CELLS >= 32_000 * 255);
+        const { assert!(crate::limits::DEFAULT_MAX_GRID_PADDING_CELLS >= 32_000 * 255) };
     }
 
     /// Padding is charged for empty slots only: a dense row costs nothing,
