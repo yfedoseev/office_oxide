@@ -23,46 +23,244 @@ fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
     Some([r, g, b])
 }
 
-pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
-    // Date styles found once and custom number formats compiled once, not
-    // re-scanned and re-parsed per cell.
-    let mut formatter = crate::xlsx::text::CellFormatter::new(doc);
-    let date_indices = formatter.date_indices().clone();
-    // Theme colours resolve cell fills; parsed once per document.
-    let theme = doc.theme_for_render();
+/// How much of a workbook the IR holds at once, and so what its resource
+/// allowances are measured against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IrScope {
+    /// The whole workbook is built into one IR and held until the caller
+    /// drops it: the empty cells that pad rows and the picture bytes are
+    /// allowed once for the document.
+    Document,
+    /// One sheet is built, used and dropped at a time: those allowances are
+    /// the sheet's, given back with it. The text budget, which is what the
+    /// whole run may output, and the characters charged for padding stay
+    /// document-wide, as does a total on picture bytes copied, so that many
+    /// sheets cannot multiply the work without bound.
+    Sheet,
+}
 
+/// Converts the worksheets of one workbook to IR sections, one at a time.
+///
+/// The state that outlives a sheet is here: the document's text budgets, the
+/// formatter that compiles each number format once, the warnings so far.
+pub(crate) struct SheetConverter<'d> {
+    doc: &'d crate::xlsx::XlsxDocument,
+    scope: IrScope,
+    formatter: crate::xlsx::text::CellFormatter<'d>,
+    date_indices: std::collections::HashSet<u32>,
+    // Theme colours resolve cell fills; parsed once per document.
+    theme: Option<std::borrow::Cow<'d, crate::core::theme::Theme>>,
     // Single String buffer reused across all cells — clear() keeps the heap
     // allocation; std::mem::take() moves it into TextSpan for non-empty cells.
-    let mut buf = String::new();
-
-    let mut sections = Vec::new();
+    buf: String,
     // One text budget for the whole document (see `crate::limits`): a
     // shared string referenced from every cell is copied into every
     // cell's span here.
-    let mut budget = crate::limits::TextBudget::new();
-    // The empty cells that pad rows out to the sheet's width have a budget of
-    // their own, also for the whole document: a row that spends the text
-    // budget is still laid out, and its padding is still paid for.
-    let mut image_budget = crate::limits::TextBudget::with_limit(crate::limits::max_image_bytes());
-    let mut comments_truncated = false;
-    let mut warnings: Vec<String> = Vec::new();
-    let mut format_code_omitted = false;
-    // The picture notice belongs to the sheet whose pictures spent the budget.
-    let mut image_notice_given = false;
-    let mut formulas_truncated = false;
-    let mut padding_notice_given = false;
-    let mut padding_budget = crate::limits::IrPaddingBudget::new();
+    budget: crate::limits::TextBudget,
+    image_budget: crate::limits::TextBudget,
+    // Picture bytes copied in all, whatever the sheets' own allowances: the
+    // bound on the work of a workbook whose sheets each draw the same picture.
+    total_image_budget: crate::limits::TextBudget,
+    padding_budget: crate::limits::IrPaddingBudget,
     // Padding is also paid for in characters, 3 an empty cell as Markdown
     // pays for an absent column, from a budget of its own: the cells' text
     // has spent the text budget by the time the rows are laid out, and the
     // rows whose text fit must not be lost for it. Lowering the text limit
     // still lowers this one.
-    let mut padding_chars = crate::limits::TextBudget::new();
+    padding_chars: crate::limits::TextBudget,
+    comments_truncated: bool,
+    format_code_omitted: bool,
+    // The picture notice belongs to the sheet whose pictures spent the budget.
+    image_notice_given: bool,
+    total_image_notice_given: bool,
+    formulas_truncated: bool,
+    padding_notice_given: bool,
+    // A sheet's own allowances are fresh for the next sheet, so what was
+    // cut is remembered here for the document's `text_truncated`.
+    padding_cut: bool,
+    image_cut: bool,
+    pivot_truncated: bool,
+    unreadable: bool,
+    // Whether the section just built was cut for any reason of its own.
+    item_truncated: bool,
+    warnings: Vec<String>,
+}
 
-    for (ws_idx, ws) in doc.worksheets.iter().enumerate() {
-        if budget.exhausted() || padding_budget.exhausted() || padding_chars.exhausted() {
-            break;
+impl<'d> SheetConverter<'d> {
+    pub(crate) fn new(doc: &'d crate::xlsx::XlsxDocument, scope: IrScope) -> Self {
+        // Date styles found once and custom number formats compiled once, not
+        // re-scanned and re-parsed per cell.
+        let formatter = crate::xlsx::text::CellFormatter::new(doc);
+        let date_indices = formatter.date_indices().clone();
+        let total_image =
+            usize::try_from(crate::limits::max_total_image_bytes()).unwrap_or(usize::MAX);
+        Self {
+            doc,
+            scope,
+            formatter,
+            date_indices,
+            theme: doc.theme_for_render(),
+            buf: String::new(),
+            budget: crate::limits::TextBudget::new(),
+            image_budget: crate::limits::TextBudget::with_limit(crate::limits::max_image_bytes()),
+            total_image_budget: crate::limits::TextBudget::with_limit(total_image),
+            padding_budget: Self::fresh_padding_budget(scope),
+            padding_chars: crate::limits::TextBudget::new(),
+            comments_truncated: false,
+            format_code_omitted: false,
+            image_notice_given: false,
+            total_image_notice_given: false,
+            formulas_truncated: false,
+            padding_notice_given: false,
+            padding_cut: false,
+            image_cut: false,
+            pivot_truncated: false,
+            unreadable: false,
+            item_truncated: false,
+            warnings: Vec::new(),
         }
+    }
+
+    fn fresh_padding_budget(scope: IrScope) -> crate::limits::IrPaddingBudget {
+        match scope {
+            IrScope::Document => crate::limits::IrPaddingBudget::new(),
+            IrScope::Sheet => crate::limits::IrPaddingBudget::new_for_sheet(),
+        }
+    }
+
+    /// Whether what is spent for the whole run ends it: no further sheet is
+    /// converted (the one that spent it carries the notice).
+    pub(crate) fn should_stop(&self) -> bool {
+        self.budget.exhausted()
+            || self.padding_chars.exhausted()
+            || (self.scope == IrScope::Document && self.padding_budget.exhausted())
+    }
+
+    /// The warnings the sections built so far have raised.
+    pub(crate) fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// Whether anything built so far was cut, for `Metadata::text_truncated`.
+    pub(crate) fn text_truncated(&self) -> bool {
+        self.unreadable
+            || self.pivot_truncated
+            || self.budget.exhausted()
+            || self.padding_cut
+            || self.padding_chars.exhausted()
+            || self.comments_truncated
+            || self.formulas_truncated
+            || self.image_cut
+            || self.total_image_budget.exhausted()
+    }
+
+    /// Whether the section built last was itself cut, or the run has been.
+    pub(crate) fn take_item_truncated(&mut self) -> bool {
+        let cut = self.item_truncated
+            || self.budget.exhausted()
+            || self.padding_chars.exhausted()
+            || self.total_image_budget.exhausted();
+        self.item_truncated = false;
+        cut
+    }
+
+    /// The warnings that describe the state of the run's budgets rather than
+    /// one event: the same text however many sheets noticed it.
+    pub(crate) fn end_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.budget.exhausted() {
+            warnings.push(self.budget.notice());
+        }
+        match self.scope {
+            IrScope::Document => {
+                if self.padding_budget.exhausted() || self.padding_chars.exhausted() {
+                    warnings.push(padding_notice(&self.padding_budget, &self.padding_chars));
+                }
+                if self.image_budget.exhausted() {
+                    warnings.push(format!(
+                        "some pictures were left out: the document's pictures exceed the {} byte budget \
+                         (office_oxide::limits::set_max_image_bytes)",
+                        self.image_budget.limit()
+                    ));
+                }
+            },
+            IrScope::Sheet => {
+                if self.padding_chars.exhausted() {
+                    warnings.push(self.padding_chars.notice());
+                }
+                if self.total_image_budget.exhausted() {
+                    warnings.push(total_image_notice(&self.total_image_budget));
+                }
+            },
+        }
+        if self.format_code_omitted {
+            warnings.push(format!(
+                "some cells' number format code is longer than {} characters and is not listed on \
+                 them (they keep their format id and values)",
+                crate::limits::MAX_NUMBER_FORMAT_CHARS
+            ));
+        }
+        warnings
+    }
+
+    /// Convert worksheet `ws_idx` to its section.
+    pub(crate) fn convert_sheet(&mut self, ws_idx: usize) -> Section {
+        let doc = self.doc;
+        let ws = &doc.worksheets[ws_idx];
+        if self.scope == IrScope::Sheet {
+            // The previous sheet has been released, and with it what it held.
+            self.padding_budget = Self::fresh_padding_budget(self.scope);
+            self.image_budget =
+                crate::limits::TextBudget::with_limit(crate::limits::max_image_bytes());
+            self.padding_notice_given = false;
+            self.image_notice_given = false;
+        }
+        let section = self.convert_sheet_inner(ws_idx, ws);
+        if self.scope == IrScope::Sheet {
+            let name = &ws.name;
+            if self.padding_budget.exhausted() {
+                self.warnings
+                    .push(format!("sheet {name:?}: {}", self.padding_budget.notice()));
+            }
+            if self.image_budget.exhausted() {
+                self.warnings.push(format!(
+                    "sheet {name:?}: some pictures were left out: the sheet's pictures exceed the {} \
+                     byte budget (office_oxide::limits::set_max_image_bytes)",
+                    self.image_budget.limit()
+                ));
+            }
+        }
+        self.padding_cut |= self.padding_budget.exhausted();
+        self.image_cut |= self.image_budget.exhausted();
+        self.item_truncated |= self.padding_budget.exhausted()
+            || self.image_budget.exhausted()
+            || ws.comments_truncated
+            || ws.formulas_dropped > 0;
+        section
+    }
+
+    fn convert_sheet_inner(&mut self, ws_idx: usize, ws: &crate::xlsx::Worksheet) -> Section {
+        let doc = self.doc;
+        let Self {
+            formatter,
+            date_indices,
+            theme,
+            buf,
+            budget,
+            image_budget,
+            total_image_budget,
+            padding_budget,
+            padding_chars,
+            comments_truncated,
+            format_code_omitted,
+            image_notice_given,
+            total_image_notice_given,
+            formulas_truncated,
+            padding_notice_given,
+            warnings,
+            scope,
+            ..
+        } = self;
         // First pass: parse all rows into `CellData` — the rendered display
         // string plus the structured facts (semantic type, raw value, number
         // format) that the grid path threads into the IR so `to_ir()`
@@ -133,7 +331,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             let mut cells: Vec<CellData> = Vec::with_capacity(row.cells.len());
             for cell in &row.cells {
                 buf.clear();
-                formatter.write(cell, &mut buf);
+                formatter.write(cell, buf);
                 let link = links.get(&(cell.reference.row, cell.reference.col));
                 // The cell's text, and the hyperlink target and hover text
                 // each span of it will carry, are paid for before any is
@@ -157,10 +355,10 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 let text = if buf.is_empty() {
                     String::new()
                 } else {
-                    std::mem::take(&mut buf)
+                    std::mem::take(buf)
                 };
                 let (data_type, raw_number, number_format, number_format_id) =
-                    cell_semantics(doc, cell, &date_indices, &mut format_code_omitted);
+                    cell_semantics(doc, cell, date_indices, format_code_omitted);
                 cells.push(CellData {
                     col: cell.reference.col,
                     hyperlink: link.map(|(target, _)| target.clone()),
@@ -257,7 +455,9 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             // A picture drawn from many anchors shares its bytes in the
             // workbook, but each IR image owns a copy, so every one is paid
             // for: the pictures past the budget are left out, and said so.
-            if !image_budget.charge(pic.data.len()) {
+            if !image_budget.charge(pic.data.len())
+                || (*scope == IrScope::Sheet && !total_image_budget.charge(pic.data.len()))
+            {
                 break;
             }
             let format = image_format_from_ext(&pic.format);
@@ -509,7 +709,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 ))],
                 ..Default::default()
             }));
-            comments_truncated = true;
+            *comments_truncated = true;
         }
         // Graceful truncation notice: when the sheet exceeded the row cap,
         // the dropped rows are not silently lost — a visible paragraph records
@@ -535,8 +735,8 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 ..Default::default()
             }));
         }
-        if image_budget.exhausted() && !image_notice_given {
-            image_notice_given = true;
+        if image_budget.exhausted() && !*image_notice_given {
+            *image_notice_given = true;
             combined.push(Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain(format!(
                     "[some pictures not shown: together they exceed the {} byte picture budget \
@@ -546,8 +746,17 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 ..Default::default()
             }));
         }
+        if total_image_budget.exhausted() && !*total_image_notice_given {
+            *total_image_notice_given = true;
+            combined.push(Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(total_image_notice(
+                    total_image_budget,
+                )))],
+                ..Default::default()
+            }));
+        }
         if ws.formulas_dropped > 0 {
-            formulas_truncated = true;
+            *formulas_truncated = true;
             warnings.push(format!(
                 "sheet {:?}: {} shared formula(s) left out: a master longer than {} characters, or \
                  copies past the character budget (office_oxide::limits::set_max_text_chars); \
@@ -571,12 +780,12 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 ..Default::default()
             }));
         }
-        if (padding_budget.exhausted() || padding_chars.exhausted()) && !padding_notice_given {
-            padding_notice_given = true;
+        if (padding_budget.exhausted() || padding_chars.exhausted()) && !*padding_notice_given {
+            *padding_notice_given = true;
             combined.push(Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain(padding_notice(
-                    &padding_budget,
-                    &padding_chars,
+                    padding_budget,
+                    padding_chars,
                 )))],
                 ..Default::default()
             }));
@@ -592,7 +801,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             })
         };
         let [fh, oh, eh, ff, of, ef] = ws.header_footer.active(&ws.name);
-        sections.push(Section {
+        Section {
             title: Some(ws.name.clone()),
             elements: combined,
             page_setup,
@@ -608,14 +817,19 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             conditional_formats: ws.conditional_formats.clone(),
             data_validations: ws.data_validations.clone(),
             ..Default::default()
-        });
+        }
     }
 
-    // Append a section for chart content. We don't render charts as graphics;
-    // capturing their text (titles, axis labels, series names, cached values)
-    // ensures that all human-meaningful words in the workbook appear in the
-    // IR and downstream conversions, even when the chart itself isn't drawn.
-    if !doc.chart_text.is_empty() {
+    /// The section for the text of the workbook's charts, when there is any.
+    /// We don't render charts as graphics; capturing their text (titles, axis
+    /// labels, series names, cached values) ensures that all
+    /// human-meaningful words in the workbook appear in the IR and downstream
+    /// conversions, even when the chart itself isn't drawn.
+    pub(crate) fn chart_section(&self) -> Option<Section> {
+        let doc = self.doc;
+        if doc.chart_text.is_empty() {
+            return None;
+        }
         let mut chart_elements: Vec<Element> = Vec::new();
         for (i, text) in doc.chart_text.iter().enumerate() {
             chart_elements.push(Element::Heading(Heading {
@@ -631,105 +845,115 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 ..Default::default()
             }));
         }
-        sections.push(Section {
+        Some(Section {
             title: Some("Charts".to_string()),
             elements: chart_elements,
             ..Default::default()
-        });
+        })
     }
 
-    // Pivot caches whose source is not in the workbook: the cached records
-    // are the only copy of the data behind the pivot. Like chart text, a
-    // trailing section, one heading and table per pivot.
-    let mut pivot_elements: Vec<Element> = Vec::new();
-    let mut pivot_truncated = false;
-    for (name, data) in doc.pivot_caches() {
-        // Pivots that name one cache each render it, so the table is
-        // charged to the budget however many of them share the data.
-        if budget.exhausted() {
-            break;
-        }
-        // The heading and the header row are paid for before they are built
-        // (an empty field name still costs its cell); a pivot whose header
-        // does not fit is left out, and so is every later one.
-        let title = crate::xlsx::text::pivot_cache_title(name);
-        let header_cost = title.len()
-            + data
-                .fields
-                .iter()
-                .map(|f| f.len().max(1))
-                .sum::<usize>()
-                .max(1);
-        if !budget.charge(header_cost) {
-            break;
-        }
-        pivot_elements.push(Element::Heading(Heading {
-            level: 3,
-            content: vec![InlineContent::Text(TextSpan::plain(title))],
-            ..Default::default()
-        }));
-        let text_cell = |t: &str| TableCell {
-            content: vec![Element::Paragraph(Paragraph {
-                content: if t.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![InlineContent::Text(TextSpan::plain(t))]
-                },
-                ..Default::default()
-            })],
-            col_span: 1,
-            row_span: 1,
-            ..Default::default()
-        };
-        let cols = data.fields.len();
-        let mut rows = vec![TableRow {
-            cells: data.fields.iter().map(|f| text_cell(f)).collect(),
-            is_header: true,
-            ..Default::default()
-        }];
-        for rec in &data.records {
-            if !budget.charge(rec.iter().map(String::len).sum::<usize>() + cols.max(rec.len())) {
+    /// The section for pivot caches whose source is not in the workbook: the
+    /// cached records are the only copy of the data behind the pivot. Like
+    /// chart text, one heading and table per pivot.
+    pub(crate) fn pivot_section(&mut self) -> Option<Section> {
+        let doc = self.doc;
+        let budget = &mut self.budget;
+        let mut pivot_elements: Vec<Element> = Vec::new();
+        let mut pivot_truncated = false;
+        for (name, data) in doc.pivot_caches() {
+            // Pivots that name one cache each render it, so the table is
+            // charged to the budget however many of them share the data.
+            if budget.exhausted() {
                 break;
             }
-            rows.push(TableRow {
-                cells: (0..cols.max(rec.len()))
-                    .map(|i| text_cell(rec.get(i).map(String::as_str).unwrap_or("")))
-                    .collect(),
+            // The heading and the header row are paid for before they are built
+            // (an empty field name still costs its cell); a pivot whose header
+            // does not fit is left out, and so is every later one.
+            let title = crate::xlsx::text::pivot_cache_title(name);
+            let header_cost = title.len()
+                + data
+                    .fields
+                    .iter()
+                    .map(|f| f.len().max(1))
+                    .sum::<usize>()
+                    .max(1);
+            if !budget.charge(header_cost) {
+                break;
+            }
+            pivot_elements.push(Element::Heading(Heading {
+                level: 3,
+                content: vec![InlineContent::Text(TextSpan::plain(title))],
                 ..Default::default()
-            });
+            }));
+            let text_cell = |t: &str| TableCell {
+                content: vec![Element::Paragraph(Paragraph {
+                    content: if t.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![InlineContent::Text(TextSpan::plain(t))]
+                    },
+                    ..Default::default()
+                })],
+                col_span: 1,
+                row_span: 1,
+                ..Default::default()
+            };
+            let cols = data.fields.len();
+            let mut rows = vec![TableRow {
+                cells: data.fields.iter().map(|f| text_cell(f)).collect(),
+                is_header: true,
+                ..Default::default()
+            }];
+            for rec in &data.records {
+                if !budget.charge(rec.iter().map(String::len).sum::<usize>() + cols.max(rec.len()))
+                {
+                    break;
+                }
+                rows.push(TableRow {
+                    cells: (0..cols.max(rec.len()))
+                        .map(|i| text_cell(rec.get(i).map(String::as_str).unwrap_or("")))
+                        .collect(),
+                    ..Default::default()
+                });
+            }
+            pivot_elements.push(Element::Table(Table {
+                rows,
+                ..Default::default()
+            }));
+            if data.truncated {
+                pivot_truncated = true;
+                pivot_elements.push(Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(
+                        crate::xlsx::text::PIVOT_CACHE_TRUNCATED_NOTICE,
+                    ))],
+                    ..Default::default()
+                }));
+            }
         }
-        pivot_elements.push(Element::Table(Table {
-            rows,
-            ..Default::default()
-        }));
-        if data.truncated {
-            pivot_truncated = true;
+        if budget.exhausted() && !pivot_elements.is_empty() {
             pivot_elements.push(Element::Paragraph(Paragraph {
-                content: vec![InlineContent::Text(TextSpan::plain(
-                    crate::xlsx::text::PIVOT_CACHE_TRUNCATED_NOTICE,
-                ))],
+                content: vec![InlineContent::Text(TextSpan::plain(budget.notice()))],
                 ..Default::default()
             }));
         }
-    }
-    if budget.exhausted() && !pivot_elements.is_empty() {
-        pivot_elements.push(Element::Paragraph(Paragraph {
-            content: vec![InlineContent::Text(TextSpan::plain(budget.notice()))],
-            ..Default::default()
-        }));
-    }
-    if !pivot_elements.is_empty() {
-        sections.push(Section {
+        if pivot_truncated {
+            self.pivot_truncated = true;
+            self.item_truncated = true;
+        }
+        (!pivot_elements.is_empty()).then(|| Section {
             title: Some("Pivot Caches".to_string()),
             elements: pivot_elements,
             ..Default::default()
-        });
+        })
     }
 
-    // A sheet that could not be read is a section holding the notice, so
-    // the loss is visible in every projection of the IR.
-    for (name, err) in &doc.unreadable_sheets {
-        sections.push(Section {
+    /// The section for the unreadable sheet `index`: the notice, so the loss
+    /// is visible in every projection of the IR.
+    pub(crate) fn unreadable_section(&mut self, index: usize) -> Option<Section> {
+        let (name, err) = self.doc.unreadable_sheets.get(index)?;
+        self.unreadable = true;
+        self.item_truncated = true;
+        Some(Section {
             title: Some(name.clone()),
             elements: vec![Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain(
@@ -738,40 +962,24 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 ..Default::default()
             })],
             ..Default::default()
-        });
+        })
     }
 
-    // The first sheet's *name* is not the workbook's title. Read the real
-    // one from `docProps/core.xml` and fall back to the sheet name only
-    // when the package carries no core properties.
-    let cp = doc.core_properties.as_ref();
-    let title = cp
-        .and_then(|c| c.title.clone())
-        .filter(|t| !t.is_empty())
-        .or_else(|| sections.first().and_then(|s| s.title.clone()));
-
-    if budget.exhausted() {
-        warnings.push(budget.notice());
-    }
-    if padding_budget.exhausted() || padding_chars.exhausted() {
-        warnings.push(padding_notice(&padding_budget, &padding_chars));
-    }
-    if image_budget.exhausted() {
-        warnings.push(format!(
-            "some pictures were left out: the document's pictures exceed the {} byte budget \
-             (office_oxide::limits::set_max_image_bytes)",
-            image_budget.limit()
-        ));
-    }
-    if format_code_omitted {
-        warnings.push(format!(
-            "some cells' number format code is longer than {} characters and is not listed on \
-             them (they keep their format id and values)",
-            crate::limits::MAX_NUMBER_FORMAT_CHARS
-        ));
-    }
-    let mut ir = DocumentIR {
-        metadata: Metadata {
+    /// The document's metadata as of the sections built so far: the
+    /// properties, the defined names and every warning and truncation flag
+    /// the conversion has raised. `first_title` is the title of the first
+    /// section, the workbook's title when its core properties carry none.
+    pub(crate) fn metadata(&self, first_title: Option<String>) -> Metadata {
+        let doc = self.doc;
+        // The first sheet's *name* is not the workbook's title. Read the real
+        // one from `docProps/core.xml` and fall back to the sheet name only
+        // when the package carries no core properties.
+        let cp = doc.core_properties.as_ref();
+        let title = cp
+            .and_then(|c| c.title.clone())
+            .filter(|t| !t.is_empty())
+            .or(first_title);
+        let mut metadata = Metadata {
             format: DocumentFormat::Xlsx,
             title,
             author: cp.and_then(|c| c.creator.clone()),
@@ -784,14 +992,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
-            text_truncated: !doc.unreadable_sheets.is_empty()
-                || pivot_truncated
-                || budget.exhausted()
-                || padding_budget.exhausted()
-                || padding_chars.exhausted()
-                || comments_truncated
-                || formulas_truncated
-                || image_budget.exhausted(),
+            text_truncated: self.text_truncated(),
             defined_names: doc
                 .workbook
                 .defined_names
@@ -808,11 +1009,180 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 doc.app_properties.as_ref(),
                 Some(&doc.package_properties),
             )
-        },
-        sections,
-    };
-    ir.metadata.warnings.extend(warnings);
-    ir
+        };
+        metadata.warnings.extend(self.warnings.iter().cloned());
+        metadata.warnings.extend(self.end_warnings());
+        metadata
+    }
+}
+
+/// The notice for picture bytes copied past the total the whole run may copy.
+fn total_image_notice(budget: &crate::limits::TextBudget) -> String {
+    format!(
+        "[some pictures not shown: the workbook's pictures together exceed the {} byte total \
+         (office_oxide::limits::set_max_total_image_bytes)]",
+        budget.limit()
+    )
+}
+
+/// One section of a workbook's IR, converted on its own: a worksheet, or one
+/// of the sections that follow the worksheets (chart text, pivot caches, a
+/// sheet that could not be read).
+///
+/// Everything a whole-document [`DocumentIR`] reports in its metadata about
+/// this section is here, so a caller that drops each section after use still
+/// learns what was cut.
+#[derive(Debug, Clone)]
+pub struct SheetIr {
+    /// The converted section.
+    pub section: Section,
+    /// What this section's conversion left out or cut, and why: the
+    /// entries `Metadata::warnings` would carry for it.
+    pub warnings: Vec<String>,
+    /// Whether this section was cut (its own rows, pictures, comments or
+    /// formulas, or the text budget of the whole run).
+    pub text_truncated: bool,
+}
+
+enum Stage {
+    Sheets(usize),
+    Charts,
+    Pivots,
+    Unreadable(usize),
+    Done,
+}
+
+/// The sections of a workbook's IR, converted one at a time as the iterator
+/// is advanced (see [`XlsxDocument::sheets_ir`](crate::xlsx::XlsxDocument::sheets_ir)).
+///
+/// Only the section being handed out exists: the conversion holds no earlier
+/// one, so a caller that drops each before asking for the next holds about
+/// one sheet's IR however many sheets the workbook has.
+pub struct SheetIrs<'d> {
+    converter: SheetConverter<'d>,
+    stage: Stage,
+    first_title: Option<String>,
+    warnings_reported: usize,
+}
+
+impl<'d> SheetIrs<'d> {
+    pub(crate) fn new(doc: &'d crate::xlsx::XlsxDocument) -> Self {
+        Self {
+            converter: SheetConverter::new(doc, IrScope::Sheet),
+            stage: Stage::Sheets(0),
+            first_title: None,
+            warnings_reported: 0,
+        }
+    }
+
+    /// The workbook's metadata as of the sections handed out so far: its
+    /// properties and defined names, every warning raised and whether
+    /// anything was cut, as `to_ir().metadata` reports them once the whole
+    /// workbook has been converted.
+    pub fn metadata(&self) -> Metadata {
+        self.converter.metadata(self.first_title.clone())
+    }
+
+    fn item(&mut self, section: Section, end_before: Vec<String>) -> SheetIr {
+        if self.first_title.is_none() {
+            self.first_title = section.title.clone();
+        }
+        let mut warnings = self.converter.warnings()[self.warnings_reported..].to_vec();
+        self.warnings_reported = self.converter.warnings().len();
+        for w in self.converter.end_warnings() {
+            if !end_before.contains(&w) {
+                warnings.push(w);
+            }
+        }
+        SheetIr {
+            section,
+            warnings,
+            text_truncated: self.converter.take_item_truncated(),
+        }
+    }
+}
+
+impl Iterator for SheetIrs<'_> {
+    type Item = SheetIr;
+
+    fn next(&mut self) -> Option<SheetIr> {
+        loop {
+            let end_before = self.converter.end_warnings();
+            match self.stage {
+                Stage::Sheets(i) => {
+                    if i >= self.converter.doc.worksheets.len() || self.converter.should_stop() {
+                        self.stage = Stage::Charts;
+                        continue;
+                    }
+                    self.stage = Stage::Sheets(i + 1);
+                    let section = self.converter.convert_sheet(i);
+                    return Some(self.item(section, end_before));
+                },
+                Stage::Charts => {
+                    self.stage = Stage::Pivots;
+                    if let Some(section) = self.converter.chart_section() {
+                        return Some(self.item(section, end_before));
+                    }
+                },
+                Stage::Pivots => {
+                    self.stage = Stage::Unreadable(0);
+                    if let Some(section) = self.converter.pivot_section() {
+                        return Some(self.item(section, end_before));
+                    }
+                },
+                Stage::Unreadable(i) => {
+                    self.stage = Stage::Unreadable(i + 1);
+                    match self.converter.unreadable_section(i) {
+                        Some(section) => return Some(self.item(section, end_before)),
+                        None => self.stage = Stage::Done,
+                    }
+                },
+                Stage::Done => return None,
+            }
+        }
+    }
+}
+
+/// Convert worksheet `index` alone, with the allowances of one sheet.
+pub(crate) fn sheet_to_ir(doc: &crate::xlsx::XlsxDocument, index: usize) -> Option<SheetIr> {
+    if index >= doc.worksheets.len() {
+        return None;
+    }
+    let mut converter = SheetConverter::new(doc, IrScope::Sheet);
+    let end_before = converter.end_warnings();
+    let section = converter.convert_sheet(index);
+    let mut warnings = converter.warnings().to_vec();
+    warnings.extend(
+        converter
+            .end_warnings()
+            .into_iter()
+            .filter(|w| !end_before.contains(w)),
+    );
+    Some(SheetIr {
+        section,
+        warnings,
+        text_truncated: converter.take_item_truncated(),
+    })
+}
+
+/// Convert every worksheet, the chart text, the pivot caches and the sheets
+/// that could not be read to one IR, held whole.
+pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
+    let mut converter = SheetConverter::new(doc, IrScope::Document);
+    let mut sections = Vec::new();
+    for ws_idx in 0..doc.worksheets.len() {
+        if converter.should_stop() {
+            break;
+        }
+        sections.push(converter.convert_sheet(ws_idx));
+    }
+    sections.extend(converter.chart_section());
+    sections.extend(converter.pivot_section());
+    for index in 0..doc.unreadable_sheets.len() {
+        sections.extend(converter.unreadable_section(index));
+    }
+    let metadata = converter.metadata(sections.first().and_then(|s| s.title.clone()));
+    DocumentIR { metadata, sections }
 }
 
 /// Give each merge anchor in `tcells` (one per grid column of sheet row
