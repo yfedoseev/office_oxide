@@ -517,7 +517,79 @@ pub(crate) fn parse_border_edge(e: &BytesStart) -> BorderEdge {
     edge
 }
 
+fn text_len(s: &Option<String>) -> usize {
+    s.as_deref().map_or(0, str::len)
+}
+
 impl RunProperties {
+    /// The characters of text this set owns on the heap, which a clone of it
+    /// copies: face names, colour names, the character style id. A style
+    /// stores them once and every run that overlays the style copies them.
+    pub(crate) fn heap_chars(&self) -> usize {
+        let script = self.script.as_deref().map_or(0, |s| {
+            text_len(&s.font_h_ansi) + text_len(&s.font_east_asia) + text_len(&s.font_cs)
+        });
+        let underline = match &self.underline {
+            Some(UnderlineType::Other(o)) => o.len(),
+            _ => 0,
+        };
+        let color = match &self.color {
+            Some(ColorRef::System(n)) => n.len(),
+            _ => 0,
+        };
+        text_len(&self.font_name)
+            + text_len(&self.highlight)
+            + text_len(&self.style_id)
+            + text_len(&self.shading_fill)
+            + script
+            + underline
+            + color
+    }
+
+    /// A copy without the text [`Self::heap_chars`] counts: every flag, size
+    /// and spacing is kept, the face and colour names and the style id are
+    /// not. The fold of a style chain for a consumer that reads only those.
+    pub(crate) fn clone_light(&self) -> Self {
+        Self {
+            bold: self.bold,
+            italic: self.italic,
+            underline: match &self.underline {
+                Some(UnderlineType::Other(_)) => None,
+                u => u.clone(),
+            },
+            strike: self.strike,
+            dstrike: self.dstrike,
+            font_size: self.font_size,
+            font_name: None,
+            color: match &self.color {
+                Some(ColorRef::System(_)) => None,
+                c => c.clone(),
+            },
+            highlight: None,
+            vertical_align: self.vertical_align,
+            style_id: None,
+            caps: self.caps,
+            small_caps: self.small_caps,
+            char_spacing: self.char_spacing,
+            shading_fill: None,
+            hidden: self.hidden,
+            script: self.script.as_deref().map(|s| {
+                Box::new(ScriptRunProperties {
+                    font_h_ansi: None,
+                    font_east_asia: None,
+                    font_cs: None,
+                    east_asia_hint: s.east_asia_hint,
+                    font_size_cs: s.font_size_cs,
+                    bold_cs: s.bold_cs,
+                    italic_cs: s.italic_cs,
+                    complex_script: s.complex_script,
+                    rtl: s.rtl,
+                })
+            }),
+            font_theme: self.font_theme,
+        }
+    }
+
     /// Overlay `src` on top of `self`: every field `src` states explicitly
     /// wins, everything else is left alone. Used to fold a style chain
     /// (document defaults → style → parent style → direct `w:rPr`) into one

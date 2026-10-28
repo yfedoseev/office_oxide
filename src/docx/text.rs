@@ -666,11 +666,8 @@ impl RunStyle {
         let effective;
         let rp = match hidden.styles {
             Some(sheet) => {
-                effective = sheet.effective_run_properties_in(
-                    hidden.table,
-                    hidden.paragraph_style_id,
-                    direct,
-                );
+                effective =
+                    sheet.effective_run_flags_in(hidden.table, hidden.paragraph_style_id, direct);
                 Some(&effective)
             },
             None => direct,

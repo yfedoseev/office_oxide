@@ -110,7 +110,14 @@ impl<'a, 'd> Cx<'a, 'd> {
         Some(match direct {
             None => EffectiveRun::Inherited(base),
             Some(d) => {
-                let mut own = (*base).clone();
+                // The fold's text (face names) is copied for this run; once
+                // the budget cannot take it the run keeps its formatting
+                // without the names, and the conversion says so.
+                let mut own = if crate::limits::charge_copied_text(base.heap_chars()) {
+                    (*base).clone()
+                } else {
+                    base.clone_light()
+                };
                 own.overlay(d);
                 EffectiveRun::Own(own)
             },
@@ -1614,6 +1621,13 @@ fn convert_run_content(
             let link = link.filter(|(url, tip)| {
                 crate::limits::charge_copied_text(url.len() + tip.map_or(0, str::len))
             });
+            // The face name is stored once (in a style or the theme) and
+            // copied into every span: charged before it is, and left off
+            // once the budget is spent.
+            let font_name = face
+                .font_name
+                .filter(|n| crate::limits::charge_copied_text(n.len()))
+                .map(str::to_string);
             content.push(InlineContent::Text(TextSpan {
                 text: piece.to_string(),
                 bold,
@@ -1624,7 +1638,7 @@ fn convert_run_content(
                 font_size_half_pt: face
                     .font_size
                     .map(|hp| crate::core::units::HalfPoint::from_word_sz(hp.0).0),
-                font_name: face.font_name.map(str::to_string),
+                font_name,
                 color: text_color,
                 underline: underline.clone(),
                 highlight,

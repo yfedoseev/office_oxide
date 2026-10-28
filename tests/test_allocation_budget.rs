@@ -673,3 +673,54 @@ fn test_docx_to_ir_does_not_copy_a_huge_style_name_per_paragraph() {
         "{bytes} bytes requested converting {PARAS} paragraphs that share a 1 MiB style name"
     );
 }
+
+/// A `.docx` whose paragraph style `S` carries `style_inner` (a `w:pPr` or
+/// `w:rPr`), used by `paragraphs` paragraphs that each hold one bold run.
+fn docx_with_style_inner(style_inner: &str, paragraphs: usize) -> Vec<u8> {
+    let body = r#"<w:p><w:pPr><w:pStyle w:val="S"/></w:pPr><w:r><w:rPr><w:b/></w:rPr><w:t>x</w:t></w:r></w:p>"#
+        .repeat(paragraphs);
+    let styles = format!(
+        r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="S"><w:name w:val="S"/>{style_inner}</w:style></w:styles>"#
+    );
+    let doc = format!(
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}</w:body></w:document>"#
+    );
+    zip_of(&[
+        (
+            "[Content_Types].xml",
+            br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/></Types>"#,
+        ),
+        (
+            "_rels/.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+        ),
+        (
+            "word/_rels/document.xml.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#,
+        ),
+        ("word/document.xml", doc.as_bytes()),
+        ("word/styles.xml", styles.as_bytes()),
+    ])
+}
+
+/// A style's 1 MiB face name, folded into the effective formatting of each
+/// run to find its bold flag, used to be copied once per run: runs x 1 MiB
+/// requested.
+#[test]
+fn test_docx_markdown_does_not_copy_a_huge_style_face_name_per_run() {
+    let _serial = serial();
+    const PARAS: usize = 200;
+    let name = "F".repeat(1 << 20);
+    let style = format!(r#"<w:rPr><w:rFonts w:ascii="{name}" w:hAnsi="{name}"/></w:rPr>"#);
+    let doc = office_oxide::Document::from_reader(
+        Cursor::new(docx_with_style_inner(&style, PARAS)),
+        office_oxide::DocumentFormat::Docx,
+    )
+    .unwrap();
+    let (md, bytes) = bytes_during(|| doc.to_markdown());
+    assert!(md.contains("**x**"));
+    assert!(
+        bytes < 8 << 20,
+        "{bytes} bytes requested rendering {PARAS} runs under a style with a 1 MiB face name"
+    );
+}

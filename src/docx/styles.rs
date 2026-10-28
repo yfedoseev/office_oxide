@@ -229,6 +229,29 @@ impl StyleSheet {
         out
     }
 
+    /// [`Self::effective_run_properties_in`] without the face names, colour
+    /// names and style id: the flags, sizes and spacing only, for a consumer
+    /// that folds the chain for every run and reads nothing else. A style
+    /// stores a face name once and the full fold copies it for every level
+    /// of the chain and every run; this one never does.
+    pub(crate) fn effective_run_flags_in(
+        &self,
+        table: Option<&RunProperties>,
+        paragraph_style_id: Option<&str>,
+        direct: Option<&RunProperties>,
+    ) -> RunProperties {
+        let mut out = self.run_style_base_with(
+            true,
+            table,
+            paragraph_style_id,
+            direct.and_then(|d| d.style_id.as_deref()),
+        );
+        if let Some(d) = direct {
+            out.overlay(&d.clone_light());
+        }
+        out
+    }
+
     /// Everything a run inherits before its own `w:rPr`: document
     /// defaults, the table layer, the paragraph style chain, then the
     /// character style chain. Depends only on its three inputs, so a
@@ -239,18 +262,38 @@ impl StyleSheet {
         paragraph_style_id: Option<&str>,
         character_style_id: Option<&str>,
     ) -> RunProperties {
+        self.run_style_base_with(false, table, paragraph_style_id, character_style_id)
+    }
+
+    /// [`Self::run_style_base`], with `light` leaving out the text of every
+    /// layer (see [`RunProperties::clone_light`]).
+    fn run_style_base_with(
+        &self,
+        light: bool,
+        table: Option<&RunProperties>,
+        paragraph_style_id: Option<&str>,
+        character_style_id: Option<&str>,
+    ) -> RunProperties {
+        let layer = |out: &mut RunProperties, rp: &RunProperties| {
+            if light {
+                out.overlay(&rp.clone_light());
+            } else {
+                out.overlay(rp);
+            }
+        };
         let mut out = self
             .doc_defaults
             .as_ref()
-            .and_then(|d| d.run_properties.clone())
+            .and_then(|d| d.run_properties.as_ref())
+            .map(|rp| if light { rp.clone_light() } else { rp.clone() })
             .unwrap_or_default();
         if let Some(t) = table {
-            out.overlay(t);
+            layer(&mut out, t);
         }
         if let Some(pid) = paragraph_style_id {
             for style in self.chain(pid) {
                 if let Some(rp) = style.run_properties.as_ref() {
-                    out.overlay(rp);
+                    layer(&mut out, rp);
                 }
             }
         }
@@ -259,7 +302,7 @@ impl StyleSheet {
         if let Some(cid) = character_style_id {
             for style in self.chain(cid) {
                 if let Some(rp) = style.run_properties.as_ref() {
-                    out.overlay(rp);
+                    layer(&mut out, rp);
                 }
             }
         }

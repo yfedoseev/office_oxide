@@ -9,7 +9,7 @@
 
 use std::io::{Cursor, Write};
 
-use office_oxide::ir::{DocumentIR, Element};
+use office_oxide::ir::{DocumentIR, Element, InlineContent};
 use office_oxide::limits::set_max_text_chars;
 use office_oxide::{Document, DocumentFormat};
 
@@ -101,6 +101,17 @@ fn assert_reported(ir: &DocumentIR) {
     );
 }
 
+fn paragraphs(ir: &DocumentIR) -> Vec<&office_oxide::ir::Paragraph> {
+    ir.sections
+        .iter()
+        .flat_map(|s| s.elements.iter())
+        .filter_map(|e| match e {
+            Element::Paragraph(p) => Some(p),
+            _ => None,
+        })
+        .collect()
+}
+
 fn lists(ir: &DocumentIR) -> Vec<&office_oxide::ir::List> {
     ir.sections
         .iter()
@@ -151,5 +162,54 @@ fn test_small_marker_pattern_is_kept_on_every_list() {
             .iter()
             .all(|l| l.marker_pattern.as_deref() == Some("(%1)"))
     );
+    assert!(!ir.metadata.text_truncated);
+}
+
+fn font_styles(name: &str) -> String {
+    format!(
+        r#"<w:styles {NS}><w:style w:type="paragraph" w:styleId="s"><w:name w:val="S"/><w:rPr><w:rFonts w:ascii="{name}" w:hAnsi="{name}"/></w:rPr></w:style></w:styles>"#
+    )
+}
+
+/// `n` styled paragraphs, each with one bold run (direct formatting).
+fn bold_body(n: usize) -> String {
+    r#"<w:p><w:pPr><w:pStyle w:val="s"/></w:pPr><w:r><w:rPr><w:b/></w:rPr><w:t>x</w:t></w:r></w:p>"#
+        .repeat(n)
+}
+
+fn span_font_names(ir: &DocumentIR) -> Vec<Option<&str>> {
+    paragraphs(ir)
+        .iter()
+        .flat_map(|p| p.content.iter())
+        .filter_map(|c| match c {
+            InlineContent::Text(t) => Some(t.font_name.as_deref()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn test_style_font_name_copies_per_run_are_charged() {
+    limits();
+    let styles = font_styles(&"F".repeat(BIG));
+    let ir = to_ir(docx(&bold_body(USERS), Some(&styles), None));
+    let names = span_font_names(&ir);
+    let copied: usize = names.iter().flatten().map(|n| n.len()).sum();
+    assert!(copied > 0, "the budget holds a few copies");
+    assert!(
+        copied <= TEXT_BUDGET,
+        "{copied} characters of font name were copied against a budget of {TEXT_BUDGET}"
+    );
+    assert_eq!(names.len(), USERS, "the runs themselves stay");
+    assert_reported(&ir);
+}
+
+#[test]
+fn test_small_style_font_name_is_kept_on_every_run() {
+    limits();
+    let ir = to_ir(docx(&bold_body(USERS), Some(&font_styles("Arial")), None));
+    let names = span_font_names(&ir);
+    assert_eq!(names.len(), USERS);
+    assert!(names.iter().all(|n| *n == Some("Arial")));
     assert!(!ir.metadata.text_truncated);
 }
