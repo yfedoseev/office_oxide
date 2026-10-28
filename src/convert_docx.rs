@@ -455,6 +455,26 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
         }
     }
 
+    // Pictures left without their bytes are reported like every other cut:
+    // the truncation flag, one warning naming the limit, and a notice in the
+    // document itself (the last section ends with it, as a spreadsheet's
+    // sheet does), so a rendering that embeds pictures does not lose them
+    // silently. Read after every conversion above: copies in headers and
+    // footers are charged too.
+    let image_cut = crate::limits::image_budget_warning();
+    if image_cut.is_some()
+        && let Some(last) = ir_sections.last_mut()
+    {
+        last.elements.push(Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan::plain(format!(
+                "[some pictures not shown: together they exceed the {} byte picture budget \
+                 (office_oxide::limits::set_max_image_bytes)]",
+                crate::limits::max_image_bytes()
+            )))],
+            ..Default::default()
+        }));
+    }
+
     // Real document metadata beats a title guessed from the first heading,
     // but the guess stays as the fallback for files with no core properties.
     let cp = doc.core_properties.as_ref();
@@ -479,14 +499,15 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             has_macros: doc.has_macros,
             text_truncated: !doc.unreadable_parts.is_empty()
                 || copied_text_notice.is_some()
-                || doc.link_notice.is_some(),
+                || doc.link_notice.is_some()
+                || image_cut.is_some(),
             warnings: doc
                 .unreadable_parts
                 .iter()
                 .map(|p| format!("skipped unreadable part {p}"))
                 .chain(copied_text_notice)
                 .chain(doc.link_notice.clone())
-                .chain(crate::limits::image_budget_warning())
+                .chain(image_cut)
                 .chain(crate::core::core_properties::package_warnings(Some(
                     &doc.package_properties,
                 )))

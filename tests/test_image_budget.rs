@@ -131,6 +131,57 @@ fn test_docx_pictures_sharing_one_image_stop_copying_at_the_budget() {
     );
 }
 
+/// Pictures left without their bytes are reported the way every format
+/// reports a cut: the truncation flag, one warning naming the limit, and a
+/// notice in the document itself, so a rendering that embeds pictures does
+/// not silently lose them.
+#[test]
+fn test_docx_picture_budget_exhaustion_is_flagged_and_noticed_in_the_document() {
+    limits();
+    let body: String = (0..20)
+        .map(|_| format!("<w:p>{}</w:p>", drawing("rId5")))
+        .collect();
+    let doc = Document::from_reader(Cursor::new(docx(&body, None)), DocumentFormat::Docx).unwrap();
+    let ir = doc.to_ir();
+    assert!(ir.metadata.text_truncated, "a cut must set the truncation flag");
+    let warnings: Vec<_> = ir
+        .metadata
+        .warnings
+        .iter()
+        .filter(|w| w.contains("set_max_image_bytes"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{:?}", ir.metadata.warnings);
+    let Some(Element::Paragraph(last)) = ir.sections.last().and_then(|s| s.elements.last()) else {
+        panic!("the last section ends with the notice");
+    };
+    let text: String = last
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            office_oxide::ir::InlineContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        text.contains("pictures not shown") && text.contains("set_max_image_bytes"),
+        "{text:?}"
+    );
+    assert!(ir.to_markdown().contains("pictures not shown"));
+}
+
+/// A document whose pictures fit says nothing.
+#[test]
+fn test_docx_pictures_within_the_budget_add_no_notice() {
+    limits();
+    let body: String = (0..2)
+        .map(|_| format!("<w:p>{}</w:p>", drawing("rId5")))
+        .collect();
+    let doc = Document::from_reader(Cursor::new(docx(&body, None)), DocumentFormat::Docx).unwrap();
+    let ir = doc.to_ir();
+    assert!(!ir.metadata.text_truncated);
+    assert!(!ir.to_markdown().contains("pictures not shown"));
+}
+
 /// A header carrying a logo, named by every section (a mail merge repeats the
 /// reference): the logo's bytes come off the image budget like a body picture's,
 /// not off the text budget, so the text of every section's header survives.
