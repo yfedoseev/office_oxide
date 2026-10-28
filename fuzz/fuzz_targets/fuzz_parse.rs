@@ -25,6 +25,14 @@ fuzz_target!(|data: &[u8]| {
             let _ = doc.to_markdown();
             let _ = doc.to_html();
             let _ = doc.to_ir();
+            // Pictures are decoded lazily: compressed metafiles are inflated
+            // here, under the per-document inflation allowance.
+            if let Some(d) = doc.as_doc() {
+                let _ = d.images();
+            }
+            if let Some(p) = doc.as_ppt() {
+                let _ = p.images();
+            }
         }
     }
 });
