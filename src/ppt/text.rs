@@ -2192,6 +2192,12 @@ struct Utf16Offsets {
     astral_ends: Vec<usize>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Characters the offset maps of this thread have scanned to build.
+    static OFFSET_MAP_CHARS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Utf16Offsets {
     fn new(text: &str) -> Self {
         let mut units = 0usize;
@@ -2204,6 +2210,8 @@ impl Utf16Offsets {
                 astral_ends.push(units);
             }
         }
+        #[cfg(test)]
+        OFFSET_MAP_CHARS.with(|c| c.set(c.get() + chars));
         Self {
             chars,
             units,
@@ -2490,33 +2498,36 @@ mod tests {
     }
 
     /// Thousands of style spans over text with an emoji in it are mapped
-    /// without rescanning the text for each: the work is counted by the
-    /// map being built once, and a large run finishes at once.
+    /// without rescanning the text for each: counted in the characters the
+    /// offset maps scan, which is the text once however many spans there are.
     #[test]
     fn test_many_spans_over_astral_text_do_not_rescan_the_text() {
-        let text = format!("\u{1F600}{}", "x".repeat(400_000));
+        let text = format!("\u{1F600}{}", "x".repeat(4_000));
         let mut run = TextRun {
             text: text.clone(),
             ..Default::default()
         };
-        // 100,000 character runs of 4 units each (CF_BOLD).
-        let spans = 100_000u32;
+        // 2,000 character runs of 2 units each (CF_BOLD).
+        let spans = 2_000u32;
         let mut data = Vec::new();
         data.extend_from_slice(&((text.encode_utf16().count() + 1) as u32).to_le_bytes());
         data.extend_from_slice(&0u16.to_le_bytes());
         data.extend_from_slice(&0u32.to_le_bytes());
         for i in 0..spans {
-            let count = if i == 0 { 6 } else { 4 };
+            let count = if i == 0 { 4 } else { 2 };
             data.extend_from_slice(&(count as u32).to_le_bytes());
             data.extend_from_slice(&1u32.to_le_bytes());
             data.extend_from_slice(&((i % 2) as u16).to_le_bytes());
         }
-        let started = std::time::Instant::now();
+        OFFSET_MAP_CHARS.with(|c| c.set(0));
         apply_style_text_prop(&mut run, &data);
-        assert!(!run.char_formats.is_empty());
-        // A rescan per span is 100,000 x 400,000 character steps (tens of
-        // seconds); the map takes milliseconds.
-        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(run.char_formats.len() > 1_000, "{} formats", run.char_formats.len());
+        let scanned = OFFSET_MAP_CHARS.with(|c| c.get());
+        assert!(
+            scanned <= text.chars().count(),
+            "{scanned} characters scanned for a text of {}",
+            text.chars().count()
+        );
     }
 
     /// `StyleTextPropAtom` run counts are UTF-16 units too: formatting on
@@ -4339,6 +4350,53 @@ mod tests {
             cut.notices
                 .iter()
                 .any(|n| n.contains("5000 character budget")),
+            "{:?}",
+            cut.notices
+        );
+    }
+
+    /// The last-resort scan of every text atom in the stream runs after the
+    /// `Slide` container walk and draws on what that walk left of the deck's
+    /// text budget. Here the walk spends the whole budget on text that is then
+    /// dropped as a field placeholder, so the loose text after it is not read
+    /// under a fresh allowance.
+    #[test]
+    fn test_last_resort_text_scan_continues_the_walks_text_budget() {
+        let mut stream: Vec<u8> = (0..10)
+            .flat_map(|_| {
+                let mut c = slide_atom_following(0, false);
+                c.extend(other_text_shape(&"*".repeat(100), None));
+                make_container(RT_SLIDE, 0, &c)
+            })
+            .collect();
+        for i in 0..20 {
+            stream.extend(other_text_shape(&format!("{i:02}{}", "t".repeat(98)), None));
+        }
+        let whole = extract_deck_text(&stream, None);
+        let whole_chars: usize = whole
+            .slides
+            .iter()
+            .flat_map(|s| &s.text_runs)
+            .map(|r| r.text.len())
+            .sum();
+        assert_eq!(whole_chars, 2_000, "{:?}", whole.notices);
+
+        let cut = extract_deck_text_with_budget(
+            &stream,
+            None,
+            crate::limits::TextBudget::with_limit(500),
+        );
+        let total: usize = cut
+            .slides
+            .iter()
+            .flat_map(|s| &s.text_runs)
+            .map(|r| r.text.len())
+            .sum();
+        assert!(total <= 500, "{total} characters under a 500 budget");
+        assert!(
+            cut.notices
+                .iter()
+                .any(|n| n.contains("500 character budget")),
             "{:?}",
             cut.notices
         );

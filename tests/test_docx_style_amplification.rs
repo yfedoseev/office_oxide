@@ -4,14 +4,17 @@
 //! lands in an IR is charged to the text budget first, and the conversion
 //! says so when the budget refuses one.
 //!
-//! These tests lower the process-wide text budget, so they have a test binary
-//! to themselves, and each sets the same value.
+//! These tests lower the process-wide text budget; each holds a `LimitScope`
+//! for its whole body, which serialises them and restores the budget.
 
 use std::io::{Cursor, Write};
 
 use office_oxide::ir::{DocumentIR, Element, InlineContent};
-use office_oxide::limits::set_max_text_chars;
+use office_oxide::limits::{max_text_chars, set_max_text_chars};
 use office_oxide::{Document, DocumentFormat};
+
+mod common;
+use common::LimitScope;
 
 const NS: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
 const PKG_REL: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
@@ -24,8 +27,11 @@ const TEXT_BUDGET: usize = 300_000;
 /// How many users of the shared value the document has.
 const USERS: usize = 40;
 
-fn limits() {
-    set_max_text_chars(TEXT_BUDGET);
+/// The text budget lowered for the length of the test that holds the result.
+fn limits() -> LimitScope {
+    let mut scope = LimitScope::new();
+    scope.set(max_text_chars, set_max_text_chars, TEXT_BUDGET);
+    scope
 }
 
 fn zip_of(parts: Vec<(String, String)>) -> Vec<u8> {
@@ -161,7 +167,7 @@ fn list_body(lists: usize) -> String {
 
 #[test]
 fn test_marker_pattern_copies_per_list_are_charged() {
-    limits();
+    let _limits = limits();
     let num = numbering(&format!("{}%1.", "x".repeat(BIG)));
     let ir = to_ir(docx(&list_body(USERS), None, Some(&num)));
     let copied: usize = lists(&ir)
@@ -179,7 +185,7 @@ fn test_marker_pattern_copies_per_list_are_charged() {
 
 #[test]
 fn test_small_marker_pattern_is_kept_on_every_list() {
-    limits();
+    let _limits = limits();
     let ir = to_ir(docx(&list_body(USERS), None, Some(&numbering("(%1)"))));
     assert!(
         lists(&ir)
@@ -214,7 +220,7 @@ fn span_font_names(ir: &DocumentIR) -> Vec<Option<&str>> {
 
 #[test]
 fn test_style_font_name_copies_per_run_are_charged() {
-    limits();
+    let _limits = limits();
     let styles = font_styles(&"F".repeat(BIG));
     let ir = to_ir(docx(&bold_body(USERS), Some(&styles), None));
     let names = span_font_names(&ir);
@@ -230,7 +236,7 @@ fn test_style_font_name_copies_per_run_are_charged() {
 
 #[test]
 fn test_small_style_font_name_is_kept_on_every_run() {
-    limits();
+    let _limits = limits();
     let ir = to_ir(docx(&bold_body(USERS), Some(&font_styles("Arial")), None));
     let names = span_font_names(&ir);
     assert_eq!(names.len(), USERS);
@@ -255,7 +261,7 @@ fn styled_body(n: usize) -> String {
 
 #[test]
 fn test_style_tab_stop_copies_per_paragraph_are_charged() {
-    limits();
+    let _limits = limits();
     let ir = to_ir(docx(&styled_body(USERS), Some(&tab_styles(1_000)), None));
     let paras = paragraphs(&ir);
     assert_eq!(paras.len(), USERS, "the paragraphs themselves stay");
@@ -271,7 +277,7 @@ fn test_style_tab_stop_copies_per_paragraph_are_charged() {
 
 #[test]
 fn test_few_style_tab_stops_are_kept_on_every_paragraph() {
-    limits();
+    let _limits = limits();
     let ir = to_ir(docx(&styled_body(USERS), Some(&tab_styles(3)), None));
     let paras = paragraphs(&ir);
     assert_eq!(paras.len(), USERS);
@@ -281,7 +287,7 @@ fn test_few_style_tab_stops_are_kept_on_every_paragraph() {
 
 #[test]
 fn test_chart_text_copies_per_drawing_are_charged() {
-    limits();
+    let _limits = limits();
     let bytes = chart_docx(&"c".repeat(BIG), USERS);
     let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
     let ir = doc.to_ir();
@@ -311,7 +317,7 @@ fn test_chart_text_copies_per_drawing_are_charged() {
 
 #[test]
 fn test_small_chart_text_is_kept_in_every_drawing() {
-    limits();
+    let _limits = limits();
     let doc =
         Document::from_reader(Cursor::new(chart_docx("Revenue", USERS)), DocumentFormat::Docx)
             .unwrap();

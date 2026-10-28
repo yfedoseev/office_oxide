@@ -831,6 +831,21 @@ pub(crate) mod tests {
         assert!(!budget.reserve(1));
     }
 
+    /// A picture that inflates to less than its header declares gives the
+    /// difference back, so a document of small pictures with large declared
+    /// sizes is not refused for the declarations.
+    #[test]
+    fn test_reservation_beyond_what_inflated_is_returned() {
+        let raw = vec![0u8; 200];
+        let mut stream = make_metafile_blip(0xF01B, 0x216, &raw, true);
+        let cb_at = 8 + 16;
+        stream[cb_at..cb_at + 4].copy_from_slice(&1000u32.to_le_bytes());
+        let mut budget = InflateBudget::with_limit(5000);
+        extract_blip_images_within(&stream, &mut budget, &mut BlipDiagnostics::default());
+        assert!(budget.reserve(4800), "only the 200 inflated bytes were spent");
+        assert!(!budget.reserve(1));
+    }
+
     #[test]
     fn test_empty_stream() {
         assert!(extract_blip_images(&[]).is_empty());

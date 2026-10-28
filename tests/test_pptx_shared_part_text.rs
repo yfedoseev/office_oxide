@@ -12,8 +12,11 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{Cursor, Write};
 
 use office_oxide::ir::{Element, InlineContent};
-use office_oxide::limits::set_max_text_chars;
+use office_oxide::limits::{max_text_chars, set_max_text_chars};
 use office_oxide::{Document, DocumentFormat};
+
+mod common;
+use common::LimitScope;
 
 struct Counting;
 
@@ -51,20 +54,10 @@ fn bytes_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
 }
 
 /// Tests change a process-wide limit and measure allocations: one at a time.
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Restores the default text budget when a test ends, however it ends.
-struct RestoreBudget;
-
-impl Drop for RestoreBudget {
-    fn drop(&mut self) {
-        set_max_text_chars(office_oxide::limits::DEFAULT_MAX_TEXT_CHARS);
-    }
+/// A limit set through the scope is back at its default when the test ends,
+/// however it ends.
+fn serial() -> LimitScope {
+    LimitScope::new()
 }
 
 const PNS: &str = r#"xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main""#;
@@ -200,9 +193,8 @@ fn test_slides_naming_one_chart_part_share_its_text_at_open() {
 
 #[test]
 fn test_ir_charges_every_frames_copy_of_chart_text() {
-    let _g = serial();
-    let _restore = RestoreBudget;
-    set_max_text_chars(20_000);
+    let mut limits = serial();
+    limits.set(max_text_chars, set_max_text_chars, 20_000);
     let doc = open(deck(1, 100, chart_part(1, 100, 8)));
     let ir = doc.to_ir();
     assert!(ir.metadata.text_truncated, "the cut must be flagged");
@@ -222,9 +214,8 @@ fn test_ir_charges_every_frames_copy_of_chart_text() {
 
 #[test]
 fn test_ir_charges_chart_text_copies_made_by_many_slides() {
-    let _g = serial();
-    let _restore = RestoreBudget;
-    set_max_text_chars(20_000);
+    let mut limits = serial();
+    limits.set(max_text_chars, set_max_text_chars, 20_000);
     let doc = open(deck(100, 1, chart_part(1, 100, 8)));
     let ir = doc.to_ir();
     assert!(ir.metadata.text_truncated);
@@ -233,11 +224,10 @@ fn test_ir_charges_chart_text_copies_made_by_many_slides() {
 
 #[test]
 fn test_ir_charges_a_copy_per_line_not_only_its_characters() {
-    let _g = serial();
-    let _restore = RestoreBudget;
+    let mut limits = serial();
     // A SmartArt-like part of many one-character lines costs a paragraph
     // each in the IR.
-    set_max_text_chars(20_000);
+    limits.set(max_text_chars, set_max_text_chars, 20_000);
     let doc = open(deck(1, 50, chart_part(512, 1, 1)));
     let ir = doc.to_ir();
     assert!(ir.metadata.text_truncated);
@@ -245,9 +235,8 @@ fn test_ir_charges_a_copy_per_line_not_only_its_characters() {
 
 #[test]
 fn test_plain_text_and_markdown_charge_chart_text_before_copying_it() {
-    let _g = serial();
-    let _restore = RestoreBudget;
-    set_max_text_chars(300_000);
+    let mut limits = serial();
+    limits.set(max_text_chars, set_max_text_chars, 300_000);
     let doc = open(deck(1, 200, chart_part(1, 4_000, 25)));
     let (plain, plain_bytes) = bytes_during(|| doc.plain_text());
     assert!(plain.contains("set_max_text_chars"), "plain text is not marked cut");

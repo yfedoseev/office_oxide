@@ -276,6 +276,26 @@ mod tests {
         assert!(steps <= entries.len(), "steps {steps} exceed the {} entries", entries.len());
     }
 
+    /// One walk stops at the per-walk cap, however long the sibling chain.
+    #[test]
+    fn test_one_walk_stops_at_the_per_walk_cap() {
+        let len: u32 = 100;
+        let mut entries = vec![entry(
+            "Root Entry",
+            EntryType::RootStorage,
+            1,
+            NO_ENTRY,
+            NO_ENTRY,
+        )];
+        for i in 0..len {
+            let right = if i + 1 < len { 2 + i } else { NO_ENTRY };
+            entries.push(entry(&format!("s{i}"), EntryType::Stream, NO_ENTRY, NO_ENTRY, right));
+        }
+        let mut walker = Walker::new(&entries, 5);
+        assert_eq!(walker.collect(1).len(), 5);
+        assert_eq!(walker.steps, 5, "the walk went past its cap");
+    }
+
     /// Many object storages whose child links all land in one large
     /// sibling chain: without a pass-wide visited set each walks the rest of
     /// the chain (objects x entries); with one, the chain is walked once in
