@@ -139,3 +139,110 @@ fn test_a_drawing_relationships_part_that_cannot_be_read_is_reported() {
         ir.metadata.warnings
     );
 }
+
+/// `sheets` sheets whose own relationships parts are not XML.
+fn sheets_with_bad_rels(sheets: usize) -> Vec<u8> {
+    let mut names = String::new();
+    let mut rels = String::new();
+    let mut parts: Vec<(String, String)> = Vec::new();
+    for i in 1..=sheets {
+        names.push_str(&format!(r#"<sheet name="S{i}" sheetId="{i}" r:id="rId{i}"/>"#));
+        rels.push_str(&format!(
+            r#"<Relationship Id="rId{i}" Type="{R}/worksheet" Target="worksheets/sheet{i}.xml"/>"#
+        ));
+        parts.push((
+            format!("xl/worksheets/sheet{i}.xml"),
+            format!(r#"<worksheet xmlns="{NS}"><sheetData><row r="1"><c r="A1"><v>{i}</v></c></row></sheetData></worksheet>"#),
+        ));
+        parts.push((
+            format!("xl/worksheets/_rels/sheet{i}.xml.rels"),
+            "<Relationships><Relationship Id=\"a\"/></Relationships>".into(),
+        ));
+    }
+    parts.push((
+        "[Content_Types].xml".into(),
+        r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#.into(),
+    ));
+    parts.push((
+        "_rels/.rels".into(),
+        format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#),
+    ));
+    parts.push((
+        "xl/workbook.xml".into(),
+        format!(r#"<workbook xmlns="{NS}" xmlns:r="{R}"><sheets>{names}</sheets></workbook>"#),
+    ));
+    parts.push((
+        "xl/_rels/workbook.xml.rels".into(),
+        format!(r#"<Relationships xmlns="{REL_NS}">{rels}</Relationships>"#),
+    ));
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
+    for (n, d) in parts {
+        zip.start_file(n.as_str(), opts).unwrap();
+        zip.write_all(d.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+#[test]
+fn test_unreadable_relationship_reports_are_bounded() {
+    let doc = open(sheets_with_bad_rels(5_000));
+    let x = doc.as_xlsx().unwrap();
+    assert!(x.unreadable_parts.len() <= 100, "{} stored", x.unreadable_parts.len());
+    assert_eq!(x.unreadable_parts.len() + x.unreadable_parts_omitted, 5_000);
+    let ir = doc.to_ir();
+    assert!(ir.metadata.text_truncated);
+    assert!(ir.metadata.warnings.len() <= 110, "{} warnings", ir.metadata.warnings.len());
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("more unreadable parts")),
+        "the rest are not counted"
+    );
+}
+
+#[test]
+fn test_one_unreadable_part_named_by_many_sheets_is_reported_once() {
+    let drawing = r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>"#;
+    let doc = open(workbook(
+        1,
+        "x",
+        &format!(
+            r#"<Relationship Id="rId2" Type="{R}/drawing" Target="../drawings/drawing1.xml"/>"#
+        ),
+        &[
+            ("xl/drawings/drawing1.xml", drawing.to_string()),
+            (
+                "xl/drawings/_rels/drawing1.xml.rels",
+                "<Relationships><Relationship Id=\"a\"/></Relationships>".to_string(),
+            ),
+        ],
+    ));
+    let x = doc.as_xlsx().unwrap();
+    assert_eq!(x.unreadable_parts.len(), 1, "{:?}", x.unreadable_parts);
+}
+
+#[test]
+fn test_an_unreadable_reason_does_not_echo_a_long_file_value() {
+    let id = "i".repeat(100_000);
+    let rels = format!(
+        r#"<Relationships xmlns="{REL_NS}"><Relationship Id="{id}" Type="{R}/hyperlink" Target="http://{}" TargetMode="External"/></Relationships>"#,
+        "u".repeat(70_000)
+    );
+    let drawing = r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>"#;
+    let doc = open(workbook(
+        1,
+        "x",
+        &format!(
+            r#"<Relationship Id="rId2" Type="{R}/drawing" Target="../drawings/drawing1.xml"/>"#
+        ),
+        &[
+            ("xl/drawings/drawing1.xml", drawing.to_string()),
+            ("xl/drawings/_rels/drawing1.xml.rels", rels),
+        ],
+    ));
+    let x = doc.as_xlsx().unwrap();
+    assert_eq!(x.unreadable_parts.len(), 1);
+    assert!(x.unreadable_parts[0].1.chars().count() <= 256);
+}

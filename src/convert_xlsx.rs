@@ -1067,18 +1067,17 @@ impl<'d> SheetConverter<'d> {
         };
         // Relationship parts that could not be read: the sheet, drawing or
         // pivot they belong to lacks what they name.
-        const PARTS_LISTED: usize = 50;
-        metadata.text_truncated |= !doc.unreadable_parts.is_empty();
+        metadata.text_truncated |=
+            !doc.unreadable_parts.is_empty() || doc.unreadable_parts_omitted > 0;
         metadata.warnings.extend(
             doc.unreadable_parts
                 .iter()
-                .take(PARTS_LISTED)
                 .map(|(part, err)| format!("skipped unreadable part {part}: {err}")),
         );
-        if doc.unreadable_parts.len() > PARTS_LISTED {
+        if doc.unreadable_parts_omitted > 0 {
             metadata.warnings.push(format!(
-                "{} more unreadable parts not listed",
-                doc.unreadable_parts.len() - PARTS_LISTED
+                "and {} more unreadable parts not listed",
+                doc.unreadable_parts_omitted
             ));
         }
         metadata.warnings.extend(self.warnings.iter().cloned());

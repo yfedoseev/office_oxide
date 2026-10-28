@@ -1036,6 +1036,7 @@ mod tests {
             has_macros: false,
             unreadable_sheets: Vec::new(),
             unreadable_parts: Vec::new(),
+            unreadable_parts_omitted: 0,
             styles_data: None,
             theme_data: None,
         };
@@ -1103,6 +1104,7 @@ mod tests {
             has_macros: false,
             unreadable_sheets: Vec::new(),
             unreadable_parts: Vec::new(),
+            unreadable_parts_omitted: 0,
             styles_data: None,
             theme_data: None,
         };
@@ -1172,6 +1174,7 @@ mod tests {
             has_macros: false,
             unreadable_sheets: Vec::new(),
             unreadable_parts: Vec::new(),
+            unreadable_parts_omitted: 0,
             styles_data: None,
             theme_data: None,
         };
@@ -1206,6 +1209,7 @@ mod tests {
             has_macros: false,
             unreadable_sheets: Vec::new(),
             unreadable_parts: Vec::new(),
+            unreadable_parts_omitted: 0,
             styles_data: None,
             theme_data: None,
         };

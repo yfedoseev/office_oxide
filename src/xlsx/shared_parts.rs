@@ -24,6 +24,38 @@ use super::{
 use crate::core::opc;
 use crate::core::relationships::{Relationships, rel_types};
 
+/// Most relationship parts recorded as unreadable; the rest are counted.
+pub(super) const MAX_UNREADABLE_PARTS: usize = 100;
+/// Longest part name or reason kept in a record, in characters: both can
+/// echo values the file controls.
+const MAX_REPORT_CHARS: usize = 256;
+
+/// The relationship parts that could not be read: each part once, at most
+/// [`MAX_UNREADABLE_PARTS`] kept, and the number of the rest.
+#[derive(Default)]
+pub(crate) struct UnreadableParts {
+    pub(super) listed: Vec<(String, String)>,
+    pub(super) omitted: usize,
+    seen: std::collections::HashSet<String>,
+}
+
+impl UnreadableParts {
+    /// Record that the part at `path` could not be read, for `reason`. A part
+    /// already recorded (by the zip entry its path resolves to) is not
+    /// recorded again.
+    pub(super) fn record(&mut self, entries: &opc::ZipEntryIndex, path: &str, reason: &str) {
+        if !self.seen.insert(part_key(entries, path)) {
+            return;
+        }
+        if self.listed.len() >= MAX_UNREADABLE_PARTS {
+            self.omitted += 1;
+            return;
+        }
+        let cut = |s: &str| s.chars().take(MAX_REPORT_CHARS).collect::<String>();
+        self.listed.push((cut(path), cut(reason)));
+    }
+}
+
 /// A drawing part, parsed: the pictures and text shapes its anchors place.
 pub(super) struct SharedDrawing {
     pub(super) pictures: Arc<[WorksheetPicture]>,
@@ -45,7 +77,7 @@ pub(super) struct SharedParts {
     charts: HashMap<String, Option<Arc<str>>>,
     /// Relationship parts met on the way that could not be read, as
     /// `(part, reason)`.
-    pub(super) unreadable: Vec<(String, String)>,
+    pub(super) unreadable: UnreadableParts,
 }
 
 impl SharedParts {
@@ -191,7 +223,7 @@ fn read_drawing<R: Read + Seek>(
     entries: &opc::ZipEntryIndex,
     media: &mut MediaCache,
     drawing_path: &str,
-    unreadable: &mut Vec<(String, String)>,
+    unreadable: &mut UnreadableParts,
 ) -> Option<SharedDrawing> {
     let drawing_xml = match XlsxDocument::read_xml_entry(archive, entries, drawing_path) {
         Ok(d) => d,

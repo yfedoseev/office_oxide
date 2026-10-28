@@ -119,6 +119,10 @@ pub struct XlsxDocument {
     /// comments, tables and pivots they name. The loss is on record here and
     /// in `Metadata::warnings` and `Metadata::text_truncated`.
     pub unreadable_parts: Vec<(String, String)>,
+    /// How many more unreadable relationship parts there were than are
+    /// listed in [`Self::unreadable_parts`] (each part is listed once, and
+    /// at most 100 are kept).
+    pub unreadable_parts_omitted: usize,
     // Raw bytes for lazy parsing (None after parsing or if not present)
     styles_data: Option<Vec<u8>>,
     theme_data: Option<Vec<u8>>,
@@ -635,7 +639,8 @@ impl XlsxDocument {
             package_properties,
             has_macros,
             unreadable_sheets,
-            unreadable_parts: shared.unreadable,
+            unreadable_parts: shared.unreadable.listed,
+            unreadable_parts_omitted: shared.unreadable.omitted,
             styles_data: None,
             theme_data,
         })
@@ -957,7 +962,7 @@ fn read_pivot_table<R: Read + Seek>(
     workbook: &WorkbookInfo,
     pivot_ctx: &mut PivotContext,
     budget: &mut crate::limits::TextBudget,
-    unreadable: &mut Vec<(String, String)>,
+    unreadable: &mut shared_parts::UnreadableParts,
 ) -> Option<worksheet::SheetPivotTable> {
     let mut pivot = match XlsxDocument::read_xml_entry(archive, entries, path)
         .map_err(|e| e.to_string())
@@ -1044,7 +1049,7 @@ fn read_pivot_cache_data<R: Read + Seek>(
     definition: &[u8],
     src: &worksheet::PivotCacheSource,
     budget: &mut crate::limits::TextBudget,
-    unreadable: &mut Vec<(String, String)>,
+    unreadable: &mut shared_parts::UnreadableParts,
 ) -> Option<worksheet::PivotCacheData> {
     let rels = read_rels_reporting(archive, entries, &sheet_rels_path(cache_path), unreadable);
     let rel = src
@@ -1142,7 +1147,7 @@ pub(super) fn chartsheet_chart_parts<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &opc::ZipEntryIndex,
     sheet_path: &str,
-    unreadable: &mut Vec<(String, String)>,
+    unreadable: &mut shared_parts::UnreadableParts,
 ) -> Vec<String> {
     let sheet_rels =
         read_rels_reporting(archive, entries, &sheet_rels_path(sheet_path), unreadable);
@@ -1170,18 +1175,18 @@ pub(super) fn read_rels_reporting<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &opc::ZipEntryIndex,
     path: &str,
-    unreadable: &mut Vec<(String, String)>,
+    unreadable: &mut shared_parts::UnreadableParts,
 ) -> Relationships {
     match XlsxDocument::read_xml_entry(archive, entries, path) {
         Ok(data) => Relationships::parse(&data).unwrap_or_else(|e| {
             log::warn!("xlsx: relationships part {path} unreadable: {e}");
-            unreadable.push((path.to_string(), e.to_string()));
+            unreadable.record(entries, path, &e.to_string());
             Relationships::empty()
         }),
         Err(crate::core::Error::MissingPart(_)) => Relationships::empty(),
         Err(e) => {
             log::warn!("xlsx: relationships part {path} unreadable: {e}");
-            unreadable.push((path.to_string(), e.to_string()));
+            unreadable.record(entries, path, &e.to_string());
             Relationships::empty()
         },
     }
@@ -1287,7 +1292,7 @@ fn read_rich_value_images<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &opc::ZipEntryIndex,
     media: &mut MediaCache,
-    unreadable: &mut Vec<(String, String)>,
+    unreadable: &mut shared_parts::UnreadableParts,
 ) -> std::collections::HashMap<u32, crate::xlsx::worksheet::WorksheetPicture> {
     let mut out = std::collections::HashMap::new();
 

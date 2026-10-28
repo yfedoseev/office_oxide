@@ -158,7 +158,8 @@ pub(super) fn from_zip<R: Read + Seek>(
         package_properties,
         has_macros,
         unreadable_sheets,
-        unreadable_parts: shared.unreadable,
+        unreadable_parts: shared.unreadable.listed,
+        unreadable_parts_omitted: shared.unreadable.omitted,
         styles_data: None,
         theme_data: None,
     })
