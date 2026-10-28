@@ -213,6 +213,13 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         },
         sections,
     };
+    // Every part the reader skipped, by name and reason, as the DOCX
+    // conversion lists them.
+    ir.metadata.warnings.extend(
+        doc.unreadable_parts
+            .iter()
+            .map(|(part, err)| format!("skipped unreadable part {part}: {err}")),
+    );
     ir.metadata.warnings.extend(copied_text_notice);
     ir.metadata
         .warnings

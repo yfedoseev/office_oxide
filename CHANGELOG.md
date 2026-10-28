@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `.pptx` part whose relationships cannot be read is now reported, and the IR metadata lists every skipped part.** A notes, layout or master part with an over-long relationship `Target` lost its links and pictures with no record, and a layout, master, picture or chart part that failed to decompress vanished silently. Each is now recorded in `PptxDocument::unreadable_parts`, `text_truncated` is set, and `Metadata::warnings` names the part and the reason.
+
 - **A `.pptx` converted past the picture budget now says so in its content and flags the cut.** Pictures left without their bytes (`limits::set_max_image_bytes`) were reported in a metadata warning only; the IR now also sets `text_truncated` and closes the last section with a "[some pictures not shown ...]" paragraph, as the spreadsheet conversion does, so Markdown and HTML renderings show it.
 
 - **Chart and SmartArt text in a `.pptx` is no longer copied for every frame or slide that names the part.** The lines of a chart or SmartArt data part were cloned into each slide's reference map, each graphic frame and the IR: a 13 KB deck of 3,000 frames naming one chart of 1 MB of text took 2.9 GB to open. The reader keeps one shared copy (`GraphicContent::Text` now holds an `Arc<[String]>`), and the IR, `plain_text` and Markdown charge each frame's copy to the text budget before making it, leaving the text out, flagged and noticed, once it is spent.
