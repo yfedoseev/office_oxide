@@ -442,7 +442,7 @@ impl DocxDocument {
         // Resolve every embedded native OOXML package object
         // (`<o:OLEObject Type="Embed">`) by opening its bytes
         // with the appropriate format reader and folding in its text.
-        let mut deferred = DeferredParts::default();
+        let mut deferred = DeferredParts::new();
         resolve_deferred_parts(
             &mut body.elements,
             &mut opc,
@@ -451,6 +451,8 @@ impl DocxDocument {
             &mut deferred,
             &skip_unreadable,
         );
+        // Packages not opened, at whatever depth, are this document's loss.
+        deferred.session.report(&skip_unreadable);
 
         // Parse headers and footers. Walk header refs and footer refs
         // separately so each parsed `HeaderFooter` can record its own
@@ -2481,8 +2483,30 @@ fn resolve_deferred_parts<R: Read + Seek>(
 /// The embedded packages already opened, by part: their paragraphs, or
 /// `None` when the part could not be read or opened. Several objects can name
 /// one part; it is opened once, and a failure is remembered as a success is.
-type DeferredParts =
-    std::collections::HashMap<crate::core::opc::PartName, Option<Vec<BlockElement>>>;
+struct DeferredParts {
+    done: std::collections::HashMap<crate::core::opc::PartName, Option<Vec<BlockElement>>>,
+    /// The document's account of the packages it embeds, joined by the
+    /// documents embedded in it.
+    session: crate::core::embedded::Session,
+}
+
+impl DeferredParts {
+    fn new() -> Self {
+        Self {
+            done: std::collections::HashMap::new(),
+            session: crate::core::embedded::Session::begin(),
+        }
+    }
+}
+
+/// What opening one embedded package yielded: its paragraphs and the
+/// characters of text they hold. Kept by the package's content, so that a
+/// blob reached through several entry names is opened once.
+#[derive(Clone)]
+struct OpenedPackage {
+    paragraphs: Option<Vec<BlockElement>>,
+    chars: usize,
+}
 
 fn resolve_one_deferred_part<R: Read + Seek>(
     rid: &str,
@@ -2506,19 +2530,21 @@ fn resolve_one_deferred_part<R: Read + Seek>(
     if !opc.has_part(&part) {
         return None;
     }
-    if let Some(found) = done.get(&part) {
+    if let Some(found) = done.done.get(&part) {
         return found.clone();
     }
-    let found = open_deferred_part(&part, opc, skip);
-    done.insert(part, found.clone());
+    let found = open_deferred_part(&part, opc, &done.session, skip);
+    done.done.insert(part, found.clone());
     found
 }
 
 fn open_deferred_part<R: Read + Seek>(
     part: &crate::core::opc::PartName,
     opc: &mut OpcReader<R>,
+    session: &crate::core::embedded::Session,
     skip: &dyn Fn(&str, &dyn std::fmt::Display),
 ) -> Option<Vec<BlockElement>> {
+    use crate::core::embedded;
     let ext = part.as_str().rsplit('.').next()?;
     let format = crate::format::DocumentFormat::from_extension(ext)?;
     let data = match opc.read_part(part) {
@@ -2528,13 +2554,46 @@ fn open_deferred_part<R: Read + Seek>(
             return None;
         },
     };
-    let text = match crate::Document::from_reader(std::io::Cursor::new(data), format) {
-        Ok(doc) => doc.plain_text(),
-        Err(e) => {
-            skip(part.as_str(), &e);
+    // The same package reached through another entry name costs what the
+    // first did to find, and nothing to open again; its text is charged
+    // again, as it is copied again.
+    let fingerprint = embedded::Fingerprint::of(&data);
+    if let Some(OpenedPackage { paragraphs, chars }) =
+        embedded::cached::<OpenedPackage>(session, fingerprint)
+    {
+        if let Err(refusal) = embedded::charge_text(session, chars) {
+            embedded::refuse(session, part.as_str(), refusal);
+            return None;
+        }
+        return paragraphs;
+    }
+    let admission = match embedded::admit(session, data.len() as u64) {
+        Ok(admission) => admission,
+        Err(refusal) => {
+            embedded::refuse(session, part.as_str(), refusal);
             return None;
         },
     };
+    let opened = crate::Document::from_reader_nested(std::io::Cursor::new(data), format)
+        .map(|doc| doc.plain_text());
+    // The level and the package's byte account end here, with the document.
+    drop(admission);
+    let text = match opened {
+        Ok(text) => text,
+        Err(e) => {
+            skip(part.as_str(), &e);
+            embedded::remember(
+                session,
+                fingerprint,
+                OpenedPackage {
+                    paragraphs: None,
+                    chars: 0,
+                },
+            );
+            return None;
+        },
+    };
+    let chars = text.chars().count();
     let paragraphs: Vec<BlockElement> = text
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -2548,11 +2607,20 @@ fn open_deferred_part<R: Read + Seek>(
             })
         })
         .collect();
-    if paragraphs.is_empty() {
-        None
-    } else {
-        Some(paragraphs)
+    let paragraphs = (!paragraphs.is_empty()).then_some(paragraphs);
+    embedded::remember(
+        session,
+        fingerprint,
+        OpenedPackage {
+            paragraphs: paragraphs.clone(),
+            chars,
+        },
+    );
+    if let Err(refusal) = embedded::charge_text(session, chars) {
+        embedded::refuse(session, part.as_str(), refusal);
+        return None;
     }
+    paragraphs
 }
 
 /// Collect every `<a:t>` text node inside a SmartArt data part

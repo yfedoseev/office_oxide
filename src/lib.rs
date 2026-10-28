@@ -216,6 +216,58 @@ where
     }
 }
 
+/// Run the parse of a package embedded in a document, on a thread of its own
+/// that does not wait for a parse slot.
+///
+/// The embedding document's parse holds a slot (or is itself nested inside
+/// one that does) while it waits for this one, so a nested parse that also
+/// waited for a slot would wait for itself: a chain of embedded packages as
+/// long as the pool, or as many documents embedding one package as the pool
+/// has slots, would never finish. The depth of embedding is bounded
+/// ([`limits::max_embedded_depth`]), so the threads are too. The thread
+/// carries the embedding document's account of its embedded packages and
+/// hands it back.
+fn with_nested_parse_stack<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    if !needs_stack_thread() {
+        return f();
+    }
+    let account = std::sync::Arc::new(std::sync::Mutex::new(core::embedded::take_state()));
+    let child_account = account.clone();
+    let spawned = std::thread::Builder::new()
+        .stack_size(PARSE_STACK_SIZE)
+        .spawn(move || {
+            let state = child_account
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            core::embedded::install_state(state);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            *child_account.lock().unwrap_or_else(|e| e.into_inner()) = core::embedded::take_state();
+            result
+        });
+    let joined = spawned
+        .map_err(|e| OfficeError::UnsupportedFormat(format!("thread spawn failed: {e}")))
+        .map(|handle| handle.join());
+    // However the nested parse ended, the embedding document's account is
+    // back on this thread.
+    core::embedded::install_state(account.lock().unwrap_or_else(|e| e.into_inner()).take());
+    match joined? {
+        Ok(Ok(result)) => result,
+        Ok(Err(payload)) | Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic payload".to_string());
+            Err(OfficeError::Panic(msg))
+        },
+    }
+}
+
 /// Whether a reader's first bytes are the CFB (compound file) signature.
 ///
 /// Leaves the reader rewound to the start. Thin wrapper around
@@ -428,6 +480,15 @@ impl Document {
         format: DocumentFormat,
     ) -> Result<Self> {
         with_parse_stack(move || Self::from_reader_inner(reader, format))
+    }
+
+    /// Open a package embedded in a document, charging it to that document's
+    /// account (see [`core::embedded`]); never waits for a parse slot.
+    pub(crate) fn from_reader_nested<R: Read + Seek + Send + 'static>(
+        reader: R,
+        format: DocumentFormat,
+    ) -> Result<Self> {
+        with_nested_parse_stack(move || Self::from_reader_inner(reader, format))
     }
 
     fn from_reader_inner<R: Read + Seek>(mut reader: R, format: DocumentFormat) -> Result<Self> {

@@ -6,14 +6,22 @@
 //! [`MAX_UNREADABLE_PARTS`] kept, a part name or reason cut at
 //! [`MAX_REPORT_CHARS`] characters (both can echo values the file controls),
 //! and the number of the rest counted.
+//!
+//! "Each part once" is decided on the exact normalised name, never on a
+//! hash of it: a hash of a fixed width can be made to collide with another
+//! part's, and the collision would hide that part's failure.
 
 use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
 
 /// Most parts recorded as unreadable; the rest are counted.
 pub(crate) const MAX_UNREADABLE_PARTS: usize = 100;
 /// Longest part name or reason kept in a record, in characters.
 pub(crate) const MAX_REPORT_CHARS: usize = 256;
+/// Most bytes of normalised names remembered to tell a part already recorded
+/// from a new one. Past it a name is not remembered, so it is treated as new
+/// each time it is met: it can then be counted more than once among the rest,
+/// but a part is never taken for one already recorded when it is not.
+const MAX_SEEN_BYTES: usize = 1 << 20;
 
 /// The parts that could not be read: each once, at most
 /// [`MAX_UNREADABLE_PARTS`] kept, and the number of the rest.
@@ -23,9 +31,10 @@ pub(crate) struct UnreadableParts {
     label: &'static str,
     listed: Vec<(String, String)>,
     omitted: usize,
-    /// A hash of each part's normalised name seen so far, so that a name
-    /// the file makes very long costs eight bytes, not its length.
-    seen: HashSet<u64>,
+    /// The normalised name of each part recorded so far (up to
+    /// [`MAX_SEEN_BYTES`] of them).
+    seen: HashSet<String>,
+    seen_bytes: usize,
 }
 
 impl UnreadableParts {
@@ -42,17 +51,22 @@ impl UnreadableParts {
     /// zip lookup is) is not recorded again; it is logged once, when it is
     /// first met.
     pub(crate) fn record(&mut self, part: &str, reason: &dyn std::fmt::Display) {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for c in part.chars() {
-            let c = if c == '\\' {
-                '/'
-            } else {
-                c.to_ascii_lowercase()
-            };
-            c.hash(&mut hasher);
-        }
-        if !self.seen.insert(hasher.finish()) {
+        let key: String = part
+            .chars()
+            .map(|c| {
+                if c == '\\' {
+                    '/'
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            })
+            .collect();
+        if self.seen.contains(&key) {
             return;
+        }
+        if self.seen_bytes + key.len() <= MAX_SEEN_BYTES {
+            self.seen_bytes += key.len();
+            self.seen.insert(key);
         }
         if self.listed.len() >= MAX_UNREADABLE_PARTS {
             self.omitted += 1;
@@ -160,6 +174,29 @@ mod tests {
         sink.record("/WORD/Header1.xml", &"bad");
         sink.record("\\word\\header1.xml", &"worse");
         assert_eq!(sink.finish(), (vec![("/word/header1.xml".into(), "bad".into())], 0));
+    }
+
+    /// The record keeps the names themselves, so two parts can never be
+    /// taken for one; past the memory bound a part is counted again, never
+    /// dropped.
+    #[test]
+    fn test_parts_are_told_apart_by_their_names_not_by_a_hash() {
+        let mut sink = UnreadableParts::new("test");
+        sink.record("/Word\\A.xml", &"bad");
+        assert!(sink.seen.contains("/word/a.xml"));
+        let long = |i: usize| format!("{i:08}{}", "n".repeat(MAX_SEEN_BYTES / 4));
+        for i in 0..6 {
+            sink.record(&long(i), &"bad");
+            sink.record(&long(i), &"bad");
+        }
+        let (listed, _) = sink.finish();
+        // Every distinct part is listed; the ones past the bound may be
+        // listed again, none is lost.
+        for i in 0..6 {
+            let prefix = &long(i)[..8];
+            assert!(listed.iter().any(|(p, _)| p.starts_with(prefix)), "{i}");
+        }
+        assert!(listed.iter().any(|(p, _)| p == "/Word\\A.xml"));
     }
 
     #[test]

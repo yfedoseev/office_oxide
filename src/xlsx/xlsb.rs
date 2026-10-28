@@ -74,15 +74,24 @@ pub(super) fn from_zip<R: Read + Seek>(
     let mut shared = super::shared_parts::SharedParts::default();
     let rels = super::read_rels_reporting(archive, entries, WORKBOOK_RELS, &mut shared.unreadable);
     let (sheets, date1904) = parse_workbook(&wb);
-    let shared_strings = match opc::read_zip_entry(archive, entries, SHARED_STRINGS) {
-        Ok(d) => parse_shared_strings(&d),
-        Err(_) => SharedStringTable {
+    // A workbook without a part simply lacks what it holds; one whose part
+    // is there and cannot be read has it damaged, which is reported.
+    let mut read_optional = |path: &str| match opc::read_zip_entry(archive, entries, path) {
+        Ok(data) => Some(data),
+        Err(crate::core::Error::MissingPart(_)) => None,
+        Err(e) => {
+            log::warn!("xlsb: part {path} unreadable: {e}");
+            shared.unreadable.record(entries, path, &e.to_string());
+            None
+        },
+    };
+    let shared_strings = match read_optional(SHARED_STRINGS) {
+        Some(d) => parse_shared_strings(&d),
+        None => SharedStringTable {
             strings: Vec::new(),
         },
     };
-    let styles = opc::read_zip_entry(archive, entries, STYLES)
-        .ok()
-        .map(|d| parse_styles(&d));
+    let styles = read_optional(STYLES).map(|d| parse_styles(&d));
     let mut worksheets = Vec::with_capacity(sheets.len());
     let mut unreadable_sheets = super::shared_parts::ReportList::default();
     let mut sheet_parts = super::SheetPartClaims::default();
@@ -690,6 +699,61 @@ mod tests {
         let doc = super::super::test_support::open_bytes(bytes);
         assert_eq!(doc.worksheets.len(), 1);
         assert_eq!(doc.unreadable_sheets.len(), 19);
+    }
+
+    /// A shared-strings or styles part the zip cannot decode (compression
+    /// method 99, APPNOTE 4.4.5) is reported; one the package lacks is not.
+    #[test]
+    fn test_xlsb_part_that_cannot_be_decoded_is_reported_not_taken_for_absent() {
+        use crate::core::relationships::rel_types;
+        let wb = bundle_sheet(0, 1, "rId1", "S");
+        let rels = format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{}" Target="worksheets/sheet1.bin"/></Relationships>"#,
+            rel_types::WORKSHEET
+        );
+        let data = string_and_bool_sheet("cell");
+        let parts: &[(&str, &[u8])] = &[
+            (WORKBOOK, &wb),
+            (WORKBOOK_RELS, rels.as_bytes()),
+            ("xl/worksheets/sheet1.bin", &data),
+            (SHARED_STRINGS, b"sst"),
+            (STYLES, b"xfs"),
+        ];
+        let intact =
+            super::super::test_support::open_bytes(super::super::test_support::zip_parts(parts));
+        assert!(intact.unreadable_parts.is_empty(), "{:?}", intact.unreadable_parts);
+        for part in [SHARED_STRINGS, STYLES] {
+            let mut bytes = super::super::test_support::zip_parts(parts);
+            let mut patched = 0;
+            for at in 0..bytes.len() - 46 {
+                // Local header: method at 8, name at 30; central: method at
+                // 10, name at 46 (APPNOTE 4.3.7, 4.3.12).
+                let (method, name_at, len_at) = match &bytes[at..at + 4] {
+                    [0x50, 0x4b, 0x03, 0x04] => (at + 8, at + 30, at + 26),
+                    [0x50, 0x4b, 0x01, 0x02] => (at + 10, at + 46, at + 28),
+                    _ => continue,
+                };
+                let len = u16::from_le_bytes([bytes[len_at], bytes[len_at + 1]]) as usize;
+                if bytes.get(name_at..name_at + len) == Some(part.as_bytes()) {
+                    bytes[method..method + 2].copy_from_slice(&99u16.to_le_bytes());
+                    patched += 1;
+                }
+            }
+            assert_eq!(patched, 2);
+            let doc = super::super::test_support::open_bytes(bytes);
+            assert!(
+                doc.unreadable_parts
+                    .iter()
+                    .any(|(p, why)| p.contains(part) && !why.contains("missing")),
+                "{part}: {:?}",
+                doc.unreadable_parts
+            );
+        }
+        // Absent parts are not damaged ones.
+        let bare = super::super::test_support::open_bytes(super::super::test_support::zip_parts(
+            &parts[..3],
+        ));
+        assert!(bare.unreadable_parts.is_empty(), "{:?}", bare.unreadable_parts);
     }
 
     /// The `.xlsb` reader dropped macro sheets, chartsheets and dialog
