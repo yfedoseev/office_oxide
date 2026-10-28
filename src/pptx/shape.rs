@@ -145,11 +145,20 @@ pub enum GraphicContent {
     /// its `ppt/charts/chartN.xml` part), or the inline `<a:t>` text of an
     /// unrecognised graphic. The graphic is not drawn, but its words are
     /// real document content.
-    Text(Vec<String>),
+    Text(std::sync::Arc<[String]>),
     /// An embedded or linked OLE object and its preview picture.
     OleObject(OleObject),
     /// Unsupported or unrecognised graphic type.
     Unknown,
+}
+
+/// The characters a copy of `lines` costs the text budget: each line's bytes,
+/// plus `per_line` for what a copy adds around it (a separator in joined
+/// text, an IR paragraph). Saturating, so a hostile length cannot wrap.
+pub(crate) fn lines_cost(lines: &[String], per_line: usize) -> usize {
+    lines
+        .iter()
+        .fold(0usize, |sum, l| sum.saturating_add(l.len()).saturating_add(per_line))
 }
 
 /// A connector line (`<p:cxnSp>`).

@@ -14,12 +14,13 @@ impl PptxDocument {
     /// [`super::layout::MASTER_TEXT_SECTION_TITLE`]; see the
     /// [`super::layout`] module.
     pub fn plain_text(&self) -> String {
+        crate::limits::begin_copied_text_budget();
         let mut parts = Vec::new();
         // Notes shared by many slides are printed with each (see
         // `crate::limits`), so the slides' text is charged to the budget.
         let mut budget = crate::limits::TextBudget::new();
         for (i, _) in self.slides.iter().enumerate() {
-            if let Some(text) = self.slide_plain_text(i) {
+            if let Some(text) = self.slide_plain(i) {
                 if !text.is_empty() {
                     if !budget.charge(text.chars().count()) {
                         break;
@@ -31,6 +32,10 @@ impl PptxDocument {
         if budget.exhausted() {
             parts.push(budget.notice());
         }
+        // Chart and SmartArt text is shared by the frames that name it and
+        // copied into the output once per frame; past the copied-text budget
+        // a frame's text is left out.
+        parts.extend(crate::limits::copied_text_notice());
         let master: Vec<String> = self
             .master_static_bodies()
             .into_iter()
@@ -49,6 +54,18 @@ impl PptxDocument {
 
     /// Extract plain text from a single slide by index.
     pub fn slide_plain_text(&self, index: usize) -> Option<String> {
+        crate::limits::begin_copied_text_budget();
+        let mut text = self.slide_plain(index)?;
+        if let Some(notice) = crate::limits::copied_text_notice() {
+            text.push_str("\n\n");
+            text.push_str(&notice);
+        }
+        Some(text)
+    }
+
+    /// [`Self::slide_plain_text`] within the copied-text budget the caller
+    /// has begun.
+    fn slide_plain(&self, index: usize) -> Option<String> {
         let slide = self.slides.get(index)?;
         if let Some(ref err) = slide.parse_error {
             return Some(unreadable_slide_notice(&slide.name, err));
@@ -258,7 +275,14 @@ fn collect_text_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePositio
                 // same dual-renderer gap already hit for XLS dates
                 // and XLSX formulas, this time for chart text.
                 GraphicContent::Text(lines) => {
-                    let text = lines.join("\n");
+                    // Joined text is a copy of the part's shared lines:
+                    // charged before it is made.
+                    let text =
+                        if crate::limits::charge_copied_text(super::shape::lines_cost(lines, 1)) {
+                            lines.join("\n")
+                        } else {
+                            String::new()
+                        };
                     if !text.is_empty() {
                         entries.push((gf.position.clone(), text));
                     }
@@ -432,7 +456,12 @@ fn collect_markdown_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePos
                     }
                 },
                 GraphicContent::Text(lines) => {
-                    let md = lines.join("\n");
+                    let md =
+                        if crate::limits::charge_copied_text(super::shape::lines_cost(lines, 1)) {
+                            lines.join("\n")
+                        } else {
+                            String::new()
+                        };
                     if !md.is_empty() {
                         entries.push((gf.position.clone(), md));
                     }
@@ -1127,10 +1156,10 @@ mod tests {
                     cx: 9000,
                     cy: 3000,
                 }),
-                content: GraphicContent::Text(vec![
+                content: GraphicContent::Text(std::sync::Arc::from(vec![
                     "Title: Dollars per Group".to_string(),
                     "Categories: Group 1, Group 2".to_string(),
-                ]),
+                ])),
             })],
             notes: None,
             background_rgb: None,

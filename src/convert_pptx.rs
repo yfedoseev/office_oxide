@@ -168,6 +168,24 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         });
     }
 
+    // Pictures left without their bytes by the image budget: said in the last
+    // slide as well as in the metadata, as the spreadsheet conversion does.
+    let image_notice = crate::limits::image_budget_notice();
+    if let Some(notice) = &image_notice {
+        let paragraph = Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan::plain(notice.clone()))],
+            ..Default::default()
+        });
+        match sections.last_mut() {
+            Some(last) => last.elements.push(paragraph),
+            None => sections.push(Section {
+                elements: vec![paragraph],
+                page_setup: page_setup.clone(),
+                ..Default::default()
+            }),
+        }
+    }
+
     // Read after every conversion above: links and notes are charged too.
     let copied_text_notice = crate::limits::copied_text_notice();
     let mut ir = DocumentIR {
@@ -184,7 +202,9 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
-            text_truncated: !doc.unreadable_parts.is_empty() || copied_text_notice.is_some(),
+            text_truncated: !doc.unreadable_parts.is_empty()
+                || copied_text_notice.is_some()
+                || image_notice.is_some(),
             ..crate::core::core_properties::ooxml_metadata_extras(
                 cp,
                 doc.app_properties.as_ref(),
@@ -193,6 +213,13 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         },
         sections,
     };
+    // Every part the reader skipped, by name and reason, as the DOCX
+    // conversion lists them.
+    ir.metadata.warnings.extend(
+        doc.unreadable_parts
+            .iter()
+            .map(|(part, err)| format!("skipped unreadable part {part}: {err}")),
+    );
     ir.metadata.warnings.extend(copied_text_notice);
     ir.metadata
         .warnings
@@ -451,8 +478,17 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
             // words are document content and used to be dropped entirely —
             // a deck built out of SmartArt extracted as empty.
             crate::pptx::GraphicContent::Text(ref lines) => {
+                // The part's lines are stored once and shared by every frame
+                // that names it; each frame's copy in the IR (a paragraph per
+                // line) is charged before it is made, and left out once the
+                // budget is spent.
+                let per_line = std::mem::size_of::<Element>() + std::mem::size_of::<TextSpan>();
+                let fits = crate::limits::charge_copied_text(crate::pptx::shape::lines_cost(
+                    lines, per_line,
+                ));
                 let paras: Vec<Element> = lines
                     .iter()
+                    .filter(|_| fits)
                     .map(|t| {
                         Element::Paragraph(Paragraph {
                             content: vec![InlineContent::Text(TextSpan::plain(t.clone()))],

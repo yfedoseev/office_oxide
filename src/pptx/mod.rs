@@ -228,7 +228,7 @@ impl PptxDocument {
             /// rId → text lines of a chart part (`ppt/charts/chartN.xml`)
             /// or SmartArt data part (`ppt/diagrams/dataN.xml`). The slide
             /// XML holds only the reference; the text lives in the part.
-            part_text: std::collections::HashMap<String, Vec<String>>,
+            part_text: slide::PartText,
             /// Index into `layouts` of the slide's layout, when its
             /// layout relationship resolves.
             layout_index: Option<usize>,
@@ -349,9 +349,12 @@ impl PptxDocument {
                         } else {
                             let body = match opc.read_part(&notes_part) {
                                 Ok(data) => {
-                                    let rels = opc
-                                        .read_rels_for(&notes_part)
-                                        .unwrap_or_else(|_| Relationships::empty());
+                                    // Unreadable relationships leave the notes
+                                    // without their links and pictures, and say so.
+                                    let rels = opc.read_rels_for(&notes_part).unwrap_or_else(|e| {
+                                        record(&notes_part.rels_path(), &e);
+                                        Relationships::empty()
+                                    });
                                     match slide::extract_notes_body(&data, &rels) {
                                         Ok(body) => body.map(std::sync::Arc::new),
                                         Err(e) => {
@@ -408,6 +411,11 @@ impl PptxDocument {
                 part_text,
                 layout_index,
             });
+        }
+        // What the shared parts (layouts, masters, pictures, charts) could
+        // not read, recorded once each.
+        for (part, err) in std::mem::take(&mut parts.problems) {
+            record(&part, &err);
         }
         let PartCache {
             layouts: layout_entries,
@@ -609,7 +617,11 @@ struct PartCache {
         Option<(std::sync::Arc<[u8]>, String)>,
     >,
     /// (target part, is-chart) → text lines.
-    part_text: std::collections::HashMap<(crate::core::opc::PartName, bool), Vec<String>>,
+    part_text:
+        std::collections::HashMap<(crate::core::opc::PartName, bool), std::sync::Arc<[String]>>,
+    /// Parts of layouts, masters, pictures and charts that could not be
+    /// read, with the reason; each part is tried once, so each is listed once.
+    problems: Vec<(String, String)>,
     /// Every part this cache decompressed, in order — what the caching
     /// tests count.
     #[cfg(test)]
@@ -617,6 +629,37 @@ struct PartCache {
 }
 
 impl PartCache {
+    /// The bytes of `part`, or `None` with the failure recorded.
+    fn read_or_record<R: Read + Seek>(
+        &mut self,
+        opc: &mut OpcReader<R>,
+        part: &crate::core::opc::PartName,
+    ) -> Option<Vec<u8>> {
+        match opc.read_part(part) {
+            Ok(data) => Some(data),
+            Err(e) => {
+                log::warn!("pptx: skipping unreadable part {part}: {e}");
+                self.problems
+                    .push((part.as_str().to_string(), e.to_string()));
+                None
+            },
+        }
+    }
+
+    /// The relationships of `part`; empty, with the failure recorded, when
+    /// its relationships part cannot be read.
+    fn rels_or_record<R: Read + Seek>(
+        &mut self,
+        opc: &mut OpcReader<R>,
+        part: &crate::core::opc::PartName,
+    ) -> Relationships {
+        opc.read_rels_for(part).unwrap_or_else(|e| {
+            log::warn!("pptx: skipping unreadable part {}: {e}", part.rels_path());
+            self.problems.push((part.rels_path(), e.to_string()));
+            Relationships::empty()
+        })
+    }
+
     /// The index of the layout at `part`, reading it (and its master) the
     /// first time it is seen.
     fn layout<R: Read + Seek>(
@@ -640,12 +683,10 @@ impl PartCache {
         if !opc.has_part(part) {
             return None;
         }
-        let data = opc.read_part(part).ok()?;
+        let data = self.read_or_record(opc, part)?;
         #[cfg(test)]
         self.reads.borrow_mut().push(part.as_str().to_string());
-        let rels = opc
-            .read_rels_for(part)
-            .unwrap_or_else(|_| Relationships::empty());
+        let rels = self.rels_or_record(opc, part);
         let master_index = rels
             .first_by_type(rel_types::SLIDE_MASTER)
             .and_then(|rel| part.resolve_relative(&rel.target).ok())
@@ -685,12 +726,10 @@ impl PartCache {
             if !opc.has_part(part) {
                 return None;
             }
-            let data = opc.read_part(part).ok()?;
+            let data = self.read_or_record(opc, part)?;
             #[cfg(test)]
             self.reads.borrow_mut().push(part.as_str().to_string());
-            let rels = opc
-                .read_rels_for(part)
-                .unwrap_or_else(|_| Relationships::empty());
+            let rels = self.rels_or_record(opc, part);
             let (shapes, _) = self.parse_shapes(opc, part, &rels, &data);
             self.masters.push(MasterEntry {
                 info: layout::SlideMaster {
@@ -748,7 +787,15 @@ impl PartCache {
                 if !opc.has_part(target) {
                     return None;
                 }
-                let bytes = opc.read_part(target).ok()?;
+                let bytes = match opc.read_part(target) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        log::warn!("pptx: skipping unreadable part {target}: {e}");
+                        self.problems
+                            .push((target.as_str().to_string(), e.to_string()));
+                        return None;
+                    },
+                };
                 #[cfg(test)]
                 self.reads.borrow_mut().push(target.as_str().to_string());
                 let ext = std::path::Path::new(target.as_str())
@@ -772,8 +819,8 @@ impl PartCache {
         opc: &mut OpcReader<R>,
         source: &crate::core::opc::PartName,
         rels: &Relationships,
-    ) -> std::collections::HashMap<String, Vec<String>> {
-        let mut out = std::collections::HashMap::new();
+    ) -> slide::PartText {
+        let mut out = slide::PartText::new();
         for rel in rels.all() {
             let is_chart = rel.rel_type == rel_types::CHART;
             if !is_chart && rel.rel_type != rel_types::DIAGRAM_DATA {
@@ -787,21 +834,27 @@ impl PartCache {
                     .entry((target, is_chart))
                     .or_insert_with_key(|(target, _)| {
                         if !opc.has_part(target) {
-                            return Vec::new();
+                            return std::sync::Arc::from(Vec::new());
                         }
-                        let Ok(data) = opc.read_part(target) else {
-                            return Vec::new();
+                        let data = match opc.read_part(target) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                log::warn!("pptx: skipping unreadable part {target}: {e}");
+                                self.problems
+                                    .push((target.as_str().to_string(), e.to_string()));
+                                return std::sync::Arc::from(Vec::new());
+                            },
                         };
                         #[cfg(test)]
                         self.reads.borrow_mut().push(target.as_str().to_string());
-                        if is_chart {
+                        std::sync::Arc::from(if is_chart {
                             crate::core::chart::chart_text_lines(&data)
                         } else {
                             slide::diagram_data_text_lines(&data)
-                        }
+                        })
                     });
             if !lines.is_empty() {
-                out.insert(rel.id.clone(), lines.clone());
+                out.insert(rel.id.clone(), std::sync::Arc::clone(lines));
             }
         }
         out
@@ -1076,7 +1129,7 @@ mod part_cache_tests {
             let media = parts.media_for(&mut opc, &slide, &rels);
             assert_eq!(media["rId2"].1, "png");
             let text = parts.part_text_for(&mut opc, &slide, &rels);
-            assert_eq!(text["rId3"], vec!["Title: Revenue".to_string()]);
+            assert_eq!(&*text["rId3"], &["Title: Revenue".to_string()][..]);
         }
         let reads = parts.reads.borrow();
         let mut sorted = reads.clone();

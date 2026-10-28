@@ -64,6 +64,35 @@ fn fill<T: Clone>(slot: &mut Option<T>, from: &Option<T>) {
     }
 }
 
+/// The longest string a style level passes down to every paragraph or run
+/// that inherits it, in characters.
+///
+/// A level's bullet character (`buChar`, ECMA-376 Part 1 §21.1.2.4.1: one
+/// glyph), its autonumber scheme (`buAutoNum`, an ST_TextAutonumberScheme
+/// enumeration value, ECMA-376 Part 1 §20.1.10) and its underline kind (an
+/// ST_TextUnderlineType enumeration value, same section) are all short. They are stored once in the master
+/// or layout and copied into each paragraph or run that takes them over, so a
+/// megabyte value would multiply by the paragraph count. A longer value cannot
+/// come from a presentation application: it is not inherited.
+pub(crate) const MAX_INHERITED_VALUE_CHARS: usize = 64;
+
+/// Whether a bullet is short enough to be copied into the paragraphs that
+/// inherit it (see [`MAX_INHERITED_VALUE_CHARS`]).
+fn inheritable_bullet(bullet: &super::shape::BulletStyle) -> bool {
+    use super::shape::BulletStyle;
+    let (value, long) = match bullet {
+        BulletStyle::Char(c) => (c.as_str(), c.chars().count() > MAX_INHERITED_VALUE_CHARS),
+        BulletStyle::AutoNum { scheme, .. } => {
+            (scheme.as_str(), scheme.chars().count() > MAX_INHERITED_VALUE_CHARS)
+        },
+        _ => ("", false),
+    };
+    if long {
+        log::warn!("pptx: ignoring an inheritable bullet of {} characters", value.len());
+    }
+    !long
+}
+
 /// Number of outline levels a list style defines (`lvl1pPr`…`lvl9pPr`).
 pub(crate) const LEVELS: usize = 9;
 
@@ -337,7 +366,9 @@ fn parse_lvl_pr(
             },
             Event::Empty(ref e) if depth == 1 => {
                 if let Some(b) = super::slide::parse_bullet(e)? {
-                    defaults.bullet = Some(b);
+                    if inheritable_bullet(&b) {
+                        defaults.bullet = Some(b);
+                    }
                 }
             },
             Event::Start(_) => depth += 1,
@@ -399,7 +430,11 @@ fn apply_rpr_attrs(
         defaults.italic = Some(v.as_ref() != "0");
     }
     if let Some(v) = xml::optional_attr_str(e, "u")? {
-        defaults.underline = Some(v.into_owned());
+        if v.chars().count() <= MAX_INHERITED_VALUE_CHARS {
+            defaults.underline = Some(v.into_owned());
+        } else {
+            log::warn!("pptx: ignoring an inheritable underline kind of {} characters", v.len());
+        }
     }
     if let Some(v) = xml::optional_attr_str(e, "sz")? {
         defaults.font_size_hundredths_pt = v.parse::<u32>().ok();

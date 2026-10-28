@@ -122,7 +122,7 @@ impl Slide {
         name: String,
         rels: &Relationships,
         media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
-        part_text: &std::collections::HashMap<String, Vec<String>>,
+        part_text: &PartText,
     ) -> CoreResult<Self> {
         let mut reader = make_content_reader(xml_data);
         let mut shapes = Vec::new();
@@ -239,7 +239,7 @@ fn parse_shape_tree(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
     media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
-    part_text: &std::collections::HashMap<String, Vec<String>>,
+    part_text: &PartText,
 ) -> CoreResult<Vec<Shape>> {
     parse_shape_tree_until(reader, rels, media, part_text, "spTree")
 }
@@ -251,7 +251,7 @@ fn parse_shape_tree_until(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
     media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
-    part_text: &std::collections::HashMap<String, Vec<String>>,
+    part_text: &PartText,
     end_local: &str,
 ) -> CoreResult<Vec<Shape>> {
     let mut shapes = Vec::new();
@@ -294,7 +294,7 @@ fn parse_alternate_content(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
     media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
-    part_text: &std::collections::HashMap<String, Vec<String>>,
+    part_text: &PartText,
 ) -> CoreResult<Vec<Shape>> {
     let mut shapes: Vec<Shape> = Vec::new();
     let mut have_choice = false;
@@ -531,7 +531,7 @@ fn parse_group_shape(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
     media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
-    part_text: &std::collections::HashMap<String, Vec<String>>,
+    part_text: &PartText,
 ) -> CoreResult<Shape> {
     // Groups nest, so this is the recursion an adversarial deck drives.
     // Past the limit the subtree is skipped: a stack overflow aborts the
@@ -632,6 +632,11 @@ fn collect_a_t_text(
     }
     Ok(out)
 }
+
+/// Relationship id → the text lines of the chart or SmartArt data part it
+/// names. A part is read once and its lines are shared by every reference,
+/// so a part named by thousands of frames or slides costs one copy.
+pub(crate) type PartText = std::collections::HashMap<String, std::sync::Arc<[String]>>;
 
 /// The text of a SmartArt data part (`ppt/diagrams/dataN.xml`,
 /// `<dgm:dataModel>`, ECMA-376 Part 1 §21.4.3): one line per non-empty
@@ -785,7 +790,7 @@ fn parse_graphic_frame(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
     media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
-    part_text: &std::collections::HashMap<String, Vec<String>>,
+    part_text: &PartText,
 ) -> CoreResult<Shape> {
     let mut id = 0u32;
     let mut name = String::new();
@@ -854,7 +859,7 @@ fn parse_graphic_frame(
                             content = if texts.is_empty() {
                                 GraphicContent::Unknown
                             } else {
-                                GraphicContent::Text(texts)
+                                GraphicContent::Text(texts.into())
                             };
                         }
                     },
@@ -2588,10 +2593,10 @@ mod tests {
         let mut charts = std::collections::HashMap::new();
         charts.insert(
             "rId2".to_string(),
-            vec![
+            std::sync::Arc::from(vec![
                 "Title: Dollars per Group".to_string(),
                 "Categories: Group 1, Group 2".to_string(),
-            ],
+            ]),
         );
 
         let slide = Slide::parse(
