@@ -480,3 +480,84 @@ fn test_a_report_the_text_budget_cannot_pay_for_is_left_out_and_the_budget_says_
         assert_eq!(skipped_warnings(&ir), 1);
     }
 }
+
+/// A part name the file shapes: link and markup syntax, a code span, and a
+/// line break that would start a list item.
+const HOSTILE_NAME: &str = "h](http:/evil) <img src=x onerror=1> `t`\n\n- Heading";
+
+/// `bytes` with every part named `from` renamed to `HOSTILE_NAME` followed by
+/// `.xml`: raw in the zip, percent-encoded where a relationship names it.
+fn hostile_part(bytes: &[u8], from: &str) -> Vec<u8> {
+    let encoded = HOSTILE_NAME
+        .replace(' ', "%20")
+        .replace('<', "%3C")
+        .replace('>', "%3E")
+        .replace('`', "%60")
+        .replace('\n', "%0A");
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes.to_vec())).unwrap();
+    let mut parts = Vec::new();
+    for i in 0..archive.len() {
+        let mut f = archive.by_index(i).unwrap();
+        let name = f
+            .name()
+            .unwrap()
+            .replace(from, &format!("{HOSTILE_NAME}.xml"));
+        let mut body = String::new();
+        f.read_to_string(&mut body).unwrap();
+        parts.push((name, body.replace(from, &format!("{encoded}.xml"))));
+    }
+    zip_of(parts)
+}
+
+#[test]
+fn test_a_part_name_the_file_shapes_stays_one_inert_line_in_every_rendering() {
+    let _limits = common::default_limits();
+    for (bytes, format) in [
+        (
+            hostile_part(&docx_with_headers(1, 1, &malformed_header()), "header0"),
+            DocumentFormat::Docx,
+        ),
+        (hostile_part(&pptx_with_notes(1, 1, None), "notes0"), DocumentFormat::Pptx),
+    ] {
+        let doc = Document::from_reader(Cursor::new(bytes), format).unwrap();
+        let ir = doc.to_ir();
+        // The metadata keeps the name as the file gave it.
+        assert!(
+            ir.metadata
+                .warnings
+                .iter()
+                .any(|w| w.contains(HOSTILE_NAME)),
+            "{:?}",
+            ir.metadata.warnings
+        );
+        for (what, text) in [
+            ("plain_text", doc.plain_text()),
+            ("to_markdown", doc.to_markdown()),
+            ("to_html", doc.to_html()),
+            ("ir plain", ir.plain_text()),
+            ("ir markdown", ir.to_markdown()),
+            ("ir html", ir.to_html()),
+        ] {
+            let reports: Vec<&str> = text
+                .lines()
+                .filter(|l| l.contains("skipped unreadable part"))
+                .collect();
+            assert_eq!(reports.len(), 1, "{what}: {text}");
+            // The name's line break did not start a block of its own.
+            assert!(
+                !text
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("- Heading")),
+                "{what}: {text}"
+            );
+            if what.contains("html") {
+                assert!(!text.contains("<img"), "{what}: {text}");
+            } else if what.contains("markdown") {
+                // A tag, a link and an image opener are escaped.
+                assert_eq!(text.matches("<img").count(), text.matches("\\<img").count(), "{what}");
+                assert_eq!(text.matches("](").count(), text.matches("\\](").count(), "{what}");
+                assert!(!text.contains("`t`"), "{what}: {text}");
+            }
+        }
+    }
+}

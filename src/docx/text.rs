@@ -82,7 +82,10 @@ impl DocxDocument {
         }
         // The parts that could not be read are listed first: the report is
         // charged to the budget before the budget's own notice is read.
-        let unreadable = crate::core::unreadable::report_lines(&self.unreadable_warnings());
+        let unreadable = crate::core::unreadable::report_lines(
+            &self.unreadable_warnings(),
+            crate::core::unreadable::ReportTarget::Plain,
+        );
         if !unreadable.is_empty() {
             out.push_str("\n\n");
             out.push_str(&unreadable.join("\n"));
@@ -163,7 +166,10 @@ impl DocxDocument {
             out.pop();
         }
         // The parts that could not be read, as in plain_text().
-        let unreadable = crate::core::unreadable::report_lines(&self.unreadable_warnings());
+        let unreadable = crate::core::unreadable::report_lines(
+            &self.unreadable_warnings(),
+            crate::core::unreadable::ReportTarget::Markdown,
+        );
         if !unreadable.is_empty() {
             out.push_str("\n\n");
             out.push_str(&unreadable.join("\n\n"));

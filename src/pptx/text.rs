@@ -49,7 +49,10 @@ impl PptxDocument {
         }
         // The parts that could not be read, charged to the budget before
         // the budget's own notice is read.
-        let unreadable = crate::core::unreadable::report_lines(&self.unreadable_warnings());
+        let unreadable = crate::core::unreadable::report_lines(
+            &self.unreadable_warnings(),
+            crate::core::unreadable::ReportTarget::Plain,
+        );
         if !unreadable.is_empty() {
             parts.push(unreadable.join("\n"));
         }
@@ -144,7 +147,10 @@ impl PptxDocument {
             parts.push(budget.notice());
         }
         // The parts that could not be read, as in plain_text().
-        let unreadable = crate::core::unreadable::report_lines(&self.unreadable_warnings());
+        let unreadable = crate::core::unreadable::report_lines(
+            &self.unreadable_warnings(),
+            crate::core::unreadable::ReportTarget::Markdown,
+        );
         if !unreadable.is_empty() {
             parts.push(unreadable.join("\n\n"));
         }
