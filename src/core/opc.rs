@@ -488,9 +488,10 @@ pub(crate) struct ZipEntryIndex {
     charged: Vec<std::cell::Cell<bool>>,
     /// Decompressed bytes charged so far.
     consumed: std::cell::Cell<u64>,
-    /// Bytes inflated by reads of an entry already read in full, and by
-    /// reads that failed after inflating.
+    /// Bytes inflated by reads of an entry already read in full.
     reinflated: std::cell::Cell<u64>,
+    /// Bytes inflated by reads that failed, which commit nothing.
+    failed: std::cell::Cell<u64>,
     /// The package-wide byte budget, fixed when the index is built.
     byte_limit: u64,
     /// Entries whose bytes failed their recorded CRC-32, in read order.
@@ -541,6 +542,7 @@ impl ZipEntryIndex {
                 .collect(),
             consumed: std::cell::Cell::new(0),
             reinflated: std::cell::Cell::new(0),
+            failed: std::cell::Cell::new(0),
             byte_limit,
             crc_mismatched: std::cell::RefCell::new(Vec::new()),
         }
@@ -556,8 +558,10 @@ impl ZipEntryIndex {
         if self.charged.get(index).is_some_and(|c| c.get()) {
             return self.charge_reinflated(bytes.saturating_sub(counted), name);
         }
+        // Reads that failed after inflating are never committed; once their
+        // total is past the limit no entry is inflated again.
         let total = self.consumed.get().saturating_add(bytes);
-        if total > self.byte_limit {
+        if total > self.byte_limit || self.failed.get() > self.byte_limit {
             return Err(Error::PackageLimit(format!(
                 "reading '{name}' brings the package's decompressed size past {} bytes",
                 self.byte_limit
@@ -581,12 +585,13 @@ impl ZipEntryIndex {
     }
 
     /// Record that a read of entry `index` inflated `bytes` and then failed.
-    /// Nothing is committed for it, so each retry would be free; the bytes go
-    /// to the re-inflated total unless the entry was already counted there.
+    /// Nothing is committed for it, so each retry would be free; the bytes
+    /// are totalled instead (unless the entry was already counted as
+    /// re-inflated), and once the total is past the limit no entry that was
+    /// not read in full is inflated again.
     fn note_failed_read(&self, index: usize, bytes: u64) {
         if !self.charged.get(index).is_some_and(|c| c.get()) {
-            self.reinflated
-                .set(self.reinflated.get().saturating_add(bytes));
+            self.failed.set(self.failed.get().saturating_add(bytes));
         }
     }
 
@@ -1401,6 +1406,60 @@ mod tests {
         assert!(matches!(err, Error::PackageLimit(_)), "{err:?}");
         // The refusal is sticky: the limit is spent for every entry.
         assert!(read_zip_entry(&mut archive, &entries, "a.bin").is_err());
+    }
+
+    /// A part that fails after inflating is not committed, so it would be
+    /// free to try again; the bytes of each failed attempt count, and once
+    /// they are past the limit the part is no longer inflated.
+    #[test]
+    fn test_package_byte_budget_stops_inflating_a_part_that_keeps_failing() {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts: zip::write::FileOptions<'_, '_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("a.bin", opts).unwrap();
+        zip.write_all(&vec![0u8; 1 << 20]).unwrap();
+        let good = zip.finish().unwrap().into_inner();
+        // Damage the compressed stream where a read inflates the most before
+        // it fails (a checksum mismatch alone keeps the bytes).
+        let limit = 2 << 20;
+        let mut found: Option<(u64, Vec<u8>)> = None;
+        for at in 40..good.len().min(400) {
+            let mut bytes = good.clone();
+            bytes[at] ^= 0x5A;
+            let Ok(mut archive) = ZipArchive::new(std::io::Cursor::new(bytes.clone())) else {
+                continue;
+            };
+            let entries = ZipEntryIndex::with_byte_limit(&archive, limit);
+            if read_zip_entry(&mut archive, &entries, "a.bin").is_err()
+                && entries.failed.get() > found.as_ref().map_or(0, |f| f.0)
+            {
+                found = Some((entries.failed.get(), bytes));
+            }
+        }
+        let (_, bytes) = found.expect("a damaged stream that fails after inflating");
+        let mut archive = ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let entries = ZipEntryIndex::with_byte_limit(&archive, limit);
+        let mut inflating = 0u64;
+        let mut refused = false;
+        for _ in 0..10_000 {
+            match read_zip_entry(&mut archive, &entries, "a.bin") {
+                Err(Error::PackageLimit(_)) => {
+                    refused = true;
+                    break;
+                },
+                Err(_) => inflating += 1,
+                Ok(_) => panic!("a damaged stream was accepted"),
+            }
+        }
+        assert!(refused, "{inflating} attempts were inflated and none refused");
+        let each = entries.failed.get() / inflating.max(1);
+        assert!(
+            each > 0 && inflating <= limit / each + 2,
+            "{inflating} attempts of {each} bytes"
+        );
+        assert!(read_zip_entry(&mut archive, &entries, "a.bin").is_err());
+        assert!(entries.failed.get() <= limit + each, "{}", entries.failed.get());
     }
 
     /// A declared size that understates the data does not dodge the package
