@@ -91,10 +91,11 @@ impl PptxDocument {
     /// Layout and master static text follows the slides once, as for
     /// [`Self::plain_text`].
     pub fn to_markdown(&self) -> String {
+        crate::limits::begin_copied_text_budget();
         let mut parts = Vec::new();
         let mut budget = crate::limits::TextBudget::new();
         for (i, _) in self.slides.iter().enumerate() {
-            if let Some(md) = self.slide_to_markdown(i) {
+            if let Some(md) = self.slide_markdown(i) {
                 if !budget.charge(md.chars().count()) {
                     break;
                 }
@@ -104,6 +105,9 @@ impl PptxDocument {
         if budget.exhausted() {
             parts.push(budget.notice());
         }
+        // A picture's link target is copied into the output once per picture;
+        // past the copied-text budget the picture is named without it.
+        parts.extend(crate::limits::copied_text_notice());
         let mut out = parts.join("\n\n");
         let master: Vec<String> = self
             .master_static_bodies()
@@ -127,6 +131,18 @@ impl PptxDocument {
 
     /// Convert a single slide to markdown by index.
     pub fn slide_to_markdown(&self, index: usize) -> Option<String> {
+        crate::limits::begin_copied_text_budget();
+        let mut md = self.slide_markdown(index)?;
+        if let Some(notice) = crate::limits::copied_text_notice() {
+            md.push_str("\n\n");
+            md.push_str(&notice);
+        }
+        Some(md)
+    }
+
+    /// [`Self::slide_to_markdown`] within the copied-text budget the caller
+    /// has begun.
+    fn slide_markdown(&self, index: usize) -> Option<String> {
         let slide = self.slides.get(index)?;
         if let Some(ref err) = slide.parse_error {
             return Some(format!(
@@ -394,6 +410,7 @@ fn collect_markdown_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePos
                 let src = pic
                     .link_target
                     .as_deref()
+                    .filter(|u| crate::limits::charge_copied_text(u.len()))
                     .and_then(crate::ir_render::safe_url)
                     .map(|u| crate::ir_render::escape_markdown_url(&u))
                     .unwrap_or_default();

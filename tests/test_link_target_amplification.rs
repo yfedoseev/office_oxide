@@ -96,6 +96,10 @@ fn pptx(target: &str, links: usize) -> Vec<u8> {
     let slide = format!(
         r#"<p:sld xmlns:p="{PML}" xmlns:a="{DML}" xmlns:r="{REL}"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="2" name="T"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/>{paras}</p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#
     );
+    pptx_with_slide(slide, target)
+}
+
+fn pptx_with_slide(slide: String, target: &str) -> Vec<u8> {
     zip_of(vec![
         ("[Content_Types].xml".to_string(), r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/><Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/></Types>"#.to_string()),
         ("_rels/.rels".to_string(), rels(&[("rId1", "officeDocument", "ppt/presentation.xml", false)])),
@@ -312,5 +316,33 @@ fn test_pptx_runs_naming_one_relationship_share_its_text_and_ir_copies_are_charg
     let text = ir.plain_text();
     for i in 0..LINKS {
         assert!(text.contains(&format!("link{i}")), "link{i} lost");
+    }
+}
+
+/// Pictures linked to one long target: the Markdown names it once per picture.
+#[test]
+fn test_pptx_markdown_copies_of_a_picture_link_target_are_charged_and_cut_off_loudly() {
+    limits();
+    let pic = |i: usize| {
+        format!(
+            r#"<p:pic><p:nvPicPr><p:cNvPr id="{id}" name="P{i}" descr="pic{i}"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:link="rId1"/></p:blipFill><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="100" cy="100"/></a:xfrm></p:spPr></p:pic>"#,
+            id = i + 2
+        )
+    };
+    let pics: String = (0..LINKS).map(pic).collect();
+    let slide = format!(
+        r#"<p:sld xmlns:p="{PML}" xmlns:a="{DML}" xmlns:r="{REL}"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>{pics}</p:spTree></p:cSld></p:sld>"#
+    );
+    // Short of the whole budget, so the slide's own output budget also holds.
+    let len = 40_000;
+    let bytes = pptx_with_slide(slide, &url(len).replace("example.com", "img.example.com"));
+    let md = Document::from_reader(Cursor::new(bytes), DocumentFormat::Pptx)
+        .unwrap()
+        .to_markdown();
+    let copies = md.matches("https://img.example.com/").count();
+    assert!(copies > 0 && copies * len <= TEXT_BUDGET, "{copies} copies");
+    assert!(md.contains("character budget"), "the cut-off is reported");
+    for i in 0..LINKS {
+        assert!(md.contains(&format!("pic{i}")), "pic{i} lost");
     }
 }
