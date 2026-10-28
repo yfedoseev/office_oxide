@@ -154,38 +154,37 @@ fn call_extract(id: &Value, args: &Value) -> Value {
 
 /// Render `doc` in `format`, refusing a result larger than `limit` bytes.
 fn render(doc: &office_oxide::Document, format: &str, limit: usize) -> Result<String, String> {
-    let content = match format {
-        "text" => doc.plain_text(),
-        "markdown" => doc.to_markdown(),
+    // Every format is written through a bounded buffer, so an oversized
+    // document stops at the limit instead of building the whole string (and
+    // a spreadsheet is produced a sheet at a time).
+    let mut out = BoundedBuf {
+        buf: Vec::new(),
+        limit,
+        exceeded: false,
+    };
+    let written = match format {
+        "text" => doc.write_plain_text(&mut out),
+        "markdown" => doc.write_markdown(&mut out),
         // Images are dropped from plain markdown entirely; this keeps both
         // their content and their position in one self-contained string.
         "markdown-with-images" => {
             use office_oxide::ir_render::{ImageEmbed, MarkdownOptions};
-            doc.to_markdown_with(MarkdownOptions {
-                image_embed: ImageEmbed::Base64,
-            })
+            doc.write_markdown_with(
+                MarkdownOptions {
+                    image_embed: ImageEmbed::Base64,
+                },
+                &mut out,
+            )
         },
-        "html" => doc.to_html(),
-        // The IR is serialised through a bounded writer, so an oversized
-        // document stops at the limit instead of building the whole string.
-        "ir" => {
-            let mut out = BoundedBuf {
-                buf: Vec::new(),
-                limit,
-                exceeded: false,
-            };
-            match serde_json::to_writer_pretty(&mut out, &doc.to_ir()) {
-                Ok(()) => String::from_utf8(out.buf).map_err(|e| e.to_string())?,
-                Err(_) if out.exceeded => return Err(too_large(format, limit)),
-                Err(e) => return Err(e.to_string()),
-            }
-        },
+        "html" => doc.write_html(&mut out),
+        "ir" => serde_json::to_writer_pretty(&mut out, &doc.to_ir()).map_err(std::io::Error::from),
         other => return Err(format!("unknown format: {other}")),
     };
-    if content.len() > limit {
-        return Err(too_large(format, limit));
+    match written {
+        Ok(()) => String::from_utf8(out.buf).map_err(|e| e.to_string()),
+        Err(_) if out.exceeded => Err(too_large(format, limit)),
+        Err(e) => Err(e.to_string()),
     }
-    Ok(content)
 }
 
 fn too_large(format: &str, limit: usize) -> String {

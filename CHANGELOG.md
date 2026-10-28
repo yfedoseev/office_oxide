@@ -124,6 +124,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`XlsxDocument::plain_text` and `to_markdown` no longer build each sheet's text, the list of its parts and the joined result in turn.** They write the text straight into one result, the cells of a row charged to the text budget before they are written, so the intermediate copies (about three times the output) are gone. The output, including where a budget cuts it, is byte-for-byte what it was.
 
+- **The CLI's `text`, `markdown` and `html` commands and the MCP `extract` tool write a spreadsheet's rendering as it is produced.** The CLI writes to stdout through a buffer instead of building the string first; `extract` writes into its size-limited buffer, so a rendering over the 32 MiB limit stops at the limit instead of being built whole and then refused. Output and errors are unchanged. `info` and `ir` still convert the whole workbook.
+
 ## [0.1.15] - 2026-10-15
 
 ### Added

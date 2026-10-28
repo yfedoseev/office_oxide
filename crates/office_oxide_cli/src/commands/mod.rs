@@ -53,16 +53,20 @@ pub enum Command {
     },
 }
 
-/// Write a rendered result to stdout.
+/// Write a rendering to stdout as the document produces it, so a large
+/// spreadsheet is never held whole in memory.
 ///
 /// `print!` panics on any write error other than a closed pipe (which
 /// `main` turns back into a quiet `SIGPIPE` exit): `office-oxide text f >
 /// /dev/full` exited 101 with a panic message. Propagating the error gives
 /// the usual `error: …` and exit status 1 instead.
-fn emit(s: &str) -> std::io::Result<()> {
+fn emit_with(
+    render: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     use std::io::Write;
-    let mut out = std::io::stdout().lock();
-    out.write_all(s.as_bytes())?;
+    // Unbuffered, every row would be a write to the terminal or pipe.
+    let mut out = std::io::BufWriter::with_capacity(1 << 16, std::io::stdout().lock());
+    render(&mut out)?;
     out.flush()
 }
 
