@@ -393,6 +393,31 @@ pub fn set_max_markdown_list_items(items: usize) {
     MAX_MARKDOWN_LIST_ITEMS.store(items, Ordering::Relaxed);
 }
 
+/// The default most blocks one Markdown document may parse into: 100,000.
+///
+/// A block costs a section, a paragraph, a heading, a code block, a break,
+/// a list or a table as 1, and each table cell as 4 (a cell is about four
+/// times the IR of a paragraph). Each is 0.5-1.4 KB of IR from a few bytes
+/// of Markdown: 100,000 sections were 214 MB, 200,000 paragraphs 285 MB and
+/// one table row of 100,000 columns 490 MB. List items have a limit of their
+/// own, [`max_markdown_list_items`].
+pub const DEFAULT_MAX_MARKDOWN_ELEMENTS: usize = 100_000;
+
+static MAX_MARKDOWN_ELEMENTS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_MARKDOWN_ELEMENTS);
+
+/// The most blocks (sections, paragraphs, headings, code blocks, breaks,
+/// lists and tables at 1, table cells at 4) `DocumentIR::from_markdown`
+/// keeps; the rest of the document is dropped with a notice.
+pub fn max_markdown_elements() -> usize {
+    MAX_MARKDOWN_ELEMENTS.load(Ordering::Relaxed)
+}
+
+/// Set the Markdown block limit for every parse afterwards. `usize::MAX`
+/// disables the bound.
+pub fn set_max_markdown_elements(elements: usize) {
+    MAX_MARKDOWN_ELEMENTS.store(elements, Ordering::Relaxed);
+}
+
 /// A document's remaining text budget.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TextBudget {

@@ -34,11 +34,15 @@ impl DocumentIR {
     /// kept (each is about 250 bytes of IR, from as little as four bytes of
     /// Markdown); the rest are dropped, a notice paragraph ends the last
     /// section, and `Metadata::text_truncated` and a warning say so.
+    /// The document as a whole is bounded the same way by
+    /// [`crate::limits::max_markdown_elements`]: past it the rest of the
+    /// Markdown is not read.
     pub fn from_markdown(markdown: &str, format: DocumentFormat) -> Self {
-        Self::from_markdown_with_list_limit(
+        Self::from_markdown_with_limits(
             markdown,
             format,
             crate::limits::max_markdown_list_items(),
+            crate::limits::max_markdown_elements(),
         )
     }
 
@@ -47,19 +51,42 @@ impl DocumentIR {
         format: DocumentFormat,
         max_list_items: usize,
     ) -> Self {
-        let mut parser = MarkdownParser::new(markdown, max_list_items);
+        Self::from_markdown_with_limits(
+            markdown,
+            format,
+            max_list_items,
+            crate::limits::max_markdown_elements(),
+        )
+    }
+
+    pub(crate) fn from_markdown_with_limits(
+        markdown: &str,
+        format: DocumentFormat,
+        max_list_items: usize,
+        max_elements: usize,
+    ) -> Self {
+        let mut parser = MarkdownParser::new(markdown, max_list_items, max_elements);
         let mut sections = parser.parse_sections();
         let mut metadata = Metadata {
             format,
             title: None,
             ..Default::default()
         };
+        let mut notices: Vec<String> = Vec::new();
         if parser.dropped_list_items > 0 {
-            let notice = format!(
+            notices.push(format!(
                 "[{} list item(s) dropped: the document exceeds the {} list item limit \
                  (office_oxide::limits::set_max_markdown_list_items)]",
                 parser.dropped_list_items, max_list_items
-            );
+            ));
+        }
+        if parser.elements_exhausted {
+            notices.push(format!(
+                "[the rest of the document was dropped: it exceeds the {max_elements} block \
+                 limit (office_oxide::limits::set_max_markdown_elements)]"
+            ));
+        }
+        for notice in notices {
             metadata.text_truncated = true;
             metadata.warnings.push(notice.clone());
             if sections.is_empty() {
@@ -87,16 +114,37 @@ struct MarkdownParser<'a> {
     list_items_left: usize,
     /// List items read and dropped for want of allowance.
     dropped_list_items: usize,
+    /// Block allowance still left, over the whole document.
+    elements_left: usize,
+    /// A block did not fit; the rest of the document is not read.
+    elements_exhausted: bool,
 }
 
 impl<'a> MarkdownParser<'a> {
-    fn new(src: &'a str, max_list_items: usize) -> Self {
+    fn new(src: &'a str, max_list_items: usize, max_elements: usize) -> Self {
         Self {
+            elements_left: max_elements,
+            elements_exhausted: false,
             lines: src.lines().collect(),
             pos: 0,
             list_items_left: max_list_items,
             dropped_list_items: 0,
         }
+    }
+
+    /// Spend `cost` blocks of the allowance before a block is built. When
+    /// they do not fit, the allowance is closed for good: the document is
+    /// cut here rather than continued with later, smaller blocks.
+    fn charge(&mut self, cost: usize) -> bool {
+        if self.elements_exhausted {
+            return false;
+        }
+        if cost > self.elements_left {
+            self.elements_exhausted = true;
+            return false;
+        }
+        self.elements_left -= cost;
+        true
     }
 
     fn peek(&self) -> Option<&'a str> {
@@ -120,6 +168,9 @@ impl<'a> MarkdownParser<'a> {
         };
 
         while self.pos < self.lines.len() {
+            if self.elements_exhausted {
+                break;
+            }
             let line = match self.peek() {
                 Some(l) => l,
                 None => break,
@@ -135,6 +186,9 @@ impl<'a> MarkdownParser<'a> {
             // into the text as an ordinary paragraph ("rust let x = 1;") and
             // no Element::CodeBlock was ever produced from markdown.
             if let Some(lang) = fence_language(line) {
+                if !self.charge(1) {
+                    break;
+                }
                 self.advance();
                 let mut body: Vec<String> = Vec::new();
                 while let Some(l) = self.peek() {
@@ -159,9 +213,15 @@ impl<'a> MarkdownParser<'a> {
             // silently swallowed) and, matching this parser's existing page-
             // boundary convention, starts a new section.
             if is_thematic_break(line) {
+                if !self.charge(1) {
+                    break;
+                }
                 self.advance();
                 current.elements.push(Element::ThematicBreak);
                 if !current.elements.is_empty() || current.title.is_some() {
+                    if !self.charge(1) {
+                        break;
+                    }
                     sections.push(current);
                     current = Section {
                         title: None,
@@ -174,10 +234,16 @@ impl<'a> MarkdownParser<'a> {
 
             // ATX heading
             if let Some((level, text)) = parse_atx_heading(line) {
+                if !self.charge(1) {
+                    break;
+                }
                 self.advance();
                 // H1 headings start a new section
                 if level == 1 {
                     if !current.elements.is_empty() || current.title.is_some() {
+                        if !self.charge(1) {
+                            break;
+                        }
                         sections.push(current);
                     }
                     current = Section {
@@ -201,10 +267,16 @@ impl<'a> MarkdownParser<'a> {
                     current.elements.push(Element::Table(table));
                     continue;
                 }
+                if self.elements_exhausted {
+                    break;
+                }
             }
 
             // Unordered list
             if is_unordered_list_marker(line) {
+                if !self.charge(1) {
+                    break;
+                }
                 let list = self.parse_list(false);
                 current.elements.push(Element::List(list));
                 continue;
@@ -212,12 +284,18 @@ impl<'a> MarkdownParser<'a> {
 
             // Ordered list
             if is_ordered_list_marker(line) {
+                if !self.charge(1) {
+                    break;
+                }
                 let list = self.parse_list(true);
                 current.elements.push(Element::List(list));
                 continue;
             }
 
             // Regular paragraph (accumulate until blank line or block element)
+            if !self.charge(1) {
+                break;
+            }
             let para = self.parse_paragraph();
             if !para.content.is_empty() {
                 current.elements.push(Element::Paragraph(para));
@@ -298,10 +376,18 @@ impl<'a> MarkdownParser<'a> {
             return None;
         }
 
+        // The table and each row's cells are charged before they are built.
+        if !self.charge(1) {
+            return None;
+        }
         let mut rows: Vec<TableRow> = Vec::new();
         for (i, row_line) in data_rows.iter().enumerate() {
             let is_header = i == 0;
-            let cells = split_pipe_row(row_line)
+            let cell_texts = split_pipe_row(row_line);
+            if !self.charge(cell_texts.len().saturating_mul(TABLE_CELL_COST)) {
+                break;
+            }
+            let cells = cell_texts
                 .into_iter()
                 .map(|cell_text| {
                     // The header is marked by its rule and `repeat_as_header`,
@@ -333,6 +419,10 @@ impl<'a> MarkdownParser<'a> {
                 repeat_as_header: is_header,
                 ..Default::default()
             });
+        }
+
+        if rows.is_empty() {
+            return None;
         }
 
         // A Markdown table has no styling of its own; without borders and a
@@ -428,6 +518,10 @@ fn ordered_marker_number(line: &str) -> Option<u32> {
 // ---------------------------------------------------------------------------
 // Inline parser (bold, italic, plain)
 // ---------------------------------------------------------------------------
+
+/// What a table cell costs against [`crate::limits::max_markdown_elements`]:
+/// about four times the IR of a paragraph.
+const TABLE_CELL_COST: usize = 4;
 
 /// Cell rule width, in eighths of a point (0.5 pt).
 const CELL_RULE_EIGHTHS_PT: u32 = 4;
@@ -1132,5 +1226,65 @@ mod tests {
         let ir = DocumentIR::from_markdown_with_list_limit("- a\n- b\n", DocumentFormat::Docx, 2);
         assert!(!ir.metadata.text_truncated);
         assert!(ir.metadata.warnings.is_empty());
+    }
+
+    fn block_count(ir: &DocumentIR) -> usize {
+        ir.sections.iter().map(|s| s.elements.len()).sum()
+    }
+
+    fn with_blocks(md: &str, max: usize) -> DocumentIR {
+        DocumentIR::from_markdown_with_limits(md, DocumentFormat::Docx, usize::MAX, max)
+    }
+
+    #[test]
+    fn test_paragraphs_past_the_block_limit_are_dropped_with_a_notice() {
+        let md = "para\n\n".repeat(100) + "# late\n";
+        let ir = with_blocks(&md, 10);
+        // Ten paragraphs, then the notice.
+        assert_eq!(block_count(&ir), 11);
+        assert!(ir.metadata.text_truncated);
+        assert!(ir.metadata.warnings[0].contains("set_max_markdown_elements"));
+        assert!(ir.plain_text().contains("block limit"), "the notice reaches every renderer");
+        assert!(!ir.plain_text().contains("late"), "nothing after the cut is read");
+    }
+
+    #[test]
+    fn test_sections_past_the_block_limit_are_dropped() {
+        let md = "---\n".repeat(1_000);
+        let ir = with_blocks(&md, 10);
+        // Each break is a block and a section: five of each fit.
+        assert!(ir.sections.len() <= 7, "{} sections", ir.sections.len());
+        assert!(ir.metadata.text_truncated);
+    }
+
+    #[test]
+    fn test_table_cells_are_charged_before_the_row_is_built() {
+        let wide = format!("|{}\n", "a|".repeat(50_000));
+        let ir = with_blocks(&wide, 100);
+        let cells: usize = ir
+            .sections
+            .iter()
+            .flat_map(|s| &s.elements)
+            .map(|e| match e {
+                Element::Table(t) => t.rows.iter().map(|r| r.cells.len()).sum(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(cells, 0, "a header row of 50,000 cells does not fit 100 blocks");
+        assert!(ir.metadata.text_truncated);
+        // A small table fits: 1 + 2 rows of 2 cells at 4 each = 17.
+        let ir = with_blocks("|a|b|\n|-|-|\n|c|d|\n", 100);
+        assert!(!ir.metadata.text_truncated);
+    }
+
+    #[test]
+    fn test_a_document_within_the_block_limit_is_unchanged() {
+        let md = "# T\n\ntext **b** [l](u)\n\n- a\n- b\n\n|x|y|\n|-|-|\n|1|2|\n\n```\ncode\n```\n\n---\n\nmore\n";
+        let unlimited = with_blocks(md, usize::MAX);
+        // Counted blocks: 2 sections, heading-less paragraphs, list, table
+        // (1 + 4 cells x 2 rows), code, break.
+        assert_eq!(with_blocks(md, 30), unlimited);
+        assert!(!unlimited.metadata.text_truncated);
+        assert!(with_blocks(md, 3).metadata.text_truncated);
     }
 }
