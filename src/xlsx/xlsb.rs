@@ -107,9 +107,7 @@ pub(super) fn from_zip<R: Read + Seek>(
             let mut ws = Worksheet::without_cells(info.name.clone(), kind);
             ws.state = info.state;
             if kind == SheetKind::Chart {
-                for chart in
-                    super::chartsheet_chart_parts(archive, entries, &path, &mut shared.unreadable)
-                {
+                for chart in shared.chartsheet_chart_parts(archive, entries, &path) {
                     ws.chart_text
                         .extend(shared.chart_text(archive, entries, &chart));
                 }

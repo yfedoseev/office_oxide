@@ -75,6 +75,10 @@ pub(super) struct SharedParts {
     tables: HashMap<String, Option<Arc<SheetTable>>>,
     /// The text of chart parts, for the chartsheets that display them.
     charts: HashMap<String, Option<Arc<str>>>,
+    /// The chart parts each drawing names, for the chartsheets that display
+    /// them, by drawing: the drawing's relationships are read once however
+    /// many chartsheets name it.
+    drawing_charts: HashMap<String, Arc<[String]>>,
     /// Relationship parts met on the way that could not be read, as
     /// `(part, reason)`.
     pub(super) unreadable: UnreadableParts,
@@ -169,6 +173,54 @@ impl SharedParts {
         };
         self.merged.insert(pair, merged.clone());
         merged
+    }
+
+    /// The chart parts a chartsheet displays: its drawing's chart
+    /// relationships ([ECMA-376] §12.3.2 — a chartsheet shows one chart
+    /// through a drawing part). A part that is missing or unrelated yields
+    /// nothing; the sheet is then its name alone. Each chart is listed once.
+    pub(super) fn chartsheet_chart_parts<R: Read + Seek>(
+        &mut self,
+        archive: &mut ZipArchive<R>,
+        entries: &opc::ZipEntryIndex,
+        sheet_path: &str,
+    ) -> Vec<String> {
+        let sheet_rels = read_rels_reporting(
+            archive,
+            entries,
+            &sheet_rels_path(sheet_path),
+            &mut self.unreadable,
+        );
+        let mut charts: Vec<String> = Vec::new();
+        let mut listed = std::collections::HashSet::new();
+        for drawing in sheet_rels.get_by_type(rel_types::DRAWING) {
+            let drawing_path = resolve_relative_zip_path(sheet_path, &drawing.target);
+            let key = part_key(entries, &drawing_path);
+            let named = match self.drawing_charts.get(&key) {
+                Some(hit) => hit.clone(),
+                None => {
+                    let drawing_rels = read_rels_reporting(
+                        archive,
+                        entries,
+                        &sheet_rels_path(&drawing_path),
+                        &mut self.unreadable,
+                    );
+                    let named: Arc<[String]> = drawing_rels
+                        .get_by_type(rel_types::CHART)
+                        .into_iter()
+                        .map(|chart| resolve_relative_zip_path(&drawing_path, &chart.target))
+                        .collect();
+                    self.drawing_charts.insert(key, named.clone());
+                    named
+                },
+            };
+            for path in named.iter() {
+                if listed.insert(part_key(entries, path)) {
+                    charts.push(path.clone());
+                }
+            }
+        }
+        charts
     }
 
     /// The text of the chart part at `path`, read once; `None` when the part

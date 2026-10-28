@@ -381,6 +381,12 @@ fn test_a_comment_of_one_character_is_charged_as_the_note_that_holds_it() {
 /// `sheets` chartsheets that display one chart whose title is `len`
 /// characters; `linked` says whether they name its drawing.
 fn shared_chartsheets(sheets: usize, len: usize, linked: bool) -> Vec<u8> {
+    shared_chartsheets_padded(sheets, len, linked, 0)
+}
+
+/// Like [`shared_chartsheets`], with `pad` bytes of padding in the drawing's
+/// relationships part.
+fn shared_chartsheets_padded(sheets: usize, len: usize, linked: bool, pad: usize) -> Vec<u8> {
     let chart = format!(
         r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>{}</a:t></a:r></a:p></c:rich></c:tx></c:title></c:chart></c:chartSpace>"#,
         "t".repeat(len)
@@ -405,7 +411,7 @@ fn shared_chartsheets(sheets: usize, len: usize, linked: bool) -> Vec<u8> {
             ("xl/drawings/drawing1.xml", drawing.into_bytes()),
             (
                 "xl/drawings/_rels/drawing1.xml.rels",
-                format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/chart" Target="../charts/chart1.xml"/></Relationships>"#).into_bytes(),
+                format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/chart" Target="../charts/chart1.xml"/><!--{}--></Relationships>"#, " ".repeat(pad)).into_bytes(),
             ),
             ("xl/charts/chart1.xml", chart.into_bytes()),
         ],
@@ -435,4 +441,81 @@ fn test_a_chart_displayed_by_many_chartsheets_is_read_once_and_charged() {
     assert!(ir_chars(&ir) < 400_000, "{}", ir_chars(&ir));
     assert!(doc.plain_text().len() < 400_000);
     assert!(doc.to_markdown().len() < 400_000);
+}
+
+/// One sheet with `pivots` pivot tables, all naming one cache definition of
+/// about `pad` bytes whose source is not a worksheet (so the early return for
+/// a source in the workbook does not apply). `linked` says whether the pivot
+/// tables name it.
+fn shared_pivot_definition(pivots: usize, pad: usize, linked: bool) -> Vec<u8> {
+    let def = format!(
+        r#"<pivotCacheDefinition xmlns="{NS}"><cacheSource type="consolidation"/><!--{}--></pivotCacheDefinition>"#,
+        " ".repeat(pad)
+    );
+    let mut extra: Vec<(String, Vec<u8>)> =
+        vec![("xl/pivotCache/pivotCacheDefinition1.xml".to_string(), def.into_bytes())];
+    let mut rels = String::new();
+    for i in 1..=pivots {
+        extra.push((
+            format!("xl/pivotTables/pivotTable{i}.xml"),
+            format!(
+                r#"<pivotTableDefinition xmlns="{NS}" name="p{i}"><location ref="A1:B2"/></pivotTableDefinition>"#
+            )
+            .into_bytes(),
+        ));
+        extra.push((
+            format!("xl/pivotTables/_rels/pivotTable{i}.xml.rels"),
+            format!(
+                r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/{}" Target="../pivotCache/pivotCacheDefinition1.xml"/></Relationships>"#,
+                if linked { "pivotCacheDefinition" } else { "unrelated" }
+            )
+            .into_bytes(),
+        ));
+        rels.push_str(&format!(
+            r#"<Relationship Id="rId{i}" Type="{R}/pivotTable" Target="../pivotTables/pivotTable{i}.xml"/>"#
+        ));
+    }
+    let extra: Vec<(&str, Vec<u8>)> = extra.iter().map(|(n, d)| (n.as_str(), d.clone())).collect();
+    workbook(1, &one_cell(""), &rels, &extra)
+}
+
+#[test]
+fn test_a_pivot_cache_definition_named_by_many_pivot_tables_is_read_once() {
+    let _g = serial();
+    // Opening with more pivot tables adds what the pivot tables themselves
+    // cost, not another copy of the definition for each: one 2 MB definition
+    // is read and scanned once whatever the number of tables that name it.
+    let pad = 2_000_000;
+    let open = |p, linked| {
+        let bytes = shared_pivot_definition(p, pad, linked);
+        let (doc, used) = bytes_during(|| open(bytes));
+        drop(doc);
+        used
+    };
+    let tables_alone = open(40, false).saturating_sub(open(1, false));
+    let with_definition = open(40, true).saturating_sub(open(1, true));
+    assert!(
+        with_definition < tables_alone + pad,
+        "40 pivot tables naming one {pad} byte definition add {with_definition} bytes to opening over one table, {tables_alone} when they do not name it: the definition is read per table"
+    );
+}
+
+#[test]
+fn test_the_relationships_of_a_drawing_named_by_many_chartsheets_are_read_once() {
+    let _g = serial();
+    // The drawing's relationships part, not the chart, is the large one: it
+    // is read for the first chartsheet that names the drawing and not again.
+    let pad = 2_000_000;
+    let by = |sheets, linked| {
+        let bytes = shared_chartsheets_padded(sheets, 10, linked, pad);
+        let (doc, used) = bytes_during(|| open(bytes));
+        drop(doc);
+        used
+    };
+    let unlinked = by(30, false).saturating_sub(by(1, false));
+    let linked = by(30, true).saturating_sub(by(1, true));
+    assert!(
+        linked < unlinked + pad,
+        "30 chartsheets naming a drawing whose relationships are {pad} bytes add {linked} bytes to opening over one, {unlinked} when they do not name it: the relationships are read per chartsheet"
+    );
 }

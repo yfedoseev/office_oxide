@@ -350,12 +350,7 @@ impl XlsxDocument {
                 // No cells to read. A chartsheet's content is the text of
                 // the chart its drawing references.
                 let chart_text = if kind == crate::ir::SheetKind::Chart {
-                    let paths = chartsheet_chart_parts(
-                        &mut archive,
-                        &entries,
-                        &sheet_path,
-                        &mut shared.unreadable,
-                    );
+                    let paths = shared.chartsheet_chart_parts(&mut archive, &entries, &sheet_path);
                     let mut texts = Vec::new();
                     for path in paths {
                         texts.extend(shared.chart_text(&mut archive, &entries, &path));
@@ -861,9 +856,11 @@ struct PivotContext {
     /// from the table parts before any sheet so a table-backed source is
     /// recognised before its records are touched.
     table_names: std::collections::HashSet<String>,
-    /// Materialised cache data by cache-definition part, so a cache shared
-    /// by several pivots is parsed once.
-    parsed: std::collections::HashMap<String, Option<std::sync::Arc<worksheet::PivotCacheData>>>,
+    /// Cache definitions by part, read, parsed and (when their source cells
+    /// are not in the workbook) materialised once however many pivot tables
+    /// name them. A definition that could not be read is remembered too: each
+    /// pivot table naming it would otherwise inflate and scan it again.
+    caches: std::collections::HashMap<String, Option<std::sync::Arc<PivotCache>>>,
     /// Pivot table parts already read, by part, so a part several sheets
     /// name is read and parsed once.
     pivots: std::collections::HashMap<String, Option<std::sync::Arc<worksheet::SheetPivotTable>>>,
@@ -873,7 +870,7 @@ impl PivotContext {
     fn new<R: Read + Seek>(archive: &mut ZipArchive<R>, entries: &opc::ZipEntryIndex) -> Self {
         let mut ctx = PivotContext {
             table_names: std::collections::HashSet::new(),
-            parsed: std::collections::HashMap::new(),
+            caches: std::collections::HashMap::new(),
             pivots: std::collections::HashMap::new(),
         };
         // Only a package with a pivot cache needs its table names.
@@ -977,33 +974,57 @@ fn read_pivot_table<R: Read + Seek>(
     let pivot_rels = read_rels_reporting(archive, entries, &sheet_rels_path(path), unreadable);
     if let Some(cache) = pivot_rels.first_by_type(PIVOT_CACHE_DEFINITION_REL) {
         let cache_path = resolve_relative_zip_path(path, &cache.target);
-        if let Ok(def) = XlsxDocument::read_xml_entry(archive, entries, &cache_path) {
-            let src = worksheet::parse_pivot_cache_definition(&def).unwrap_or_default();
-            pivot.source = src.display();
-            if !pivot_source_in_workbook(&src, workbook, &pivot_ctx.table_names) {
-                pivot.cache_data = match pivot_ctx.parsed.get(&part_key(entries, &cache_path)) {
-                    Some(data) => data.clone(),
-                    None => {
-                        let data = read_pivot_cache_data(
-                            archive,
-                            entries,
-                            &cache_path,
-                            &def,
-                            &src,
-                            budget,
-                            unreadable,
-                        );
-                        let data = data.map(std::sync::Arc::new);
-                        pivot_ctx
-                            .parsed
-                            .insert(part_key(entries, &cache_path), data.clone());
-                        data
-                    },
-                };
-            }
+        if let Some(cache) =
+            pivot_cache(archive, entries, &cache_path, workbook, pivot_ctx, budget, unreadable)
+        {
+            pivot.source = cache.source.clone();
+            pivot.cache_data = cache.data.clone();
         }
     }
     Some(pivot)
+}
+
+/// What a pivot cache definition gives every pivot table that names it: the
+/// source it displays and, when the source cells are not in the workbook, the
+/// records materialised from them.
+struct PivotCache {
+    source: Option<String>,
+    data: Option<std::sync::Arc<worksheet::PivotCacheData>>,
+}
+
+/// The cache definition at `cache_path`, read once. The definition can be as
+/// large as a part may be, and a package can hold thousands of pivot tables
+/// that name it, so neither the read nor the scan is repeated per table.
+fn pivot_cache<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &opc::ZipEntryIndex,
+    cache_path: &str,
+    workbook: &WorkbookInfo,
+    pivot_ctx: &mut PivotContext,
+    budget: &mut crate::limits::TextBudget,
+    unreadable: &mut shared_parts::UnreadableParts,
+) -> Option<std::sync::Arc<PivotCache>> {
+    let key = part_key(entries, cache_path);
+    if let Some(hit) = pivot_ctx.caches.get(&key) {
+        return hit.clone();
+    }
+    let built = XlsxDocument::read_xml_entry(archive, entries, cache_path)
+        .ok()
+        .map(|def| {
+            let src = worksheet::parse_pivot_cache_definition(&def).unwrap_or_default();
+            let data = if pivot_source_in_workbook(&src, workbook, &pivot_ctx.table_names) {
+                None
+            } else {
+                read_pivot_cache_data(archive, entries, cache_path, &def, &src, budget, unreadable)
+                    .map(std::sync::Arc::new)
+            };
+            std::sync::Arc::new(PivotCache {
+                source: src.display(),
+                data,
+            })
+        });
+    pivot_ctx.caches.insert(key, built.clone());
+    built
 }
 
 /// Whether a pivot cache's source cells are in this workbook: a
@@ -1137,33 +1158,6 @@ pub(super) fn sheet_kind_of(
         Some(rel_types::DIALOGSHEET) => Some(SheetKind::Dialog),
         Some(_) => None,
     }
-}
-
-/// The chart parts a chartsheet displays: its drawing's chart
-/// relationships ([ECMA-376] §12.3.2 — a chartsheet shows one chart
-/// through a drawing part). A part that is missing or unrelated yields
-/// nothing; the sheet is then its name alone.
-pub(super) fn chartsheet_chart_parts<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
-    entries: &opc::ZipEntryIndex,
-    sheet_path: &str,
-    unreadable: &mut shared_parts::UnreadableParts,
-) -> Vec<String> {
-    let sheet_rels =
-        read_rels_reporting(archive, entries, &sheet_rels_path(sheet_path), unreadable);
-    let mut charts = Vec::new();
-    for drawing in sheet_rels.get_by_type(rel_types::DRAWING) {
-        let drawing_path = resolve_relative_zip_path(sheet_path, &drawing.target);
-        let drawing_rels =
-            read_rels_reporting(archive, entries, &sheet_rels_path(&drawing_path), unreadable);
-        for chart in drawing_rels.get_by_type(rel_types::CHART) {
-            let path = resolve_relative_zip_path(&drawing_path, &chart.target);
-            if !charts.contains(&path) {
-                charts.push(path);
-            }
-        }
-    }
-    charts
 }
 
 /// Read and parse the relationships part at `path`. A package without the
