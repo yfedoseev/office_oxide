@@ -51,10 +51,16 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     let mut image_notice_given = false;
     let mut formulas_truncated = false;
     let mut padding_notice_given = false;
-    let mut padding_budget = crate::limits::GridBudget::new();
+    let mut padding_budget = crate::limits::IrPaddingBudget::new();
+    // Padding is also paid for in characters, 3 an empty cell as Markdown
+    // pays for an absent column, from a budget of its own: the cells' text
+    // has spent the text budget by the time the rows are laid out, and the
+    // rows whose text fit must not be lost for it. Lowering the text limit
+    // still lowers this one.
+    let mut padding_chars = crate::limits::TextBudget::new();
 
     for (ws_idx, ws) in doc.worksheets.iter().enumerate() {
-        if budget.exhausted() || padding_budget.exhausted() {
+        if budget.exhausted() || padding_budget.exhausted() || padding_chars.exhausted() {
             break;
         }
         // First pass: parse all rows into `CellData` — the rendered display
@@ -322,8 +328,15 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 // are charged to the budget, which ends the table at the row
                 // that spends it: a sheet with cells at A1 and XFD1 and a
                 // thousand rows between would otherwise be 16 million cells.
-                let padding = grid_width.saturating_sub(cells.len());
-                if !padding_budget.charge(padding) {
+                // The empty cells made are those of the grid's columns no cell
+                // of the row occupies (cells may share a column or arrive out
+                // of order). They are paid for as memory, and as characters
+                // too, as Markdown pays for an absent column.
+                let padding = grid_width.saturating_sub(distinct_columns(cells));
+                if !padding_budget.charge_cells(padding)
+                    || !padding_chars
+                        .charge(padding.saturating_mul(crate::xlsx::text::MARKDOWN_PAD_CHARS))
+                {
                     break;
                 }
                 let mut tcells: Vec<TableCell> = Vec::with_capacity(grid_width);
@@ -558,12 +571,13 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 ..Default::default()
             }));
         }
-        if padding_budget.exhausted() && !padding_notice_given {
+        if (padding_budget.exhausted() || padding_chars.exhausted()) && !padding_notice_given {
             padding_notice_given = true;
             combined.push(Element::Paragraph(Paragraph {
-                content: vec![InlineContent::Text(TextSpan::plain(
-                    padding_budget.notice(),
-                ))],
+                content: vec![InlineContent::Text(TextSpan::plain(padding_notice(
+                    &padding_budget,
+                    &padding_chars,
+                )))],
                 ..Default::default()
             }));
         }
@@ -739,8 +753,8 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     if budget.exhausted() {
         warnings.push(budget.notice());
     }
-    if padding_budget.exhausted() {
-        warnings.push(padding_budget.notice());
+    if padding_budget.exhausted() || padding_chars.exhausted() {
+        warnings.push(padding_notice(&padding_budget, &padding_chars));
     }
     if image_budget.exhausted() {
         warnings.push(format!(
@@ -774,6 +788,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 || pivot_truncated
                 || budget.exhausted()
                 || padding_budget.exhausted()
+                || padding_chars.exhausted()
                 || comments_truncated
                 || formulas_truncated
                 || image_budget.exhausted(),
@@ -858,6 +873,30 @@ fn cell_is_blank(cell: &TableCell) -> bool {
         Element::Paragraph(p) => p.content.is_empty(),
         _ => false,
     })
+}
+
+/// The notice for padding that ran out: the memory allowance when that is
+/// what was spent, otherwise the character budget.
+fn padding_notice(
+    memory: &crate::limits::IrPaddingBudget,
+    chars: &crate::limits::TextBudget,
+) -> String {
+    if memory.exhausted() {
+        memory.notice()
+    } else {
+        chars.notice()
+    }
+}
+
+/// How many different columns the cells of a row occupy.
+fn distinct_columns(cells: &[CellData]) -> usize {
+    if cells.windows(2).all(|w| w[0].col < w[1].col) {
+        return cells.len();
+    }
+    let mut cols: Vec<u32> = cells.iter().map(|cd| cd.col).collect();
+    cols.sort_unstable();
+    cols.dedup();
+    cols.len()
 }
 
 fn empty_cell() -> TableCell {

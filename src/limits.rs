@@ -93,12 +93,6 @@ pub fn set_max_text_chars(chars: usize) {
 
 /// The default per-document allowance of empty grid slots: 8 Mi.
 ///
-/// A spreadsheet's IR table is as wide as the sheet, so a row with cells at
-/// `A` and `CV` is laid out with 98 empty table cells between them, each its
-/// own allocation. The `.xlsx` converter charges those empty cells to this
-/// allowance too, apart from the text budget: a workbook of eight sheets of
-/// 10,000 such rows, which `to_markdown` renders in full, stays inside it.
-///
 /// A legacy `.xls` sheet is stored as rows that run to their last used
 /// column, so one number in column 255 of each of 65,535 rows costs 256
 /// slots per row: 16.7M slots from 65,535 records, and six such sheets
@@ -235,6 +229,95 @@ impl GridBudget {
         format!(
             "[workbook truncated: its sparse rows need more than {} empty cells of padding \
              (office_oxide::limits::set_max_grid_padding_cells) — later rows are missing]",
+            self.total
+        )
+    }
+}
+
+/// The default allowance of memory for the empty table cells that pad the
+/// rows of an `.xlsx` sheet in the IR: 512 MiB.
+///
+/// A spreadsheet's IR table is as wide as the sheet, so a row with cells at
+/// `A` and `CV` is laid out with 98 empty table cells between them, each a
+/// `TableCell` and its paragraph element, about 600 bytes. They are charged
+/// at that size, apart from the text budget (which is also charged 3
+/// characters a cell, as Markdown charges an absent column): at the default a
+/// sheet may hold about 900,000 of them, enough for a multi-sheet export of
+/// a hundred sparse columns and several thousand rows.
+pub const DEFAULT_MAX_IR_PADDING_BYTES: usize = 512 << 20;
+
+static MAX_IR_PADDING_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_IR_PADDING_BYTES);
+
+/// The per-document allowance of bytes for the empty cells padding the rows
+/// of a spreadsheet's IR.
+pub fn max_ir_padding_bytes() -> usize {
+    MAX_IR_PADDING_BYTES.load(Ordering::Relaxed)
+}
+
+/// Set the empty-cell padding allowance for every document converted
+/// afterwards. `usize::MAX` disables the bound.
+pub fn set_max_ir_padding_bytes(bytes: usize) {
+    MAX_IR_PADDING_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// A document's remaining allowance of bytes for IR padding cells.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IrPaddingBudget {
+    total: usize,
+    remaining: usize,
+    exhausted: bool,
+}
+
+impl IrPaddingBudget {
+    pub(crate) fn new() -> Self {
+        Self::with_limit(max_ir_padding_bytes())
+    }
+
+    pub(crate) fn with_limit(total: usize) -> Self {
+        Self {
+            total,
+            remaining: total,
+            exhausted: false,
+        }
+    }
+
+    /// What one empty table cell holds in the IR: the cell and the element of
+    /// its paragraph.
+    pub(crate) fn cell_bytes() -> usize {
+        std::mem::size_of::<crate::ir::TableCell>() + std::mem::size_of::<crate::ir::Element>()
+    }
+
+    /// Charge `cells` empty cells. `false` — from the first refusal on —
+    /// when the allowance is spent; the caller stops building rows.
+    pub(crate) fn charge_cells(&mut self, cells: usize) -> bool {
+        if self.exhausted {
+            return false;
+        }
+        match cells
+            .checked_mul(Self::cell_bytes())
+            .and_then(|bytes| self.remaining.checked_sub(bytes))
+        {
+            Some(rest) => {
+                self.remaining = rest;
+                true
+            },
+            None => {
+                self.remaining = 0;
+                self.exhausted = true;
+                false
+            },
+        }
+    }
+
+    pub(crate) fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    pub(crate) fn notice(&self) -> String {
+        format!(
+            "[workbook truncated: its rows are padded to the sheet's width with more than {} \
+             bytes of empty table cells (office_oxide::limits::set_max_ir_padding_bytes) — \
+             later rows are missing]",
             self.total
         )
     }
@@ -511,6 +594,16 @@ mod tests {
         assert!(b.exhausted());
         assert!(!b.charge(0), "spent stays spent");
         assert!(b.notice().contains("10 character budget"));
+    }
+
+    #[test]
+    fn test_ir_padding_is_charged_at_the_size_of_the_cells_it_makes() {
+        let mut b = IrPaddingBudget::with_limit(IrPaddingBudget::cell_bytes() * 10);
+        assert!(b.charge_cells(10));
+        assert!(!b.charge_cells(1));
+        assert!(b.exhausted());
+        assert!(b.notice().contains("empty table cells"));
+        assert!(!IrPaddingBudget::with_limit(usize::MAX).charge_cells(usize::MAX));
     }
 
     #[test]

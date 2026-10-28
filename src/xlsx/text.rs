@@ -29,7 +29,7 @@ impl XlsxDocument {
 }
 
 /// What an unused column of a Markdown table row costs: `" | "`.
-const MARKDOWN_PAD_CHARS: usize = 3;
+pub(crate) const MARKDOWN_PAD_CHARS: usize = 3;
 
 /// The line every renderer gives a sheet whose threaded comments stopped at
 /// the document's text budget.

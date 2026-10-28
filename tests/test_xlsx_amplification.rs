@@ -19,8 +19,12 @@ const TEXT_BUDGET: usize = 60_000;
 
 fn set_budgets() {
     set_max_text_chars(TEXT_BUDGET);
-    // About five rows of the 200-column sheets below.
-    office_oxide::limits::set_max_grid_padding_cells(1_000);
+    // About a thousand empty cells: five rows of the 200-column sheets below.
+    office_oxide::limits::set_max_ir_padding_bytes(
+        1_000
+            * (std::mem::size_of::<office_oxide::ir::TableCell>()
+                + std::mem::size_of::<office_oxide::ir::Element>()),
+    );
 }
 
 const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
@@ -208,13 +212,13 @@ fn test_ir_table_rows_padded_to_the_sheet_width_are_bounded() {
     assert!(cells < 2_000, "{cells} table cells were built from a 3 KB workbook");
     assert!(ir.metadata.text_truncated, "the truncation is not flagged");
     let html = doc.to_html();
-    assert!(html.contains("empty cells of padding"), "HTML names no cause");
+    assert!(html.contains("empty table cells"), "HTML names no cause");
     assert!(!html.contains("character budget"), "the cause is not the text budget");
     assert!(
         ir.metadata
             .warnings
             .iter()
-            .any(|w| w.contains("empty cells of padding")),
+            .any(|w| w.contains("empty table cells")),
         "no warning: {:?}",
         ir.metadata.warnings
     );

@@ -109,3 +109,40 @@ fn test_a_wide_multi_sheet_export_is_the_same_in_markdown_and_the_ir() {
     assert!(ir.plain_text().contains("LASTROW"), "the IR is missing the last row");
     assert!(doc.to_html().contains("LASTROW"), "the HTML is missing the last row");
 }
+
+#[test]
+fn test_a_single_far_cell_over_many_narrow_rows_stays_bounded_in_the_ir() {
+    use office_oxide::ir::Element;
+    set_max_text_chars(100_000);
+    // 500 rows with a cell in A and one cell in XFD (16,384 columns): 8
+    // million empty table cells if every row were laid out in full, against
+    // a 100,000 character budget that Markdown spends 3 per column of.
+    let far = col_name(16_384);
+    let mut sheet = format!(r#"<worksheet xmlns="{NS}"><sheetData>"#);
+    for r in 1..=500 {
+        sheet.push_str(&format!(r#"<row r="{r}"><c r="A{r}" t="inlineStr"><is><t>x</t></is></c>"#));
+        if r == 1 {
+            sheet.push_str(&format!(r#"<c r="{far}1" t="inlineStr"><is><t>y</t></is></c>"#));
+        }
+        sheet.push_str("</row>");
+    }
+    sheet.push_str("</sheetData></worksheet>");
+    let bytes = package(
+        r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#,
+        &worksheet_rel("rId1", "worksheets/sheet1.xml"),
+        &[("xl/worksheets/sheet1.xml", sheet.into_bytes())],
+    );
+    let ir = open(bytes).unwrap().to_ir();
+    let cells: usize = ir
+        .sections
+        .iter()
+        .flat_map(|s| &s.elements)
+        .filter_map(|e| match e {
+            Element::Table(t) => Some(t.rows.iter().map(|r| r.cells.len()).sum::<usize>()),
+            _ => None,
+        })
+        .sum();
+    // Three characters a cell, plus the one row the budget runs out in.
+    assert!(cells <= 100_000 / 3 + 2 * 16_384, "{cells} table cells");
+    assert!(ir.metadata.text_truncated);
+}
