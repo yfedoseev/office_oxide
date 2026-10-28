@@ -5,17 +5,29 @@
 //! string is stored once, the rendered text is the string times the cell
 //! count. A 110 KB `.xlsx` holding a 1 MB string referenced from 12,000
 //! cells rendered to 393 MB; the same string from a million rows would be
-//! 32 GB from a 300 KB file. The spreadsheet paths — XLSX text rendering
-//! (`plain_text`/CSV/Markdown/HTML over cells), the XLSX → IR converter,
-//! and the legacy `.xls` reader (which materialises each referencing
-//! cell's copy at open) — charge the characters they emit against one
-//! per-document budget and stop, loudly, when it is spent. The word-
-//! processing and presentation paths do not: their text is stored once
-//! per occurrence, so its size is already bounded by the package's
-//! decompressed size. The one exception is a paragraph style's name,
-//! which is stored once in the style sheet and copied into every
-//! paragraph that uses the style; `classify_style_name` bounds it. Apache
-//! POI does the same with `ZipSecureFile.setMaxTextSize`.
+//! 32 GB from a 300 KB file. Every reader and converter that can copy
+//! stored text charges the characters it emits against one per-document
+//! budget ([`max_text_chars`]) and stops, loudly, when it is spent: the
+//! XLSX text rendering and IR converter, the legacy `.xls` reader (which
+//! materialises each referencing cell's copy at open), the legacy `.doc`
+//! piece table and its header, footer and comment stories, the legacy `.ppt`
+//! slide, notes and master text, and the DOCX and PPTX Markdown and IR
+//! converters for what they copy out of shared storage (hyperlink targets,
+//! shared headers, notes, a paragraph style's name — `classify_style_name`
+//! bounds that one). Apache POI does the same with
+//! `ZipSecureFile.setMaxTextSize`.
+//!
+//! The text budget is one of several, each for the thing that multiplies:
+//! pictures ([`max_image_bytes`], [`max_total_image_bytes`] and, for the
+//! compressed metafiles of the legacy formats,
+//! [`max_inflated_image_bytes`]); the empty slots and table cells that pad
+//! the rows of a sparse sheet ([`max_grid_padding_cells`] and
+//! [`max_sheet_grid_padding_cells`] for `.xls`, [`max_ir_padding_bytes`] and
+//! [`max_sheet_ir_padding_bytes`] for the IR); the blocks, list items and
+//! table cells of parsed Markdown ([`max_markdown_elements`],
+//! [`max_markdown_list_items`], [`max_markdown_table_cells`]); and the
+//! sheets and table cells a writer will write ([`max_write_sheets`],
+//! [`max_write_table_cells`]).
 //!
 //! The default keeps every genuine workbook this crate has been tested
 //! against (the largest, 181 MB of cell text, with room to spare) and
