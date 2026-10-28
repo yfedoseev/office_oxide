@@ -5,6 +5,8 @@
 //! Each BLIP has an 8-byte OfficeArt record header followed by a UID
 //! and raw image data.
 
+use crate::limits::InflateBudget;
+
 /// Image format stored in a BLIP record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlipFormat {
@@ -152,17 +154,52 @@ pub(crate) fn metafile_header_size(rec_type: u16) -> usize {
     }
 }
 
+/// The most a compressed metafile may claim to inflate to, relative to the
+/// bytes it is stored in, beyond [`METAFILE_FREE_INFLATION`]. Deflate itself
+/// cannot exceed about 1,030:1, and genuine metafiles stay far below 100:1;
+/// a header that claims more is a size amplifier, not a picture.
+const MAX_INFLATION_RATIO: u64 = 100;
+/// Declared size always accepted whatever the ratio, so a tiny, highly
+/// regular metafile is not refused for being small.
+const METAFILE_FREE_INFLATION: u64 = 1 << 20;
+
 /// Inflate a zlib-compressed metafile, reading at most `cb_size` bytes
 /// (the header's declared uncompressed size), itself capped. `None` when
-/// the stream is not valid zlib.
-fn inflate_metafile(compressed: &[u8], cb_size: u32) -> Option<Vec<u8>> {
+/// the stream is not valid zlib, when the declared size is implausible for
+/// the stored length, or when the document's inflation allowance is spent.
+///
+/// The declared size is reserved from `budget` before any byte is inflated,
+/// and what the picture did not use is handed back afterwards.
+fn inflate_metafile(
+    compressed: &[u8],
+    cb_size: u32,
+    budget: &mut InflateBudget,
+) -> Option<Vec<u8>> {
     use std::io::Read;
     let limit = u64::from(cb_size).min(MAX_INFLATED_METAFILE);
+    let plausible = (compressed.len() as u64)
+        .saturating_mul(MAX_INFLATION_RATIO)
+        .saturating_add(METAFILE_FREE_INFLATION);
+    if limit > plausible {
+        log::warn!(
+            "office art: compressed picture declares {limit} bytes from {} stored; skipped",
+            compressed.len()
+        );
+        return None;
+    }
+    if !budget.reserve(limit) {
+        log::warn!(
+            "office art: compressed picture of {limit} bytes exceeds the document's \
+             inflated-image allowance (office_oxide::limits::set_max_inflated_image_bytes); skipped"
+        );
+        return None;
+    }
     let mut out = Vec::with_capacity((limit as usize).min(compressed.len().saturating_mul(4)));
-    flate2::read::ZlibDecoder::new(compressed)
+    let read = flate2::read::ZlibDecoder::new(compressed)
         .take(limit)
-        .read_to_end(&mut out)
-        .ok()?;
+        .read_to_end(&mut out);
+    budget.release(limit - out.len() as u64);
+    read.ok()?;
     Some(out)
 }
 
@@ -186,6 +223,7 @@ pub(crate) fn extract_one_blip(
     inst: u16,
     data_start: usize,
     data_end: usize,
+    budget: &mut InflateBudget,
 ) -> Option<BlipImage> {
     let format = BlipFormat::from_record_type(rec_type);
     if !format.is_image() {
@@ -202,7 +240,7 @@ pub(crate) fn extract_one_blip(
         let cb_size = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
         let payload = &data[header_end..data_end];
         match header[METAFILE_COMPRESSION_OFFSET] {
-            MSO_COMPRESSION_DEFLATE => match inflate_metafile(payload, cb_size) {
+            MSO_COMPRESSION_DEFLATE => match inflate_metafile(payload, cb_size, budget) {
                 Some(v) => v,
                 None => {
                     log::warn!("office art: compressed {format:?} picture is not valid zlib");
@@ -239,7 +277,17 @@ pub(crate) fn extract_one_blip(
 /// toward [`BlipImage::index`], whether or not it actually yielded an
 /// image; only "descend into a container" steps into the array rather
 /// than past a sibling of it, so those don't count.
+///
+/// The compressed metafiles of one call share one allowance of inflated
+/// bytes ([`limits::set_max_inflated_image_bytes`](crate::limits::set_max_inflated_image_bytes)):
+/// a picture that does not fit is left out. A document has one such stream,
+/// so the allowance is the document's.
 pub fn extract_blip_images(data: &[u8]) -> Vec<BlipImage> {
+    extract_blip_images_within(data, &mut InflateBudget::new())
+}
+
+/// [`extract_blip_images`] against an explicit allowance.
+fn extract_blip_images_within(data: &[u8], budget: &mut InflateBudget) -> Vec<BlipImage> {
     let mut images = Vec::new();
     let mut pos = 0;
     let mut slot_index = 0usize;
@@ -279,7 +327,7 @@ pub fn extract_blip_images(data: &[u8]) -> Vec<BlipImage> {
                     let e_data_start = embedded_start + 8;
                     let e_data_end = (e_data_start + e_rec_len).min(data_end);
                     if let Some(mut img) =
-                        extract_one_blip(data, e_rec_type, e_inst, e_data_start, e_data_end)
+                        extract_one_blip(data, e_rec_type, e_inst, e_data_start, e_data_end, budget)
                     {
                         img.index = slot_index;
                         images.push(img);
@@ -288,7 +336,9 @@ pub fn extract_blip_images(data: &[u8]) -> Vec<BlipImage> {
             }
             slot_index += 1;
             pos = data_end;
-        } else if let Some(mut img) = extract_one_blip(data, rec_type, inst, data_start, data_end) {
+        } else if let Some(mut img) =
+            extract_one_blip(data, rec_type, inst, data_start, data_end, budget)
+        {
             img.index = slot_index;
             images.push(img);
             slot_index += 1;
@@ -566,6 +616,57 @@ mod tests {
         stream[cb_at..cb_at + 4].copy_from_slice(&1000u32.to_le_bytes());
         let images = extract_blip_images(&stream);
         assert_eq!(images[0].data.len(), 1000);
+    }
+
+    /// A stream of `n` compressed pictures, each declaring `raw_len` zero
+    /// bytes.
+    fn zero_metafiles(n: usize, raw_len: usize) -> Vec<u8> {
+        let raw = vec![0u8; raw_len];
+        (0..n)
+            .flat_map(|_| make_metafile_blip(0xF01A, 0x3D4, &raw, true))
+            .collect()
+    }
+
+    /// The compressed pictures of one document share one allowance of
+    /// inflated bytes, reserved before any is inflated: pictures past it are
+    /// left out instead of each inflating to its full declared size.
+    #[test]
+    fn test_inflated_metafiles_share_one_per_document_allowance() {
+        // 1 MiB each: regular enough to be a few KiB stored.
+        let stream = zero_metafiles(4, 1 << 20);
+        let mut budget = InflateBudget::with_limit(5 << 19);
+        let images = extract_blip_images_within(&stream, &mut budget);
+        assert_eq!(images.len(), 2, "two fit in 2.5 MiB, the third does not");
+        assert!(images.iter().all(|i| i.data.len() == 1 << 20));
+        // Only what is left can be reserved afterwards.
+        assert!(budget.reserve(1 << 19));
+        assert!(!budget.reserve(1));
+    }
+
+    /// A declared size that is wildly larger than the stored bytes could be
+    /// is refused before anything is inflated or reserved.
+    #[test]
+    fn test_implausible_declared_size_is_refused_without_inflating() {
+        let raw = vec![0u8; 16 << 20];
+        let stream = make_metafile_blip(0xF01A, 0x3D4, &raw, true);
+        let stored = zlib(&raw).len() as u64;
+        assert!(16u64 << 20 > stored * MAX_INFLATION_RATIO + METAFILE_FREE_INFLATION);
+        let mut budget = InflateBudget::with_limit(u64::MAX);
+        assert!(extract_blip_images_within(&stream, &mut budget).is_empty());
+        assert!(budget.reserve(u64::MAX), "a refused picture reserves nothing");
+    }
+
+    /// A picture whose stream ends early hands back what it did not use.
+    #[test]
+    fn test_unused_reservation_is_returned() {
+        let raw = vec![0u8; 100_000];
+        let mut stream = make_metafile_blip(0xF01B, 0x216, &raw, true);
+        let cb_at = 8 + 16;
+        stream[cb_at..cb_at + 4].copy_from_slice(&1000u32.to_le_bytes());
+        let mut budget = InflateBudget::with_limit(5000);
+        assert_eq!(extract_blip_images_within(&stream, &mut budget).len(), 1);
+        assert!(budget.reserve(4000), "only the 1000 inflated bytes were spent");
+        assert!(!budget.reserve(1));
     }
 
     #[test]

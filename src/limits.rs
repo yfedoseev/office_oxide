@@ -116,6 +116,64 @@ pub fn set_max_grid_padding_cells(cells: usize) {
     MAX_GRID_PADDING_CELLS.store(cells, Ordering::Relaxed);
 }
 
+/// The default per-document allowance of inflated image bytes: 256 Mi.
+///
+/// A compressed metafile picture (EMF/WMF/PICT) declares its uncompressed
+/// size and is stored as a zlib stream, which can shrink a run of zeros a
+/// thousandfold: four such pictures in a 1 MB `.ppt` inflated to 3.3 GB.
+/// Every compressed picture of a document is charged its declared size
+/// against this allowance before it is inflated; one that does not fit is
+/// left out. Pictures stored uncompressed are bounded by the file itself and
+/// cost nothing.
+pub const DEFAULT_MAX_INFLATED_IMAGE_BYTES: u64 = 256 << 20;
+
+static MAX_INFLATED_IMAGE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_INFLATED_IMAGE_BYTES);
+
+/// The per-document allowance of bytes a legacy file's compressed metafile
+/// pictures may inflate to.
+pub fn max_inflated_image_bytes() -> u64 {
+    MAX_INFLATED_IMAGE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Set the per-document inflated-image allowance for every document read
+/// afterwards. `u64::MAX` disables the bound.
+pub fn set_max_inflated_image_bytes(bytes: u64) {
+    MAX_INFLATED_IMAGE_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// A document's remaining allowance of inflated image bytes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InflateBudget {
+    remaining: u64,
+}
+
+impl InflateBudget {
+    pub(crate) fn new() -> Self {
+        Self::with_limit(max_inflated_image_bytes())
+    }
+
+    pub(crate) fn with_limit(total: u64) -> Self {
+        Self { remaining: total }
+    }
+
+    /// Reserve `bytes` before inflating them. `false` when they do not fit;
+    /// nothing is taken then, so a smaller picture later can still fit.
+    pub(crate) fn reserve(&mut self, bytes: u64) -> bool {
+        match self.remaining.checked_sub(bytes) {
+            Some(rest) => {
+                self.remaining = rest;
+                true
+            },
+            None => false,
+        }
+    }
+
+    /// Give back the part of a reservation the picture did not use.
+    pub(crate) fn release(&mut self, bytes: u64) {
+        self.remaining = self.remaining.saturating_add(bytes);
+    }
+}
+
 /// A document's remaining allowance of empty grid slots.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct GridBudget {
