@@ -144,7 +144,7 @@ fn test_docx_pictures_sharing_one_image_stop_copying_at_the_budget() {
 /// not silently lose them.
 #[test]
 fn test_docx_picture_budget_exhaustion_is_flagged_and_noticed_in_the_document() {
-    limits();
+    let _limits = limits();
     let body: String = (0..20)
         .map(|_| format!("<w:p>{}</w:p>", drawing("rId5")))
         .collect();
@@ -179,7 +179,7 @@ fn test_docx_picture_budget_exhaustion_is_flagged_and_noticed_in_the_document() 
 /// A document whose pictures fit says nothing.
 #[test]
 fn test_docx_pictures_within_the_budget_add_no_notice() {
-    limits();
+    let _limits = limits();
     let body: String = (0..2)
         .map(|_| format!("<w:p>{}</w:p>", drawing("rId5")))
         .collect();

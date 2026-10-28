@@ -31,6 +31,7 @@ static LIMITS: std::sync::RwLock<()> = std::sync::RwLock::new(());
 /// limits for as long as it lives, and every limit it set restored, last set
 /// first, when it is dropped.
 #[allow(dead_code)]
+#[must_use = "the limits are restored as soon as the scope is dropped; bind it for the length of the test"]
 pub struct LimitScope {
     restore: Vec<Box<dyn FnOnce()>>,
     _lock: std::sync::RwLockWriteGuard<'static, ()>,

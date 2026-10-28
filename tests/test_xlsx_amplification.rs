@@ -858,7 +858,7 @@ fn test_a_hyperlink_target_past_the_package_limit_is_reported_not_dropped_silent
 
 #[test]
 fn test_a_hyperlink_target_within_the_package_limit_is_kept_and_charged() {
-    set_budgets();
+    let _budgets = set_budgets();
     // 40 links to a 30,000-character target (inside 64 KiB, as docx and
     // pptx accept) is 1.2 million characters against a 60,000 budget: the
     // links that fit are kept, the rest are cut, loudly.
