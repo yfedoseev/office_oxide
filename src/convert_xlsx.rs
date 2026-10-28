@@ -49,7 +49,8 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     let mut format_code_omitted = false;
     // The picture notice belongs to the sheet whose pictures spent the budget.
     let mut image_notice_given = false;
-    let mut padding_budget = crate::limits::TextBudget::new();
+    let mut padding_notice_given = false;
+    let mut padding_budget = crate::limits::GridBudget::new();
 
     for (ws_idx, ws) in doc.worksheets.iter().enumerate() {
         if budget.exhausted() || padding_budget.exhausted() {
@@ -321,9 +322,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 // that spends it: a sheet with cells at A1 and XFD1 and a
                 // thousand rows between would otherwise be 16 million cells.
                 let padding = grid_width.saturating_sub(cells.len());
-                if !padding_budget
-                    .charge(padding.saturating_mul(crate::limits::EMPTY_TABLE_CELL_CHARS))
-                {
+                if !padding_budget.charge(padding) {
                     break;
                 }
                 let mut tcells: Vec<TableCell> = Vec::with_capacity(grid_width);
@@ -541,9 +540,18 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 crate::limits::MAX_HYPERLINK_TARGET_CHARS
             ));
         }
-        if budget.exhausted() || padding_budget.exhausted() {
+        if budget.exhausted() {
             combined.push(Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain(budget.notice()))],
+                ..Default::default()
+            }));
+        }
+        if padding_budget.exhausted() && !padding_notice_given {
+            padding_notice_given = true;
+            combined.push(Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(
+                    padding_budget.notice(),
+                ))],
                 ..Default::default()
             }));
         }
@@ -718,6 +726,9 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
 
     if budget.exhausted() {
         warnings.push(budget.notice());
+    }
+    if padding_budget.exhausted() {
+        warnings.push(padding_budget.notice());
     }
     if image_budget.exhausted() {
         warnings.push(format!(

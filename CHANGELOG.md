@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`to_ir`/`to_html` of a wide `.xlsx` are no longer cut where `to_markdown` is not.** The IR charged each empty table cell that pads a row to the sheet's width as 64 characters of the text budget, Markdown charged 3 per absent column, so eight sheets of 10,000 rows with cells at `A` and `CV` were complete in Markdown and truncated in the IR, with a notice blaming the character budget and no warning. The padding cells are now counted against the same per-document allowance the legacy `.xls` reader uses (`limits::set_max_grid_padding_cells`, 8 Mi by default; that workbook needs 7.8 million), separately from the text budget. When it is spent the IR stops at that row with a notice and a `Metadata::warnings` entry that name the padding allowance, and `Metadata::text_truncated` is set.
+
 - **The text of a rich-text cell's runs is charged in full.** The charge for a rich-text cell's spans left out the runs' own text, and the displayed cell text it was counted against stops at 32 KB, so a shared string of runs holding far more could put more text in the IR than the budget allowed. Each run's text is now charged with its span.
 
 - **The "pictures not shown" notice of an `.xlsx` is given once.** Once the picture budget (`limits::set_max_image_bytes`) was spent, the notice was appended to every later sheet, including sheets without pictures. It now appears on the sheet whose pictures spent the budget, and a `Metadata::warnings` entry names the limit.

@@ -93,6 +93,12 @@ pub fn set_max_text_chars(chars: usize) {
 
 /// The default per-document allowance of empty grid slots: 8 Mi.
 ///
+/// A spreadsheet's IR table is as wide as the sheet, so a row with cells at
+/// `A` and `CV` is laid out with 98 empty table cells between them, each its
+/// own allocation. The `.xlsx` converter charges those empty cells to this
+/// allowance too, apart from the text budget: a workbook of eight sheets of
+/// 10,000 such rows, which `to_markdown` renders in full, stays inside it.
+///
 /// A legacy `.xls` sheet is stored as rows that run to their last used
 /// column, so one number in column 255 of each of 65,535 rows costs 256
 /// slots per row: 16.7M slots from 65,535 records, and six such sheets
@@ -474,11 +480,6 @@ pub(crate) const MAX_HYPERLINK_TARGET_CHARS: usize = 2083;
 /// A longer code cannot come from a spreadsheet application; the cells keep
 /// their format id and their values, and the code is left off, reported.
 pub(crate) const MAX_NUMBER_FORMAT_CHARS: usize = 255;
-
-/// What one empty table cell in the IR counts for against the text budget:
-/// its allocation is a few hundred bytes, where a character of text is one,
-/// so the default budget admits about four million of them.
-pub(crate) const EMPTY_TABLE_CELL_CHARS: usize = 64;
 
 #[cfg(test)]
 thread_local! {
