@@ -416,9 +416,13 @@ impl<'d> SheetConverter<'d> {
         // paragraph the same way. The flow renderer then paints
         // both at their absolute EMU rectangle (see
         // `render_text_box`).
-        let mut image_elements: Vec<Element> =
-            Vec::with_capacity(ws.images.len() + ws.text_shapes.len());
-        for ts in &ws.text_shapes {
+        let mut image_elements: Vec<Element> = Vec::new();
+        for ts in ws.text_shapes.iter() {
+            // A drawing is shared by every sheet that names it, but each
+            // sheet's IR owns a copy of its text: paid for before it is made.
+            if !budget.charge(text_shape_chars(ts)) {
+                break;
+            }
             let mut span = TextSpan::plain(ts.text.clone());
             if let Some(sz) = ts.font_size_pt {
                 span.font_size_half_pt =
@@ -451,11 +455,14 @@ impl<'d> SheetConverter<'d> {
                 ..Default::default()
             }));
         }
-        for pic in &ws.images {
+        for pic in ws.images.iter().chain(&ws.cell_images) {
             // A picture drawn from many anchors shares its bytes in the
             // workbook, but each IR image owns a copy, so every one is paid
             // for: the pictures past the budget are left out, and said so.
-            if !image_budget.charge(pic.data.len())
+            // Its alternative text and the elements around it are paid for
+            // as text.
+            if !budget.charge(picture_chars(pic))
+                || !image_budget.charge(pic.data.len())
                 || (*scope == IrScope::Sheet && !total_image_budget.charge(pic.data.len()))
             {
                 break;
@@ -661,16 +668,22 @@ impl<'d> SheetConverter<'d> {
         // absolute regardless of order, but inline images render
         // first). Empty `image_elements` means no drawing on this sheet.
         // A chart sheet's content is its chart's text; it has no cells.
-        let mut combined: Vec<Element> = ws
-            .chart_text
-            .iter()
-            .map(|t| {
-                Element::Paragraph(Paragraph {
-                    content: vec![InlineContent::Text(TextSpan::plain(t.trim()))],
-                    ..Default::default()
-                })
-            })
-            .collect();
+        // The chart is shared by every chartsheet that displays it, and each
+        // sheet's IR owns a copy of its text: paid for before it is made.
+        let mut combined: Vec<Element> = Vec::new();
+        for t in &ws.chart_text {
+            if !budget.charge(
+                std::mem::size_of::<Paragraph>()
+                    .saturating_add(std::mem::size_of::<TextSpan>())
+                    .saturating_add(t.trim().len()),
+            ) {
+                break;
+            }
+            combined.push(Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(t.trim()))],
+                ..Default::default()
+            }));
+        }
         combined.extend(image_elements);
         combined.extend(elements);
 
@@ -1014,6 +1027,24 @@ impl<'d> SheetConverter<'d> {
         metadata.warnings.extend(self.end_warnings());
         metadata
     }
+}
+
+/// What the IR's text box for a drawn text shape costs: the shape's text and
+/// font name, which the IR copies, and the elements that hold them.
+fn text_shape_chars(ts: &crate::xlsx::worksheet::WorksheetTextShape) -> usize {
+    std::mem::size_of::<TextBox>()
+        .saturating_add(std::mem::size_of::<Paragraph>())
+        .saturating_add(std::mem::size_of::<TextSpan>())
+        .saturating_add(ts.text.len())
+        .saturating_add(ts.font_name.as_ref().map_or(0, String::len))
+}
+
+/// What the IR's image for a picture costs besides its bytes (which the
+/// picture budgets count): its alternative text and the elements that hold it.
+fn picture_chars(pic: &crate::xlsx::worksheet::WorksheetPicture) -> usize {
+    std::mem::size_of::<TextBox>()
+        .saturating_add(std::mem::size_of::<Image>())
+        .saturating_add(pic.alt_text.as_ref().map_or(0, String::len))
 }
 
 /// The notice for picture bytes copied past the total the whole run may copy.

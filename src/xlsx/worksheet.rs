@@ -33,12 +33,20 @@ pub struct Worksheet {
     pub page_setup: Option<PageSetup>,
     /// Pictures anchored on this worksheet via `xl/drawings/drawingN.xml`.
     /// Resolved at parse time: anchor + image bytes are materialised
-    /// into this `Vec` so consumers don't need to re-walk the OPC
-    /// reader. Empty when the worksheet has no drawing rel.
-    pub images: Vec<WorksheetPicture>,
+    /// so consumers don't need to re-walk the OPC reader. Empty when the
+    /// worksheet has no drawing rel.
+    ///
+    /// Shared by every sheet that names the same drawing part: the part is
+    /// parsed once.
+    pub images: std::sync::Arc<[WorksheetPicture]>,
+    /// Pictures placed in cells (Excel's "Place in Cell" rich values),
+    /// which have no anchor in a drawing. Kept apart from [`Self::images`]
+    /// so that a drawing shared by several sheets stays shared.
+    pub cell_images: Vec<WorksheetPicture>,
     /// Cell comments from the sheet's `xl/comments*.xml` part, in document
-    /// order. Empty when the sheet has no comments.
-    pub comments: Vec<SheetComment>,
+    /// order. Empty when the sheet has no comments. Shared by every sheet
+    /// that names the same comments part.
+    pub comments: std::sync::Arc<[SheetComment]>,
     /// `true` when the comments stopped at the document's text budget: the
     /// threaded comments past it are missing (or show their legacy note).
     pub comments_truncated: bool,
@@ -47,7 +55,9 @@ pub struct Worksheet {
     /// single styled run — populated by the round-trip from
     /// `to_xlsx_bytes_layout`. Empty when the worksheet has no
     /// `<xdr:sp>` shapes (the common XLSX case).
-    pub text_shapes: Vec<WorksheetTextShape>,
+    ///
+    /// Shared by every sheet that names the same drawing part.
+    pub text_shapes: std::sync::Arc<[WorksheetTextShape]>,
     /// Conditional formatting rules from `<conditionalFormatting>`/
     /// `<cfRule>`. Empty when the worksheet defines none.
     pub conditional_formats: Vec<crate::ir::ConditionalFormat>,
@@ -65,18 +75,20 @@ pub struct Worksheet {
     /// Table definitions (`xl/tables/tableN.xml`, [ECMA-376] §18.5) the
     /// sheet's `<tableParts>` reference: each names a range of the sheet's
     /// own cells, whose values are in `rows`.
-    pub tables: Vec<SheetTable>,
+    /// Each is shared by every sheet that names the same table part.
+    pub tables: Vec<std::sync::Arc<SheetTable>>,
     /// Pivot tables anchored on this sheet ([ECMA-376] §18.10). The values
     /// a pivot table displays are ordinary cells in `rows`; this records
-    /// the pivot itself and where its data comes from.
-    pub pivot_tables: Vec<SheetPivotTable>,
+    /// the pivot itself and where its data comes from. Each is shared by
+    /// every sheet that names the same pivot table part.
+    pub pivot_tables: Vec<std::sync::Arc<SheetPivotTable>>,
     /// What the sheet is. A macro sheet's cells are in `rows` like a
     /// worksheet's; a chart sheet or dialog sheet has none.
     pub kind: crate::ir::SheetKind,
     /// A chart sheet's own chart text (titles, series, categories, in the
     /// shape of [`super::XlsxDocument::chart_text`]), reached through the
     /// chartsheet's drawing. Empty for every other kind.
-    pub chart_text: Vec<String>,
+    pub chart_text: Vec<std::sync::Arc<str>>,
 }
 
 /// A table part ([ECMA-376] §18.5.1.2 `table`).
@@ -678,19 +690,22 @@ pub(crate) fn parse_persons(
 /// first, author-resolved via `persons`) instead of the legacy
 /// boilerplate; a `ref` with no threaded entry (a genuine, non-threaded
 /// legacy "Note") keeps its own legacy text unchanged.
+///
+/// The parts may be shared by several sheets, so the merge reads them and the
+/// legacy notes it keeps are copies, charged to `budget` like the thread text.
 pub(crate) fn merge_threaded_comments(
-    legacy: Vec<SheetComment>,
-    threaded: Vec<RawThreadedComment>,
+    legacy: &[SheetComment],
+    threaded: &[RawThreadedComment],
     persons: &std::collections::HashMap<String, std::sync::Arc<str>>,
     budget: &mut crate::limits::TextBudget,
 ) -> (Vec<SheetComment>, bool) {
     if threaded.is_empty() {
-        return (legacy, false);
+        return (legacy.to_vec(), false);
     }
 
     let mut by_ref: std::collections::BTreeMap<&str, Vec<&RawThreadedComment>> =
         std::collections::BTreeMap::new();
-    for tc in &threaded {
+    for tc in threaded {
         by_ref.entry(tc.cell_ref.as_str()).or_default().push(tc);
     }
 
@@ -731,10 +746,17 @@ pub(crate) fn merge_threaded_comments(
     }
 
     // A cell whose thread was left out keeps its legacy note.
-    let mut out: Vec<SheetComment> = legacy
-        .into_iter()
+    let mut out: Vec<SheetComment> = Vec::new();
+    for c in legacy
+        .iter()
         .filter(|c| !resolved.contains(c.cell_ref.as_str()))
-        .collect();
+    {
+        if !budget.charge(crate::xlsx::text::comment_chars(c)) {
+            truncated = true;
+            break;
+        }
+        out.push(c.clone());
+    }
     out.extend(threads);
     (out, truncated)
 }
@@ -860,10 +882,11 @@ impl Worksheet {
             hyperlinks_dropped: 0,
             formulas_dropped: 0,
             page_setup: None,
-            images: Vec::new(),
-            comments: Vec::new(),
+            images: std::sync::Arc::from([]),
+            cell_images: Vec::new(),
+            comments: std::sync::Arc::from([]),
             comments_truncated: false,
-            text_shapes: Vec::new(),
+            text_shapes: std::sync::Arc::from([]),
             conditional_formats: Vec::new(),
             data_validations: Vec::new(),
             state: super::SheetState::Visible,
@@ -999,7 +1022,7 @@ impl Worksheet {
             header_footer,
             tables: Vec::new(),
             pivot_tables: Vec::new(),
-            comments: Vec::new(),
+            comments: std::sync::Arc::from([]),
             comments_truncated: false,
             name,
             dimension,
@@ -1009,8 +1032,9 @@ impl Worksheet {
             hyperlinks_dropped: link_targets.dropped,
             formulas_dropped: 0,
             page_setup,
-            images: Vec::new(),
-            text_shapes: Vec::new(),
+            images: std::sync::Arc::from([]),
+            cell_images: Vec::new(),
+            text_shapes: std::sync::Arc::from([]),
             conditional_formats,
             data_validations,
         };
@@ -2494,8 +2518,8 @@ mod tests {
         persons.insert("{P1}".to_string(), "Pankaj Chaudhary".into());
 
         let merged = merge_threaded_comments(
-            legacy,
-            threaded,
+            &legacy,
+            &threaded,
             &persons,
             &mut crate::limits::TextBudget::new(),
         )
@@ -2531,8 +2555,8 @@ mod tests {
             },
         ];
         let merged = merge_threaded_comments(
-            Vec::new(),
-            threaded,
+            &[],
+            &threaded,
             &std::collections::HashMap::new(),
             &mut crate::limits::TextBudget::new(),
         )
@@ -2556,8 +2580,7 @@ mod tests {
         let mut persons = std::collections::HashMap::new();
         persons.insert("{P1}".to_string(), "n".repeat(100).into());
         let mut budget = crate::limits::TextBudget::with_limit(1_000);
-        let (merged, truncated) =
-            merge_threaded_comments(Vec::new(), threaded, &persons, &mut budget);
+        let (merged, truncated) = merge_threaded_comments(&[], &threaded, &persons, &mut budget);
         assert!(truncated, "5,000 characters of thread text exceed a 1,000 budget");
         assert!(merged.is_empty(), "a thread that does not fit is left out whole");
     }
@@ -2570,8 +2593,8 @@ mod tests {
             text: "plain note".to_string(),
         }];
         let merged = merge_threaded_comments(
-            legacy.clone(),
-            Vec::new(),
+            &legacy,
+            &[],
             &std::collections::HashMap::new(),
             &mut crate::limits::TextBudget::new(),
         )

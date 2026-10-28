@@ -89,6 +89,7 @@ pub(super) fn from_zip<R: Read + Seek>(
     let mut worksheets = Vec::with_capacity(sheets.len());
     let mut unreadable_sheets = Vec::new();
     let mut sheet_parts = super::SheetPartClaims::default();
+    let mut shared = super::shared_parts::SharedParts::default();
     for (i, info) in sheets.iter().enumerate() {
         let rel = rels.get_by_id(&info.rel_id);
         // A macro sheet has the same cell records as a worksheet (its part
@@ -111,12 +112,8 @@ pub(super) fn from_zip<R: Read + Seek>(
             ws.state = info.state;
             if kind == SheetKind::Chart {
                 for chart in super::chartsheet_chart_parts(archive, entries, &path) {
-                    if let Ok(data) = XlsxDocument::read_xml_entry(archive, entries, &chart) {
-                        let text = super::extract_chart_text(&data);
-                        if !text.is_empty() {
-                            ws.chart_text.push(text);
-                        }
-                    }
+                    ws.chart_text
+                        .extend(shared.chart_text(archive, entries, &chart));
                 }
             }
             worksheets.push(ws);

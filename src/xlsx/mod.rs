@@ -30,6 +30,7 @@ pub mod numfmt;
 pub(crate) mod range_sweep;
 /// Shared-formula (`<f t="shared">`) group expansion.
 pub mod shared_formula;
+mod shared_parts;
 /// Shared string table (SST) parsing and lookup.
 pub mod shared_strings;
 /// Spreadsheet styles: number formats, fonts, fills, borders, cell formats.
@@ -276,14 +277,14 @@ impl XlsxDocument {
             name: String,
             state: SheetState,
             kind: crate::ir::SheetKind,
-            chart_text: Vec<String>,
-            tables: Vec<worksheet::SheetTable>,
-            pivot_tables: Vec<worksheet::SheetPivotTable>,
+            chart_text: Vec<std::sync::Arc<str>>,
+            tables: Vec<std::sync::Arc<worksheet::SheetTable>>,
+            pivot_tables: Vec<std::sync::Arc<worksheet::SheetPivotTable>>,
             data: Vec<u8>,
             rels: Relationships,
-            images: Vec<crate::xlsx::worksheet::WorksheetPicture>,
-            text_shapes: Vec<crate::xlsx::worksheet::WorksheetTextShape>,
-            comments: Vec<crate::xlsx::worksheet::SheetComment>,
+            images: std::sync::Arc<[crate::xlsx::worksheet::WorksheetPicture]>,
+            text_shapes: std::sync::Arc<[crate::xlsx::worksheet::WorksheetTextShape]>,
+            comments: std::sync::Arc<[crate::xlsx::worksheet::SheetComment]>,
             comments_truncated: bool,
         }
         let mut bundles = Vec::with_capacity(workbook.sheets.len());
@@ -293,6 +294,8 @@ impl XlsxDocument {
         let mut pivot_ctx = PivotContext::new(&mut archive, &entries);
         let mut unreadable_sheets: Vec<(String, String)> = Vec::new();
         let mut media = MediaCache::new();
+        // Parts several sheets may name are read and parsed once.
+        let mut shared = shared_parts::SharedParts::default();
         let mut sheet_parts = SheetPartClaims::default();
         // Threaded-comment text, which repeats each author's name on every
         // message, shares one budget across the workbook.
@@ -339,12 +342,7 @@ impl XlsxDocument {
                     let paths = chartsheet_chart_parts(&mut archive, &entries, &sheet_path);
                     let mut texts = Vec::new();
                     for path in paths {
-                        if let Ok(data) = Self::read_xml_entry(&mut archive, &entries, &path) {
-                            let text = extract_chart_text(&data);
-                            if !text.is_empty() {
-                                texts.push(text);
-                            }
-                        }
+                        texts.extend(shared.chart_text(&mut archive, &entries, &path));
                         chartsheet_charts.insert(path);
                     }
                     texts
@@ -360,9 +358,9 @@ impl XlsxDocument {
                     pivot_tables: Vec::new(),
                     data: Vec::new(),
                     rels: Relationships::empty(),
-                    images: Vec::new(),
-                    text_shapes: Vec::new(),
-                    comments: Vec::new(),
+                    images: std::sync::Arc::from([]),
+                    text_shapes: std::sync::Arc::from([]),
+                    comments: std::sync::Arc::from([]),
                     comments_truncated: false,
                 });
                 continue;
@@ -419,29 +417,22 @@ impl XlsxDocument {
             // `<xdr:pic>` and `<xdr:sp>` anchors and the underlying
             // media bytes so Phase 2's parallel parser doesn't need
             // the archive.
-            let (images, text_shapes) =
-                read_drawing_for_sheet(&mut archive, &entries, &mut media, &sheet_path, &ws_rels);
+            let drawing =
+                shared.drawing_for_sheet(&mut archive, &entries, &mut media, &sheet_path, &ws_rels);
+            let (images, text_shapes) = match drawing {
+                Some(d) => (d.pictures.clone(), d.text_shapes.clone()),
+                None => (std::sync::Arc::from([]), std::sync::Arc::from([])),
+            };
 
             // Cell comments live in a separate part reached through the
-            // sheet's own relationships.
-            let comments = ws_rels
-                .first_by_type(rel_types::COMMENTS)
-                .map(|rel| resolve_relative_zip_path(&sheet_path, &rel.target))
-                .and_then(|path| Self::read_xml_entry(&mut archive, &entries, &path).ok())
-                .and_then(|data| worksheet::parse_comments(&data).ok())
-                .unwrap_or_default();
-            // Modern (Excel 2016+) threaded comments, when present,
-            // replace the legacy compatibility-boilerplate text for the
-            // same cell with the real thread text.
-            let threaded_comments = ws_rels
-                .first_by_type(rel_types::THREADED_COMMENTS)
-                .map(|rel| resolve_relative_zip_path(&sheet_path, &rel.target))
-                .and_then(|path| Self::read_xml_entry(&mut archive, &entries, &path).ok())
-                .and_then(|data| worksheet::parse_threaded_comments(&data).ok())
-                .unwrap_or_default();
-            let (comments, comments_truncated) = worksheet::merge_threaded_comments(
-                comments,
-                threaded_comments,
+            // sheet's own relationships; modern (Excel 2016+) threaded
+            // comments, when present, replace the legacy compatibility
+            // boilerplate for the same cell with the real thread text.
+            let (comments, comments_truncated) = shared.comments_for_sheet(
+                &mut archive,
+                &entries,
+                &sheet_path,
+                &ws_rels,
                 &persons,
                 &mut comment_budget,
             );
@@ -453,6 +444,7 @@ impl XlsxDocument {
                 &ws_rels,
                 &workbook,
                 &mut pivot_ctx,
+                &mut shared,
                 &mut pivot_budget,
             );
 
@@ -551,7 +543,7 @@ impl XlsxDocument {
                             continue;
                         }
                         if let Some(pic) = rich_value_images.get(&vm) {
-                            ws.images.push(pic.clone());
+                            ws.cell_images.push(pic.clone());
                             cell.value = CellValue::Empty;
                         }
                     }
@@ -855,6 +847,9 @@ struct PivotContext {
     /// Materialised cache data by cache-definition part, so a cache shared
     /// by several pivots is parsed once.
     parsed: std::collections::HashMap<String, Option<std::sync::Arc<worksheet::PivotCacheData>>>,
+    /// Pivot table parts already read, by part, so a part several sheets
+    /// name is read and parsed once.
+    pivots: std::collections::HashMap<String, Option<std::sync::Arc<worksheet::SheetPivotTable>>>,
 }
 
 impl PivotContext {
@@ -862,6 +857,7 @@ impl PivotContext {
         let mut ctx = PivotContext {
             table_names: std::collections::HashSet::new(),
             parsed: std::collections::HashMap::new(),
+            pivots: std::collections::HashMap::new(),
         };
         // Only a package with a pivot cache needs its table names.
         if !archive
@@ -902,68 +898,90 @@ fn read_tables_and_pivots<R: Read + Seek>(
     ws_rels: &Relationships,
     workbook: &WorkbookInfo,
     pivot_ctx: &mut PivotContext,
+    shared: &mut shared_parts::SharedParts,
     budget: &mut crate::limits::TextBudget,
-) -> (Vec<worksheet::SheetTable>, Vec<worksheet::SheetPivotTable>) {
+) -> (
+    Vec<std::sync::Arc<worksheet::SheetTable>>,
+    Vec<std::sync::Arc<worksheet::SheetPivotTable>>,
+) {
     let mut tables = Vec::new();
     for rel in ws_rels.get_by_type(TABLE_REL) {
         let path = resolve_relative_zip_path(sheet_path, &rel.target);
-        match XlsxDocument::read_xml_entry(archive, entries, &path)
-            .map_err(|e| e.to_string())
-            .and_then(|d| worksheet::parse_table_part(&d).map_err(|e| e.to_string()))
-        {
-            Ok(t) => tables.push(t),
-            Err(e) => log::warn!("xlsx: table part {path} skipped: {e}"),
-        }
+        tables.extend(shared.table(archive, entries, &path));
     }
     let mut pivots = Vec::new();
     for rel in ws_rels.get_by_type(PIVOT_TABLE_REL) {
         let path = resolve_relative_zip_path(sheet_path, &rel.target);
-        let mut pivot = match XlsxDocument::read_xml_entry(archive, entries, &path)
-            .map_err(|e| e.to_string())
-            .and_then(|d| worksheet::parse_pivot_table_part(&d).map_err(|e| e.to_string()))
-        {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!("xlsx: pivot table part {path} skipped: {e}");
-                continue;
+        // A pivot table part several sheets name is read once, with the
+        // cache it points at: it is the same pivot wherever it is named.
+        let key = part_key(entries, &path);
+        let pivot = match pivot_ctx.pivots.get(&key) {
+            Some(hit) => hit.clone(),
+            None => {
+                let read = read_pivot_table(archive, entries, &path, workbook, pivot_ctx, budget)
+                    .map(std::sync::Arc::new);
+                pivot_ctx.pivots.insert(key, read.clone());
+                read
             },
         };
-        let pivot_rels = XlsxDocument::read_xml_entry(archive, entries, &sheet_rels_path(&path))
-            .ok()
-            .and_then(|d| Relationships::parse(&d).ok());
-        if let Some(cache) = pivot_rels
-            .as_ref()
-            .and_then(|r| r.first_by_type(PIVOT_CACHE_DEFINITION_REL))
-        {
-            let cache_path = resolve_relative_zip_path(&path, &cache.target);
-            if let Ok(def) = XlsxDocument::read_xml_entry(archive, entries, &cache_path) {
-                let src = worksheet::parse_pivot_cache_definition(&def).unwrap_or_default();
-                pivot.source = src.display();
-                if !pivot_source_in_workbook(&src, workbook, &pivot_ctx.table_names) {
-                    pivot.cache_data = match pivot_ctx.parsed.get(&part_key(entries, &cache_path)) {
-                        Some(data) => data.clone(),
-                        None => {
-                            let data = read_pivot_cache_data(
-                                archive,
-                                entries,
-                                &cache_path,
-                                &def,
-                                &src,
-                                budget,
-                            );
-                            let data = data.map(std::sync::Arc::new);
-                            pivot_ctx
-                                .parsed
-                                .insert(part_key(entries, &cache_path), data.clone());
-                            data
-                        },
-                    };
-                }
-            }
-        }
-        pivots.push(pivot);
+        pivots.extend(pivot);
     }
     (tables, pivots)
+}
+
+/// One pivot table part and the cache definition and records it names.
+fn read_pivot_table<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &opc::ZipEntryIndex,
+    path: &str,
+    workbook: &WorkbookInfo,
+    pivot_ctx: &mut PivotContext,
+    budget: &mut crate::limits::TextBudget,
+) -> Option<worksheet::SheetPivotTable> {
+    let mut pivot = match XlsxDocument::read_xml_entry(archive, entries, path)
+        .map_err(|e| e.to_string())
+        .and_then(|d| worksheet::parse_pivot_table_part(&d).map_err(|e| e.to_string()))
+    {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("xlsx: pivot table part {path} skipped: {e}");
+            return None;
+        },
+    };
+    let pivot_rels = XlsxDocument::read_xml_entry(archive, entries, &sheet_rels_path(path))
+        .ok()
+        .and_then(|d| Relationships::parse(&d).ok());
+    if let Some(cache) = pivot_rels
+        .as_ref()
+        .and_then(|r| r.first_by_type(PIVOT_CACHE_DEFINITION_REL))
+    {
+        let cache_path = resolve_relative_zip_path(path, &cache.target);
+        if let Ok(def) = XlsxDocument::read_xml_entry(archive, entries, &cache_path) {
+            let src = worksheet::parse_pivot_cache_definition(&def).unwrap_or_default();
+            pivot.source = src.display();
+            if !pivot_source_in_workbook(&src, workbook, &pivot_ctx.table_names) {
+                pivot.cache_data = match pivot_ctx.parsed.get(&part_key(entries, &cache_path)) {
+                    Some(data) => data.clone(),
+                    None => {
+                        let data = read_pivot_cache_data(
+                            archive,
+                            entries,
+                            &cache_path,
+                            &def,
+                            &src,
+                            budget,
+                        );
+                        let data = data.map(std::sync::Arc::new);
+                        pivot_ctx
+                            .parsed
+                            .insert(part_key(entries, &cache_path), data.clone());
+                        data
+                    },
+                };
+            }
+        }
+    }
+    Some(pivot)
 }
 
 /// Whether a pivot cache's source cells are in this workbook: a
@@ -1047,21 +1065,40 @@ fn read_pivot_cache_data<R: Read + Seek>(
 
 /// A pivot whose source is a table name has its source cells in the
 /// workbook after all: drop the cached copy.
+///
+/// A table or pivot table several sheets name is one shared value, looked at
+/// once and replaced once however many sheets hold it.
 fn drop_pivot_caches_backed_by_tables(worksheets: &mut [Worksheet]) {
-    let tables: Vec<String> = worksheets
+    use std::sync::Arc;
+    let mut seen_tables = std::collections::HashSet::new();
+    let tables: Vec<Arc<worksheet::SheetTable>> = worksheets
         .iter()
         .flat_map(|ws| &ws.tables)
-        .flat_map(|t| [t.name.clone(), t.display_name.clone()])
-        .filter(|n| !n.is_empty())
+        .filter(|t| seen_tables.insert(Arc::as_ptr(t)))
+        .cloned()
         .collect();
+    let backed = |pivot: &worksheet::SheetPivotTable| {
+        pivot.cache_data.is_some()
+            && pivot.source.as_deref().is_some_and(|s| {
+                tables.iter().any(|t| {
+                    [&t.name, &t.display_name]
+                        .into_iter()
+                        .any(|n| !n.is_empty() && n.eq_ignore_ascii_case(s))
+                })
+            })
+    };
+    let mut replaced: std::collections::HashMap<*const worksheet::SheetPivotTable, Arc<_>> =
+        std::collections::HashMap::new();
     for pivot in worksheets.iter_mut().flat_map(|ws| &mut ws.pivot_tables) {
-        if pivot
-            .source
-            .as_deref()
-            .is_some_and(|s| tables.iter().any(|t| t.eq_ignore_ascii_case(s)))
-        {
-            pivot.cache_data = None;
+        if !backed(pivot) {
+            continue;
         }
+        let cleared = replaced.entry(Arc::as_ptr(pivot)).or_insert_with(|| {
+            let mut copy = (**pivot).clone();
+            copy.cache_data = None;
+            Arc::new(copy)
+        });
+        *pivot = cleared.clone();
     }
 }
 
@@ -1196,96 +1233,6 @@ fn read_media_cached<R: Read + Seek>(
     let bytes: std::sync::Arc<[u8]> = opc::read_zip_entry(archive, entries, path).ok()?.into();
     cache.insert(key, bytes.clone());
     Some(bytes)
-}
-
-fn read_drawing_for_sheet<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
-    entries: &opc::ZipEntryIndex,
-    media: &mut MediaCache,
-    sheet_path: &str,
-    sheet_rels: &Relationships,
-) -> (
-    Vec<crate::xlsx::worksheet::WorksheetPicture>,
-    Vec<crate::xlsx::worksheet::WorksheetTextShape>,
-) {
-    let drawing_rel = match sheet_rels.first_by_type(rel_types::DRAWING) {
-        Some(r) => r,
-        None => return (Vec::new(), Vec::new()),
-    };
-
-    let drawing_path = resolve_relative_zip_path(sheet_path, &drawing_rel.target);
-
-    let drawing_xml = match XlsxDocument::read_xml_entry(archive, entries, &drawing_path) {
-        Ok(d) => d,
-        Err(e) => {
-            debug!("XlsxDocument: drawing part {} unreadable ({}); skipping", drawing_path, e);
-            return (Vec::new(), Vec::new());
-        },
-    };
-
-    let drawing_rels_path = sheet_rels_path(&drawing_path);
-    let drawing_rels = match XlsxDocument::read_xml_entry(archive, entries, &drawing_rels_path) {
-        Ok(d) => Relationships::parse(&d).unwrap_or_else(|_| Relationships::empty()),
-        Err(_) => Relationships::empty(),
-    };
-
-    let parsed = match parse_drawing_anchors(&drawing_xml) {
-        Ok(a) => a,
-        Err(e) => {
-            debug!(
-                "XlsxDocument: drawing {} failed to parse ({}); dropping anchors",
-                drawing_path, e
-            );
-            return (Vec::new(), Vec::new());
-        },
-    };
-
-    // Resolve picture anchors → bytes.
-    let mut pictures = Vec::with_capacity(parsed.pictures.len());
-    for a in parsed.pictures {
-        let rel = match drawing_rels.get_by_id(&a.embed_rid) {
-            Some(r) => r,
-            None => continue,
-        };
-        let media_path = resolve_relative_zip_path(&drawing_path, &rel.target);
-        let Some(bytes) = read_media_cached(archive, entries, &media_path, media) else {
-            continue;
-        };
-        let ext = std::path::Path::new(&*rel.target)
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_else(|| guess_image_format_from_bytes(&bytes).to_string());
-
-        pictures.push(crate::xlsx::worksheet::WorksheetPicture {
-            data: bytes,
-            format: ext,
-            x_emu: a.x_emu,
-            y_emu: a.y_emu,
-            cx_emu: a.cx_emu,
-            cy_emu: a.cy_emu,
-            alt_text: a.alt_text,
-        });
-    }
-
-    let text_shapes = parsed
-        .text_shapes
-        .into_iter()
-        .map(|t| crate::xlsx::worksheet::WorksheetTextShape {
-            text: t.text,
-            font_name: t.font_name,
-            font_size_pt: t.font_size_pt,
-            bold: t.bold,
-            italic: t.italic,
-            color_hex: t.color_hex,
-            x_emu: t.x_emu,
-            y_emu: t.y_emu,
-            cx_emu: t.cx_emu,
-            cy_emu: t.cy_emu,
-        })
-        .collect();
-
-    (pictures, text_shapes)
 }
 
 /// Workbook-level in-cell rich-value images (Excel 365's
@@ -2656,8 +2603,8 @@ mod tests {
     fn test_a_self_closing_vm_cell_keeps_its_value_metadata_link() {
         let doc = open_bytes(rich_value_image_package(r#"<c r="B2" vm="1"/>"#));
         let ws = &doc.worksheets[0];
-        assert_eq!(ws.images.len(), 1, "the rich-value image must reach ws.images");
-        assert_eq!(&*ws.images[0].data, RICH_VALUE_PNG);
+        assert_eq!(ws.cell_images.len(), 1, "the rich-value image must reach ws.cell_images");
+        assert_eq!(&*ws.cell_images[0].data, RICH_VALUE_PNG);
     }
 
     /// Build a minimal SpreadsheetML package whose main part carries
@@ -2676,9 +2623,9 @@ mod tests {
             open_bytes(rich_value_image_package(r#"<c r="B2" t="e" vm="1"><v>#VALUE!</v></c>"#));
         let ws = &doc.worksheets[0];
 
-        assert_eq!(ws.images.len(), 1, "the rich-value image must reach ws.images");
-        assert_eq!(&*ws.images[0].data, RICH_VALUE_PNG);
-        assert_eq!(ws.images[0].format, "png");
+        assert_eq!(ws.cell_images.len(), 1, "the rich-value image must reach ws.cell_images");
+        assert_eq!(&*ws.cell_images[0].data, RICH_VALUE_PNG);
+        assert_eq!(ws.cell_images[0].format, "png");
 
         let cell = &ws.rows[0].cells[0];
         assert!(
@@ -3163,25 +3110,27 @@ mod tests {
         );
         let doc = open_bytes(bytes);
         let ws = &doc.worksheets[0];
+        assert_eq!(ws.tables.len(), 1);
         assert_eq!(
-            ws.tables,
-            [worksheet::SheetTable {
+            *ws.tables[0],
+            worksheet::SheetTable {
                 name: "Sales".into(),
                 display_name: "SalesTbl".into(),
                 range: "A1:B5".into(),
                 columns: vec!["Region".into(), "Qty".into()],
                 header_row_count: 1,
                 totals_row_count: 1,
-            }]
+            }
         );
+        assert_eq!(ws.pivot_tables.len(), 1);
         assert_eq!(
-            ws.pivot_tables,
-            [worksheet::SheetPivotTable {
+            *ws.pivot_tables[0],
+            worksheet::SheetPivotTable {
                 name: "PivotTable1".into(),
                 location: "D1:E4".into(),
                 source: Some("Sheet1!A1:B4".into()),
                 cache_data: None,
-            }]
+            }
         );
     }
 
