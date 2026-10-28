@@ -44,7 +44,9 @@ pub struct DrawingInfo {
     /// The chart part lives outside the document part, so this is filled in
     /// by `DocxDocument::from_opc` after the body has been parsed; a
     /// standalone `<w:drawing>` parse leaves it empty.
-    pub chart_text: Vec<String>,
+    ///
+    /// Shared: a chart part named by many drawings is read once.
+    pub chart_text: std::sync::Arc<[String]>,
     /// Relationship id from `<dgm:relIds r:dm="…"/>` when the graphic is a
     /// SmartArt diagram, pointing at its data part
     /// (`word/diagrams/dataN.xml`) rather than a picture or a shape.
@@ -55,7 +57,9 @@ pub struct DrawingInfo {
     /// Like `chart_text`, the diagram data part lives outside the document
     /// part, so this is filled in by `DocxDocument::from_opc` after the
     /// body has been parsed.
-    pub dgm_text: Vec<String>,
+    ///
+    /// Shared like `chart_text`.
+    pub dgm_text: std::sync::Arc<[String]>,
 }
 
 /// Absolute coordinates extracted from a `<wp:anchor>` wrapper.

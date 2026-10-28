@@ -102,7 +102,15 @@ impl<'a, 'd> Cx<'a, 'd> {
         let base = match cached {
             Some(b) => b,
             None => {
-                let b = Rc::new(sheet.run_style_base(layer, pkey, ckey));
+                // The memo keeps the fold for the whole conversion, one per
+                // table-style layer: its text is charged, and left out once
+                // the budget cannot take it.
+                let fold = sheet.run_style_base(layer, pkey, ckey);
+                let b = Rc::new(if crate::limits::charge_copied_text(fold.heap_chars()) {
+                    fold
+                } else {
+                    fold.clone_light()
+                });
                 self.folds.runs.borrow_mut().insert(key, Rc::clone(&b));
                 b
             },
@@ -110,7 +118,14 @@ impl<'a, 'd> Cx<'a, 'd> {
         Some(match direct {
             None => EffectiveRun::Inherited(base),
             Some(d) => {
-                let mut own = (*base).clone();
+                // The fold's text (face names) is copied for this run; once
+                // the budget cannot take it the run keeps its formatting
+                // without the names, and the conversion says so.
+                let mut own = if crate::limits::charge_copied_text(base.heap_chars()) {
+                    (*base).clone()
+                } else {
+                    base.clone_light()
+                };
                 own.overlay(d);
                 EffectiveRun::Own(own)
             },
@@ -137,7 +152,13 @@ impl<'a, 'd> Cx<'a, 'd> {
         let base = match cached {
             Some(b) => b,
             None => {
-                let b = Rc::new(sheet.paragraph_style_base(layer, pkey));
+                // Kept for the whole conversion, like the run folds: charged.
+                let fold = sheet.paragraph_style_base(layer, pkey);
+                let b = Rc::new(if crate::limits::charge_copied_text(fold.heap_chars()) {
+                    fold
+                } else {
+                    fold.clone_light()
+                });
                 self.folds
                     .paragraphs
                     .borrow_mut()
@@ -145,7 +166,15 @@ impl<'a, 'd> Cx<'a, 'd> {
                 b
             },
         };
-        let mut out = (*base).clone();
+        // The fold's tab stops and names are copied for this paragraph, and
+        // the IR holds the tab stops again; once the budget cannot take them
+        // the paragraph keeps the rest of its formatting without them, and
+        // the conversion says so.
+        let mut out = if crate::limits::charge_copied_text(base.heap_chars()) {
+            (*base).clone()
+        } else {
+            base.clone_light()
+        };
         if let Some(d) = direct {
             out.overlay(d);
         }
@@ -440,6 +469,26 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
         }
     }
 
+    // Pictures left without their bytes are reported like every other cut:
+    // the truncation flag, one warning naming the limit, and a notice in the
+    // document itself (the last section ends with it, as a spreadsheet's
+    // sheet does), so a rendering that embeds pictures does not lose them
+    // silently. Read after every conversion above: copies in headers and
+    // footers are charged too.
+    let image_cut = crate::limits::image_budget_warning();
+    if image_cut.is_some()
+        && let Some(last) = ir_sections.last_mut()
+    {
+        last.elements.push(Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan::plain(format!(
+                "[some pictures not shown: together they exceed the {} byte picture budget \
+                 (office_oxide::limits::set_max_image_bytes)]",
+                crate::limits::max_image_bytes()
+            )))],
+            ..Default::default()
+        }));
+    }
+
     // Real document metadata beats a title guessed from the first heading,
     // but the guess stays as the fallback for files with no core properties.
     let cp = doc.core_properties.as_ref();
@@ -464,14 +513,15 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             has_macros: doc.has_macros,
             text_truncated: !doc.unreadable_parts.is_empty()
                 || copied_text_notice.is_some()
-                || doc.link_notice.is_some(),
+                || doc.link_notice.is_some()
+                || image_cut.is_some(),
             warnings: doc
                 .unreadable_parts
                 .iter()
                 .map(|p| format!("skipped unreadable part {p}"))
                 .chain(copied_text_notice)
                 .chain(doc.link_notice.clone())
-                .chain(crate::limits::image_budget_warning())
+                .chain(image_cut)
                 .chain(crate::core::core_properties::package_warnings(Some(
                     &doc.package_properties,
                 )))
@@ -1144,6 +1194,12 @@ fn collect_paragraph_chart_text(p: &crate::docx::Paragraph, out: &mut Vec<Elemen
                     continue;
                 };
                 for line in d.chart_text.iter().chain(d.dgm_text.iter()) {
+                    // The part's text is stored once and copied for every
+                    // drawing that names the part: charged before it is
+                    // copied, and left out once the budget is spent.
+                    if !crate::limits::charge_copied_text(line.len()) {
+                        break;
+                    }
                     out.push(Element::Paragraph(Paragraph {
                         content: vec![InlineContent::Text(TextSpan::plain(line.clone()))],
                         ..Default::default()
@@ -1614,6 +1670,13 @@ fn convert_run_content(
             let link = link.filter(|(url, tip)| {
                 crate::limits::charge_copied_text(url.len() + tip.map_or(0, str::len))
             });
+            // The face name is stored once (in a style or the theme) and
+            // copied into every span: charged before it is, and left off
+            // once the budget is spent.
+            let font_name = face
+                .font_name
+                .filter(|n| crate::limits::charge_copied_text(n.len()))
+                .map(str::to_string);
             content.push(InlineContent::Text(TextSpan {
                 text: piece.to_string(),
                 bold,
@@ -1624,7 +1687,7 @@ fn convert_run_content(
                 font_size_half_pt: face
                     .font_size
                     .map(|hp| crate::core::units::HalfPoint::from_word_sz(hp.0).0),
-                font_name: face.font_name.map(str::to_string),
+                font_name,
                 color: text_color,
                 underline: underline.clone(),
                 highlight,
@@ -1904,15 +1967,17 @@ fn convert_list_group(
 }
 
 /// One numbering level's marker, as the IR's `List` describes it.
-struct LevelMarker {
+struct LevelMarker<'a> {
     ordered: bool,
     style: Option<ListStyle>,
-    pattern: Option<String>,
+    /// Borrowed from the numbering level: it is copied into a list only
+    /// after the copy is charged.
+    pattern: Option<&'a str>,
     alignment: Option<ParagraphAlignment>,
 }
 
-impl LevelMarker {
-    fn of(level: &crate::docx::numbering::NumberingLevel, ilvl: u8) -> Self {
+impl<'a> LevelMarker<'a> {
+    fn of(level: &'a crate::docx::numbering::NumberingLevel, ilvl: u8) -> Self {
         use crate::docx::NumberFormat as NF;
         let ordered = !matches!(level.format, NF::Bullet | NF::None);
         // Only an ordered level's `w:lvlText` is a pattern around a counter;
@@ -1921,7 +1986,7 @@ impl LevelMarker {
         // so only a different pattern is reported.
         let plain = format!("%{}.", u32::from(ilvl) + 1);
         let pattern = (ordered && !level.level_text.is_empty() && level.level_text != plain)
-            .then(|| level.level_text.clone());
+            .then_some(level.level_text.as_str());
         let alignment = level.justification.as_ref().and_then(|jc| match jc {
             crate::docx::Justification::Center => Some(ParagraphAlignment::Center),
             crate::docx::Justification::Right => Some(ParagraphAlignment::Right),
@@ -1946,7 +2011,7 @@ fn apply_level_markers(
     list: &mut List,
     items: &[(u8, Vec<InlineContent>)],
     next_item: &mut usize,
-    markers: &std::collections::HashMap<u8, LevelMarker>,
+    markers: &std::collections::HashMap<u8, LevelMarker<'_>>,
     // `Some(top level)` for the top list; `None` for a sub-list, whose
     // level is its first item's.
     top_ilvl: Option<u8>,
@@ -1955,7 +2020,13 @@ fn apply_level_markers(
     let ilvl = top_ilvl.or_else(|| items.get(*next_item).map(|(l, _)| *l));
     if let Some(m) = ilvl.and_then(|l| markers.get(&l)) {
         list.ordered = m.ordered;
-        list.marker_pattern = m.pattern.clone();
+        // The level's text is stored once and copied into every list that
+        // uses the level: charged before it is, and left off (the list is
+        // numbered `%N.`) once the budget is spent.
+        list.marker_pattern = m
+            .pattern
+            .filter(|p| crate::limits::charge_copied_text(p.len()))
+            .map(str::to_string);
         list.marker_alignment = m.alignment.clone();
         if !is_top {
             list.style = m.style.clone();

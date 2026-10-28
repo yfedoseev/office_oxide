@@ -314,7 +314,7 @@ impl DocxDocument {
         // cached data values all live in the separate part that id resolves
         // to (`word/charts/chartN.xml`), which was never opened, so none of
         // that text reached any consumer.
-        let mut chart_text_by_rid: std::collections::HashMap<String, Vec<String>> =
+        let mut chart_text_by_rid: std::collections::HashMap<String, std::sync::Arc<[String]>> =
             std::collections::HashMap::new();
         for rel in doc_rels.all() {
             if rel.rel_type != rel_types::CHART || rel.target_mode != TargetMode::Internal {
@@ -331,12 +331,12 @@ impl DocxDocument {
             };
             let lines = crate::core::chart::chart_text_lines(&data);
             if !lines.is_empty() {
-                chart_text_by_rid.insert(rel.id.clone(), lines);
+                chart_text_by_rid.insert(rel.id.clone(), lines.into());
             }
         }
         // Resolve every SmartArt diagram the body references, the same
         // way charts are resolved just above.
-        let mut dgm_text_by_rid: std::collections::HashMap<String, Vec<String>> =
+        let mut dgm_text_by_rid: std::collections::HashMap<String, std::sync::Arc<[String]>> =
             std::collections::HashMap::new();
         for rel in doc_rels.all() {
             if rel.rel_type != rel_types::DIAGRAM_DATA || rel.target_mode != TargetMode::Internal {
@@ -353,7 +353,7 @@ impl DocxDocument {
             };
             let lines = diagram_text_lines(&data);
             if !lines.is_empty() {
-                dgm_text_by_rid.insert(rel.id.clone(), lines);
+                dgm_text_by_rid.insert(rel.id.clone(), lines.into());
             }
         }
         if !chart_text_by_rid.is_empty() || !dgm_text_by_rid.is_empty() {
@@ -425,15 +425,21 @@ impl DocxDocument {
                                 return Ok(None);
                             },
                         };
-                        if let Ok(hf_rels) = opc.read_rels_for(&part_name) {
-                            resolve_hyperlinks(&mut content, &hf_rels, &links);
-                            qualify_part_images(
-                                &mut content,
-                                &part_name,
-                                &hf_rels,
-                                &mut opc,
-                                &mut part_images,
-                            );
+                        // A relationships part that cannot be read leaves the
+                        // part without its links and images; the part is
+                        // kept, and the loss is reported.
+                        match opc.read_rels_for(&part_name) {
+                            Ok(hf_rels) => {
+                                resolve_hyperlinks(&mut content, &hf_rels, &links);
+                                qualify_part_images(
+                                    &mut content,
+                                    &part_name,
+                                    &hf_rels,
+                                    &mut opc,
+                                    &mut part_images,
+                                );
+                            },
+                            Err(e) => skip_unreadable(&part_name.rels_path(), &e),
                         }
                         headers_footers.push(HeaderFooter {
                             hf_type: hf_ref.hf_type,
@@ -517,17 +523,22 @@ impl DocxDocument {
             // `_rels`, not `document.xml.rels`. Resolving against the
             // document's relationships left the raw `rIdN` string as the
             // "URL" for every note hyperlink.
-            if let Ok(note_rels) = opc.read_rels_for(&part) {
-                for n in &mut notes {
-                    resolve_hyperlinks(&mut n.content, &note_rels, &links);
-                    qualify_part_images(
-                        &mut n.content,
-                        &part,
-                        &note_rels,
-                        &mut opc,
-                        &mut part_images,
-                    );
-                }
+            match opc.read_rels_for(&part) {
+                Ok(note_rels) => {
+                    for n in &mut notes {
+                        resolve_hyperlinks(&mut n.content, &note_rels, &links);
+                        qualify_part_images(
+                            &mut n.content,
+                            &part,
+                            &note_rels,
+                            &mut opc,
+                            &mut part_images,
+                        );
+                    }
+                },
+                // The notes are kept without their links and images; the
+                // loss is reported.
+                Err(e) => skip_unreadable(&part.rels_path(), &e),
             }
             notes
         };
@@ -938,9 +949,9 @@ impl VmlContent {
                 anchor_position: None,
                 shape: None,
                 chart_rel_id: None,
-                chart_text: Vec::new(),
+                chart_text: std::sync::Arc::default(),
                 dgm_data_rel_id: None,
-                dgm_text: Vec::new(),
+                dgm_text: std::sync::Arc::default(),
             })));
         }
         for b in self.boxes {
@@ -2212,8 +2223,8 @@ fn prefix_drawing_rids(elements: &mut [BlockElement], prefix: &str) {
 
 fn attach_chart_text(
     elements: &mut [BlockElement],
-    chart_text_by_rid: &std::collections::HashMap<String, Vec<String>>,
-    dgm_text_by_rid: &std::collections::HashMap<String, Vec<String>>,
+    chart_text_by_rid: &std::collections::HashMap<String, std::sync::Arc<[String]>>,
+    dgm_text_by_rid: &std::collections::HashMap<String, std::sync::Arc<[String]>>,
 ) {
     for elem in elements {
         match elem {
@@ -2229,12 +2240,12 @@ fn attach_chart_text(
                                 RunContent::Drawing(d) => {
                                     if let Some(rid) = d.chart_rel_id.as_deref() {
                                         if let Some(lines) = chart_text_by_rid.get(rid) {
-                                            d.chart_text = lines.clone();
+                                            d.chart_text = std::sync::Arc::clone(lines);
                                         }
                                     }
                                     if let Some(rid) = d.dgm_data_rel_id.as_deref() {
                                         if let Some(lines) = dgm_text_by_rid.get(rid) {
-                                            d.dgm_text = lines.clone();
+                                            d.dgm_text = std::sync::Arc::clone(lines);
                                         }
                                     }
                                 },
@@ -2540,9 +2551,9 @@ fn parse_inline_or_anchor_body(
             anchor_position,
             shape,
             chart_rel_id,
-            chart_text: Vec::new(),
+            chart_text: std::sync::Arc::default(),
             dgm_data_rel_id,
-            dgm_text: Vec::new(),
+            dgm_text: std::sync::Arc::default(),
         }))
     } else {
         Ok(None)
