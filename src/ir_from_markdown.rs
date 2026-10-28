@@ -46,6 +46,7 @@ impl DocumentIR {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn from_markdown_with_list_limit(
         markdown: &str,
         format: DocumentFormat,
