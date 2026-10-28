@@ -370,3 +370,98 @@ pub fn headers_footers(instance: u16, flags: u16, strings: &[(u16, &str)]) -> Ve
     }
     container(RT_HEADERS_FOOTERS, instance, &children)
 }
+
+/// `DocumentAtom` ([MS-PPT] 2.4.2).
+const RT_DOCUMENT_ATOM: u16 = 0x03E9;
+/// `OfficeArtDgContainer` ([MS-ODRAW] 2.2.13).
+const RT_DG_CONTAINER: u16 = 0xF002;
+/// `OfficeArtSpgrContainer` ([MS-ODRAW] 2.2.16).
+const RT_SPGR_CONTAINER: u16 = 0xF003;
+
+/// A deck for the persist-directory and container-claim paths: one slide
+/// container per `slide_texts` entry, and a slide list with one entry per
+/// `entry_targets` byte. Entry `i` has persist id `2 + i`, and the persist
+/// directory maps it to a slide container (`target % (slides + 2)` below the
+/// slide count), to nothing (`slides`), or to the middle of the first slide's
+/// header (`slides + 1`). With `nest` the slide containers after the first sit
+/// inside it, so their claims overlap it.
+pub fn aliasing_deck(slide_texts: &[String], nest: bool, entry_targets: &[u8]) -> Vec<u8> {
+    let slide = |text: &str, nested: &[u8]| {
+        let shape = container(RT_SHAPE, 0, &atom(RT_TEXT_CHARS, 0, &utf16(text)));
+        container(
+            RT_SLIDE,
+            0,
+            &[
+                atom(RT_SLIDE_ATOM, 0, &[0u8; 32]),
+                container(RT_DG_CONTAINER, 0, &container(RT_SPGR_CONTAINER, 0, &shape)),
+                nested.to_vec(),
+            ]
+            .concat(),
+        )
+    };
+    let entries = entry_targets.len();
+    let list: Vec<u8> = (0..entries as u32)
+        .flat_map(|i| {
+            let mut body = (2 + i).to_le_bytes().to_vec();
+            body.extend_from_slice(&[0u8; 12]);
+            atom(RT_SLIDE_PERSIST_ATOM, 0, &body)
+        })
+        .collect();
+    let doc = container(
+        RT_DOCUMENT,
+        0,
+        &[
+            atom(RT_DOCUMENT_ATOM, 0, &[0u8; 48]),
+            container(RT_SLIDE_LIST_WITH_TEXT, 0, &list),
+        ]
+        .concat(),
+    );
+    let edit_len = 8 + 28;
+    let dir_len = 8 + 4 + 4 * (1 + entries);
+    let slides_at = doc.len() + edit_len + dir_len;
+    let n = slide_texts.len();
+    // Each slide container's offset, and the bytes that follow the directory.
+    let mut slide_offsets = Vec::with_capacity(n);
+    let mut slides_bytes = Vec::new();
+    if nest && n > 1 {
+        let inner: Vec<Vec<u8>> = slide_texts[1..].iter().map(|t| slide(t, &[])).collect();
+        let outer = slide(&slide_texts[0], &inner.concat());
+        let inner_at = slides_at + outer.len() - inner.iter().map(Vec::len).sum::<usize>();
+        slide_offsets.push(slides_at);
+        let mut at = inner_at;
+        for i in &inner {
+            slide_offsets.push(at);
+            at += i.len();
+        }
+        slides_bytes = outer;
+    } else {
+        for t in slide_texts {
+            slide_offsets.push(slides_at + slides_bytes.len());
+            slides_bytes.extend(slide(t, &[]));
+        }
+    }
+    let target_offset = |t: u8| -> u32 {
+        let k = usize::from(t) % (n + 2);
+        match k {
+            _ if k < n => slide_offsets[k] as u32,
+            _ if k == n => 0xFFFF_FFF0,
+            _ => (slides_at + 8) as u32,
+        }
+    };
+    // `PersistDirectoryAtom` ([MS-PPT] 2.3.4): one run starting at persist id
+    // 1 (the document), followed by one offset per id.
+    let dir_offset = doc.len() + edit_len;
+    let mut dir = (1u32 | ((1 + entries as u32) << 20)).to_le_bytes().to_vec();
+    dir.extend_from_slice(&0u32.to_le_bytes());
+    for &t in entry_targets {
+        dir.extend_from_slice(&target_offset(t).to_le_bytes());
+    }
+    let mut edit = vec![0u8; 28];
+    edit[12..16].copy_from_slice(&(dir_offset as u32).to_le_bytes());
+    edit[16..20].copy_from_slice(&1u32.to_le_bytes());
+    let mut stream = doc;
+    stream.extend(atom(RT_USER_EDIT_ATOM, 0, &edit));
+    stream.extend(atom(RT_PERSIST_DIRECTORY_ATOM, 0, &dir));
+    stream.extend(slides_bytes);
+    super::cfb_with_stream("PowerPoint Document", &stream)
+}

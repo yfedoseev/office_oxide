@@ -1434,3 +1434,39 @@ pub fn cfb_with_streams(streams: &[(&str, &[u8])]) -> Vec<u8> {
     }
     file
 }
+
+/// A BIFF8 `.xls` ([MS-XLS]) of one `NUMBER` cell per `(row, col)` pair in
+/// each sheet, for the paths that pad sparse rows: sheet `i` is named `S{i}`.
+#[allow(dead_code)]
+pub fn sparse_xls(sheets: &[Vec<(u16, u16)>]) -> Vec<u8> {
+    let bof = |dt: u16| {
+        // BOF ([MS-XLS] 2.4.21): vers 0x0600, dt, then build/year/flags.
+        let mut b = 0x0600u16.to_le_bytes().to_vec();
+        b.extend_from_slice(&dt.to_le_bytes());
+        b.extend_from_slice(&[0u8; 12]);
+        biff(0x0809, &b)
+    };
+    let mut s = bof(0x0005);
+    for i in 0..sheets.len() {
+        // BoundSheet8 ([MS-XLS] 2.4.28): lbPlyPos, hsState, dt, name.
+        let name = format!("S{i}");
+        let mut b = 0u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&[0, 0, name.len() as u8, 0]);
+        b.extend_from_slice(name.as_bytes());
+        s.extend(biff(0x0085, &b));
+    }
+    s.extend(biff(0x000A, &[]));
+    for cells in sheets {
+        s.extend(bof(0x0010));
+        for &(row, col) in cells {
+            // Number ([MS-XLS] 2.4.180): rw, col, ixfe, num.
+            let mut d = row.to_le_bytes().to_vec();
+            d.extend_from_slice(&col.to_le_bytes());
+            d.extend_from_slice(&0u16.to_le_bytes());
+            d.extend_from_slice(&1.0f64.to_le_bytes());
+            s.extend(biff(0x0203, &d));
+        }
+        s.extend(biff(0x000A, &[]));
+    }
+    cfb_with_stream("Workbook", &s)
+}

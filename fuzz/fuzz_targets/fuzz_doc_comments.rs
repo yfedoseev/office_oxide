@@ -14,7 +14,7 @@ mod common;
 use std::io::Cursor;
 
 use common::{
-    FibTweaks, Para, Subdocs, build_doc_streams, cfb_with_streams, prose_grpprl, with_comment_plcs,
+    build_doc_streams, cfb_with_streams, prose_grpprl, with_comment_plcs, FibTweaks, Para, Subdocs,
 };
 use libfuzzer_sys::fuzz_target;
 use office_oxide::{Document, DocumentFormat};
@@ -30,8 +30,15 @@ fuzz_target!(|data: &[u8]| {
     if cps.len() < 3 {
         return;
     }
-    let paras = vec![Para { text: "body", terminator: '\r', grpprl: prose_grpprl() }];
-    let subdocs = Subdocs { comments: STORY, ..Default::default() };
+    let paras = vec![Para {
+        text: "body",
+        terminator: '\r',
+        grpprl: prose_grpprl(),
+    }];
+    let subdocs = Subdocs {
+        comments: STORY,
+        ..Default::default()
+    };
     let (mut word_doc, mut table) = build_doc_streams(&paras, &subdocs, FibTweaks::default());
     with_comment_plcs(&mut word_doc, &mut table, &cps);
     let bytes = cfb_with_streams(&[("WordDocument", &word_doc), ("0Table", &table)]);
