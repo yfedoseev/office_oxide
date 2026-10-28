@@ -51,7 +51,6 @@ pub(crate) struct SheetConverter<'d> {
     doc: &'d crate::xlsx::XlsxDocument,
     scope: IrScope,
     formatter: crate::xlsx::text::CellFormatter<'d>,
-    date_indices: std::collections::HashSet<u32>,
     // Theme colours resolve cell fills; parsed once per document.
     theme: Option<std::borrow::Cow<'d, crate::core::theme::Theme>>,
     // Single String buffer reused across all cells — clear() keeps the heap
@@ -101,14 +100,12 @@ impl<'d> SheetConverter<'d> {
         // Date styles found once and custom number formats compiled once, not
         // re-scanned and re-parsed per cell.
         let formatter = crate::xlsx::text::CellFormatter::new(doc);
-        let date_indices = formatter.date_indices().clone();
         let total_image =
             usize::try_from(crate::limits::max_total_image_bytes()).unwrap_or(usize::MAX);
         Self {
             doc,
             scope,
             formatter,
-            date_indices,
             theme: doc.theme_for_render(),
             buf: String::new(),
             budget: crate::limits::TextBudget::new(),
@@ -294,7 +291,6 @@ impl<'d> SheetConverter<'d> {
         let doc = self.doc;
         let Self {
             formatter,
-            date_indices,
             theme,
             buf,
             budget,
@@ -409,7 +405,7 @@ impl<'d> SheetConverter<'d> {
                     std::mem::take(buf)
                 };
                 let (data_type, raw_number, number_format, number_format_id) =
-                    cell_semantics(doc, cell, date_indices, format_code_omitted);
+                    cell_semantics(doc, cell, formatter.date_indices(), format_code_omitted);
                 cells.push(CellData {
                     col: cell.reference.col,
                     hyperlink: link.map(|(target, _)| target.clone()),

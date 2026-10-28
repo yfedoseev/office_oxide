@@ -133,6 +133,8 @@ pub struct XlsxDocument {
     // Raw bytes for lazy parsing (None after parsing or if not present)
     styles_data: Option<Vec<u8>>,
     theme_data: Option<Vec<u8>>,
+    // Workbook-level tables built on first render and shared by every sheet.
+    render_cache: text::RenderCache,
 }
 
 impl XlsxDocument {
@@ -152,10 +154,9 @@ impl XlsxDocument {
         match &self.theme {
             Some(t) => Some(std::borrow::Cow::Borrowed(t)),
             None => self
-                .theme_data
-                .as_ref()
-                .and_then(|d| Theme::parse(d).ok())
-                .map(std::borrow::Cow::Owned),
+                .render_cache
+                .theme(self.theme_data.as_deref())
+                .map(std::borrow::Cow::Borrowed),
         }
     }
 
@@ -678,6 +679,7 @@ impl XlsxDocument {
             unreadable_parts_omitted: shared.unreadable.omitted,
             styles_data: None,
             theme_data,
+            render_cache: Default::default(),
         })
     }
 }
