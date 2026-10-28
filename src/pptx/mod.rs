@@ -313,9 +313,12 @@ impl PptxDocument {
                     continue;
                 },
             };
-            let slide_rels = opc
-                .read_rels_for(&part_name)
-                .unwrap_or_else(|_| Relationships::empty());
+            // A relationships part that cannot be read leaves the slide with
+            // none, and says so.
+            let slide_rels = opc.read_rels_for(&part_name).unwrap_or_else(|e| {
+                record(&part_name.rels_path(), &e);
+                Relationships::empty()
+            });
             let slide_data = match opc.read_part(&part_name) {
                 Ok(d) => Ok(d),
                 Err(e) => {

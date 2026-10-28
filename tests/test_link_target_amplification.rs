@@ -16,6 +16,8 @@ use office_oxide::{Document, DocumentFormat};
 const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const PKG_REL: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 const WML: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const PML: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
+const DML: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
 
 /// The length of the shared target: a long but admissible address.
 const TARGET_LEN: usize = 50_000;
@@ -84,6 +86,35 @@ fn docx(target: &str, links: usize, fragments: bool) -> Vec<u8> {
     ])
 }
 
+fn pptx(target: &str, links: usize) -> Vec<u8> {
+    let mut paras = String::new();
+    for i in 0..links {
+        paras.push_str(&format!(
+            r#"<a:p><a:r><a:rPr><a:hlinkClick r:id="rId1"/></a:rPr><a:t>link{i}</a:t></a:r></a:p>"#
+        ));
+    }
+    let slide = format!(
+        r#"<p:sld xmlns:p="{PML}" xmlns:a="{DML}" xmlns:r="{REL}"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="2" name="T"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/>{paras}</p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#
+    );
+    zip_of(vec![
+        ("[Content_Types].xml".to_string(), r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/><Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/></Types>"#.to_string()),
+        ("_rels/.rels".to_string(), rels(&[("rId1", "officeDocument", "ppt/presentation.xml", false)])),
+        (
+            "ppt/presentation.xml".to_string(),
+            format!(r#"<p:presentation xmlns:p="{PML}" xmlns:r="{REL}"><p:sldIdLst><p:sldId id="256" r:id="rId2"/></p:sldIdLst><p:sldSz cx="9144000" cy="6858000"/></p:presentation>"#),
+        ),
+        (
+            "ppt/_rels/presentation.xml.rels".to_string(),
+            rels(&[("rId2", "slide", "slides/slide1.xml", false)]),
+        ),
+        ("ppt/slides/slide1.xml".to_string(), slide),
+        (
+            "ppt/slides/_rels/slide1.xml.rels".to_string(),
+            rels(&[("rId1", "hyperlink", target, true)]),
+        ),
+    ])
+}
+
 /// Every hyperlink target in the IR's text spans, and how many bytes they hold.
 fn linked_spans(ir: &DocumentIR) -> (usize, usize) {
     fn walk(elements: &[Element], count: &mut usize, bytes: &mut usize) {
@@ -132,6 +163,13 @@ fn test_relationship_target_beyond_the_length_cap_is_refused() {
     let bytes = docx(&url(1 << 20), 400, false);
     let err = DocxDocument::from_reader(Cursor::new(bytes)).unwrap_err();
     assert!(err.to_string().contains("Target"), "{err}");
+    let bytes = pptx(&url(1 << 20), 300);
+    // A slide whose relationships are refused is reported, not shown without
+    // them in silence.
+    let doc = office_oxide::pptx::PptxDocument::from_reader(Cursor::new(bytes)).unwrap();
+    let (part, reason) = &doc.unreadable_parts[0];
+    assert!(part.ends_with("slide1.xml.rels"), "{part}");
+    assert!(reason.contains("Target"), "{reason}");
 }
 
 // ---------------------------------------------------------------------------
@@ -228,4 +266,51 @@ fn test_docx_fragment_copies_made_while_reading_are_charged() {
         ir.metadata.warnings
     );
     assert!(ir.metadata.text_truncated);
+}
+
+// ---------------------------------------------------------------------------
+// PPTX
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_pptx_runs_naming_one_relationship_share_its_text_and_ir_copies_are_charged() {
+    limits();
+    let bytes = pptx(&url(TARGET_LEN), LINKS);
+    let doc = office_oxide::pptx::PptxDocument::from_reader(Cursor::new(bytes.clone())).unwrap();
+    let mut targets = Vec::new();
+    for shape in &doc.slides[0].shapes {
+        if let office_oxide::pptx::Shape::AutoShape(a) = shape {
+            for p in &a.text_body.as_ref().unwrap().paragraphs {
+                for c in &p.content {
+                    if let office_oxide::pptx::TextContent::Run(r) = c {
+                        if let Some(h) = &r.hyperlink {
+                            if let office_oxide::pptx::HyperlinkTarget::External(t) = &h.target {
+                                targets.push(t.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(targets.len(), LINKS);
+    assert!(
+        targets
+            .iter()
+            .all(|t| std::sync::Arc::ptr_eq(t, &targets[0]))
+    );
+
+    let ir = Document::from_reader(Cursor::new(bytes), DocumentFormat::Pptx)
+        .unwrap()
+        .to_ir();
+    let (count, bytes) = linked_spans(&ir);
+    assert!(
+        count > 0 && count < LINKS && bytes <= TEXT_BUDGET,
+        "{count} links, {bytes} bytes"
+    );
+    assert_budget_notice(&ir);
+    let text = ir.plain_text();
+    for i in 0..LINKS {
+        assert!(text.contains(&format!("link{i}")), "link{i} lost");
+    }
 }
