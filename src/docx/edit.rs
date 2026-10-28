@@ -144,27 +144,44 @@ fn replace_across_runs(xml: &str, find: &str, replace: &str) -> (String, usize) 
             at += nodes[i].text.len();
         }
         let mut out: Vec<String> = vec![String::new(); group.len()];
+        // The matches are sorted and do not overlap, and the spans are
+        // sorted and contiguous, so both walks over the spans only move
+        // forward: `first` is the first span that ends after the text
+        // copied so far, and `start_node` the first that ends after the
+        // current match start.
+        let mut first = 0usize;
+        let mut start_node = 0usize;
         // Copy `joined[a..b]` into the nodes that hold it.
-        let copy = |out: &mut Vec<String>, a: usize, b: usize| {
-            for (k, &(s, e)) in spans.iter().enumerate() {
+        let copy = |out: &mut Vec<String>, first: &mut usize, a: usize, b: usize| {
+            while *first < spans.len() && spans[*first].1 <= a {
+                *first += 1;
+            }
+            let mut k = *first;
+            while k < spans.len() && spans[k].0 < b {
+                let (s, e) = spans[k];
                 let (lo, hi) = (a.max(s), b.min(e));
                 if lo < hi {
                     out[k].push_str(&joined[lo..hi]);
                 }
+                k += 1;
             }
         };
         let mut cur = 0;
         for &(s, e) in &matches {
-            copy(&mut out, cur, s);
+            copy(&mut out, &mut first, cur, s);
             // The node the match starts in (`s < e`, so it holds `s`).
-            let k = spans
-                .iter()
-                .position(|&(a, b)| a <= s && s < b)
-                .unwrap_or(0);
+            while start_node < spans.len() && spans[start_node].1 <= s {
+                start_node += 1;
+            }
+            let k = if start_node < spans.len() && spans[start_node].0 <= s {
+                start_node
+            } else {
+                0
+            };
             out[k].push_str(replace);
             cur = e;
         }
-        copy(&mut out, cur, joined.len());
+        copy(&mut out, &mut first, cur, joined.len());
         for (k, &i) in group.iter().enumerate() {
             if out[k] != nodes[i].text {
                 new_text[i] = Some(std::mem::take(&mut out[k]));
@@ -271,6 +288,169 @@ fn scan_text_nodes(xml: &str) -> Vec<TextNode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-match span rescans `replace_across_runs` replaced, kept as the
+    /// reference its output must equal.
+    fn replace_across_runs_reference(xml: &str, find: &str, replace: &str) -> (String, usize) {
+        if find.is_empty() {
+            return (xml.to_string(), 0);
+        }
+        let nodes = scan_text_nodes(xml);
+
+        // Group the nodes by paragraph, keeping document order.
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        let mut group_of: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        for (i, n) in nodes.iter().enumerate() {
+            let g = *group_of.entry(n.paragraph).or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
+            });
+            groups[g].push(i);
+        }
+
+        let mut new_text: Vec<Option<String>> = vec![None; nodes.len()];
+        let mut count = 0;
+        for group in &groups {
+            let joined: String = group.iter().map(|&i| nodes[i].text.as_str()).collect();
+            let matches: Vec<(usize, usize)> = joined
+                .match_indices(find)
+                .map(|(s, m)| (s, s + m.len()))
+                .collect();
+            if matches.is_empty() {
+                continue;
+            }
+            count += matches.len();
+            // Each node's span in `joined`.
+            let mut spans = Vec::with_capacity(group.len());
+            let mut at = 0;
+            for &i in group {
+                spans.push((at, at + nodes[i].text.len()));
+                at += nodes[i].text.len();
+            }
+            let mut out: Vec<String> = vec![String::new(); group.len()];
+            // Copy `joined[a..b]` into the nodes that hold it.
+            let copy = |out: &mut Vec<String>, a: usize, b: usize| {
+                for (k, &(s, e)) in spans.iter().enumerate() {
+                    let (lo, hi) = (a.max(s), b.min(e));
+                    if lo < hi {
+                        out[k].push_str(&joined[lo..hi]);
+                    }
+                }
+            };
+            let mut cur = 0;
+            for &(s, e) in &matches {
+                copy(&mut out, cur, s);
+                // The node the match starts in (`s < e`, so it holds `s`).
+                let k = spans
+                    .iter()
+                    .position(|&(a, b)| a <= s && s < b)
+                    .unwrap_or(0);
+                out[k].push_str(replace);
+                cur = e;
+            }
+            copy(&mut out, cur, joined.len());
+            for (k, &i) in group.iter().enumerate() {
+                if out[k] != nodes[i].text {
+                    new_text[i] = Some(std::mem::take(&mut out[k]));
+                }
+            }
+        }
+        if count == 0 {
+            return (xml.to_string(), 0);
+        }
+
+        let mut result = String::with_capacity(xml.len());
+        let mut pos = 0;
+        for (n, text) in nodes.iter().zip(&new_text) {
+            let Some(text) = text else { continue };
+            let tag = &xml[n.tag_start..n.tag_end];
+            result.push_str(&xml[pos..n.tag_start]);
+            // Text that now starts or ends with whitespace needs
+            // `xml:space="preserve"`, or Word drops that whitespace.
+            let edge_space =
+                text.starts_with(char::is_whitespace) || text.ends_with(char::is_whitespace);
+            if edge_space && !tag.contains("xml:space") {
+                result.push_str(&tag[..tag.len() - 1]);
+                result.push_str(r#" xml:space="preserve">"#);
+            } else {
+                result.push_str(tag);
+            }
+            result.push_str(&quick_xml::escape::escape(text.as_str()));
+            pos = n.content_end;
+        }
+        result.push_str(&xml[pos..]);
+        (result, count)
+    }
+
+    /// A paragraph whose text is split into runs at varied points, searched
+    /// for strings that fall inside a run, across runs, at the ends, next to
+    /// empty runs and overlapping themselves, gives the reference's result.
+    #[test]
+    fn test_replace_across_runs_equals_the_reference_on_varied_splits() {
+        let text = "abababcabca&b<aa";
+        let finds = [
+            "a",
+            "ab",
+            "aba",
+            "abc",
+            "ca&",
+            "b<",
+            "aa",
+            "abababcabca&b<aa",
+            "zz",
+            "c",
+        ];
+        let mut state = 11u32;
+        for _ in 0..400 {
+            // Cut the text at pseudo-random byte offsets (all ASCII), with
+            // some empty runs, and wrap it in paragraphs.
+            let mut xml = String::from("<w:p>");
+            let mut at = 0;
+            while at < text.len() {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let take = 1 + (state >> 20) as usize % 4;
+                let end = (at + take).min(text.len());
+                if state & 0x10 != 0 {
+                    xml.push_str("<w:r><w:t></w:t></w:r>");
+                }
+                let piece = text[at..end].replace('&', "&amp;").replace('<', "&lt;");
+                xml.push_str(&format!("<w:r><w:t>{piece}</w:t></w:r>"));
+                at = end;
+            }
+            xml.push_str("</w:p><w:p><w:r><w:t>ab</w:t></w:r><w:r><w:t>a</w:t></w:r></w:p>");
+            for find in finds {
+                for replace in ["", "X", "longer"] {
+                    assert_eq!(
+                        replace_across_runs(&xml, find, replace),
+                        replace_across_runs_reference(&xml, find, replace),
+                        "find {find:?} replace {replace:?} in {xml}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// One paragraph of many one-character runs with a match in every run
+    /// took time in matches times runs.
+    #[test]
+    fn test_replace_across_many_runs_is_not_quadratic() {
+        let runs = 30_000;
+        let mut xml = String::from("<w:p>");
+        for _ in 0..runs {
+            xml.push_str("<w:r><w:t>a</w:t></w:r>");
+        }
+        xml.push_str("</w:p>");
+        let start = std::time::Instant::now();
+        let (out, count) = replace_across_runs(&xml, "a", "b");
+        assert_eq!(count, runs);
+        assert_eq!(out.matches("<w:t>b</w:t>").count(), runs);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            start.elapsed()
+        );
+    }
 
     #[test]
     fn test_replace_in_wt_simple() {
