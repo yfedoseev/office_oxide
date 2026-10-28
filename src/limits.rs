@@ -91,17 +91,24 @@ pub fn set_max_text_chars(chars: usize) {
     MAX_TEXT_CHARS.store(chars, Ordering::Relaxed);
 }
 
-/// The default per-document allowance of empty grid slots: 32 Mi.
+/// The default per-document allowance of empty grid slots: 8 Mi.
 ///
 /// A legacy `.xls` sheet is stored as rows that run to their last used
 /// column, so one number in column 255 of each of 65,535 rows costs 256
 /// slots per row: 16.7M slots from 65,535 records, and six such sheets
-/// made a 7 MB file allocate 2.6 GB. Only the *empty* slots that pad a
-/// row out to its last cell are charged, never the cells themselves, so a
-/// dense 65,536 x 256 sheet (which carries 16.7M cells and a file to
-/// match) costs nothing, and one sheet with a cell in the last column of
-/// every row still fits.
-pub const DEFAULT_MAX_GRID_PADDING_CELLS: usize = 32 << 20;
+/// made a 7 MB file allocate 2.6 GB. Each slot is a `CellValue` and an
+/// `XF` index in the sheet, and converting the sheet to the IR adds a table
+/// cell for it, about 70 bytes in all: the earlier 32 Mi allowance let that
+/// file reach 0.9 GB on open and 2.1 GB in `to_ir`; 8 Mi bounds both near a
+/// quarter of that. Only the *empty* slots that pad a row out to its last
+/// cell are charged, never the cells themselves, so a dense 65,536 x 256
+/// sheet (which carries 16.7M cells and a file to match) costs nothing, and
+/// a sheet whose rows reach their last column with up to about 32,000 rows
+/// of nothing in between still fits. A workbook that needs more is cut at
+/// the row that does not fit, loudly; processes that read such workbooks
+/// raise the allowance with
+/// [the setter](crate::limits::set_max_grid_padding_cells).
+pub const DEFAULT_MAX_GRID_PADDING_CELLS: usize = 8 << 20;
 
 static MAX_GRID_PADDING_CELLS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_GRID_PADDING_CELLS);
 
@@ -114,6 +121,64 @@ pub fn max_grid_padding_cells() -> usize {
 /// afterwards. `usize::MAX` disables the bound.
 pub fn set_max_grid_padding_cells(cells: usize) {
     MAX_GRID_PADDING_CELLS.store(cells, Ordering::Relaxed);
+}
+
+/// The default per-document allowance of inflated image bytes: 256 Mi.
+///
+/// A compressed metafile picture (EMF/WMF/PICT) declares its uncompressed
+/// size and is stored as a zlib stream, which can shrink a run of zeros a
+/// thousandfold: four such pictures in a 1 MB `.ppt` inflated to 3.3 GB.
+/// Every compressed picture of a document is charged its declared size
+/// against this allowance before it is inflated; one that does not fit is
+/// left out. Pictures stored uncompressed are bounded by the file itself and
+/// cost nothing.
+pub const DEFAULT_MAX_INFLATED_IMAGE_BYTES: u64 = 256 << 20;
+
+static MAX_INFLATED_IMAGE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_INFLATED_IMAGE_BYTES);
+
+/// The per-document allowance of bytes a legacy file's compressed metafile
+/// pictures may inflate to.
+pub fn max_inflated_image_bytes() -> u64 {
+    MAX_INFLATED_IMAGE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Set the per-document inflated-image allowance for every document read
+/// afterwards. `u64::MAX` disables the bound.
+pub fn set_max_inflated_image_bytes(bytes: u64) {
+    MAX_INFLATED_IMAGE_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// A document's remaining allowance of inflated image bytes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InflateBudget {
+    remaining: u64,
+}
+
+impl InflateBudget {
+    pub(crate) fn new() -> Self {
+        Self::with_limit(max_inflated_image_bytes())
+    }
+
+    pub(crate) fn with_limit(total: u64) -> Self {
+        Self { remaining: total }
+    }
+
+    /// Reserve `bytes` before inflating them. `false` when they do not fit;
+    /// nothing is taken then, so a smaller picture later can still fit.
+    pub(crate) fn reserve(&mut self, bytes: u64) -> bool {
+        match self.remaining.checked_sub(bytes) {
+            Some(rest) => {
+                self.remaining = rest;
+                true
+            },
+            None => false,
+        }
+    }
+
+    /// Give back the part of a reservation the picture did not use.
+    pub(crate) fn release(&mut self, bytes: u64) {
+        self.remaining = self.remaining.saturating_add(bytes);
+    }
 }
 
 /// A document's remaining allowance of empty grid slots.

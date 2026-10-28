@@ -100,6 +100,28 @@ pub struct LinkRange {
     pub url: String,
 }
 
+/// What one formatting span or link range costs the budget besides any text
+/// it holds: the size of the record that stores it.
+const SPAN_COST: usize = 32;
+
+/// The size of the hyperlink target and placeholder role copied onto every
+/// text run a shape produces. A target can be kilobytes and the shape's many
+/// runs each hold their own copy, so the copies are charged with the text.
+fn copied_label_cost(hyperlink: Option<&str>, role: Option<&str>) -> usize {
+    hyperlink.map_or(0, str::len) + role.map_or(0, str::len)
+}
+
+/// The size of the formatting spans and link ranges (with their targets) a
+/// stored run carries and a clone of it copies.
+fn stored_spans_cost(run: &TextRun) -> usize {
+    (run.para_formats.len() + run.char_formats.len()) * SPAN_COST
+        + run
+            .link_ranges
+            .iter()
+            .map(|r| r.url.len() + SPAN_COST)
+            .sum::<usize>()
+}
+
 /// Extract per-slide text from a "PowerPoint Document" stream.
 ///
 /// `current_user` is the raw "Current User" stream, if present.
@@ -372,6 +394,7 @@ fn extract_slides_via_persist(
     let mut slide_offsets: std::collections::HashSet<Option<usize>> =
         std::collections::HashSet::new();
     let mut aliased_entries = 0usize;
+    let mut claims = ContainerClaims::default();
     let mut slides_cut_by_budget = false;
     for entry in slide_list_entries(&slide_list) {
         if !slide_offsets.insert(dir.resolve(entry.persist_id_ref)) {
@@ -387,6 +410,7 @@ fn extract_slides_via_persist(
             &hyperlinks,
             &ole_objects,
             &mut text_budget,
+            &mut claims,
         );
         let hf_texts = links
             .headers_footers
@@ -439,6 +463,7 @@ fn extract_slides_via_persist(
                 &hyperlinks,
                 &ole_objects,
                 &mut text_budget,
+                &mut claims,
             ) else {
                 continue;
             };
@@ -508,6 +533,12 @@ fn extract_slides_via_persist(
         notices.push(format!(
             "{aliased_entries} slide-list entries name a slide or notes page that an earlier \
              entry already names, or name none; they were left out"
+        ));
+    }
+    if claims.refused > 0 {
+        notices.push(format!(
+            "{} slide or notes containers overlap an earlier one; they were left out",
+            claims.refused
         ));
     }
     if slides_cut_by_budget || text_budget.exhausted() {
@@ -901,8 +932,12 @@ fn resolve_notes(
     hyperlinks: &HashMap<u32, String>,
     ole_objects: &HashMap<u32, OleObjectInfo>,
     budget: &mut crate::limits::TextBudget,
+    claims: &mut ContainerClaims,
 ) -> Option<(Vec<TextRun>, Option<u32>)> {
     let offset = dir.resolve(persist_id_ref)?;
+    if !claims.claim(stream, offset, RT_NOTES) {
+        return None;
+    }
     let children = bounded_container_children(stream, offset, RT_NOTES)?;
     let slide_id_ref = RecordIter::new(&children)
         .filter_map(Result::ok)
@@ -931,6 +966,57 @@ fn resolve_notes(
     Some((runs, slide_id_ref))
 }
 
+/// The byte ranges of the `Slide` and `Notes` containers read so far.
+///
+/// The persist directory can map any number of ids to offsets inside one
+/// another, so that each of thousands of "slides" is a container that covers
+/// most of the stream. Every one is then parsed and copied in full, and the
+/// text budget does not slow that down when the containers hold no text. A
+/// genuine deck's containers are disjoint, so one that overlaps an earlier
+/// one is left out; the work of reading all of them is then at most the
+/// stream's length.
+#[derive(Default)]
+struct ContainerClaims {
+    /// `start -> end` of each accepted container, disjoint.
+    ranges: std::collections::BTreeMap<usize, usize>,
+    /// Containers refused for overlapping an accepted one.
+    refused: usize,
+}
+
+impl ContainerClaims {
+    /// Claim the container of type `rec_type` at `offset`. `false` when it
+    /// overlaps one already claimed (or is not that container at all, in
+    /// which case nothing is claimed and the caller finds that out itself).
+    fn claim(&mut self, stream: &[u8], offset: usize, rec_type: u16) -> bool {
+        let Some(header) = stream
+            .get(offset..offset.saturating_add(8))
+            .and_then(|b| RecordHeader::parse(b).ok())
+        else {
+            return true;
+        };
+        if header.rec_type != rec_type || !header.is_container() {
+            return true;
+        }
+        let end = offset
+            .saturating_add(8)
+            .saturating_add(header.rec_len as usize)
+            .min(stream.len());
+        // The nearest accepted range starting before `end` is the only one
+        // that can reach back over `offset`: the ranges are disjoint.
+        let overlaps = self
+            .ranges
+            .range(..end)
+            .next_back()
+            .is_some_and(|(_, &other_end)| other_end > offset);
+        if overlaps {
+            self.refused += 1;
+            return false;
+        }
+        self.ranges.insert(offset, end);
+        true
+    }
+}
+
 /// Resolve one slide's shape text: locate its `Slide` container via the
 /// persist directory and walk its shape tree, resolving any
 /// `OutlineTextRefAtom` references against `outline_texts`. Also returns
@@ -949,6 +1035,7 @@ fn resolve_slide(
     hyperlinks: &HashMap<u32, String>,
     ole_objects: &HashMap<u32, OleObjectInfo>,
     budget: &mut crate::limits::TextBudget,
+    claims: &mut ContainerClaims,
 ) -> (SlideText, SlideLinks) {
     let mut text_runs = Vec::new();
     let mut tables = Vec::new();
@@ -958,7 +1045,10 @@ fn resolve_slide(
     let mut notes_id_ref = None;
     let mut headers_footers = None;
     let mut master = None;
-    if let Some(offset) = dir.resolve(persist_id_ref) {
+    if let Some(offset) = dir
+        .resolve(persist_id_ref)
+        .filter(|&o| claims.claim(stream, o, RT_SLIDE))
+    {
         if let Some(children) = bounded_container_children(stream, offset, RT_SLIDE) {
             master = slide_master_ref(&children);
             headers_footers = find_child(&children, RT_HEADER_FOOTER, HF_INSTANCE_SLIDES)
@@ -1236,6 +1326,9 @@ fn extract_shape_text_in(
     // giving the character range, within the *most recently pushed* text
     // run, that the hyperlink actually covers.
     let mut last_text_run_idx: Option<usize> = None;
+    // The UTF-16 offset map of the run the link ranges are being applied to,
+    // built once per run rather than once per range.
+    let mut link_offsets: Option<(usize, Utf16Offsets)> = None;
     let mut pending_interactive: Option<(u32, u8)> = None;
 
     for rec in RecordIter::new(data) {
@@ -1250,7 +1343,9 @@ fn extract_shape_text_in(
             RT_TEXT_CHARS => {
                 let text = decode_utf16le(&rec.data);
                 if !text.is_empty() {
-                    if !budget.charge(text.len()) {
+                    if !budget.charge(
+                        text.len() + copied_label_cost(current_hyperlink, current_placeholder_role),
+                    ) {
                         return;
                     }
                     out.push(TextRun {
@@ -1266,7 +1361,9 @@ fn extract_shape_text_in(
             RT_TEXT_BYTES => {
                 let text = decode_text_bytes(&rec.data);
                 if !text.is_empty() {
-                    if !budget.charge(text.len()) {
+                    if !budget.charge(
+                        text.len() + copied_label_cost(current_hyperlink, current_placeholder_role),
+                    ) {
                         return;
                     }
                     out.push(TextRun {
@@ -1293,7 +1390,16 @@ fn extract_shape_text_in(
                         // stored once, so repeating the reference copies the
                         // run once per repeat: charge each copy before making
                         // it, and stop at the first one that does not fit.
-                        if !run.text.is_empty() && !budget.charge(run.text.len()) {
+                        if !run.text.is_empty()
+                            && !budget.charge(
+                                run.text.len()
+                                    + stored_spans_cost(run)
+                                    + copied_label_cost(
+                                        current_hyperlink,
+                                        current_placeholder_role,
+                                    ),
+                            )
+                        {
                             return;
                         }
                         if !run.text.is_empty() {
@@ -1329,6 +1435,10 @@ fn extract_shape_text_in(
                 {
                     if matches!(action, 0x03 | 0x04 | 0x07) {
                         if let Some(url) = hyperlinks.get(&ex_hyperlink_id_ref) {
+                            // Every range holds its own copy of the target.
+                            if !budget.charge(url.len() + SPAN_COST) {
+                                return;
+                            }
                             let begin = i32::from_le_bytes([
                                 rec.data[0],
                                 rec.data[1],
@@ -1343,7 +1453,12 @@ fn extract_shape_text_in(
                                 rec.data[7],
                             ])
                             .max(0) as usize;
-                            add_link_range(out, idx, begin, end, url);
+                            if link_offsets.as_ref().map(|(i, _)| *i) != Some(idx) {
+                                link_offsets = Some((idx, Utf16Offsets::new(&out[idx].text)));
+                            }
+                            if let Some((_, offsets)) = &link_offsets {
+                                add_link_range(out, idx, offsets, begin, end, url);
+                            }
                         }
                     }
                 }
@@ -1960,11 +2075,18 @@ fn resolve_shape_pib(shape_data: &[u8]) -> Option<usize> {
 /// The run is not split: splitting it into prefix/link/suffix runs made
 /// each piece its own paragraph downstream, breaking the sentence around
 /// the link into three lines and dropping the spaces at the joins.
-fn add_link_range(out: &mut [TextRun], idx: usize, begin: usize, end: usize, url: &str) {
+fn add_link_range(
+    out: &mut [TextRun],
+    idx: usize,
+    offsets: &Utf16Offsets,
+    begin: usize,
+    end: usize,
+    url: &str,
+) {
     let Some(run) = out.get_mut(idx) else { return };
-    let len = run.text.chars().count();
-    let begin = utf16_to_char_index(&run.text, begin).min(len);
-    let end = utf16_to_char_index(&run.text, end).clamp(begin, len);
+    let len = offsets.chars;
+    let begin = offsets.char_index(begin).min(len);
+    let end = offsets.char_index(end).clamp(begin, len);
     if begin >= end {
         return; // empty or invalid range — leave the run untouched
     }
@@ -1987,34 +2109,64 @@ fn add_link_range(out: &mut [TextRun], idx: usize, begin: usize, end: usize, url
 /// stored in; the spans are parsed in those units and then converted to
 /// `char` indices, which is what every consumer slices by.
 fn apply_style_text_prop(run: &mut TextRun, data: &[u8]) {
-    let text_utf16_len = run.text.encode_utf16().count();
-    let (mut para_spans, mut char_spans) = style::parse_style_text_prop(data, text_utf16_len);
-    if text_utf16_len != run.text.chars().count() {
+    let offsets = Utf16Offsets::new(&run.text);
+    let (mut para_spans, mut char_spans) = style::parse_style_text_prop(data, offsets.units);
+    if offsets.units != offsets.chars {
         for s in &mut para_spans {
-            s.start = utf16_to_char_index(&run.text, s.start);
-            s.end = utf16_to_char_index(&run.text, s.end);
+            s.start = offsets.char_index(s.start);
+            s.end = offsets.char_index(s.end);
         }
         for s in &mut char_spans {
-            s.start = utf16_to_char_index(&run.text, s.start);
-            s.end = utf16_to_char_index(&run.text, s.end);
+            s.start = offsets.char_index(s.start);
+            s.end = offsets.char_index(s.end);
         }
     }
     run.para_formats = para_spans;
     run.char_formats = char_spans;
 }
 
-/// The `char` index of UTF-16 code unit offset `units` in `text` (an offset
-/// inside a surrogate pair rounds up to the next character; past the end
-/// clamps to the length).
-fn utf16_to_char_index(text: &str, units: usize) -> usize {
-    let mut seen = 0usize;
-    for (i, c) in text.chars().enumerate() {
-        if seen >= units {
-            return i;
+/// Maps UTF-16 code-unit offsets to `char` indices for one text, in one pass
+/// over it to build and a binary search per lookup. Only the characters
+/// outside the basic plane (two units each) make the two unit systems
+/// differ, so only those are recorded. A scan of the text per offset was
+/// quadratic in the number of style spans and link ranges.
+struct Utf16Offsets {
+    /// Number of `char`s in the text.
+    chars: usize,
+    /// Number of UTF-16 code units in the text.
+    units: usize,
+    /// For each non-BMP character, the unit offset just past it, ascending.
+    astral_ends: Vec<usize>,
+}
+
+impl Utf16Offsets {
+    fn new(text: &str) -> Self {
+        let mut units = 0usize;
+        let mut chars = 0usize;
+        let mut astral_ends = Vec::new();
+        for c in text.chars() {
+            units += c.len_utf16();
+            chars += 1;
+            if c.len_utf16() == 2 {
+                astral_ends.push(units);
+            }
         }
-        seen += c.len_utf16();
+        Self {
+            chars,
+            units,
+            astral_ends,
+        }
     }
-    text.chars().count()
+
+    /// The `char` index of UTF-16 code unit offset `units` (an offset inside
+    /// a surrogate pair rounds up to the next character; past the end clamps
+    /// to the length).
+    fn char_index(&self, units: usize) -> usize {
+        // Each non-BMP character wholly before `units` is one unit shorter
+        // in chars than in units.
+        let wholly_before = self.astral_ends.partition_point(|&end| end <= units);
+        units.saturating_sub(wholly_before).min(self.chars)
+    }
 }
 
 /// Text content of a single slide.
@@ -2255,11 +2407,63 @@ mod tests {
             ..Default::default()
         }];
         // Emoji = 2 units, space = 1: "link" is units 3..7, chars 2..6.
-        add_link_range(&mut out, 0, 3, 7, "http://example.com/");
+        let offsets = Utf16Offsets::new(text);
+        add_link_range(&mut out, 0, &offsets, 3, 7, "http://example.com/");
         assert_eq!((out[0].link_ranges[0].start, out[0].link_ranges[0].end), (2, 6));
-        assert_eq!(utf16_to_char_index(text, 2), 1);
-        assert_eq!(utf16_to_char_index(text, 1), 1, "inside the pair rounds up");
-        assert_eq!(utf16_to_char_index(text, 99), text.chars().count());
+        assert_eq!(offsets.char_index(2), 1);
+        assert_eq!(offsets.char_index(1), 1, "inside the pair rounds up");
+        assert_eq!(offsets.char_index(99), text.chars().count());
+    }
+
+    /// The offset map agrees with a plain scan at every offset, for text
+    /// mixing basic-plane and astral characters.
+    #[test]
+    fn test_utf16_offset_map_matches_a_linear_scan() {
+        let text = "a\u{1F600}b\u{1F601}\u{1F602}c\u{e9}";
+        let scan = |units: usize| {
+            let mut seen = 0usize;
+            for (i, c) in text.chars().enumerate() {
+                if seen >= units {
+                    return i;
+                }
+                seen += c.len_utf16();
+            }
+            text.chars().count()
+        };
+        let offsets = Utf16Offsets::new(text);
+        for u in 0..40 {
+            assert_eq!(offsets.char_index(u), scan(u), "offset {u}");
+        }
+    }
+
+    /// Thousands of style spans over text with an emoji in it are mapped
+    /// without rescanning the text for each: the work is counted by the
+    /// map being built once, and a large run finishes at once.
+    #[test]
+    fn test_many_spans_over_astral_text_do_not_rescan_the_text() {
+        let text = format!("\u{1F600}{}", "x".repeat(400_000));
+        let mut run = TextRun {
+            text: text.clone(),
+            ..Default::default()
+        };
+        // 100,000 character runs of 4 units each (CF_BOLD).
+        let spans = 100_000u32;
+        let mut data = Vec::new();
+        data.extend_from_slice(&((text.encode_utf16().count() + 1) as u32).to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        for i in 0..spans {
+            let count = if i == 0 { 6 } else { 4 };
+            data.extend_from_slice(&(count as u32).to_le_bytes());
+            data.extend_from_slice(&1u32.to_le_bytes());
+            data.extend_from_slice(&((i % 2) as u16).to_le_bytes());
+        }
+        let started = std::time::Instant::now();
+        apply_style_text_prop(&mut run, &data);
+        assert!(!run.char_formats.is_empty());
+        // A rescan per span is 100,000 x 400,000 character steps (tens of
+        // seconds); the map takes milliseconds.
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
     }
 
     /// `StyleTextPropAtom` run counts are UTF-16 units too: formatting on
@@ -3930,6 +4134,65 @@ mod tests {
         (stream, current_user_bytes(edit_offset))
     }
 
+    /// Slide containers the persist directory places inside one another are
+    /// read once, as the outermost: each nested one would otherwise be parsed
+    /// and copied in full for its own entry, and a stream of nested
+    /// containers costs its length once per entry.
+    #[test]
+    fn test_slide_containers_nested_in_one_another_are_read_once() {
+        let nested = 50u32;
+        let prefix = {
+            let mut c = slide_atom_following(0, false);
+            c.extend(other_text_shape("OUTER", None));
+            c
+        };
+        let inners: Vec<Vec<u8>> = (0..nested)
+            .map(|i| {
+                let mut c = slide_atom_following(0, false);
+                c.extend(other_text_shape(&format!("INNER {i}"), None));
+                make_container(RT_SLIDE, 0, &c)
+            })
+            .collect();
+        let outer = make_container(RT_SLIDE, 0, &[prefix.clone(), inners.concat()].concat());
+        let ids: Vec<u32> = (2..3 + nested).collect();
+        let entries: Vec<u8> = ids
+            .iter()
+            .map(|&id| slide_persist_atom_bytes(id, 256 + id))
+            .collect::<Vec<_>>()
+            .concat();
+        let doc = make_container(RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES, &entries);
+        let mut stream = make_container(RT_DOCUMENT, 0, &doc);
+        let outer_offset = stream.len() as u32;
+        stream.extend(&outer);
+        let mut dir = vec![(1u32, 0u32), (2, outer_offset)];
+        let mut at = outer_offset + 8 + prefix.len() as u32;
+        for (i, inner) in inners.iter().enumerate() {
+            dir.push((3 + i as u32, at));
+            at += inner.len() as u32;
+        }
+        let pd_offset = stream.len() as u32;
+        stream.extend(persist_directory_bytes(&dir));
+        let edit_offset = stream.len() as u32;
+        stream.extend(user_edit_atom_bytes(0, pd_offset, 1));
+        let cu = current_user_bytes(edit_offset);
+
+        let deck = extract_deck_text(&stream, Some(&cu));
+        // The outer container is read (its own walk may reach its nested
+        // records); each nested container's own entry is left out rather
+        // than read again.
+        assert!(deck.slides[0].text_runs.iter().any(|r| r.text == "OUTER"));
+        for (i, slide) in deck.slides.iter().enumerate().skip(1) {
+            assert!(slide.text_runs.is_empty(), "entry {i} read a nested container");
+        }
+        assert!(
+            deck.notices
+                .iter()
+                .any(|n| n.contains("50 slide or notes containers overlap")),
+            "{:?}",
+            deck.notices
+        );
+    }
+
     /// A deck-level footer is copied onto every slide, so it is charged for
     /// each copy: many slides under a small budget stop short of all of them.
     #[test]
@@ -4037,6 +4300,39 @@ mod tests {
         let copied: usize = runs.iter().map(|r| r.text.len()).sum();
         assert!(copied <= 5_000, "{copied} characters copied under a 5,000 budget");
         assert!(budget.exhausted());
+    }
+
+    /// A shape's hyperlink target is copied onto each text run it holds, so
+    /// the copies are charged with the text: many short runs under a long
+    /// target stop with the budget instead of multiplying the target.
+    #[test]
+    fn test_hyperlink_copies_on_text_runs_are_charged_to_the_text_budget() {
+        let atoms: Vec<u8> = (0..2000)
+            .flat_map(|_| make_atom(RT_TEXT_CHARS, 0, &[b'a', 0]))
+            .collect();
+        let url = "u".repeat(1000);
+        let mut runs = Vec::new();
+        let mut budget = crate::limits::TextBudget::with_limit(10_000);
+        extract_shape_text_in(
+            &atoms,
+            0,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            Some(&url),
+            None,
+            &mut runs,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut budget,
+        );
+        let held: usize = runs
+            .iter()
+            .map(|r| r.text.len() + r.hyperlink.as_deref().map_or(0, str::len))
+            .sum();
+        assert!(held <= 10_000, "{held} bytes held under a 10,000 budget");
+        assert!(runs.len() < 20 && budget.exhausted(), "{} runs", runs.len());
     }
 
     /// A master reference cycle (title master naming itself through a

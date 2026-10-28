@@ -2355,6 +2355,21 @@ mod tests {
         assert!(!whole.truncated());
     }
 
+    /// The default allowance keeps the sparse worst case small: six sheets of
+    /// one number in the last column of 65,535 rows (a 7 MB file) reached
+    /// 0.9 GB on open under the earlier 32 Mi allowance. Memory is the slots
+    /// kept times what a slot costs, and the allowance is what bounds the
+    /// slots, whatever the number of sheets.
+    #[test]
+    fn test_default_padding_allowance_bounds_the_sparse_worst_case() {
+        let slot = std::mem::size_of::<CellValue>() + std::mem::size_of::<u16>();
+        let worst = crate::limits::DEFAULT_MAX_GRID_PADDING_CELLS * slot;
+        assert!(worst <= 320 << 20, "{} MiB of padding at the default allowance", worst >> 20);
+        // A dense sheet is free and one sheet's rows reaching column 255
+        // over 32,000 rows still fit.
+        const { assert!(crate::limits::DEFAULT_MAX_GRID_PADDING_CELLS >= 32_000 * 255) };
+    }
+
     /// Padding is charged for empty slots only: a dense row costs nothing,
     /// whatever its width.
     #[test]
