@@ -403,10 +403,13 @@ fn extract_slides_via_persist(
     // ids to one `Slide` container, and reading it for each would copy its
     // text once per entry: 10,000 entries over a 100,000-character slide
     // were a gigabyte of text from a 395 KB file.
-    // An entry whose persist id resolves to nothing is an empty slide; one is
-    // kept, as a placeholder for the slide count, and the rest are left out
-    // with the aliased ones, so unresolvable entries cannot be listed without
-    // bound.
+    // An entry that names a container an earlier entry already names, and one
+    // whose container overlaps another, are left out and counted: neither
+    // stays as an empty slide, so later slides number the same whichever way
+    // an entry was left out. An entry whose persist id resolves to nothing is
+    // an empty slide; one is kept, as a placeholder for the slide count, and
+    // the rest are left out with the aliased ones, so unresolvable entries
+    // cannot be listed without bound.
     let mut slide_offsets: std::collections::HashSet<Option<usize>> =
         std::collections::HashSet::new();
     let mut aliased_entries = 0usize;
@@ -427,8 +430,13 @@ fn extract_slides_via_persist(
     );
     let mut slides_cut_by_budget = false;
     for entry in slide_entries {
-        if !slide_offsets.insert(dir.resolve(entry.persist_id_ref)) {
+        let offset = dir.resolve(entry.persist_id_ref);
+        if !slide_offsets.insert(offset) {
             aliased_entries += 1;
+            continue;
+        }
+        if offset.is_some_and(|o| !claims.claim(o)) {
+            // Counted in `claims.refused`.
             continue;
         }
         let (mut slide, links) = resolve_slide(
@@ -4242,6 +4250,13 @@ mod tests {
                 .filter(|s| !s.text_runs.is_empty())
                 .collect();
             assert_eq!(read.len(), 1, "inner_first={inner_first}: {} slides read", read.len());
+            // Entries left out are not kept as empty slides, as aliased and
+            // unresolvable entries are not: the notice says they were left out.
+            assert_eq!(
+                deck.slides.len(),
+                1,
+                "inner_first={inner_first}: refused entries must not stay as empty slides"
+            );
             assert!(
                 read[0].text_runs.iter().any(|r| r.text == "OUTER"),
                 "inner_first={inner_first}: the outermost container wins"

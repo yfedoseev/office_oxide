@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `.ppt` slide whose container overlaps another is left out like an aliased one.** Slide-list entries naming a container that overlaps an earlier one stayed in the deck as empty slides while the notice said they were left out, and entries naming an already-listed slide were dropped, so later slides were numbered differently depending on why an entry was skipped. Both are now left out, and the notice counts them.
+
 - **A multi-sheet `.xls` of wide, partly filled sheets is no longer cut by the document-wide padding allowance.** The 8 Mi allowance of empty slots that pad rows was shared by every sheet, so about four sheets of 65,000 rows by 60 columns at 60% fill exhausted it and later rows were dropped. Each sheet now has its own allowance (8 Mi, `limits::set_max_sheet_grid_padding_cells`) within a document total of 16 Mi (`limits::set_max_grid_padding_cells`, default raised from 8 Mi), so one sparse sheet cannot starve the rest and the worst case stays bounded. A sheet that is cut is named in the notice.
 
 - **A `.doc` whose comment boundaries run backwards no longer copies the comment text once per range.** The `PlcfandTxt` boundaries were not checked to be non-decreasing, and each range was cut with a character scan from the start of the story: 1,000 ranges over a 100,000-character story (a 243 KB file) took 14 s and 50 MB. A `PlcfandTxt` whose boundaries decrease is now refused, with a warning, and the comments are shown as one block; the ranges of a valid one are cut in a single pass.
