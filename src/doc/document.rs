@@ -534,12 +534,15 @@ impl DocDocument {
         // surface its identity — before this, `ObjectPool` was never
         // traversed at all, so an embedded Excel workbook, Equation
         // Editor object, etc. left no trace anywhere.
-        let ole_objects = super::ole_objects::extract_ole_objects(&cfb);
+        let mut embedded_warnings = Vec::new();
+        let found_objects = super::ole_objects::extract_ole_objects_with_storage(&cfb);
+        let ole_objects = read_embedded_word_texts(&mut cfb, found_objects, &mut embedded_warnings);
         let summary_properties = crate::cfb::read_document_properties(&mut cfb);
         // A container stream that came back shorter than its declared size
         // lost content just as surely as a piece-table gap.
         let text_complete = text_complete && !hdd_cut && cfb.truncated_streams().is_empty();
         let mut warnings = container_warnings(&cfb);
+        warnings.extend(embedded_warnings);
         warnings.extend(style_warnings);
         warnings.extend(work_warnings);
 
@@ -840,6 +843,10 @@ impl DocDocument {
             out.push('[');
             out.push_str(&obj.description);
             out.push_str("]\n");
+            if let Some(text) = &obj.text {
+                out.push_str(text);
+                out.push('\n');
+            }
         }
         out
     }
@@ -874,6 +881,175 @@ impl DocDocument {
 /// Whether the file carries a VBA project: Word keeps it in a root
 /// `Macros` storage holding the `VBA` storage ([MS-OVBA] §2.2.1 project
 /// storage; Excel's equivalent root storage is `_VBA_PROJECT_CUR`).
+/// Read the main text of each embedded Word document, within the document's
+/// embedded-package account: the object is admitted by the size of its
+/// streams (a count, a byte allowance, depth one), its text is charged to the
+/// text budget, a document embedded under several names is read from its
+/// content once, and an object that is not read keeps its placeholder and is
+/// reported. Objects inside an embedded document are not followed.
+fn read_embedded_word_texts<R: Read + Seek>(
+    cfb: &mut CfbReader<R>,
+    found: Vec<(super::ole_objects::EmbeddedOleObject, usize)>,
+    warnings: &mut Vec<String>,
+) -> Vec<super::ole_objects::EmbeddedOleObject> {
+    use crate::core::embedded;
+    let mut session = embedded::Session::begin();
+    let mut out = Vec::with_capacity(found.len());
+    for (mut object, storage) in found {
+        if object.description == super::ole_objects::EMBEDDED_WORD {
+            let name = format!("ObjectPool/{}", cfb.entries()[storage].name);
+            object.text = embedded_word_text(cfb, storage, &session, &name, warnings);
+        }
+        out.push(object);
+    }
+    let refused = std::cell::RefCell::new(Vec::new());
+    session.report(&|name, why| {
+        refused
+            .borrow_mut()
+            .push(format!("embedded object {name} was not read: {why}"));
+    });
+    warnings.extend(refused.into_inner());
+    out
+}
+
+/// The main text of the Word document in the object storage `storage`, or
+/// `None` (the reason recorded in `warnings` or the session) when it is not
+/// read.
+fn embedded_word_text<R: Read + Seek>(
+    cfb: &mut CfbReader<R>,
+    storage: usize,
+    session: &crate::core::embedded::Session,
+    name: &str,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    use super::ole_objects::find_direct_child;
+    use crate::cfb::EntryType;
+    use crate::core::embedded;
+    let (word_idx, table_idxs, declared) = {
+        let entries = cfb.entries();
+        let child = entries.get(storage)?.child;
+        let stream = |n: &str| {
+            find_direct_child(entries, child, n)
+                .filter(|&i| entries[i].entry_type == EntryType::Stream)
+        };
+        let word_idx = stream("WordDocument")?;
+        let (t0, t1) = (stream("0Table"), stream("1Table"));
+        let size = |i: Option<usize>| i.map_or(0, |i| entries[i].stream_size);
+        let declared = entries[word_idx]
+            .stream_size
+            .saturating_add(size(t0).max(size(t1)));
+        (word_idx, (t0, t1), declared)
+    };
+    let admission = match embedded::admit(session, declared) {
+        Ok(admission) => admission,
+        Err(refusal) => {
+            embedded::refuse(session, name, refusal);
+            return None;
+        },
+    };
+    let read = embedded_word_main_text(cfb, word_idx, table_idxs);
+    // The level and the object's byte account end here.
+    drop(admission);
+    let EmbeddedRead {
+        text,
+        fingerprint,
+        cut,
+    } = match read {
+        Ok(read) => read,
+        Err(why) => {
+            warnings.push(format!("embedded object {name} was not read: {why}"));
+            return None;
+        },
+    };
+    if let Some(notice) = cut {
+        warnings.push(format!("embedded object {name}: {notice}"));
+    }
+    if let Some(cached) = embedded::cached::<String>(session, fingerprint) {
+        return charge_embedded_text(session, name, cached);
+    }
+    embedded::remember(session, fingerprint, text.clone());
+    charge_embedded_text(session, name, text)
+}
+
+/// Charge an embedded document's text to the text budget; the text, or
+/// `None` when the budget is spent or the document has no text.
+fn charge_embedded_text(
+    session: &crate::core::embedded::Session,
+    name: &str,
+    text: String,
+) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    if let Err(refusal) = crate::core::embedded::charge_text(session, text.chars().count()) {
+        crate::core::embedded::refuse(session, name, refusal);
+        return None;
+    }
+    Some(text)
+}
+
+/// The main story of the Word 97+ document whose `WordDocument` and table
+/// streams are the directory entries given, read as the top-level document's
+/// own is (the deleted and hidden text excluded). The fingerprint is of the
+/// `WordDocument` stream.
+fn embedded_word_main_text<R: Read + Seek>(
+    cfb: &mut CfbReader<R>,
+    word_idx: usize,
+    (t0, t1): (Option<usize>, Option<usize>),
+) -> std::result::Result<EmbeddedRead, String> {
+    let word_doc = cfb
+        .read_stream_by_index(word_idx)
+        .map_err(|e| e.to_string())?;
+    if word_doc.len() >= 2
+        && super::word6::is_word6_magic(u16::from_le_bytes([word_doc[0], word_doc[1]]))
+    {
+        return Err("a Word 6/95 document; its text is not read from inside another".into());
+    }
+    let fingerprint = crate::core::embedded::Fingerprint::of(&word_doc);
+    let fib = Fib::parse(&word_doc).map_err(|e| e.to_string())?;
+    let table_idx = if fib.use_table1 { t1.or(t0) } else { t0.or(t1) }
+        .ok_or_else(|| "neither 0Table nor 1Table stream is present".to_string())?;
+    let table_stream = cfb
+        .read_stream_by_index(table_idx)
+        .map_err(|e| e.to_string())?;
+    let clx_start = fib.clx_offset as usize;
+    if clx_start >= table_stream.len()
+        || clx_size_zero_or_oob(fib.clx_size, clx_start, table_stream.len())
+    {
+        return Err("the piece table lies outside the table stream".into());
+    }
+    let clx_end = (clx_start + fib.clx_size as usize).min(table_stream.len());
+    let mut pieces = parse_clx(&table_stream[clx_start..clx_end]).map_err(|e| e.to_string())?;
+    let mut budget = crate::limits::TextBudget::new();
+    let cut = super::piece_table::bound_piece_reads(&mut pieces, word_doc.len(), &mut budget)
+        .map_err(|e| e.to_string())?
+        .then(|| budget.notice());
+    let mut chpx_runs = if fib.fc_plcf_bte_chpx != 0 && fib.lcb_plcf_bte_chpx != 0 {
+        parse_chpx_runs(&word_doc, &table_stream, fib.fc_plcf_bte_chpx, fib.lcb_plcf_bte_chpx)
+    } else {
+        Vec::new()
+    };
+    if runs_work_too_large(&pieces, chpx_runs.iter().map(|r| (r.fc_start, r.fc_end))) {
+        chpx_runs.clear();
+    }
+    let excluded = resolve_excluded_cp_ranges_from_runs(&chpx_runs, &pieces, fib.text_len);
+    let raw = extract_text_range_excluding(&word_doc, &pieces, 0, fib.text_len, fib.lid, &excluded);
+    Ok(EmbeddedRead {
+        text: sanitize_text(&raw).trim().to_string(),
+        fingerprint,
+        cut,
+    })
+}
+
+/// What reading an embedded Word document's main story yielded.
+struct EmbeddedRead {
+    text: String,
+    /// Fingerprint of its `WordDocument` stream.
+    fingerprint: crate::core::embedded::Fingerprint,
+    /// The text-budget notice, when the budget cut the story short.
+    cut: Option<String>,
+}
+
 fn has_vba_project<R: Read + Seek>(cfb: &CfbReader<R>) -> bool {
     cfb.find_entry_by_path("Macros/VBA").is_some()
 }
@@ -1487,6 +1663,7 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: vec![crate::doc::ole_objects::EmbeddedOleObject {
+                text: None,
                 description: "Embedded Equation Editor/MathType Object".into(),
             }],
             header_footers: Vec::new(),

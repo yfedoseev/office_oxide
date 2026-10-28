@@ -25,7 +25,13 @@ pub struct EmbeddedOleObject {
     /// Human-readable identity, e.g. `"Embedded Microsoft Excel
     /// Workbook"`.
     pub description: String,
+    /// The main text of an embedded Word document, when it could be read
+    /// within the document's embedded-package account.
+    pub text: Option<String>,
 }
+
+/// The description of an embedded Word document.
+pub(super) const EMBEDDED_WORD: &str = "Embedded Microsoft Word Document";
 
 /// Find every embedded object under the root's `ObjectPool` storage (if
 /// present) and classify each by the presence of a well-known stream
@@ -34,13 +40,27 @@ pub struct EmbeddedOleObject {
 /// expectations — this is a best-effort enhancement, never a hard
 /// requirement for reading the rest of the document.
 pub fn extract_ole_objects<R: Read + Seek>(reader: &CfbReader<R>) -> Vec<EmbeddedOleObject> {
+    extract_ole_objects_with_storage(reader)
+        .into_iter()
+        .map(|(object, _)| object)
+        .collect()
+}
+
+/// As [`extract_ole_objects`], with the directory index of each object's
+/// storage, for reading what is inside it.
+pub(super) fn extract_ole_objects_with_storage<R: Read + Seek>(
+    reader: &CfbReader<R>,
+) -> Vec<(EmbeddedOleObject, usize)> {
     classify_objects(reader.entries(), MAX_ENTRIES_WALKED).0
 }
 
 /// The walk behind [`extract_ole_objects`], over a bare directory, with
 /// the per-walk cap as a parameter; also returns the entries the object
 /// walks took.
-fn classify_objects(entries: &[DirEntry], max_walk: usize) -> (Vec<EmbeddedOleObject>, usize) {
+fn classify_objects(
+    entries: &[DirEntry],
+    max_walk: usize,
+) -> (Vec<(EmbeddedOleObject, usize)>, usize) {
     if entries.is_empty() || entries[0].entry_type != EntryType::RootStorage {
         return (Vec::new(), 0);
     }
@@ -64,7 +84,13 @@ fn classify_objects(entries: &[DirEntry], max_walk: usize) -> (Vec<EmbeddedOleOb
         let children = objects.collect(obj.child);
         let names: Vec<&str> = children.iter().map(|&i| entries[i].name.as_str()).collect();
         if let Some(description) = classify(&names) {
-            out.push(EmbeddedOleObject { description });
+            out.push((
+                EmbeddedOleObject {
+                    description,
+                    text: None,
+                },
+                obj_idx,
+            ));
         }
     }
     (out, objects.steps)
@@ -83,7 +109,7 @@ fn classify(names: &[&str]) -> Option<String> {
     } else if has("Equation Native") {
         Some("Embedded Equation Editor/MathType Object".to_string())
     } else if has("WordDocument") {
-        Some("Embedded Microsoft Word Document".to_string())
+        Some(EMBEDDED_WORD.to_string())
     } else if has("PowerPoint Document") {
         Some("Embedded Microsoft PowerPoint Presentation".to_string())
     } else if has("Package") {
@@ -100,7 +126,7 @@ fn classify(names: &[&str]) -> Option<String> {
 /// comes from an untrusted file, so a corrupted/adversarial sibling
 /// cycle must not overflow the stack or loop unboundedly. Each entry is
 /// visited once and the walk stops at the first match.
-fn find_direct_child(entries: &[DirEntry], root: u32, name: &str) -> Option<usize> {
+pub(super) fn find_direct_child(entries: &[DirEntry], root: u32, name: &str) -> Option<usize> {
     let mut stack = vec![root];
     let mut seen = vec![false; entries.len()];
     while let Some(node) = stack.pop() {
@@ -205,9 +231,13 @@ mod tests {
         let (out, _) = classify_objects(&entries, MAX_ENTRIES_WALKED);
         assert_eq!(
             out,
-            vec![EmbeddedOleObject {
-                description: "Embedded Microsoft Excel Workbook".to_string()
-            }]
+            vec![(
+                EmbeddedOleObject {
+                    description: "Embedded Microsoft Excel Workbook".to_string(),
+                    text: None,
+                },
+                2
+            )]
         );
     }
 

@@ -326,6 +326,16 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
                 data: None,
                 ..Default::default()
             }));
+            // The text of an embedded Word document, which the placeholder
+            // stands for, follows it.
+            for line in obj.text.iter().flat_map(|t| t.lines()) {
+                if !line.trim().is_empty() {
+                    last.elements.push(Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan::plain(line))],
+                        ..Default::default()
+                    }));
+                }
+            }
         }
     }
 

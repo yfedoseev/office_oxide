@@ -1471,3 +1471,162 @@ pub fn sparse_xls(sheets: &[Vec<(u16, u16)>]) -> Vec<u8> {
     }
     cfb_with_stream("Workbook", &s)
 }
+
+// ── A compound file with nested storages ──
+
+/// One node of a synthetic compound file's directory.
+#[allow(dead_code)]
+pub enum CfbNode {
+    /// A stream and its bytes.
+    Stream(String, Vec<u8>),
+    /// A storage and the nodes directly under it.
+    Storage(String, Vec<CfbNode>),
+}
+
+/// A CFB v3 container with the given nodes under the root storage. Every
+/// stream is stored in regular sectors (the mini-stream cutoff is 1), and the
+/// siblings of a storage are chained through their right links, which is all
+/// the reader's tree walk needs.
+#[allow(dead_code)]
+pub fn cfb_tree(root: Vec<CfbNode>) -> Vec<u8> {
+    struct Flat {
+        name: String,
+        kind: u8,
+        child: u32,
+        right: u32,
+        data: Vec<u8>,
+    }
+    fn add(nodes: Vec<CfbNode>, flat: &mut Vec<Flat>, parent: usize) {
+        let first = flat.len();
+        let mut pending = Vec::new();
+        for node in nodes {
+            let at = flat.len();
+            match node {
+                CfbNode::Stream(name, data) => flat.push(Flat {
+                    name,
+                    kind: 2,
+                    child: NO_ENTRY,
+                    right: NO_ENTRY,
+                    data,
+                }),
+                CfbNode::Storage(name, children) => {
+                    flat.push(Flat {
+                        name,
+                        kind: 1,
+                        child: NO_ENTRY,
+                        right: NO_ENTRY,
+                        data: Vec::new(),
+                    });
+                    pending.push((at, children));
+                },
+            }
+        }
+        let count = flat.len() - first;
+        if count > 0 {
+            flat[parent].child = first as u32;
+            for k in first..first + count - 1 {
+                flat[k].right = (k + 1) as u32;
+            }
+        }
+        for (at, children) in pending {
+            add(children, flat, at);
+        }
+    }
+    let mut flat = vec![Flat {
+        name: "Root Entry".into(),
+        kind: 5,
+        child: NO_ENTRY,
+        right: NO_ENTRY,
+        data: Vec::new(),
+    }];
+    add(root, &mut flat, 0);
+
+    let dir_sectors = flat.len().div_ceil(4);
+    let data_sectors: Vec<usize> = flat
+        .iter()
+        .map(|f| {
+            if f.kind == 2 {
+                f.data.len().div_ceil(512)
+            } else {
+                0
+            }
+        })
+        .collect();
+    let data_total: usize = data_sectors.iter().sum();
+    let mut fat_sectors = 1;
+    while (dir_sectors + fat_sectors + data_total).div_ceil(128) > fat_sectors {
+        fat_sectors += 1;
+    }
+    let total = dir_sectors + fat_sectors + data_total;
+    let mut file = vec![0u8; 512 * (1 + total)];
+
+    file[0..8].copy_from_slice(&CFB_SIGNATURE);
+    file[0x18..0x1A].copy_from_slice(&0x003Eu16.to_le_bytes());
+    file[0x1A..0x1C].copy_from_slice(&3u16.to_le_bytes());
+    file[0x1C..0x1E].copy_from_slice(&0xFFFEu16.to_le_bytes());
+    file[0x1E..0x20].copy_from_slice(&9u16.to_le_bytes());
+    file[0x20..0x22].copy_from_slice(&6u16.to_le_bytes());
+    file[0x2C..0x30].copy_from_slice(&(fat_sectors as u32).to_le_bytes());
+    file[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());
+    file[0x38..0x3C].copy_from_slice(&1u32.to_le_bytes()); // mini-stream cutoff
+    file[0x3C..0x40].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+    file[0x44..0x48].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+    for i in 0..109 {
+        let v = if i < fat_sectors {
+            (dir_sectors + i) as u32
+        } else {
+            FREE_SECT
+        };
+        file[0x4C + i * 4..0x50 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    // FAT: the directory chain, the FAT sectors, each stream's chain.
+    let mut fat = vec![FREE_SECT; fat_sectors * 128];
+    for s in 0..dir_sectors {
+        fat[s] = if s + 1 < dir_sectors {
+            (s + 1) as u32
+        } else {
+            END_OF_CHAIN
+        };
+    }
+    for s in 0..fat_sectors {
+        fat[dir_sectors + s] = FAT_SECT;
+    }
+    let mut next = dir_sectors + fat_sectors;
+    let mut starts = vec![END_OF_CHAIN; flat.len()];
+    for (i, n) in data_sectors.iter().enumerate() {
+        if *n == 0 {
+            continue;
+        }
+        starts[i] = next as u32;
+        for k in 0..*n {
+            fat[next + k] = if k + 1 < *n {
+                (next + k + 1) as u32
+            } else {
+                END_OF_CHAIN
+            };
+            let off = 512 * (1 + next + k);
+            let chunk = &flat[i].data[k * 512..((k + 1) * 512).min(flat[i].data.len())];
+            file[off..off + chunk.len()].copy_from_slice(chunk);
+        }
+        next += n;
+    }
+    for (i, v) in fat.iter().enumerate() {
+        let off = 512 * (1 + dir_sectors) + i * 4;
+        file[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    for (i, f) in flat.iter().enumerate() {
+        let off = 512 + i * 128;
+        write_dir_entry_with_sibling(
+            &mut file[off..off + 128],
+            &f.name,
+            f.kind,
+            f.child,
+            f.right,
+            if f.kind == 5 { END_OF_CHAIN } else { starts[i] },
+            if f.kind == 2 { f.data.len() as u32 } else { 0 },
+        );
+    }
+    file
+}
