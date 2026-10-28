@@ -722,3 +722,29 @@ fn test_a_dangling_numbering_relationship_is_not_a_lost_part() {
     }
     assert_nothing_reported(zip_of(parts), DocumentFormat::Docx);
 }
+
+#[test]
+fn test_a_deck_with_no_readable_slide_names_a_slide_not_the_first_part_that_failed() {
+    let _limits = common::default_limits();
+    let mut parts = zip_entries(&clean_deck(|name, body| {
+        match name {
+            // The theme fails first, as the reader meets it before any slide.
+            "ppt/_rels/presentation.xml.rels" => add_rel(
+                body,
+                &format!(
+                    r#"<Relationship Id="rId9" Type="{REL}/theme" Target="theme/theme1.xml"/>"#
+                ),
+            ),
+            "ppt/slides/slide0.xml" => "<p:sld".to_string(),
+            _ => body,
+        }
+    }));
+    parts.push(("ppt/theme/theme1.xml".into(), "<a:theme><a:x></a:theme>".into()));
+    let err = match PptxDocument::from_reader(Cursor::new(zip_of(parts))) {
+        Ok(_) => panic!("a deck with no readable slide opened"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("no slide could be read"), "{err}");
+    assert!(err.contains("/ppt/slides/slide0.xml"), "{err}");
+    assert!(!err.contains("theme"), "{err}");
+}

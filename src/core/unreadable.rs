@@ -64,11 +64,6 @@ impl UnreadableParts {
         self.listed.push((part, reason));
     }
 
-    /// The first part recorded, with its reason.
-    pub(crate) fn first(&self) -> Option<&(String, String)> {
-        self.listed.first()
-    }
-
     /// The parts kept and the number left out.
     pub(crate) fn finish(self) -> (Vec<(String, String)>, usize) {
         (self.listed, self.omitted)

@@ -533,7 +533,12 @@ impl PptxDocument {
             slides.push(slide);
         }
         if !slides.is_empty() && slides.iter().all(|s| s.parse_error.is_some()) {
-            let (part, err) = unreadable_parts.first().cloned().unwrap_or_default();
+            // Name a slide: another part (a theme met first) did not decide
+            // that no slide could be read.
+            let (part, err) = slides
+                .iter()
+                .find_map(|s| s.parse_error.as_ref().map(|e| (s.name.clone(), e.clone())))
+                .unwrap_or_default();
             return Err(crate::core::Error::MalformedXml(format!(
                 "no slide could be read; {part}: {err}"
             ))
