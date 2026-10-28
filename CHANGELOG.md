@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `.pptx` style level's bullet or underline kind is no longer copied into every paragraph that inherits it.** A master or layout `buChar`, `buAutoNum` type or `defRPr u` of a megabyte was cloned into each inheriting paragraph or run (300 paragraphs inheriting 50 KB took 61 MB to open). A value longer than 64 characters, which no presentation application writes, is not inherited.
+
 - **A `.pptx` part whose relationships cannot be read is now reported, and the IR metadata lists every skipped part.** A notes, layout or master part with an over-long relationship `Target` lost its links and pictures with no record, and a layout, master, picture or chart part that failed to decompress vanished silently. Each is now recorded in `PptxDocument::unreadable_parts`, `text_truncated` is set, and `Metadata::warnings` names the part and the reason.
 
 - **A `.pptx` converted past the picture budget now says so in its content and flags the cut.** Pictures left without their bytes (`limits::set_max_image_bytes`) were reported in a metadata warning only; the IR now also sets `text_truncated` and closes the last section with a "[some pictures not shown ...]" paragraph, as the spreadsheet conversion does, so Markdown and HTML renderings show it.

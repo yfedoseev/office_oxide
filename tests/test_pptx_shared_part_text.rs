@@ -273,3 +273,74 @@ fn test_chart_text_within_budget_is_unchanged() {
     assert_eq!(ir_text_chars(&ir), 2 * 3 * "Series 1: vvv, vvv".len());
     assert_eq!(doc.plain_text().matches("Series 1: vvv, vvv").count(), 6);
 }
+
+/// One slide with a body placeholder of `paragraphs` paragraphs whose master
+/// gives the body style a bullet character and an underline kind of `value`.
+/// The paragraphs inherit both, so a reader that copies the inherited values
+/// holds `value` once per paragraph.
+fn inheriting_deck(value: &str, paragraphs: usize) -> Vec<u8> {
+    let ct = |name: &str, kind: &str| {
+        format!(
+            r#"<Override PartName="/ppt/{name}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.{kind}+xml"/>"#
+        )
+    };
+    let body = "<a:p><a:r><a:t>x</a:t></a:r></a:p>".repeat(paragraphs);
+    let slide = format!(
+        r#"<p:sld {PNS}><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="B"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/>{body}</p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#
+    );
+    let layout = format!(r#"<p:sldLayout {PNS}><p:cSld><p:spTree/></p:cSld></p:sldLayout>"#);
+    let master = format!(
+        r#"<p:sldMaster {PNS}><p:cSld><p:spTree/></p:cSld><p:txStyles><p:bodyStyle><a:lvl1pPr><a:buChar char="{value}"/><a:defRPr u="{value}"/></a:lvl1pPr></p:bodyStyle></p:txStyles></p:sldMaster>"#
+    );
+    let rels = |entries: &[(&str, &str, &str)]| {
+        let mut s = format!(r#"<Relationships xmlns="{PKG_REL}">"#);
+        for (id, ty, target) in entries {
+            s.push_str(&format!(
+                r#"<Relationship Id="{id}" Type="{REL}/{ty}" Target="{target}"/>"#
+            ));
+        }
+        s.push_str("</Relationships>");
+        s.into_bytes()
+    };
+    zip_of(&[
+        ("[Content_Types].xml".to_string(), format!(r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>{}{}{}{}</Types>"#, ct("presentation", "presentation.main"), ct("slides/slide1", "slide"), ct("slideLayouts/slideLayout1", "slideLayout"), ct("slideMasters/slideMaster1", "slideMaster")).into_bytes()),
+        ("_rels/.rels".to_string(), rels(&[("rId1", "officeDocument", "ppt/presentation.xml")])),
+        ("ppt/presentation.xml".to_string(), format!(r#"<p:presentation {PNS}><p:sldIdLst><p:sldId id="256" r:id="rId2"/></p:sldIdLst></p:presentation>"#).into_bytes()),
+        ("ppt/_rels/presentation.xml.rels".to_string(), rels(&[("rId2", "slide", "slides/slide1.xml")])),
+        ("ppt/slides/slide1.xml".to_string(), slide.into_bytes()),
+        ("ppt/slides/_rels/slide1.xml.rels".to_string(), rels(&[("rId1", "slideLayout", "../slideLayouts/slideLayout1.xml")])),
+        ("ppt/slideLayouts/slideLayout1.xml".to_string(), layout.into_bytes()),
+        ("ppt/slideLayouts/_rels/slideLayout1.xml.rels".to_string(), rels(&[("rId1", "slideMaster", "../slideMasters/slideMaster1.xml")])),
+        ("ppt/slideMasters/slideMaster1.xml".to_string(), master.into_bytes()),
+    ])
+}
+
+#[test]
+fn test_paragraphs_inheriting_a_master_value_do_not_each_hold_a_copy() {
+    let _g = serial();
+    // 300 paragraphs x 2 x 50 KB would be 30 MB if each held its own copy.
+    let big = inheriting_deck(&"u".repeat(50_000), 300);
+    let (doc, allocated) = bytes_during(|| open(big));
+    drop(doc);
+    assert!(
+        allocated < 3_000_000,
+        "opening allocated {allocated} bytes: an inherited style value is copied per paragraph"
+    );
+}
+
+#[test]
+fn test_ordinary_inherited_bullet_and_underline_are_unchanged() {
+    let _g = serial();
+    let doc = open(inheriting_deck("sng", 2));
+    let p = doc.as_pptx().expect("a pptx");
+    let office_oxide::pptx::Shape::AutoShape(shape) = &p.slides[0].shapes[0] else {
+        panic!("a shape")
+    };
+    let body = shape.text_body.as_ref().expect("a body");
+    assert_eq!(body.paragraphs.len(), 2);
+    for para in &body.paragraphs {
+        assert!(
+            matches!(&para.bullet, Some(office_oxide::pptx::BulletStyle::Char(c)) if c == "sng")
+        );
+    }
+}
