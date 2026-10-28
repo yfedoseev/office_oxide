@@ -92,6 +92,8 @@ pub(crate) struct SheetConverter<'d> {
     // Whether the section just built was cut for any reason of its own.
     item_truncated: bool,
     warnings: Vec<String>,
+    // The reports of what could not be read, once first asked for.
+    reports: Option<Vec<crate::xlsx::text::ReportNotice>>,
 }
 
 impl<'d> SheetConverter<'d> {
@@ -127,6 +129,7 @@ impl<'d> SheetConverter<'d> {
             omitted: false,
             item_truncated: false,
             warnings: Vec::new(),
+            reports: None,
         }
     }
 
@@ -509,10 +512,8 @@ impl<'d> SheetConverter<'d> {
             // for: the pictures past the budget are left out, and said so.
             // Its alternative text and the elements around it are paid for
             // as text.
-            if !budget.charge(picture_chars(pic))
-                || !image_budget.charge(pic.data.len())
-                || (*scope == IrScope::Sheet && !total_image_budget.charge(pic.data.len()))
-            {
+            let total = (*scope == IrScope::Sheet).then_some(&mut *total_image_budget);
+            if !charge_picture(budget, image_budget, total, picture_chars(pic), pic.data.len()) {
                 break;
             }
             let format = image_format_from_ext(&pic.format);
@@ -1002,22 +1003,62 @@ impl<'d> SheetConverter<'d> {
         })
     }
 
-    /// The section for the unreadable sheet `index`: the notice, so the loss
-    /// is visible in every projection of the IR.
-    pub(crate) fn unreadable_section(&mut self, index: usize) -> Option<Section> {
-        let (name, err) = self.doc.unreadable_sheets.get(index)?;
+    /// How many sections report what could not be read (see
+    /// [`Self::unreadable_section`]).
+    pub(crate) fn unreadable_count(&mut self) -> usize {
+        self.reports
+            .get_or_insert_with(|| self.doc.report_notices())
+            .len()
+    }
+
+    /// The section for the report `index` of what could not be read (an
+    /// unreadable sheet, the sheets and parts left unlisted, the unreadable
+    /// parts), and the warnings it carries: the notice, so the loss is
+    /// visible in every projection of the IR. The notice is charged to the
+    /// text budget before it is copied; one the budget cannot pay for is
+    /// left out, with the budget's notice in its place, and the metadata
+    /// still lists it.
+    pub(crate) fn unreadable_section(&mut self, index: usize) -> Option<(Section, Vec<String>)> {
+        let notices = self
+            .reports
+            .get_or_insert_with(|| self.doc.report_notices());
+        let notice = notices.get(index)?;
         self.unreadable = true;
         self.item_truncated = true;
-        Some(Section {
-            title: Some(name.clone()),
-            elements: vec![Element::Paragraph(Paragraph {
-                content: vec![InlineContent::Text(TextSpan::plain(
-                    crate::xlsx::text::unreadable_notice(name, err),
-                ))],
-                ..Default::default()
-            })],
+        let was_spent = self.budget.exhausted();
+        if !self.budget.charge(notice.chars()) {
+            // Said once, in the content, unless something already said it.
+            return (!was_spent).then(|| {
+                (
+                    Section {
+                        title: Some("Output truncated".to_string()),
+                        elements: vec![Element::Paragraph(Paragraph {
+                            content: vec![InlineContent::Text(TextSpan::plain(
+                                self.budget.notice(),
+                            ))],
+                            ..Default::default()
+                        })],
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )
+            });
+        }
+        let section = Section {
+            title: Some(notice.title.clone()),
+            elements: notice
+                .lines
+                .iter()
+                .map(|line| {
+                    Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan::plain(line.clone()))],
+                        ..Default::default()
+                    })
+                })
+                .collect(),
             ..Default::default()
-        })
+        };
+        Some((section, notice.warnings.clone()))
     }
 
     /// The document's metadata as of the sections built so far: the
@@ -1065,21 +1106,13 @@ impl<'d> SheetConverter<'d> {
                 Some(&doc.package_properties),
             )
         };
-        // Relationship parts that could not be read: the sheet, drawing or
+        // Sheets and parts that could not be read: the sheet, drawing or
         // pivot they belong to lacks what they name.
-        metadata.text_truncated |=
-            !doc.unreadable_parts.is_empty() || doc.unreadable_parts_omitted > 0;
-        metadata.warnings.extend(
-            doc.unreadable_parts
-                .iter()
-                .map(|(part, err)| format!("skipped unreadable part {part}: {err}")),
-        );
-        if doc.unreadable_parts_omitted > 0 {
-            metadata.warnings.push(format!(
-                "and {} more unreadable parts not listed",
-                doc.unreadable_parts_omitted
-            ));
-        }
+        let notices = doc.report_notices();
+        metadata.text_truncated |= !notices.is_empty();
+        metadata
+            .warnings
+            .extend(notices.into_iter().flat_map(|n| n.warnings));
         metadata.warnings.extend(self.warnings.iter().cloned());
         metadata.warnings.extend(self.end_warnings());
         metadata
@@ -1102,6 +1135,43 @@ fn picture_chars(pic: &crate::xlsx::worksheet::WorksheetPicture) -> usize {
     std::mem::size_of::<TextBox>()
         .saturating_add(std::mem::size_of::<Image>())
         .saturating_add(pic.alt_text.as_ref().map_or(0, String::len))
+}
+
+/// Pay for a picture from every budget that bounds it, or from none: a
+/// picture that is not produced costs nothing, whichever budget refuses it.
+/// The budget (or budgets) that cannot pay is charged all the same, which is
+/// what marks it spent for the notice that says so.
+fn charge_picture(
+    text: &mut crate::limits::TextBudget,
+    image: &mut crate::limits::TextBudget,
+    total: Option<&mut crate::limits::TextBudget>,
+    chars: usize,
+    bytes: usize,
+) -> bool {
+    let fits =
+        text.fits(chars) && image.fits(bytes) && total.as_deref().is_none_or(|t| t.fits(bytes));
+    if fits {
+        // Each fits, so each charge succeeds.
+        let _ = text.charge(chars);
+        let _ = image.charge(bytes);
+        if let Some(t) = total {
+            let _ = t.charge(bytes);
+        }
+        return true;
+    }
+    // Only the budgets that cannot pay are touched.
+    if !text.fits(chars) {
+        let _ = text.charge(chars);
+    }
+    if !image.fits(bytes) {
+        let _ = image.charge(bytes);
+    }
+    if let Some(t) = total {
+        if !t.fits(bytes) {
+            let _ = t.charge(bytes);
+        }
+    }
+    false
 }
 
 /// The notice for picture bytes copied past the total the whole run may copy.
@@ -1173,10 +1243,20 @@ impl<'d> SheetIrs<'d> {
     }
 
     fn item(&mut self, section: Section, end_before: Vec<String>) -> SheetIr {
+        self.item_with(section, end_before, Vec::new())
+    }
+
+    fn item_with(
+        &mut self,
+        section: Section,
+        end_before: Vec<String>,
+        extra: Vec<String>,
+    ) -> SheetIr {
         if self.first_title.is_none() {
             self.first_title = section.title.clone();
         }
         let mut warnings = self.converter.warnings()[self.warnings_reported..].to_vec();
+        warnings.extend(extra);
         self.warnings_reported = self.converter.warnings().len();
         for w in self.converter.end_warnings() {
             if !end_before.contains(&w) {
@@ -1231,9 +1311,12 @@ impl Iterator for SheetIrs<'_> {
                 },
                 Stage::Unreadable(i) => {
                     self.stage = Stage::Unreadable(i + 1);
-                    match self.converter.unreadable_section(i) {
-                        Some(section) => return Some(self.item(section, end_before)),
-                        None => self.stage = Stage::Done,
+                    if i >= self.converter.unreadable_count() {
+                        self.stage = Stage::Done;
+                        continue;
+                    }
+                    if let Some((section, extra)) = self.converter.unreadable_section(i) {
+                        return Some(self.item_with(section, end_before, extra));
                     }
                 },
                 Stage::Done => return None,
@@ -1278,8 +1361,12 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     }
     sections.extend(converter.chart_section());
     sections.extend(converter.pivot_section());
-    for index in 0..doc.unreadable_sheets.len() {
-        sections.extend(converter.unreadable_section(index));
+    for index in 0..converter.unreadable_count() {
+        sections.extend(
+            converter
+                .unreadable_section(index)
+                .map(|(section, _)| section),
+        );
     }
     let metadata = converter.metadata(sections.first().and_then(|s| s.title.clone()));
     DocumentIR { metadata, sections }
@@ -1693,5 +1780,44 @@ fn image_format_from_ext(ext: &str) -> Option<ImageFormat> {
         "emf" => Some(ImageFormat::Emf),
         "wmf" => Some(ImageFormat::Wmf),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::charge_picture;
+    use crate::limits::TextBudget;
+
+    /// A picture that one budget refuses costs the others nothing, whichever
+    /// of them refuses it.
+    #[test]
+    fn test_a_refused_picture_costs_no_budget_anything() {
+        let (mut text, mut image, mut total) = (
+            TextBudget::with_limit(100),
+            TextBudget::with_limit(10),
+            TextBudget::with_limit(100),
+        );
+        assert!(!charge_picture(&mut text, &mut image, Some(&mut total), 60, 50));
+        assert!(image.exhausted());
+        assert!(!text.exhausted() && !total.exhausted());
+        assert!(text.charge(100) && total.charge(100), "the refused picture spent budget");
+
+        let (mut text, mut image, mut total) = (
+            TextBudget::with_limit(100),
+            TextBudget::with_limit(100),
+            TextBudget::with_limit(10),
+        );
+        assert!(!charge_picture(&mut text, &mut image, Some(&mut total), 60, 50));
+        assert!(total.exhausted());
+        assert!(text.charge(100) && image.charge(100), "the refused picture spent budget");
+
+        let (mut text, mut image) = (TextBudget::with_limit(10), TextBudget::with_limit(100));
+        assert!(!charge_picture(&mut text, &mut image, None, 60, 50));
+        assert!(text.exhausted());
+        assert!(image.charge(100), "the refused picture spent budget");
+
+        let (mut text, mut image) = (TextBudget::with_limit(100), TextBudget::with_limit(100));
+        assert!(charge_picture(&mut text, &mut image, None, 60, 50));
+        assert!(!text.charge(60) && image.charge(50), "an accepted picture is charged to each");
     }
 }

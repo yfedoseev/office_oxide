@@ -84,7 +84,7 @@ pub(super) fn from_zip<R: Read + Seek>(
         .ok()
         .map(|d| parse_styles(&d));
     let mut worksheets = Vec::with_capacity(sheets.len());
-    let mut unreadable_sheets = Vec::new();
+    let mut unreadable_sheets = super::shared_parts::ReportList::default();
     let mut sheet_parts = super::SheetPartClaims::default();
     for (i, info) in sheets.iter().enumerate() {
         let rel = rels.get_by_id(&info.rel_id);
@@ -100,16 +100,14 @@ pub(super) fn from_zip<R: Read + Seek>(
             .unwrap_or_else(|| format!("xl/worksheets/sheet{}.bin", i + 1));
         if let Err(reason) = sheet_parts.claim(entries, &path, &info.name) {
             log::warn!("xlsb: sheet {:?}: {reason}", info.name);
-            unreadable_sheets.push((info.name.clone(), reason));
+            unreadable_sheets.record_item(&info.name, &reason);
             continue;
         }
         if matches!(kind, SheetKind::Chart | SheetKind::Dialog) {
             let mut ws = Worksheet::without_cells(info.name.clone(), kind);
             ws.state = info.state;
             if kind == SheetKind::Chart {
-                for chart in
-                    super::chartsheet_chart_parts(archive, entries, &path, &mut shared.unreadable)
-                {
+                for chart in shared.chartsheet_chart_parts(archive, entries, &path) {
                     ws.chart_text
                         .extend(shared.chart_text(archive, entries, &chart));
                 }
@@ -121,11 +119,11 @@ pub(super) fn from_zip<R: Read + Seek>(
             Ok(data) => data,
             Err(crate::core::Error::MissingPart(_)) => {
                 unreadable_sheets
-                    .push((info.name.clone(), format!("worksheet part {path} not found")));
+                    .record_item(&info.name, &format!("worksheet part {path} not found"));
                 continue;
             },
             Err(e) => {
-                unreadable_sheets.push((info.name.clone(), format!("worksheet part {path}: {e}")));
+                unreadable_sheets.record_item(&info.name, &format!("worksheet part {path}: {e}"));
                 continue;
             },
         };
@@ -157,7 +155,8 @@ pub(super) fn from_zip<R: Read + Seek>(
         app_properties,
         package_properties,
         has_macros,
-        unreadable_sheets,
+        unreadable_sheets: unreadable_sheets.listed,
+        unreadable_sheets_omitted: unreadable_sheets.omitted,
         unreadable_parts: shared.unreadable.listed,
         unreadable_parts_omitted: shared.unreadable.omitted,
         styles_data: None,

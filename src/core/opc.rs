@@ -475,12 +475,23 @@ impl<R: Read + Seek> OpcReader<R> {
 /// [`crate::limits::max_package_bytes`], so a package of many parts each
 /// just under [`MAX_PART_SIZE`] — or many entries pointing at the same
 /// compressed data — cannot add up to an unbounded allocation.
+///
+/// Reading an entry again allocates nothing that outlives the read, so it is
+/// not charged to that account, but it is as much work as the first read. The
+/// bytes inflated by reads past the first (and by reads that failed, which
+/// are never committed) are therefore totalled separately and held to the
+/// same limit: no entry can be inflated unboundedly often, however many parts
+/// name it and whether or not a caller remembers its result.
 pub(crate) struct ZipEntryIndex {
     by_normalized: HashMap<String, usize>,
     /// Entries already charged against the byte budget, by index.
     charged: Vec<std::cell::Cell<bool>>,
     /// Decompressed bytes charged so far.
     consumed: std::cell::Cell<u64>,
+    /// Bytes inflated by reads of an entry already read in full.
+    reinflated: std::cell::Cell<u64>,
+    /// Bytes inflated by reads that failed, which commit nothing.
+    failed: std::cell::Cell<u64>,
     /// The package-wide byte budget, fixed when the index is built.
     byte_limit: u64,
     /// Entries whose bytes failed their recorded CRC-32, in read order.
@@ -530,26 +541,58 @@ impl ZipEntryIndex {
                 .map(|_| std::cell::Cell::new(false))
                 .collect(),
             consumed: std::cell::Cell::new(0),
+            reinflated: std::cell::Cell::new(0),
+            failed: std::cell::Cell::new(0),
             byte_limit,
             crc_mismatched: std::cell::RefCell::new(Vec::new()),
         }
     }
 
     /// Charge `bytes` decompressed from entry `index` against the package
-    /// budget. An entry already charged is free: re-reading a shared image
-    /// allocates nothing that outlives the previous read.
-    fn charge(&self, index: usize, bytes: u64, name: &str) -> Result<()> {
+    /// budget. An entry already charged costs the package account nothing
+    /// (re-reading a shared image allocates nothing that outlives the previous
+    /// read) but its bytes count towards the re-inflated total, so that the
+    /// work of reading it again is bounded too. `counted` is the part of
+    /// `bytes` an earlier call for this read has already put to that total.
+    fn charge(&self, index: usize, bytes: u64, name: &str, counted: u64) -> Result<()> {
         if self.charged.get(index).is_some_and(|c| c.get()) {
-            return Ok(());
+            return self.charge_reinflated(bytes.saturating_sub(counted), name);
         }
+        // Reads that failed after inflating are never committed; once their
+        // total is past the limit no entry is inflated again.
         let total = self.consumed.get().saturating_add(bytes);
-        if total > self.byte_limit {
+        if total > self.byte_limit || self.failed.get() > self.byte_limit {
             return Err(Error::PackageLimit(format!(
                 "reading '{name}' brings the package's decompressed size past {} bytes",
                 self.byte_limit
             )));
         }
         Ok(())
+    }
+
+    /// Add `bytes` to the re-inflated total; an error once it is past the
+    /// package limit.
+    fn charge_reinflated(&self, bytes: u64, name: &str) -> Result<()> {
+        let total = self.reinflated.get().saturating_add(bytes);
+        self.reinflated.set(total);
+        if total > self.byte_limit {
+            return Err(Error::PackageLimit(format!(
+                "reading '{name}' again brings the bytes the package re-inflates past {} bytes",
+                self.byte_limit
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record that a read of entry `index` inflated `bytes` and then failed.
+    /// Nothing is committed for it, so each retry would be free; the bytes
+    /// are totalled instead (unless the entry was already counted as
+    /// re-inflated), and once the total is past the limit no entry that was
+    /// not read in full is inflated again.
+    fn note_failed_read(&self, index: usize, bytes: u64) {
+        if !self.charged.get(index).is_some_and(|c| c.get()) {
+            self.failed.set(self.failed.get().saturating_add(bytes));
+        }
     }
 
     /// Record that entry `index` was read in full, `bytes` long.
@@ -797,7 +840,7 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
     }
     // The package-wide account, checked against the declared size before
     // reading and against the actual size after.
-    entries.charge(index, file.size(), name)?;
+    entries.charge(index, file.size(), name, 0)?;
     let mut buf = Vec::with_capacity((file.size() as usize).min(1 << 20));
     let mut capped = (&mut file).take(MAX_PART_SIZE + 1);
     match capped.read_to_end(&mut buf) {
@@ -817,16 +860,23 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
             log::warn!("opc: part '{name}' failed its CRC-32 check; read as stored");
             entries.record_crc_mismatch(name);
         },
-        Err(e) => return Err(e.into()),
+        Err(e) => {
+            entries.note_failed_read(index, buf.len() as u64);
+            return Err(e.into());
+        },
     }
     if buf.len() as u64 > MAX_PART_SIZE {
+        entries.note_failed_read(index, buf.len() as u64);
         return Err(Error::DecompressionLimit {
             part: name.to_string(),
             limit: MAX_PART_SIZE,
         });
     }
     // A lying declared size is caught here, before the bytes are kept.
-    entries.charge(index, buf.len() as u64, name)?;
+    if let Err(e) = entries.charge(index, buf.len() as u64, name, file.size()) {
+        entries.note_failed_read(index, buf.len() as u64);
+        return Err(e);
+    }
     entries.commit(index, buf.len() as u64);
     Ok(buf)
 }
@@ -1332,6 +1382,84 @@ mod tests {
         assert!(matches!(err, Error::PackageLimit(_)), "{err:?}");
         // Already-charged parts stay readable.
         assert!(read_zip_entry(&mut archive, &entries, "b.bin").is_ok());
+    }
+
+    /// Reading one entry again is free of the package account but not of the
+    /// work: the bytes inflated by reads past the first are totalled and held
+    /// to the same limit, so no entry can be inflated unboundedly often.
+    #[test]
+    fn test_package_byte_budget_bounds_the_bytes_re_inflated() {
+        let bytes = raw_zip(&[("a.bin", &[1u8; 8])], Eocd::Count(1), &[]);
+        let mut archive = ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let entries = ZipEntryIndex::with_byte_limit(&archive, 16);
+        // The first read is charged to the package account (8 of 16), the
+        // next two to the re-inflated total (16 of 16).
+        for _ in 0..3 {
+            assert_eq!(
+                read_zip_entry(&mut archive, &entries, "a.bin")
+                    .unwrap()
+                    .len(),
+                8
+            );
+        }
+        let err = read_zip_entry(&mut archive, &entries, "a.bin").unwrap_err();
+        assert!(matches!(err, Error::PackageLimit(_)), "{err:?}");
+        // The refusal is sticky: the limit is spent for every entry.
+        assert!(read_zip_entry(&mut archive, &entries, "a.bin").is_err());
+    }
+
+    /// A part that fails after inflating is not committed, so it would be
+    /// free to try again; the bytes of each failed attempt count, and once
+    /// they are past the limit the part is no longer inflated.
+    #[test]
+    fn test_package_byte_budget_stops_inflating_a_part_that_keeps_failing() {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts: zip::write::FileOptions<'_, '_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("a.bin", opts).unwrap();
+        zip.write_all(&vec![0u8; 1 << 20]).unwrap();
+        let good = zip.finish().unwrap().into_inner();
+        // Damage the compressed stream where a read inflates the most before
+        // it fails (a checksum mismatch alone keeps the bytes).
+        let limit = 2 << 20;
+        let mut found: Option<(u64, Vec<u8>)> = None;
+        for at in 40..good.len().min(400) {
+            let mut bytes = good.clone();
+            bytes[at] ^= 0x5A;
+            let Ok(mut archive) = ZipArchive::new(std::io::Cursor::new(bytes.clone())) else {
+                continue;
+            };
+            let entries = ZipEntryIndex::with_byte_limit(&archive, limit);
+            if read_zip_entry(&mut archive, &entries, "a.bin").is_err()
+                && entries.failed.get() > found.as_ref().map_or(0, |f| f.0)
+            {
+                found = Some((entries.failed.get(), bytes));
+            }
+        }
+        let (_, bytes) = found.expect("a damaged stream that fails after inflating");
+        let mut archive = ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let entries = ZipEntryIndex::with_byte_limit(&archive, limit);
+        let mut inflating = 0u64;
+        let mut refused = false;
+        for _ in 0..10_000 {
+            match read_zip_entry(&mut archive, &entries, "a.bin") {
+                Err(Error::PackageLimit(_)) => {
+                    refused = true;
+                    break;
+                },
+                Err(_) => inflating += 1,
+                Ok(_) => panic!("a damaged stream was accepted"),
+            }
+        }
+        assert!(refused, "{inflating} attempts were inflated and none refused");
+        let each = entries.failed.get() / inflating.max(1);
+        assert!(
+            each > 0 && inflating <= limit / each + 2,
+            "{inflating} attempts of {each} bytes"
+        );
+        assert!(read_zip_entry(&mut archive, &entries, "a.bin").is_err());
+        assert!(entries.failed.get() <= limit + each, "{}", entries.failed.get());
     }
 
     /// A declared size that understates the data does not dodge the package

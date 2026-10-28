@@ -381,6 +381,12 @@ fn test_a_comment_of_one_character_is_charged_as_the_note_that_holds_it() {
 /// `sheets` chartsheets that display one chart whose title is `len`
 /// characters; `linked` says whether they name its drawing.
 fn shared_chartsheets(sheets: usize, len: usize, linked: bool) -> Vec<u8> {
+    shared_chartsheets_padded(sheets, len, linked, 0)
+}
+
+/// Like [`shared_chartsheets`], with `pad` bytes of padding in the drawing's
+/// relationships part.
+fn shared_chartsheets_padded(sheets: usize, len: usize, linked: bool, pad: usize) -> Vec<u8> {
     let chart = format!(
         r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>{}</a:t></a:r></a:p></c:rich></c:tx></c:title></c:chart></c:chartSpace>"#,
         "t".repeat(len)
@@ -405,7 +411,7 @@ fn shared_chartsheets(sheets: usize, len: usize, linked: bool) -> Vec<u8> {
             ("xl/drawings/drawing1.xml", drawing.into_bytes()),
             (
                 "xl/drawings/_rels/drawing1.xml.rels",
-                format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/chart" Target="../charts/chart1.xml"/></Relationships>"#).into_bytes(),
+                format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/chart" Target="../charts/chart1.xml"/><!--{}--></Relationships>"#, " ".repeat(pad)).into_bytes(),
             ),
             ("xl/charts/chart1.xml", chart.into_bytes()),
         ],
@@ -435,4 +441,240 @@ fn test_a_chart_displayed_by_many_chartsheets_is_read_once_and_charged() {
     assert!(ir_chars(&ir) < 400_000, "{}", ir_chars(&ir));
     assert!(doc.plain_text().len() < 400_000);
     assert!(doc.to_markdown().len() < 400_000);
+}
+
+/// One sheet with `pivots` pivot tables, all naming one cache definition of
+/// about `pad` bytes whose source is not a worksheet (so the early return for
+/// a source in the workbook does not apply). `linked` says whether the pivot
+/// tables name it.
+fn shared_pivot_definition(pivots: usize, pad: usize, linked: bool) -> Vec<u8> {
+    let def = format!(
+        r#"<pivotCacheDefinition xmlns="{NS}"><cacheSource type="consolidation"/><!--{}--></pivotCacheDefinition>"#,
+        " ".repeat(pad)
+    );
+    let mut extra: Vec<(String, Vec<u8>)> =
+        vec![("xl/pivotCache/pivotCacheDefinition1.xml".to_string(), def.into_bytes())];
+    let mut rels = String::new();
+    for i in 1..=pivots {
+        extra.push((
+            format!("xl/pivotTables/pivotTable{i}.xml"),
+            format!(
+                r#"<pivotTableDefinition xmlns="{NS}" name="p{i}"><location ref="A1:B2"/></pivotTableDefinition>"#
+            )
+            .into_bytes(),
+        ));
+        extra.push((
+            format!("xl/pivotTables/_rels/pivotTable{i}.xml.rels"),
+            format!(
+                r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/{}" Target="../pivotCache/pivotCacheDefinition1.xml"/></Relationships>"#,
+                if linked { "pivotCacheDefinition" } else { "unrelated" }
+            )
+            .into_bytes(),
+        ));
+        rels.push_str(&format!(
+            r#"<Relationship Id="rId{i}" Type="{R}/pivotTable" Target="../pivotTables/pivotTable{i}.xml"/>"#
+        ));
+    }
+    let extra: Vec<(&str, Vec<u8>)> = extra.iter().map(|(n, d)| (n.as_str(), d.clone())).collect();
+    workbook(1, &one_cell(""), &rels, &extra)
+}
+
+#[test]
+fn test_a_pivot_cache_definition_named_by_many_pivot_tables_is_read_once() {
+    let _g = serial();
+    // Opening with more pivot tables adds what the pivot tables themselves
+    // cost, not another copy of the definition for each: one 2 MB definition
+    // is read and scanned once whatever the number of tables that name it.
+    let pad = 2_000_000;
+    let open = |p, linked| {
+        let bytes = shared_pivot_definition(p, pad, linked);
+        let (doc, used) = bytes_during(|| open(bytes));
+        drop(doc);
+        used
+    };
+    let tables_alone = open(40, false).saturating_sub(open(1, false));
+    let with_definition = open(40, true).saturating_sub(open(1, true));
+    assert!(
+        with_definition < tables_alone + pad,
+        "40 pivot tables naming one {pad} byte definition add {with_definition} bytes to opening over one table, {tables_alone} when they do not name it: the definition is read per table"
+    );
+}
+
+#[test]
+fn test_the_relationships_of_a_drawing_named_by_many_chartsheets_are_read_once() {
+    let _g = serial();
+    // The drawing's relationships part, not the chart, is the large one: it
+    // is read for the first chartsheet that names the drawing and not again.
+    let pad = 2_000_000;
+    let by = |sheets, linked| {
+        let bytes = shared_chartsheets_padded(sheets, 10, linked, pad);
+        let (doc, used) = bytes_during(|| open(bytes));
+        drop(doc);
+        used
+    };
+    let unlinked = by(30, false).saturating_sub(by(1, false));
+    let linked = by(30, true).saturating_sub(by(1, true));
+    assert!(
+        linked < unlinked + pad,
+        "30 chartsheets naming a drawing whose relationships are {pad} bytes add {linked} bytes to opening over one, {unlinked} when they do not name it: the relationships are read per chartsheet"
+    );
+}
+
+/// A package of `t` threaded-comment parts of `entries` messages each and `l`
+/// small legacy comments parts, with one sheet for each of the `t * l` pairs.
+fn comment_pairs(t: usize, l: usize, entries: usize) -> Vec<u8> {
+    const THREADED: &str =
+        "http://schemas.microsoft.com/office/2017/10/relationships/threadedComment";
+    let mut parts: Vec<(String, String)> = Vec::new();
+    let mut names = String::new();
+    let mut wb_rels = String::new();
+    let mut n = 0;
+    for j in 0..t {
+        let mut s = String::from(
+            r#"<ThreadedComments xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments">"#,
+        );
+        for i in 0..entries {
+            s.push_str(&format!(
+                r#"<threadedComment ref="A{}" id="{{{i}}}"><text>x</text></threadedComment>"#,
+                i + 1
+            ));
+        }
+        s.push_str("</ThreadedComments>");
+        parts.push((format!("xl/threadedComments/t{j}.xml"), s));
+    }
+    for i in 0..l {
+        parts.push((
+            format!("xl/comments{i}.xml"),
+            format!(
+                r#"<comments xmlns="{NS}"><authors><author>a</author></authors><commentList><comment ref="B1" authorId="0"><text><t>y</t></text></comment></commentList></comments>"#
+            ),
+        ));
+        for j in 0..t {
+            n += 1;
+            names.push_str(&format!(r#"<sheet name="S{n}" sheetId="{n}" r:id="rId{n}"/>"#));
+            wb_rels.push_str(&format!(
+                r#"<Relationship Id="rId{n}" Type="{R}/worksheet" Target="worksheets/sheet{n}.xml"/>"#
+            ));
+            parts.push((format!("xl/worksheets/sheet{n}.xml"), one_cell("")));
+            parts.push((
+                format!("xl/worksheets/_rels/sheet{n}.xml.rels"),
+                format!(
+                    r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/comments" Target="../comments{i}.xml"/><Relationship Id="rId2" Type="{THREADED}" Target="../threadedComments/t{j}.xml"/></Relationships>"#
+                ),
+            ));
+        }
+    }
+    parts.push((
+        "[Content_Types].xml".into(),
+        r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#.into(),
+    ));
+    parts.push((
+        "_rels/.rels".into(),
+        format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#),
+    ));
+    parts.push((
+        "xl/workbook.xml".into(),
+        format!(r#"<workbook xmlns="{NS}" xmlns:r="{R}"><sheets>{names}</sheets></workbook>"#),
+    ));
+    parts.push((
+        "xl/_rels/workbook.xml.rels".into(),
+        format!(r#"<Relationships xmlns="{REL_NS}">{wb_rels}</Relationships>"#),
+    ));
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts: zip::write::FileOptions<'_, '_, ()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (name, data) in parts {
+        zip.start_file(name, opts).unwrap();
+        zip.write_all(data.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+#[test]
+fn test_large_threaded_parts_paired_with_many_legacy_parts_cost_nothing_once_the_budget_is_spent() {
+    let mut limits = serial();
+    // The first pairs spend the comment allowance; every later pair then has
+    // nothing to merge and must not even group the threaded part's messages.
+    limits.set(max_text_chars, set_max_text_chars, 1_000);
+    // What each further legacy part adds to opening, against two threaded
+    // parts of `entries` messages: the sheets' own cost, from messages of
+    // few, and what the large parts add to it.
+    let per_legacy_part = |entries| {
+        let by = |l| {
+            let bytes = comment_pairs(2, l, entries);
+            let (doc, used) = bytes_during(|| open(bytes));
+            assert!(doc.to_ir().metadata.text_truncated);
+            drop(doc);
+            used
+        };
+        by(22).saturating_sub(by(2)) / 20
+    };
+    let (small, large) = (per_legacy_part(20), per_legacy_part(5_000));
+    assert!(
+        large < small + 5_000 * 8,
+        "each further legacy part costs {large} bytes to open against two threaded parts of 5,000 messages, {small} against two of 20: the messages are grouped per pair"
+    );
+}
+
+/// One sheet whose drawing places `anchors` pictures that all name the media
+/// part `xl/media/bad.png`: 1 MiB of zeros, deflated, with one byte of the
+/// compressed stream flipped at `damage` (not at all when `None`).
+fn pictures_of_one_damaged_image(anchors: usize, damage: Option<usize>) -> Vec<u8> {
+    let mut drawing = format!("<xdr:wsDr {XDR}>");
+    for _ in 0..anchors {
+        drawing.push_str(r#"<xdr:oneCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx="100" cy="100"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="p"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill><xdr:spPr/></xdr:pic><xdr:clientData/></xdr:oneCellAnchor>"#);
+    }
+    drawing.push_str("</xdr:wsDr>");
+    let mut bytes = workbook(
+        1,
+        &one_cell(r#"<drawing r:id="rId1"/>"#),
+        &format!(r#"<Relationship Id="rId1" Type="{R}/drawing" Target="../drawings/drawing1.xml"/>"#),
+        &[
+            ("xl/drawings/drawing1.xml", drawing.into_bytes()),
+            (
+                "xl/drawings/_rels/drawing1.xml.rels",
+                format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/image" Target="../media/bad.png"/></Relationships>"#).into_bytes(),
+            ),
+            ("xl/media/bad.png", vec![0u8; 1 << 20]),
+        ],
+    );
+    if let Some(at) = damage {
+        // The local header: 30 bytes, the name, an extra field.
+        let name = b"xl/media/bad.png";
+        let header = bytes.windows(name.len()).position(|w| w == name).unwrap() - 30;
+        let extra = u16::from_le_bytes([bytes[header + 28], bytes[header + 29]]) as usize;
+        bytes[header + 30 + name.len() + extra + at] ^= 0x5A;
+    }
+    bytes
+}
+
+#[test]
+fn test_a_damaged_picture_named_by_many_anchors_is_read_once_and_reported_once() {
+    let _g = serial();
+    // Damage the stream where the read fails (a checksum mismatch alone
+    // keeps the bytes).
+    let damage = (3..60)
+        .find(|&at| {
+            let doc = open(pictures_of_one_damaged_image(1, Some(at)));
+            doc.as_xlsx()
+                .unwrap()
+                .unreadable_parts
+                .iter()
+                .any(|(p, _)| p.contains("bad.png"))
+        })
+        .expect("a damage that makes the read fail");
+    let by = |anchors| {
+        let bytes = pictures_of_one_damaged_image(anchors, Some(damage));
+        let (doc, used) = bytes_during(|| open(bytes));
+        let parts = doc.as_xlsx().unwrap().unreadable_parts.clone();
+        drop(doc);
+        (used, parts)
+    };
+    let (one, _) = by(1);
+    let (many, parts) = by(200);
+    assert!(
+        many < one + (1 << 20),
+        "200 anchors naming a damaged picture take {many} bytes to open, one anchor {one}: the read is repeated"
+    );
+    assert_eq!(parts.iter().filter(|(p, _)| p.contains("bad.png")).count(), 1, "{parts:?}");
 }

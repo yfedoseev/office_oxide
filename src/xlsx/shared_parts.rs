@@ -24,35 +24,54 @@ use super::{
 use crate::core::opc;
 use crate::core::relationships::{Relationships, rel_types};
 
-/// Most relationship parts recorded as unreadable; the rest are counted.
-pub(super) const MAX_UNREADABLE_PARTS: usize = 100;
-/// Longest part name or reason kept in a record, in characters: both can
-/// echo values the file controls.
+/// Most reports kept in a [`ReportList`]; the rest are counted.
+pub(super) const MAX_REPORTS: usize = 100;
+/// Longest name or reason kept in a report, in characters: both can echo
+/// values the file controls.
 const MAX_REPORT_CHARS: usize = 256;
 
-/// The relationship parts that could not be read: each part once, at most
-/// [`MAX_UNREADABLE_PARTS`] kept, and the number of the rest.
+/// What could not be read, as `(name, reason)`: each item once, at most
+/// [`MAX_REPORTS`] kept, each name and reason cut to a fixed length, and the
+/// number of the rest. One sink for the relationship and other parts that
+/// could not be read and for the sheets that could not, so that however many
+/// the file names, and however long it makes their names, what is kept (and
+/// every renderer echoes) is bounded.
 #[derive(Default)]
-pub(crate) struct UnreadableParts {
+pub(crate) struct ReportList {
     pub(super) listed: Vec<(String, String)>,
     pub(super) omitted: usize,
-    seen: std::collections::HashSet<String>,
+    /// Hashes of the parts recorded, so that the names of parts the file
+    /// makes up (a missing part has none but its path) are not all kept.
+    seen: std::collections::HashSet<u64>,
 }
 
-impl UnreadableParts {
+impl ReportList {
     /// Record that the part at `path` could not be read, for `reason`. A part
     /// already recorded (by the zip entry its path resolves to) is not
-    /// recorded again.
+    /// recorded again, whether or not it was kept.
     pub(super) fn record(&mut self, entries: &opc::ZipEntryIndex, path: &str, reason: &str) {
-        if !self.seen.insert(part_key(entries, path)) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        part_key(entries, path).hash(&mut hasher);
+        if !self.seen.insert(hasher.finish()) {
             return;
         }
-        if self.listed.len() >= MAX_UNREADABLE_PARTS {
+        self.push(path, reason);
+    }
+
+    /// Record that the item `name` could not be read, for `reason`. Every
+    /// call is one item: two sheets of the same name are two.
+    pub(super) fn record_item(&mut self, name: &str, reason: &str) {
+        self.push(name, reason);
+    }
+
+    fn push(&mut self, name: &str, reason: &str) {
+        if self.listed.len() >= MAX_REPORTS {
             self.omitted += 1;
             return;
         }
         let cut = |s: &str| s.chars().take(MAX_REPORT_CHARS).collect::<String>();
-        self.listed.push((cut(path), cut(reason)));
+        self.listed.push((cut(name), cut(reason)));
     }
 }
 
@@ -69,15 +88,19 @@ pub(super) struct SharedDrawing {
 pub(super) struct SharedParts {
     drawings: HashMap<String, Option<Arc<SharedDrawing>>>,
     comments: HashMap<String, Option<Arc<[SheetComment]>>>,
-    threaded: HashMap<String, Option<Arc<Vec<worksheet::RawThreadedComment>>>>,
+    threaded: HashMap<String, Option<Arc<worksheet::ThreadedComments>>>,
     /// Merged comments by the pair of parts merged.
     merged: HashMap<(String, String), (Arc<[SheetComment]>, bool)>,
     tables: HashMap<String, Option<Arc<SheetTable>>>,
     /// The text of chart parts, for the chartsheets that display them.
     charts: HashMap<String, Option<Arc<str>>>,
+    /// The chart parts each drawing names, for the chartsheets that display
+    /// them, by drawing: the drawing's relationships are read once however
+    /// many chartsheets name it.
+    drawing_charts: HashMap<String, Arc<[String]>>,
     /// Relationship parts met on the way that could not be read, as
     /// `(part, reason)`.
-    pub(super) unreadable: UnreadableParts,
+    pub(super) unreadable: ReportList,
 }
 
 impl SharedParts {
@@ -132,32 +155,37 @@ impl SharedParts {
         }
 
         let legacy: Arc<[SheetComment]> = match (legacy_path, legacy_key) {
-            (Some(path), Some(key)) => self
-                .comments
-                .entry(key)
-                .or_insert_with(|| {
-                    XlsxDocument::read_xml_entry(archive, entries, &path)
-                        .ok()
-                        .and_then(|d| worksheet::parse_comments(&d).ok())
-                        .map(Arc::from)
-                })
-                .clone()
-                .unwrap_or_else(|| Arc::from([])),
+            (Some(path), Some(key)) => {
+                let unreadable = &mut self.unreadable;
+                self.comments
+                    .entry(key)
+                    .or_insert_with(|| {
+                        read_parsed(archive, entries, &path, unreadable, worksheet::parse_comments)
+                            .map(Arc::from)
+                    })
+                    .clone()
+                    .unwrap_or_else(|| Arc::from([]))
+            },
             _ => Arc::from([]),
         };
-        let threaded: Arc<Vec<worksheet::RawThreadedComment>> = match (threaded_path, threaded_key)
-        {
-            (Some(path), Some(key)) => self
-                .threaded
-                .entry(key)
-                .or_insert_with(|| {
-                    XlsxDocument::read_xml_entry(archive, entries, &path)
-                        .ok()
-                        .and_then(|d| worksheet::parse_threaded_comments(&d).ok())
-                        .map(Arc::new)
-                })
-                .clone()
-                .unwrap_or_default(),
+        let threaded: Arc<worksheet::ThreadedComments> = match (threaded_path, threaded_key) {
+            (Some(path), Some(key)) => {
+                let unreadable = &mut self.unreadable;
+                self.threaded
+                    .entry(key)
+                    .or_insert_with(|| {
+                        read_parsed(
+                            archive,
+                            entries,
+                            &path,
+                            unreadable,
+                            worksheet::parse_threaded_comments,
+                        )
+                        .map(|messages| Arc::new(worksheet::ThreadedComments::new(messages)))
+                    })
+                    .clone()
+                    .unwrap_or_default()
+            },
             _ => Arc::default(),
         };
         let merged = if threaded.is_empty() {
@@ -171,6 +199,54 @@ impl SharedParts {
         merged
     }
 
+    /// The chart parts a chartsheet displays: its drawing's chart
+    /// relationships ([ECMA-376] §12.3.2 — a chartsheet shows one chart
+    /// through a drawing part). A part that is missing or unrelated yields
+    /// nothing; the sheet is then its name alone. Each chart is listed once.
+    pub(super) fn chartsheet_chart_parts<R: Read + Seek>(
+        &mut self,
+        archive: &mut ZipArchive<R>,
+        entries: &opc::ZipEntryIndex,
+        sheet_path: &str,
+    ) -> Vec<String> {
+        let sheet_rels = read_rels_reporting(
+            archive,
+            entries,
+            &sheet_rels_path(sheet_path),
+            &mut self.unreadable,
+        );
+        let mut charts: Vec<String> = Vec::new();
+        let mut listed = std::collections::HashSet::new();
+        for drawing in sheet_rels.get_by_type(rel_types::DRAWING) {
+            let drawing_path = resolve_relative_zip_path(sheet_path, &drawing.target);
+            let key = part_key(entries, &drawing_path);
+            let named = match self.drawing_charts.get(&key) {
+                Some(hit) => hit.clone(),
+                None => {
+                    let drawing_rels = read_rels_reporting(
+                        archive,
+                        entries,
+                        &sheet_rels_path(&drawing_path),
+                        &mut self.unreadable,
+                    );
+                    let named: Arc<[String]> = drawing_rels
+                        .get_by_type(rel_types::CHART)
+                        .into_iter()
+                        .map(|chart| resolve_relative_zip_path(&drawing_path, &chart.target))
+                        .collect();
+                    self.drawing_charts.insert(key, named.clone());
+                    named
+                },
+            };
+            for path in named.iter() {
+                if listed.insert(part_key(entries, path)) {
+                    charts.push(path.clone());
+                }
+            }
+        }
+        charts
+    }
+
     /// The text of the chart part at `path`, read once; `None` when the part
     /// cannot be read or holds no text.
     pub(super) fn chart_text<R: Read + Seek>(
@@ -179,17 +255,18 @@ impl SharedParts {
         entries: &opc::ZipEntryIndex,
         path: &str,
     ) -> Option<Arc<str>> {
+        let unreadable = &mut self.unreadable;
         self.charts
             .entry(part_key(entries, path))
             .or_insert_with(|| {
-                let data = XlsxDocument::read_xml_entry(archive, entries, path).ok()?;
+                let data = read_reporting(archive, entries, path, unreadable)?;
                 let text = super::extract_chart_text(&data);
                 (!text.is_empty()).then(|| Arc::from(text))
             })
             .clone()
     }
 
-    /// The table part at `path`, parsed once. `None` (and a log line, once)
+    /// The table part at `path`, parsed once. `None` (and a report, once)
     /// when it is missing or does not parse: the cells it describes are in
     /// the sheet either way.
     pub(super) fn table<R: Read + Seek>(
@@ -198,21 +275,53 @@ impl SharedParts {
         entries: &opc::ZipEntryIndex,
         path: &str,
     ) -> Option<Arc<SheetTable>> {
+        let unreadable = &mut self.unreadable;
         self.tables
             .entry(part_key(entries, path))
             .or_insert_with(|| {
-                match XlsxDocument::read_xml_entry(archive, entries, path)
-                    .map_err(|e| e.to_string())
-                    .and_then(|d| worksheet::parse_table_part(&d).map_err(|e| e.to_string()))
-                {
-                    Ok(t) => Some(Arc::new(t)),
-                    Err(e) => {
-                        log::warn!("xlsx: table part {path} skipped: {e}");
-                        None
-                    },
-                }
+                read_parsed(archive, entries, path, unreadable, worksheet::parse_table_part)
+                    .map(Arc::new)
             })
             .clone()
+    }
+}
+
+/// The part at `path`, read; `None` when it cannot be, with the reason
+/// recorded (once per part) in `unreadable`. Callers keep the outcome, so the
+/// part is not tried again by every reference to it.
+pub(super) fn read_reporting<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &opc::ZipEntryIndex,
+    path: &str,
+    unreadable: &mut ReportList,
+) -> Option<Vec<u8>> {
+    match XlsxDocument::read_xml_entry(archive, entries, path) {
+        Ok(data) => Some(data),
+        Err(e) => {
+            log::warn!("xlsx: part {path} unreadable: {e}");
+            unreadable.record(entries, path, &e.to_string());
+            None
+        },
+    }
+}
+
+/// The part at `path`, read and parsed by `parse`; `None` with the reason
+/// recorded when either fails.
+pub(super) fn read_parsed<R: Read + Seek, T>(
+    archive: &mut ZipArchive<R>,
+    entries: &opc::ZipEntryIndex,
+    path: &str,
+    unreadable: &mut ReportList,
+    parse: impl FnOnce(&[u8]) -> crate::core::Result<T>,
+) -> Option<T> {
+    let data = read_reporting(archive, entries, path, unreadable)?;
+    match parse(&data) {
+        Ok(parsed) => Some(parsed),
+        Err(e) => {
+            log::warn!("xlsx: part {path} unreadable: {e}");
+            unreadable.record(entries, path, &e.to_string());
+            None
+        },
     }
 }
 
@@ -223,15 +332,9 @@ fn read_drawing<R: Read + Seek>(
     entries: &opc::ZipEntryIndex,
     media: &mut MediaCache,
     drawing_path: &str,
-    unreadable: &mut UnreadableParts,
+    unreadable: &mut ReportList,
 ) -> Option<SharedDrawing> {
-    let drawing_xml = match XlsxDocument::read_xml_entry(archive, entries, drawing_path) {
-        Ok(d) => d,
-        Err(e) => {
-            log::debug!("XlsxDocument: drawing part {drawing_path} unreadable ({e}); skipping");
-            return None;
-        },
-    };
+    let drawing_xml = read_reporting(archive, entries, drawing_path, unreadable)?;
 
     let drawing_rels =
         read_rels_reporting(archive, entries, &sheet_rels_path(drawing_path), unreadable);
@@ -239,9 +342,8 @@ fn read_drawing<R: Read + Seek>(
     let parsed = match parse_drawing_anchors(&drawing_xml) {
         Ok(a) => a,
         Err(e) => {
-            log::debug!(
-                "XlsxDocument: drawing {drawing_path} failed to parse ({e}); dropping anchors"
-            );
+            log::warn!("xlsx: drawing {drawing_path} failed to parse ({e}); dropping anchors");
+            unreadable.record(entries, drawing_path, &e.to_string());
             return None;
         },
     };
@@ -253,7 +355,12 @@ fn read_drawing<R: Read + Seek>(
             continue;
         };
         let media_path = resolve_relative_zip_path(drawing_path, &rel.target);
-        let Some(bytes) = read_media_cached(archive, entries, &media_path, media) else {
+        // A linked picture names a target outside the package.
+        if rel.target_mode == crate::core::relationships::TargetMode::External {
+            continue;
+        }
+        let Some(bytes) = read_media_cached(archive, entries, &media_path, media, unreadable)
+        else {
             continue;
         };
         let ext = std::path::Path::new(&*rel.target)

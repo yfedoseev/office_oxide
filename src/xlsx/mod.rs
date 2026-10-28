@@ -111,7 +111,14 @@ pub struct XlsxDocument {
     /// fail the whole workbook where Tika/POI return the sheets that are
     /// intact; those are returned now, and the loss is on record here,
     /// in every renderer's output and in `Metadata::text_truncated`.
+    ///
+    /// At most 100 are kept, in the order the workbook lists them, with each
+    /// name and error cut to 256 characters; [`Self::unreadable_sheets_omitted`]
+    /// counts the rest.
     pub unreadable_sheets: Vec<(String, String)>,
+    /// How many more unreadable sheets there were than are listed in
+    /// [`Self::unreadable_sheets`].
+    pub unreadable_sheets_omitted: usize,
     /// Relationship parts that could not be read or parsed — `(part, error)`:
     /// a target past the package limit, a part that is not XML. The sheet
     /// (or drawing, pivot table, chart) they belong to is read without the
@@ -245,29 +252,49 @@ impl XlsxDocument {
             package: mut package_properties,
         } = Self::read_package_metadata(&mut archive, &entries);
 
+        // Parts several sheets may name are read and parsed once, and what
+        // could not be read is reported.
+        let mut shared = shared_parts::SharedParts::default();
+
         // Read workbook relationships to resolve sheet targets
-        let wb_rels =
-            match Self::read_xml_entry(&mut archive, &entries, "xl/_rels/workbook.xml.rels") {
-                Ok(data) => Relationships::parse(&data)?,
-                Err(_) => Relationships::empty(),
-            };
+        let wb_rels = match read_optional(
+            &mut archive,
+            &entries,
+            "xl/_rels/workbook.xml.rels",
+            &mut shared.unreadable,
+        ) {
+            Some(data) => Relationships::parse(&data)?,
+            None => Relationships::empty(),
+        };
         let has_macros = wb_rels.has_vba_project();
 
         // Parse shared strings (must be first — cells reference by index)
-        let shared_strings =
-            match Self::read_xml_entry(&mut archive, &entries, "xl/sharedStrings.xml") {
-                Ok(data) => SharedStringTable::parse(&data)?,
-                Err(_) => SharedStringTable::empty(),
-            };
-
-        // Parse styles eagerly — needed for date detection in format_cell_value().
-        let styles = match Self::read_xml_entry(&mut archive, &entries, "xl/styles.xml") {
-            Ok(data) => StyleSheet::parse(&data).ok(),
-            Err(_) => None,
+        let shared_strings = match read_optional(
+            &mut archive,
+            &entries,
+            "xl/sharedStrings.xml",
+            &mut shared.unreadable,
+        ) {
+            Some(data) => SharedStringTable::parse(&data)?,
+            None => SharedStringTable::empty(),
         };
 
+        // Parse styles eagerly — needed for date detection in format_cell_value().
+        let styles = read_optional(&mut archive, &entries, "xl/styles.xml", &mut shared.unreadable)
+            .and_then(|data| match StyleSheet::parse(&data) {
+                Ok(styles) => Some(styles),
+                Err(e) => {
+                    log::warn!("xlsx: styles part unreadable: {e}");
+                    shared
+                        .unreadable
+                        .record(&entries, "xl/styles.xml", &e.to_string());
+                    None
+                },
+            });
+
         // Read theme data lazily
-        let theme_data = Self::read_xml_entry(&mut archive, &entries, "xl/theme/theme1.xml").ok();
+        let theme_data =
+            read_optional(&mut archive, &entries, "xl/theme/theme1.xml", &mut shared.unreadable);
 
         // Parse workbook
         let wb_data = Self::read_xml_entry(&mut archive, &entries, "xl/workbook.xml")?;
@@ -279,8 +306,17 @@ impl XlsxDocument {
             .first_by_type(rel_types::PERSONS)
             .map(|rel| resolve_relative_zip_path("xl/workbook.xml", &rel.target))
             .or_else(|| Some("xl/persons/person.xml".to_string()))
-            .and_then(|path| Self::read_xml_entry(&mut archive, &entries, &path).ok())
-            .and_then(|data| worksheet::parse_persons(&data).ok())
+            .and_then(|path| {
+                let data = read_optional(&mut archive, &entries, &path, &mut shared.unreadable)?;
+                match worksheet::parse_persons(&data) {
+                    Ok(persons) => Some(persons),
+                    Err(e) => {
+                        log::warn!("xlsx: persons part {path} unreadable: {e}");
+                        shared.unreadable.record(&entries, &path, &e.to_string());
+                        None
+                    },
+                }
+            })
             .unwrap_or_default();
 
         // Phase 1: gather raw data sequentially (requires &mut archive)
@@ -303,10 +339,8 @@ impl XlsxDocument {
         // workbook share one text budget, like every other cell text.
         let mut pivot_budget = crate::limits::TextBudget::new();
         let mut pivot_ctx = PivotContext::new(&mut archive, &entries);
-        let mut unreadable_sheets: Vec<(String, String)> = Vec::new();
+        let mut unreadable_sheets = shared_parts::ReportList::default();
         let mut media = MediaCache::new();
-        // Parts several sheets may name are read and parsed once.
-        let mut shared = shared_parts::SharedParts::default();
         let mut sheet_parts = SheetPartClaims::default();
         // Threaded-comment text, which repeats each author's name on every
         // message, shares one budget across the workbook.
@@ -342,7 +376,7 @@ impl XlsxDocument {
 
             if let Err(reason) = sheet_parts.claim(&entries, &sheet_path, &sheet.name) {
                 log::warn!("xlsx: sheet {:?}: {reason}", sheet.name);
-                unreadable_sheets.push((sheet.name.clone(), reason));
+                unreadable_sheets.record_item(&sheet.name, &reason);
                 continue;
             }
 
@@ -350,16 +384,11 @@ impl XlsxDocument {
                 // No cells to read. A chartsheet's content is the text of
                 // the chart its drawing references.
                 let chart_text = if kind == crate::ir::SheetKind::Chart {
-                    let paths = chartsheet_chart_parts(
-                        &mut archive,
-                        &entries,
-                        &sheet_path,
-                        &mut shared.unreadable,
-                    );
+                    let paths = shared.chartsheet_chart_parts(&mut archive, &entries, &sheet_path);
                     let mut texts = Vec::new();
                     for path in paths {
                         texts.extend(shared.chart_text(&mut archive, &entries, &path));
-                        chartsheet_charts.insert(path);
+                        chartsheet_charts.insert(part_key(&entries, &path));
                     }
                     texts
                 } else {
@@ -416,7 +445,7 @@ impl XlsxDocument {
                 // not pass for a complete one.
                 Err(reason) => {
                     log::warn!("xlsx: sheet {:?}: {reason}", sheet.name);
-                    unreadable_sheets.push((sheet.name.clone(), reason));
+                    unreadable_sheets.record_item(&sheet.name, &reason);
                     continue;
                 },
             };
@@ -528,16 +557,17 @@ impl XlsxDocument {
                     }
                     worksheets.push(ws);
                 },
-                Err(u) => unreadable_sheets.push(u),
+                Err((name, reason)) => unreadable_sheets.record_item(&name, &reason),
             }
         }
         drop_pivot_caches_backed_by_tables(&mut worksheets);
-        if !unreadable_sheets.is_empty() && worksheets.is_empty() {
-            let (name, err) = &unreadable_sheets[0];
-            return Err(crate::core::Error::MalformedXml(format!(
-                "no readable sheet: {name:?}: {err}"
-            ))
-            .into());
+        if worksheets.is_empty() {
+            if let Some((name, err)) = unreadable_sheets.listed.first() {
+                return Err(crate::core::Error::MalformedXml(format!(
+                    "no readable sheet: {name:?}: {err}"
+                ))
+                .into());
+            }
         }
 
         // Resolve any in-cell rich-value images: a `vm`-
@@ -580,10 +610,12 @@ impl XlsxDocument {
                     .and_then(|f| f.name().ok().map(|n| n.into_owned()))
             })
             .filter(|n| n.starts_with("xl/charts/chart") && n.ends_with(".xml"))
-            .filter(|n| !chartsheet_charts.contains(n))
+            .filter(|n| !chartsheet_charts.contains(&part_key(&entries, n)))
             .collect();
         for name in chart_names {
-            if let Ok(data) = Self::read_xml_entry(&mut archive, &entries, &name) {
+            if let Some(data) =
+                shared_parts::read_reporting(&mut archive, &entries, &name, &mut shared.unreadable)
+            {
                 let text = extract_chart_text(&data);
                 if !text.is_empty() {
                     chart_text.push(text);
@@ -607,7 +639,9 @@ impl XlsxDocument {
             })
             .collect();
         for name in font_names {
-            if let Ok(data) = opc::read_zip_entry(&mut archive, &entries, &name) {
+            if let Some(data) =
+                shared_parts::read_reporting(&mut archive, &entries, &name, &mut shared.unreadable)
+            {
                 let basename = name.rsplit('/').next().unwrap_or("font");
                 let face = crate::docx::strip_embedded_font_filename(basename);
                 let font_name = if face.is_empty() {
@@ -638,7 +672,8 @@ impl XlsxDocument {
             app_properties,
             package_properties,
             has_macros,
-            unreadable_sheets,
+            unreadable_sheets: unreadable_sheets.listed,
+            unreadable_sheets_omitted: unreadable_sheets.omitted,
             unreadable_parts: shared.unreadable.listed,
             unreadable_parts_omitted: shared.unreadable.omitted,
             styles_data: None,
@@ -861,9 +896,11 @@ struct PivotContext {
     /// from the table parts before any sheet so a table-backed source is
     /// recognised before its records are touched.
     table_names: std::collections::HashSet<String>,
-    /// Materialised cache data by cache-definition part, so a cache shared
-    /// by several pivots is parsed once.
-    parsed: std::collections::HashMap<String, Option<std::sync::Arc<worksheet::PivotCacheData>>>,
+    /// Cache definitions by part, read, parsed and (when their source cells
+    /// are not in the workbook) materialised once however many pivot tables
+    /// name them. A definition that could not be read is remembered too: each
+    /// pivot table naming it would otherwise inflate and scan it again.
+    caches: std::collections::HashMap<String, Option<std::sync::Arc<PivotCache>>>,
     /// Pivot table parts already read, by part, so a part several sheets
     /// name is read and parsed once.
     pivots: std::collections::HashMap<String, Option<std::sync::Arc<worksheet::SheetPivotTable>>>,
@@ -873,7 +910,7 @@ impl PivotContext {
     fn new<R: Read + Seek>(archive: &mut ZipArchive<R>, entries: &opc::ZipEntryIndex) -> Self {
         let mut ctx = PivotContext {
             table_names: std::collections::HashSet::new(),
-            parsed: std::collections::HashMap::new(),
+            caches: std::collections::HashMap::new(),
             pivots: std::collections::HashMap::new(),
         };
         // Only a package with a pivot cache needs its table names.
@@ -962,48 +999,71 @@ fn read_pivot_table<R: Read + Seek>(
     workbook: &WorkbookInfo,
     pivot_ctx: &mut PivotContext,
     budget: &mut crate::limits::TextBudget,
-    unreadable: &mut shared_parts::UnreadableParts,
+    unreadable: &mut shared_parts::ReportList,
 ) -> Option<worksheet::SheetPivotTable> {
-    let mut pivot = match XlsxDocument::read_xml_entry(archive, entries, path)
-        .map_err(|e| e.to_string())
-        .and_then(|d| worksheet::parse_pivot_table_part(&d).map_err(|e| e.to_string()))
-    {
-        Ok(p) => p,
-        Err(e) => {
-            log::warn!("xlsx: pivot table part {path} skipped: {e}");
-            return None;
-        },
-    };
+    let mut pivot = shared_parts::read_parsed(
+        archive,
+        entries,
+        path,
+        unreadable,
+        worksheet::parse_pivot_table_part,
+    )?;
     let pivot_rels = read_rels_reporting(archive, entries, &sheet_rels_path(path), unreadable);
     if let Some(cache) = pivot_rels.first_by_type(PIVOT_CACHE_DEFINITION_REL) {
         let cache_path = resolve_relative_zip_path(path, &cache.target);
-        if let Ok(def) = XlsxDocument::read_xml_entry(archive, entries, &cache_path) {
-            let src = worksheet::parse_pivot_cache_definition(&def).unwrap_or_default();
-            pivot.source = src.display();
-            if !pivot_source_in_workbook(&src, workbook, &pivot_ctx.table_names) {
-                pivot.cache_data = match pivot_ctx.parsed.get(&part_key(entries, &cache_path)) {
-                    Some(data) => data.clone(),
-                    None => {
-                        let data = read_pivot_cache_data(
-                            archive,
-                            entries,
-                            &cache_path,
-                            &def,
-                            &src,
-                            budget,
-                            unreadable,
-                        );
-                        let data = data.map(std::sync::Arc::new);
-                        pivot_ctx
-                            .parsed
-                            .insert(part_key(entries, &cache_path), data.clone());
-                        data
-                    },
-                };
-            }
+        if let Some(cache) =
+            pivot_cache(archive, entries, &cache_path, workbook, pivot_ctx, budget, unreadable)
+        {
+            pivot.source = cache.source.clone();
+            pivot.cache_data = cache.data.clone();
         }
     }
     Some(pivot)
+}
+
+/// What a pivot cache definition gives every pivot table that names it: the
+/// source it displays and, when the source cells are not in the workbook, the
+/// records materialised from them.
+struct PivotCache {
+    source: Option<String>,
+    data: Option<std::sync::Arc<worksheet::PivotCacheData>>,
+}
+
+/// The cache definition at `cache_path`, read once. The definition can be as
+/// large as a part may be, and a package can hold thousands of pivot tables
+/// that name it, so neither the read nor the scan is repeated per table.
+fn pivot_cache<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &opc::ZipEntryIndex,
+    cache_path: &str,
+    workbook: &WorkbookInfo,
+    pivot_ctx: &mut PivotContext,
+    budget: &mut crate::limits::TextBudget,
+    unreadable: &mut shared_parts::ReportList,
+) -> Option<std::sync::Arc<PivotCache>> {
+    let key = part_key(entries, cache_path);
+    if let Some(hit) = pivot_ctx.caches.get(&key) {
+        return hit.clone();
+    }
+    let built = shared_parts::read_reporting(archive, entries, cache_path, unreadable).map(|def| {
+        let src = worksheet::parse_pivot_cache_definition(&def).unwrap_or_else(|e| {
+            log::warn!("xlsx: pivot cache definition {cache_path} unreadable: {e}");
+            unreadable.record(entries, cache_path, &e.to_string());
+            Default::default()
+        });
+        let data = if pivot_source_in_workbook(&src, workbook, &pivot_ctx.table_names) {
+            None
+        } else {
+            read_pivot_cache_data(archive, entries, cache_path, &def, &src, budget, unreadable)
+                .map(std::sync::Arc::new)
+        };
+        std::sync::Arc::new(PivotCache {
+            source: src.display(),
+            data,
+        })
+    });
+    pivot_ctx.caches.insert(key, built.clone());
+    built
 }
 
 /// Whether a pivot cache's source cells are in this workbook: a
@@ -1049,7 +1109,7 @@ fn read_pivot_cache_data<R: Read + Seek>(
     definition: &[u8],
     src: &worksheet::PivotCacheSource,
     budget: &mut crate::limits::TextBudget,
-    unreadable: &mut shared_parts::UnreadableParts,
+    unreadable: &mut shared_parts::ReportList,
 ) -> Option<worksheet::PivotCacheData> {
     let rels = read_rels_reporting(archive, entries, &sheet_rels_path(cache_path), unreadable);
     let rel = src
@@ -1058,17 +1118,12 @@ fn read_pivot_cache_data<R: Read + Seek>(
         .and_then(|id| rels.get_by_id(id))
         .or_else(|| rels.first_by_type(PIVOT_CACHE_RECORDS_REL))?;
     let records_path = resolve_relative_zip_path(cache_path, &rel.target);
-    let records = match XlsxDocument::read_xml_entry(archive, entries, &records_path) {
-        Ok(r) => r,
-        Err(e) => {
-            log::warn!("xlsx: pivot cache records {records_path} skipped: {e}");
-            return None;
-        },
-    };
+    let records = shared_parts::read_reporting(archive, entries, &records_path, unreadable)?;
     let (fields, fields_truncated) = match worksheet::parse_pivot_cache_fields(definition, budget) {
         Ok(f) => f,
         Err(e) => {
             log::warn!("xlsx: pivot cache definition {cache_path} fields unreadable: {e}");
+            unreadable.record(entries, cache_path, &e.to_string());
             return None;
         },
     };
@@ -1079,6 +1134,7 @@ fn read_pivot_cache_data<R: Read + Seek>(
         },
         Err(e) => {
             log::warn!("xlsx: pivot cache records {records_path} unreadable: {e}");
+            unreadable.record(entries, &records_path, &e.to_string());
             None
         },
     }
@@ -1139,33 +1195,6 @@ pub(super) fn sheet_kind_of(
     }
 }
 
-/// The chart parts a chartsheet displays: its drawing's chart
-/// relationships ([ECMA-376] §12.3.2 — a chartsheet shows one chart
-/// through a drawing part). A part that is missing or unrelated yields
-/// nothing; the sheet is then its name alone.
-pub(super) fn chartsheet_chart_parts<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
-    entries: &opc::ZipEntryIndex,
-    sheet_path: &str,
-    unreadable: &mut shared_parts::UnreadableParts,
-) -> Vec<String> {
-    let sheet_rels =
-        read_rels_reporting(archive, entries, &sheet_rels_path(sheet_path), unreadable);
-    let mut charts = Vec::new();
-    for drawing in sheet_rels.get_by_type(rel_types::DRAWING) {
-        let drawing_path = resolve_relative_zip_path(sheet_path, &drawing.target);
-        let drawing_rels =
-            read_rels_reporting(archive, entries, &sheet_rels_path(&drawing_path), unreadable);
-        for chart in drawing_rels.get_by_type(rel_types::CHART) {
-            let path = resolve_relative_zip_path(&drawing_path, &chart.target);
-            if !charts.contains(&path) {
-                charts.push(path);
-            }
-        }
-    }
-    charts
-}
-
 /// Read and parse the relationships part at `path`. A package without the
 /// part has no relationships there; a part that is present but cannot be
 /// read or parsed (a target past the package limit, a part that is not XML)
@@ -1175,7 +1204,7 @@ pub(super) fn read_rels_reporting<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &opc::ZipEntryIndex,
     path: &str,
-    unreadable: &mut shared_parts::UnreadableParts,
+    unreadable: &mut shared_parts::ReportList,
 ) -> Relationships {
     match XlsxDocument::read_xml_entry(archive, entries, path) {
         Ok(data) => Relationships::parse(&data).unwrap_or_else(|e| {
@@ -1241,7 +1270,8 @@ impl SheetPartClaims {
                 Err(format!("sheet part {path} is already the content of sheet {owner:?}"))
             },
             None => {
-                self.0.insert(part_key(entries, path), sheet.to_string());
+                self.0
+                    .insert(part_key(entries, path), sheet.chars().take(256).collect());
                 Ok(())
             },
         }
@@ -1260,21 +1290,51 @@ fn part_key(entries: &opc::ZipEntryIndex, path: &str) -> String {
 /// Media parts already read, by part name. A picture's bytes are shared by
 /// every anchor and rich value that names the part, where each used to get a
 /// copy (and a decompression) of its own.
-type MediaCache = std::collections::HashMap<String, std::sync::Arc<[u8]>>;
+type MediaCache = std::collections::HashMap<String, Option<std::sync::Arc<[u8]>>>;
 
 fn read_media_cached<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &opc::ZipEntryIndex,
     path: &str,
     cache: &mut MediaCache,
+    unreadable: &mut shared_parts::ReportList,
 ) -> Option<std::sync::Arc<[u8]>> {
     let key = part_key(entries, path);
     if let Some(hit) = cache.get(&key) {
-        return Some(hit.clone());
+        return hit.clone();
     }
-    let bytes: std::sync::Arc<[u8]> = opc::read_zip_entry(archive, entries, path).ok()?.into();
+    // A part that cannot be read is remembered, and reported once: each
+    // anchor naming it would otherwise inflate it again.
+    let bytes: Option<std::sync::Arc<[u8]>> = match opc::read_zip_entry(archive, entries, path) {
+        Ok(bytes) => Some(bytes.into()),
+        Err(e) => {
+            log::warn!("xlsx: picture part {path} unreadable: {e}");
+            unreadable.record(entries, path, &e.to_string());
+            None
+        },
+    };
     cache.insert(key, bytes.clone());
-    Some(bytes)
+    bytes
+}
+
+/// The part at `path` when the package has it. A package without it simply
+/// lacks the feature it holds; one whose part cannot be read has it damaged,
+/// which is reported.
+fn read_optional<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &opc::ZipEntryIndex,
+    path: &str,
+    unreadable: &mut shared_parts::ReportList,
+) -> Option<Vec<u8>> {
+    match XlsxDocument::read_xml_entry(archive, entries, path) {
+        Ok(data) => Some(data),
+        Err(crate::core::Error::MissingPart(_)) => None,
+        Err(e) => {
+            log::warn!("xlsx: part {path} unreadable: {e}");
+            unreadable.record(entries, path, &e.to_string());
+            None
+        },
+    }
 }
 
 /// Workbook-level in-cell rich-value images (Excel 365's
@@ -1292,11 +1352,11 @@ fn read_rich_value_images<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &opc::ZipEntryIndex,
     media: &mut MediaCache,
-    unreadable: &mut shared_parts::UnreadableParts,
+    unreadable: &mut shared_parts::ReportList,
 ) -> std::collections::HashMap<u32, crate::xlsx::worksheet::WorksheetPicture> {
     let mut out = std::collections::HashMap::new();
 
-    let Ok(metadata_xml) = XlsxDocument::read_xml_entry(archive, entries, "xl/metadata.xml") else {
+    let Some(metadata_xml) = read_optional(archive, entries, "xl/metadata.xml", unreadable) else {
         return out;
     };
     let Some((rich_type_id, future_rvb, value_metadata)) = parse_rich_value_metadata(&metadata_xml)
@@ -1304,21 +1364,21 @@ fn read_rich_value_images<R: Read + Seek>(
         return out;
     };
 
-    let Ok(rv_xml) = XlsxDocument::read_xml_entry(archive, entries, "xl/richData/rdrichvalue.xml")
+    let Some(rv_xml) = read_optional(archive, entries, "xl/richData/rdrichvalue.xml", unreadable)
     else {
         return out;
     };
     let rv_list = parse_rdrichvalue(&rv_xml);
 
-    let Ok(struct_xml) =
-        XlsxDocument::read_xml_entry(archive, entries, "xl/richData/rdrichvaluestructure.xml")
+    let Some(struct_xml) =
+        read_optional(archive, entries, "xl/richData/rdrichvaluestructure.xml", unreadable)
     else {
         return out;
     };
     let image_key_positions = parse_rich_value_structures(&struct_xml);
 
     let rel_path = "xl/richData/richValueRel.xml";
-    let Ok(rel_xml) = XlsxDocument::read_xml_entry(archive, entries, rel_path) else {
+    let Some(rel_xml) = read_optional(archive, entries, rel_path, unreadable) else {
         return out;
     };
     let rel_rids = parse_rich_value_rel(&rel_xml);
@@ -1358,7 +1418,8 @@ fn read_rich_value_images<R: Read + Seek>(
             continue;
         };
         let media_path = resolve_relative_zip_path(rel_path, &rel.target);
-        let Some(bytes) = read_media_cached(archive, entries, &media_path, media) else {
+        let Some(bytes) = read_media_cached(archive, entries, &media_path, media, unreadable)
+        else {
             continue;
         };
         let ext = Path::new(&*rel.target)

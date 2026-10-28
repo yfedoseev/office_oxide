@@ -251,11 +251,7 @@ impl XlsxDocument {
             begin(out)?;
             out.write_str(&budget.notice())?;
         }
-        for (name, err) in &self.unreadable_sheets {
-            begin(out)?;
-            out.write_str(&unreadable_notice(name, err))?;
-        }
-        Ok(())
+        write_report_notices(out, &mut budget, &mut begin, &self.report_notices(), false)
     }
 
     /// Extract a single sheet as plain text.
@@ -559,11 +555,7 @@ impl XlsxDocument {
             begin(out)?;
             out.write_str(&budget.notice())?;
         }
-        for (name, err) in &self.unreadable_sheets {
-            begin(out)?;
-            write!(out, "## {name}\n\n{}", unreadable_notice(name, err))?;
-        }
-        Ok(())
+        write_report_notices(out, &mut budget, &mut begin, &self.report_notices(), true)
     }
 
     /// Convert specific sheet to markdown.
@@ -922,6 +914,106 @@ pub(crate) fn unreadable_notice(name: &str, err: &str) -> String {
     format!("[unreadable sheet {name:?}: {err}]")
 }
 
+/// What could not be read, as every renderer reports it: one entry for each
+/// unreadable sheet listed, one for the sheets left unlisted and one for the
+/// parts (relationship, drawing, comments, table, pivot, chart and picture
+/// parts). They are bounded (see [`XlsxDocument::unreadable_sheets`]), cut and
+/// charged to the text budget by every renderer before it writes them.
+pub(crate) struct ReportNotice {
+    /// The heading of the entry's section: the sheet's name, or what the
+    /// entry lists.
+    pub(crate) title: String,
+    /// The in-band lines, each a bracketed notice.
+    pub(crate) lines: Vec<String>,
+    /// The `Metadata::warnings` entries for the same.
+    pub(crate) warnings: Vec<String>,
+}
+
+impl ReportNotice {
+    /// What the entry costs to write: its heading and lines.
+    pub(crate) fn chars(&self) -> usize {
+        self.lines
+            .iter()
+            .fold(self.title.len(), |n, l| n.saturating_add(l.len()).saturating_add(4))
+    }
+}
+
+impl XlsxDocument {
+    /// The entries reporting what could not be read, in the order every
+    /// renderer writes them: the unreadable sheets, then the parts.
+    pub(crate) fn report_notices(&self) -> Vec<ReportNotice> {
+        let mut out: Vec<ReportNotice> = self
+            .unreadable_sheets
+            .iter()
+            .map(|(name, err)| ReportNotice {
+                title: name.clone(),
+                lines: vec![unreadable_notice(name, err)],
+                warnings: vec![format!("skipped unreadable sheet {name:?}: {err}")],
+            })
+            .collect();
+        if self.unreadable_sheets_omitted > 0 {
+            let more =
+                format!("and {} more unreadable sheets not listed", self.unreadable_sheets_omitted);
+            out.push(ReportNotice {
+                title: "Unreadable sheets".to_string(),
+                lines: vec![format!("[{more}]")],
+                warnings: vec![more],
+            });
+        }
+        if !self.unreadable_parts.is_empty() || self.unreadable_parts_omitted > 0 {
+            let mut warnings: Vec<String> = self
+                .unreadable_parts
+                .iter()
+                .map(|(part, err)| format!("skipped unreadable part {part}: {err}"))
+                .collect();
+            if self.unreadable_parts_omitted > 0 {
+                warnings.push(format!(
+                    "and {} more unreadable parts not listed",
+                    self.unreadable_parts_omitted
+                ));
+            }
+            out.push(ReportNotice {
+                title: "Unreadable parts".to_string(),
+                lines: warnings.iter().map(|w| format!("[{w}]")).collect(),
+                warnings,
+            });
+        }
+        out
+    }
+}
+
+/// Write the entries of `notices` that the budget pays for, each by `write`,
+/// and the budget's own notice (unless something already wrote it) where it
+/// runs out. `begin` starts each part of the output.
+fn write_report_notices<W: Write + ?Sized>(
+    out: &mut W,
+    budget: &mut TextBudget,
+    begin: &mut dyn FnMut(&mut W) -> fmt::Result,
+    notices: &[ReportNotice],
+    markdown: bool,
+) -> fmt::Result {
+    for n in notices {
+        let was_spent = budget.exhausted();
+        if !budget.charge(n.chars()) {
+            if !was_spent {
+                begin(out)?;
+                out.write_str(&budget.notice())?;
+            }
+            break;
+        }
+        if markdown {
+            begin(out)?;
+            write!(out, "## {}\n\n{}", n.title, n.lines.join("\n\n"))?;
+        } else {
+            for line in &n.lines {
+                begin(out)?;
+                out.write_str(line)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Whether a sheet reads as prose — flowing text laid out one paragraph
 /// per row — rather than as a grid. `rows` yields, per row, the character
 /// count of each non-empty cell.
@@ -1035,6 +1127,7 @@ mod tests {
             package_properties: Default::default(),
             has_macros: false,
             unreadable_sheets: Vec::new(),
+            unreadable_sheets_omitted: 0,
             unreadable_parts: Vec::new(),
             unreadable_parts_omitted: 0,
             styles_data: None,
@@ -1103,6 +1196,7 @@ mod tests {
             package_properties: Default::default(),
             has_macros: false,
             unreadable_sheets: Vec::new(),
+            unreadable_sheets_omitted: 0,
             unreadable_parts: Vec::new(),
             unreadable_parts_omitted: 0,
             styles_data: None,
@@ -1173,6 +1267,7 @@ mod tests {
             package_properties: Default::default(),
             has_macros: false,
             unreadable_sheets: Vec::new(),
+            unreadable_sheets_omitted: 0,
             unreadable_parts: Vec::new(),
             unreadable_parts_omitted: 0,
             styles_data: None,
@@ -1208,6 +1303,7 @@ mod tests {
             package_properties: Default::default(),
             has_macros: false,
             unreadable_sheets: Vec::new(),
+            unreadable_sheets_omitted: 0,
             unreadable_parts: Vec::new(),
             unreadable_parts_omitted: 0,
             styles_data: None,

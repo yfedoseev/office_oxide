@@ -845,6 +845,11 @@ impl TextBudget {
         }
     }
 
+    /// Whether `chars` would be paid for now, charging nothing.
+    pub(crate) fn fits(&self, chars: usize) -> bool {
+        !self.exhausted && chars <= self.remaining
+    }
+
     /// Take up to `want` characters from what is left: all of them while the
     /// budget lasts, otherwise whatever remains, after which the budget is
     /// spent. For a caller that can use a part of a run (cut a piece short)

@@ -674,6 +674,40 @@ pub(crate) fn parse_persons(
     Ok(out)
 }
 
+/// The messages of a threaded-comments part grouped into threads, one per
+/// cell reference in reference order, each thread's root message first and
+/// its replies after it in file order.
+///
+/// Built once for a part, however many legacy comments parts it is merged
+/// with: grouping the messages is work in proportion to the whole part, and
+/// a package can pair one large part with a great many small ones.
+#[derive(Default)]
+pub(crate) struct ThreadedComments {
+    threads: Vec<Vec<RawThreadedComment>>,
+}
+
+impl ThreadedComments {
+    pub(crate) fn new(messages: Vec<RawThreadedComment>) -> Self {
+        let mut by_ref: std::collections::BTreeMap<String, Vec<RawThreadedComment>> =
+            std::collections::BTreeMap::new();
+        for tc in messages {
+            by_ref.entry(tc.cell_ref.clone()).or_default().push(tc);
+        }
+        let mut threads: Vec<Vec<RawThreadedComment>> = by_ref.into_values().collect();
+        for msgs in &mut threads {
+            // The root message (no parentId) leads; replies follow in their
+            // original file order — a stable sort on "has a parent" keeps
+            // that order within each group.
+            msgs.sort_by_key(|m| m.parent_id.is_some());
+        }
+        Self { threads }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.threads.is_empty()
+    }
+}
+
 /// Merge legacy `xl/comments*.xml` entries with modern threaded-comment
 /// entries for the same worksheet.
 ///
@@ -688,31 +722,38 @@ pub(crate) fn parse_persons(
 /// legacy "Note") keeps its own legacy text unchanged.
 ///
 /// The parts may be shared by several sheets, so the merge reads them and the
-/// legacy notes it keeps are copies, charged to `budget` like the thread text.
+/// legacy notes it keeps are copies. Everything it copies is charged to
+/// `budget` before it is copied (a thread's note, each of its messages, each
+/// legacy note kept), so the work of a merge is bounded by what the budget
+/// allows and a merge made after the budget is spent does none.
 pub(crate) fn merge_threaded_comments(
     legacy: &[SheetComment],
-    threaded: &[RawThreadedComment],
+    threaded: &ThreadedComments,
     persons: &std::collections::HashMap<String, std::sync::Arc<str>>,
     budget: &mut crate::limits::TextBudget,
 ) -> (Vec<SheetComment>, bool) {
     if threaded.is_empty() {
         return (legacy.to_vec(), false);
     }
-
-    let mut by_ref: std::collections::BTreeMap<&str, Vec<&RawThreadedComment>> =
-        std::collections::BTreeMap::new();
-    for tc in threaded {
-        by_ref.entry(tc.cell_ref.as_str()).or_default().push(tc);
+    // Nothing more fits: the legacy notes of this sheet cannot be paid for
+    // either, and the caller says so.
+    if budget.exhausted() {
+        return (Vec::new(), true);
     }
 
     let mut threads: Vec<SheetComment> = Vec::new();
     let mut resolved: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut truncated = false;
-    'threads: for (cell_ref, mut msgs) in by_ref {
-        // The root message (no parentId) leads; replies follow in their
-        // original file order — a stable sort on "has a parent" keeps
-        // that order within each group.
-        msgs.sort_by_key(|m| m.parent_id.is_some());
+    'threads: for msgs in &threaded.threads {
+        let Some(first) = msgs.first() else {
+            continue;
+        };
+        let cell_ref = first.cell_ref.as_str();
+        // The note that holds the thread, whatever the messages say.
+        if !budget.charge(std::mem::size_of::<crate::ir::Note>().saturating_add(cell_ref.len())) {
+            truncated = true;
+            break;
+        }
         let mut lines = Vec::with_capacity(msgs.len());
         let mut thread_author = None;
         for (i, m) in msgs.iter().enumerate() {
@@ -723,7 +764,11 @@ pub(crate) fn merge_threaded_comments(
             // Each message line names its author, so a long name repeated
             // down a long thread is charged for every message. A thread
             // that does not fit is left out whole, and so are the rest.
-            let line_chars = author.as_ref().map_or(0, |a| a.len() + 2) + m.text.len();
+            // A message is a string of its own until the thread's lines are
+            // joined, however short its text.
+            let line_chars = author.as_ref().map_or(0, |a| a.len() + 2)
+                + m.text.len()
+                + std::mem::size_of::<String>();
             if !budget.charge(line_chars) {
                 truncated = true;
                 break 'threads;
@@ -2467,12 +2512,12 @@ mod tests {
                 text: "Microsoft Office User:\nSample Notes".to_string(),
             },
         ];
-        let threaded = vec![RawThreadedComment {
+        let threaded = ThreadedComments::new(vec![RawThreadedComment {
             cell_ref: "C2".to_string(),
             parent_id: None,
             person_id: Some("{P1}".to_string()),
             text: "testing".to_string(),
-        }];
+        }]);
         let mut persons = std::collections::HashMap::new();
         persons.insert("{P1}".to_string(), "Pankaj Chaudhary".into());
 
@@ -2499,7 +2544,7 @@ mod tests {
     /// reply — the issue's own secondary, not-corpus-confirmed concern.
     #[test]
     fn test_merge_orders_reply_after_root_in_a_thread() {
-        let threaded = vec![
+        let threaded = ThreadedComments::new(vec![
             RawThreadedComment {
                 cell_ref: "A1".to_string(),
                 parent_id: Some("{ROOT}".to_string()),
@@ -2512,7 +2557,7 @@ mod tests {
                 person_id: None,
                 text: "the root message".to_string(),
             },
-        ];
+        ]);
         let merged = merge_threaded_comments(
             &[],
             &threaded,
@@ -2528,20 +2573,45 @@ mod tests {
     /// long thread multiplies; the thread text is charged to the budget.
     #[test]
     fn test_threaded_comment_author_repeated_down_a_thread_is_budgeted() {
-        let threaded: Vec<RawThreadedComment> = (0..50)
-            .map(|_| RawThreadedComment {
-                cell_ref: "A1".to_string(),
-                parent_id: None,
-                person_id: Some("{P1}".to_string()),
-                text: "x".to_string(),
-            })
-            .collect();
+        let threaded = ThreadedComments::new(
+            (0..50)
+                .map(|_| RawThreadedComment {
+                    cell_ref: "A1".to_string(),
+                    parent_id: None,
+                    person_id: Some("{P1}".to_string()),
+                    text: "x".to_string(),
+                })
+                .collect(),
+        );
         let mut persons = std::collections::HashMap::new();
         persons.insert("{P1}".to_string(), "n".repeat(100).into());
         let mut budget = crate::limits::TextBudget::with_limit(1_000);
         let (merged, truncated) = merge_threaded_comments(&[], &threaded, &persons, &mut budget);
         assert!(truncated, "5,000 characters of thread text exceed a 1,000 budget");
         assert!(merged.is_empty(), "a thread that does not fit is left out whole");
+    }
+
+    /// A message of one character is still a string of its own, so the
+    /// messages of a thread are charged for more than their text: many short
+    /// ones cannot be merged for a budget of their characters.
+    #[test]
+    fn test_a_short_threaded_message_is_charged_as_the_string_that_holds_it() {
+        let threaded = ThreadedComments::new(
+            (0..100)
+                .map(|_| RawThreadedComment {
+                    cell_ref: "A1".to_string(),
+                    parent_id: None,
+                    person_id: None,
+                    text: "x".to_string(),
+                })
+                .collect(),
+        );
+        // The note that holds the thread, and the messages' text, fit.
+        let note = std::mem::size_of::<crate::ir::Note>() + 2;
+        let mut budget = crate::limits::TextBudget::with_limit(note + 100 + 100);
+        let (merged, truncated) =
+            merge_threaded_comments(&[], &threaded, &std::collections::HashMap::new(), &mut budget);
+        assert!(truncated && merged.is_empty(), "100 strings cost more than 100 characters");
     }
 
     #[test]
@@ -2553,7 +2623,7 @@ mod tests {
         }];
         let merged = merge_threaded_comments(
             &legacy,
-            &[],
+            &ThreadedComments::new(Vec::new()),
             &std::collections::HashMap::new(),
             &mut crate::limits::TextBudget::new(),
         )
