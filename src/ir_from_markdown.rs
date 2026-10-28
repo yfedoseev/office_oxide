@@ -36,13 +36,16 @@ impl DocumentIR {
     /// section, and `Metadata::text_truncated` and a warning say so.
     /// The document as a whole is bounded the same way by
     /// [`crate::limits::max_markdown_elements`]: past it the rest of the
-    /// Markdown is not read.
+    /// Markdown is not read. Table cells have an allowance of their own,
+    /// [`crate::limits::max_markdown_table_cells`]: the rows of a table past
+    /// it are dropped, with a notice, and the rest of the document is read.
     pub fn from_markdown(markdown: &str, format: DocumentFormat) -> Self {
         Self::from_markdown_with_limits(
             markdown,
             format,
             crate::limits::max_markdown_list_items(),
             crate::limits::max_markdown_elements(),
+            crate::limits::max_markdown_table_cells(),
         )
     }
 
@@ -57,6 +60,7 @@ impl DocumentIR {
             format,
             max_list_items,
             crate::limits::max_markdown_elements(),
+            crate::limits::max_markdown_table_cells(),
         )
     }
 
@@ -65,8 +69,10 @@ impl DocumentIR {
         format: DocumentFormat,
         max_list_items: usize,
         max_elements: usize,
+        max_table_cells: usize,
     ) -> Self {
-        let mut parser = MarkdownParser::new(markdown, max_list_items, max_elements);
+        let mut parser =
+            MarkdownParser::new(markdown, max_list_items, max_elements, max_table_cells);
         let mut sections = parser.parse_sections();
         let mut metadata = Metadata {
             format,
@@ -79,6 +85,13 @@ impl DocumentIR {
                 "[{} list item(s) dropped: the document exceeds the {} list item limit \
                  (office_oxide::limits::set_max_markdown_list_items)]",
                 parser.dropped_list_items, max_list_items
+            ));
+        }
+        if parser.dropped_table_rows > 0 {
+            notices.push(format!(
+                "[{} table row(s) dropped: the document's tables exceed the {} cell limit \
+                 (office_oxide::limits::set_max_markdown_table_cells)]",
+                parser.dropped_table_rows, max_table_cells
             ));
         }
         if parser.elements_exhausted {
@@ -119,13 +132,30 @@ struct MarkdownParser<'a> {
     elements_left: usize,
     /// A block did not fit; the rest of the document is not read.
     elements_exhausted: bool,
+    /// Table cells still allowed, over the whole document.
+    table_cells_left: usize,
+    /// The table-cell allowance ran out.
+    table_cells_exhausted: bool,
+    /// Table rows read and dropped for want of allowance.
+    dropped_table_rows: usize,
+    /// The table just read left nothing to keep (every row was dropped).
+    table_left_out: bool,
 }
 
 impl<'a> MarkdownParser<'a> {
-    fn new(src: &'a str, max_list_items: usize, max_elements: usize) -> Self {
+    fn new(
+        src: &'a str,
+        max_list_items: usize,
+        max_elements: usize,
+        max_table_cells: usize,
+    ) -> Self {
         Self {
             elements_left: max_elements,
             elements_exhausted: false,
+            table_cells_left: max_table_cells,
+            table_cells_exhausted: false,
+            dropped_table_rows: 0,
+            table_left_out: false,
             lines: src.lines().collect(),
             pos: 0,
             list_items_left: max_list_items,
@@ -271,6 +301,11 @@ impl<'a> MarkdownParser<'a> {
                 if self.elements_exhausted {
                     break;
                 }
+                if self.table_left_out {
+                    // Its lines are read and reported; what follows is not
+                    // part of it.
+                    continue;
+                }
             }
 
             // Unordered list
@@ -351,6 +386,7 @@ impl<'a> MarkdownParser<'a> {
     }
 
     fn parse_table(&mut self) -> Option<Table> {
+        self.table_left_out = false;
         // Collect all consecutive pipe lines
         let mut raw: Vec<&'a str> = Vec::new();
         while let Some(line) = self.peek() {
@@ -377,7 +413,10 @@ impl<'a> MarkdownParser<'a> {
             return None;
         }
 
-        // The table and each row's cells are charged before they are built.
+        // The table is charged as a block, and each row's cells against the
+        // cell allowance, before they are built. A row that does not fit ends
+        // the table there: the rows after it are dropped and counted, and
+        // what follows the table is read as usual.
         if !self.charge(1) {
             return None;
         }
@@ -385,9 +424,12 @@ impl<'a> MarkdownParser<'a> {
         for (i, row_line) in data_rows.iter().enumerate() {
             let is_header = i == 0;
             let cell_texts = split_pipe_row(row_line);
-            if !self.charge(cell_texts.len().saturating_mul(TABLE_CELL_COST)) {
+            if self.table_cells_exhausted || cell_texts.len() > self.table_cells_left {
+                self.table_cells_exhausted = true;
+                self.dropped_table_rows += data_rows.len() - i;
                 break;
             }
+            self.table_cells_left -= cell_texts.len();
             let cells = cell_texts
                 .into_iter()
                 .map(|cell_text| {
@@ -423,6 +465,7 @@ impl<'a> MarkdownParser<'a> {
         }
 
         if rows.is_empty() {
+            self.table_left_out = true;
             return None;
         }
 
@@ -519,10 +562,6 @@ fn ordered_marker_number(line: &str) -> Option<u32> {
 // ---------------------------------------------------------------------------
 // Inline parser (bold, italic, plain)
 // ---------------------------------------------------------------------------
-
-/// What a table cell costs against [`crate::limits::max_markdown_elements`]:
-/// about four times the IR of a paragraph.
-const TABLE_CELL_COST: usize = 4;
 
 /// Cell rule width, in eighths of a point (0.5 pt).
 const CELL_RULE_EIGHTHS_PT: u32 = 4;
@@ -1234,7 +1273,7 @@ mod tests {
     }
 
     fn with_blocks(md: &str, max: usize) -> DocumentIR {
-        DocumentIR::from_markdown_with_limits(md, DocumentFormat::Docx, usize::MAX, max)
+        DocumentIR::from_markdown_with_limits(md, DocumentFormat::Docx, usize::MAX, max, usize::MAX)
     }
 
     #[test]
@@ -1249,6 +1288,92 @@ mod tests {
         assert!(!ir.plain_text().contains("late"), "nothing after the cut is read");
     }
 
+    /// A table of the size a spreadsheet exports to CSV and Markdown is not a
+    /// reason to drop what follows it.
+    #[test]
+    fn test_a_realistic_table_keeps_what_follows_it() {
+        for (rows, cols) in [(1_000usize, 25usize), (4_200, 6)] {
+            let mut md = String::new();
+            md.push_str(&format!(
+                "|{}\n",
+                (0..cols).map(|c| format!(" h{c} |")).collect::<String>()
+            ));
+            md.push_str(&format!("|{}\n", " --- |".repeat(cols)));
+            for r in 0..rows {
+                md.push_str(&format!(
+                    "|{}\n",
+                    (0..cols).map(|c| format!(" {r}x{c} |")).collect::<String>()
+                ));
+            }
+            md.push_str("\nafter the table\n");
+            let ir = DocumentIR::from_markdown(&md, DocumentFormat::Docx);
+            let cells: usize = ir
+                .sections
+                .iter()
+                .flat_map(|s| &s.elements)
+                .filter_map(|e| {
+                    if let Element::Table(t) = e {
+                        Some(t)
+                    } else {
+                        None
+                    }
+                })
+                .map(|t| t.rows.iter().map(|r| r.cells.len()).sum::<usize>())
+                .sum();
+            assert_eq!(cells, (rows + 1) * cols, "{rows} x {cols}: every cell kept");
+            assert!(ir.plain_text().contains("after the table"), "{rows} x {cols}");
+            assert!(!ir.metadata.text_truncated, "{:?}", ir.metadata.warnings);
+        }
+    }
+
+    /// Past the cell limit only the rows that do not fit are cut: the text
+    /// after the table is read, and the cut is reported.
+    #[test]
+    fn test_a_table_past_the_cell_limit_loses_only_its_late_rows() {
+        let mut md = String::from("| a | b |\n| - | - |\n");
+        for r in 0..50 {
+            md.push_str(&format!("| r{r} | x |\n"));
+        }
+        md.push_str("\nafter the table\n");
+        let ir =
+            DocumentIR::from_markdown_with_limits(&md, DocumentFormat::Docx, usize::MAX, 1_000, 20);
+        let table = ir
+            .sections
+            .iter()
+            .flat_map(|s| &s.elements)
+            .find_map(|e| {
+                if let Element::Table(t) = e {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .expect("the table");
+        assert_eq!(table.rows.len(), 10, "20 cells of 2 columns");
+        let text = ir.plain_text();
+        assert!(text.contains("after the table"), "the rest of the document is kept");
+        assert!(text.contains("41 table row(s)"), "{text}");
+        assert!(ir.metadata.text_truncated);
+        assert!(ir.metadata.warnings[0].contains("set_max_markdown_table_cells"));
+    }
+
+    /// A first row that alone is over the cell limit leaves no table, and the
+    /// lines after it are still read.
+    #[test]
+    fn test_a_first_row_over_the_cell_limit_leaves_no_table_and_the_rest_is_read() {
+        let md = "| a | b | c | d |\n| - | - | - | - |\n| 1 | 2 | 3 | 4 |\n\nafter\n";
+        let ir =
+            DocumentIR::from_markdown_with_limits(md, DocumentFormat::Docx, usize::MAX, 1_000, 3);
+        assert!(
+            !ir.sections
+                .iter()
+                .flat_map(|s| &s.elements)
+                .any(|e| matches!(e, Element::Table(_)))
+        );
+        assert!(ir.plain_text().contains("after"));
+        assert!(ir.metadata.text_truncated);
+    }
+
     #[test]
     fn test_sections_past_the_block_limit_are_dropped() {
         let md = "---\n".repeat(1_000);
@@ -1261,7 +1386,13 @@ mod tests {
     #[test]
     fn test_table_cells_are_charged_before_the_row_is_built() {
         let wide = format!("|{}\n", "a|".repeat(50_000));
-        let ir = with_blocks(&wide, 100);
+        let ir = DocumentIR::from_markdown_with_limits(
+            &wide,
+            DocumentFormat::Docx,
+            usize::MAX,
+            usize::MAX,
+            100,
+        );
         let cells: usize = ir
             .sections
             .iter()
@@ -1271,10 +1402,16 @@ mod tests {
                 _ => 0,
             })
             .sum();
-        assert_eq!(cells, 0, "a header row of 50,000 cells does not fit 100 blocks");
+        assert_eq!(cells, 0, "a header row of 50,000 cells does not fit 100 cells");
         assert!(ir.metadata.text_truncated);
-        // A small table fits: 1 + 2 rows of 2 cells at 4 each = 17.
-        let ir = with_blocks("|a|b|\n|-|-|\n|c|d|\n", 100);
+        // A small table fits: two rows of 2 cells.
+        let ir = DocumentIR::from_markdown_with_limits(
+            "|a|b|\n|-|-|\n|c|d|\n",
+            DocumentFormat::Docx,
+            usize::MAX,
+            usize::MAX,
+            4,
+        );
         assert!(!ir.metadata.text_truncated);
     }
 
@@ -1282,8 +1419,8 @@ mod tests {
     fn test_a_document_within_the_block_limit_is_unchanged() {
         let md = "# T\n\ntext **b** [l](u)\n\n- a\n- b\n\n|x|y|\n|-|-|\n|1|2|\n\n```\ncode\n```\n\n---\n\nmore\n";
         let unlimited = with_blocks(md, usize::MAX);
-        // Counted blocks: 2 sections, heading-less paragraphs, list, table
-        // (1 + 4 cells x 2 rows), code, break.
+        // Counted blocks: 2 sections, heading-less paragraphs, list, table,
+        // code, break.
         assert_eq!(with_blocks(md, 30), unlimited);
         assert!(!unlimited.metadata.text_truncated);
         assert!(with_blocks(md, 3).metadata.text_truncated);

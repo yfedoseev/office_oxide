@@ -724,17 +724,40 @@ pub fn set_max_markdown_list_items(items: usize) {
 /// The default most blocks one Markdown document may parse into: 100,000.
 ///
 /// A block costs a section, a paragraph, a heading, a code block, a break,
-/// a list or a table as 1, and each table cell as 4 (a cell is about four
-/// times the IR of a paragraph). Each is 0.5-1.4 KB of IR from a few bytes
-/// of Markdown: 100,000 sections were 214 MB, 200,000 paragraphs 285 MB and
-/// one table row of 100,000 columns 490 MB. List items have a limit of their
-/// own, [`max_markdown_list_items`].
+/// a list or a table as 1. Each is 0.5-1.4 KB of IR from a few bytes of
+/// Markdown: 100,000 sections were 214 MB and 200,000 paragraphs 285 MB.
+/// List items and table cells have limits of their own,
+/// [`max_markdown_list_items`] and [`max_markdown_table_cells`].
 pub const DEFAULT_MAX_MARKDOWN_ELEMENTS: usize = 100_000;
+
+/// The default most table cells one Markdown document may parse into: 250,000.
+///
+/// A cell is about 1.2 KB of IR (measured: a table of 25,000 cells held
+/// 29 MB more than its text), so the default keeps the cells of one document
+/// near 300 MB, and equals the most cells a writer will write
+/// ([`DEFAULT_MAX_WRITE_TABLE_CELLS`]). A table of 1,000 rows by 25 columns
+/// is a tenth of it. Past it the rows that do not fit are dropped, with a
+/// notice, and the rest of the document is read.
+pub const DEFAULT_MAX_MARKDOWN_TABLE_CELLS: usize = 250_000;
+
+static MAX_MARKDOWN_TABLE_CELLS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_MARKDOWN_TABLE_CELLS);
+
+/// The most table cells `DocumentIR::from_markdown` keeps, over all of a
+/// document's tables.
+pub fn max_markdown_table_cells() -> usize {
+    MAX_MARKDOWN_TABLE_CELLS.load(Ordering::Relaxed)
+}
+
+/// Set the Markdown table-cell limit for every parse afterwards.
+/// `usize::MAX` disables the bound.
+pub fn set_max_markdown_table_cells(cells: usize) {
+    MAX_MARKDOWN_TABLE_CELLS.store(cells, Ordering::Relaxed);
+}
 
 static MAX_MARKDOWN_ELEMENTS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_MARKDOWN_ELEMENTS);
 
 /// The most blocks (sections, paragraphs, headings, code blocks, breaks,
-/// lists and tables at 1, table cells at 4) `DocumentIR::from_markdown`
+/// lists and tables) `DocumentIR::from_markdown`
 /// keeps; the rest of the document is dropped with a notice.
 pub fn max_markdown_elements() -> usize {
     MAX_MARKDOWN_ELEMENTS.load(Ordering::Relaxed)

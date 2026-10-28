@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Markdown table of a realistic size no longer drops the rest of the document.** `DocumentIR::from_markdown` charged each table cell as four blocks of the 100,000-block limit, so about 25,000 cells (1,000 rows of 25 columns, or 4,200 of 6) used it up and everything after the table was lost. Table cells now have their own limit, `limits::set_max_markdown_table_cells` (default 250,000, the most the writers accept); past it only the table rows that do not fit are dropped, with a notice, and the rest of the document is read.
+
 - **A conversion's image and copied-text budgets end with the conversion.** They were set at the start of a conversion and never cleared, and an image charge made outside any conversion was unlimited. Each is now held by a guard that restores the previous state when the conversion ends (including by an early return or a panic), and a charge made outside a conversion is held to the configured limit. Tests that change a process-wide limit now take a shared lock and restore the limit.
 
 - **A `.ppt` slide whose container overlaps another is left out like an aliased one.** Slide-list entries naming a container that overlaps an earlier one stayed in the deck as empty slides while the notice said they were left out, and entries naming an already-listed slide were dropped, so later slides were numbered differently depending on why an entry was skipped. Both are now left out, and the notice counts them.
