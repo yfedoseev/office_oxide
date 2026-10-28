@@ -13,7 +13,7 @@ pub struct DrawingInfo {
     pub linked_image_rid: Option<String>,
     /// That picture's target, once resolved through the relationships of
     /// the part the drawing is in.
-    pub linked_image: Option<String>,
+    pub linked_image: Option<std::sync::Arc<str>>,
     /// Marked decorative (`wp:docPr` extension `adec:decorative`
     /// `val="1"`): the picture carries no meaning, so assistive
     /// technology skips it.

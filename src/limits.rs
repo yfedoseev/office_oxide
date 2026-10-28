@@ -328,8 +328,17 @@ impl IrPaddingBudget {
     }
 }
 
-/// The default budget for picture bytes in the IR: 1 GiB.
-pub const DEFAULT_MAX_IMAGE_BYTES: usize = 1 << 30;
+/// The default budget for picture bytes in the IR: 128 MiB.
+///
+/// The IR gives every picture its own copy of the bytes, and its JSON form
+/// writes them again as base64 (a third larger): at the earlier 1 GiB a 5 KB
+/// `.docx` drawing one 1 MB image 1,100 times converted to 1 GB of IR and 1.4 GB
+/// of JSON. Genuine documents are far smaller: a photo-heavy report or a deck of
+/// a hundred full-resolution photographs is tens of megabytes of distinct
+/// pictures, each used once. A picture past the budget keeps its place without
+/// its bytes, and the conversion says so; processes that convert larger
+/// documents raise it with [the setter](crate::limits::set_max_image_bytes).
+pub const DEFAULT_MAX_IMAGE_BYTES: usize = 128 << 20;
 
 static MAX_IMAGE_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_IMAGE_BYTES);
 
@@ -356,6 +365,35 @@ thread_local! {
 /// Start a conversion's image budget at the configured limit.
 pub(crate) fn begin_image_budget() {
     IMAGE_BUDGET.with(|b| b.set((max_image_bytes() as u64, false)));
+}
+
+thread_local! {
+    /// Text the running conversion has copied out of the document's shared
+    /// storage (a hyperlink target, a shared header, a speaker-notes body).
+    static COPIED_TEXT: std::cell::RefCell<TextBudget> =
+        std::cell::RefCell::new(TextBudget::new());
+}
+
+/// Start a conversion's budget for copied text at the configured limit
+/// ([`max_text_chars`]).
+pub(crate) fn begin_copied_text_budget() {
+    COPIED_TEXT.with(|b| *b.borrow_mut() = TextBudget::new());
+}
+
+/// Charge `chars` of text about to be copied into the output against the
+/// running conversion's budget, before the copy is made. `false` (from the
+/// first refusal on) means the caller leaves the text out.
+pub(crate) fn charge_copied_text(chars: usize) -> bool {
+    COPIED_TEXT.with(|b| b.borrow_mut().charge(chars))
+}
+
+/// The line to report when copied text was left out, or `None` when the
+/// budget held.
+pub(crate) fn copied_text_notice() -> Option<String> {
+    COPIED_TEXT.with(|b| {
+        let b = b.borrow();
+        b.exhausted().then(|| b.notice())
+    })
 }
 
 /// Charge `bytes` of image data against the running conversion's budget.

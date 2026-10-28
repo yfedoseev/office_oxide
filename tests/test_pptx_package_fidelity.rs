@@ -570,7 +570,7 @@ fn test_a_video_shape_surfaces_its_clip() {
     };
     let media = pic.media.as_ref().expect("the clip reference");
     assert_eq!(media.kind, office_oxide::pptx::MediaKind::Video);
-    assert_eq!(media.target, "../media/media1.mp4");
+    assert_eq!(&*media.target, "../media/media1.mp4");
     assert!(!media.external);
     assert_eq!(pic.data.as_deref(), Some(PNG), "the poster frame is still the picture");
 }

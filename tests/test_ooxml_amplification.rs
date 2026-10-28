@@ -233,3 +233,121 @@ fn test_header_shared_by_many_sections_is_stored_once() {
             .all(|s| s.header.is_some() && s.footer.is_some())
     );
 }
+
+// ---------------------------------------------------------------------------
+// DOCX: one picture drawn many times, at the default image budget
+// ---------------------------------------------------------------------------
+
+/// A 5 KB package that draws one 1 MiB zero-filled image 200 times converted
+/// to 200 MiB of IR. The default image budget must stop the copies well short
+/// of that, keep every picture's place and say so.
+#[test]
+fn test_one_image_drawn_many_times_stops_copying_at_the_default_budget() {
+    use office_oxide::ir::Element;
+    let drawing = |i: usize| {
+        format!(
+            r#"<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="100" cy="100"/><wp:docPr id="{i}" name="p"/><a:graphic xmlns:a="{DML}"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:blipFill><a:blip r:embed="rId5"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#
+        )
+    };
+    let pictures = 200;
+    let body: String = (0..pictures).map(drawing).collect();
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let ct = r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
+    for (name, data) in [
+        ("[Content_Types].xml", ct.as_bytes().to_vec()),
+        (
+            "_rels/.rels",
+            rels(&[("rId1", "officeDocument", "word/document.xml")]).into_bytes(),
+        ),
+        (
+            "word/document.xml",
+            format!(r#"<w:document xmlns:w="{WML}" xmlns:r="{REL}"><w:body>{body}</w:body></w:document>"#)
+                .into_bytes(),
+        ),
+        (
+            "word/_rels/document.xml.rels",
+            rels(&[("rId5", "image", "media/img.png")]).into_bytes(),
+        ),
+        ("word/media/img.png", vec![0u8; 1 << 20]),
+    ] {
+        zip.start_file(name, opts).unwrap();
+        zip.write_all(&data).unwrap();
+    }
+    let bytes = zip.finish().unwrap().into_inner();
+    let ir = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    let images: Vec<_> = ir
+        .sections
+        .iter()
+        .flat_map(|s| &s.elements)
+        .filter_map(|e| match e {
+            Element::Image(i) => Some(i),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(images.len(), pictures, "every picture keeps its place");
+    let copied: usize = images
+        .iter()
+        .filter_map(|i| i.data.as_ref())
+        .map(Vec::len)
+        .sum();
+    assert!(copied > 0 && copied <= 128 << 20, "{copied} bytes of image copies");
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("image bytes")),
+        "{:?}",
+        ir.metadata.warnings
+    );
+}
+
+// ---------------------------------------------------------------------------
+// DOCX: a style sheet of tens of thousands of chained styles
+// ---------------------------------------------------------------------------
+
+/// Each style is about 1 KB in memory for about 100 bytes of XML, and a
+/// `w:basedOn` chain is only ever followed 20 links deep. A sheet far past
+/// anything a word processor produces (Word stops near 4,000 styles) keeps its
+/// first styles, resolves them as before, and says the rest were left out.
+#[test]
+fn test_style_sheet_with_tens_of_thousands_of_chained_styles_is_cut_loudly() {
+    let n = 30_000;
+    let mut styles = format!(r#"<w:styles xmlns:w="{WML}">"#);
+    for i in 0..n {
+        let based = if i > 0 {
+            format!(r#"<w:basedOn w:val="S{}"/>"#, i - 1)
+        } else {
+            String::new()
+        };
+        styles.push_str(&format!(
+            r#"<w:style w:type="paragraph" w:styleId="S{i}"><w:name w:val="s{i}"/>{based}</w:style>"#
+        ));
+    }
+    styles.push_str("</w:styles>");
+    let parts = vec![
+        ("[Content_Types].xml".to_string(), r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.to_string()),
+        ("_rels/.rels".to_string(), rels(&[("rId1", "officeDocument", "word/document.xml")])),
+        (
+            "word/document.xml".to_string(),
+            format!(r#"<w:document xmlns:w="{WML}"><w:body><w:p><w:pPr><w:pStyle w:val="S5"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p></w:body></w:document>"#),
+        ),
+        ("word/_rels/document.xml.rels".to_string(), rels(&[("rId1", "styles", "styles.xml")])),
+        ("word/styles.xml".to_string(), styles),
+    ];
+    let bytes = zip_of(parts);
+    let doc = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes.clone())).unwrap();
+    let kept = doc.styles.as_ref().unwrap().styles.len();
+    assert!(kept > 0 && kept <= 20_000, "{kept} styles kept");
+    let ir = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert!(
+        ir.metadata.warnings.iter().any(|w| w.contains("style")),
+        "{:?}",
+        ir.metadata.warnings
+    );
+}

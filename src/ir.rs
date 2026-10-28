@@ -952,6 +952,48 @@ enum DropWork {
     Items(Vec<ListItem>),
 }
 
+/// Call `f` on every [`Image`] in `elements`, nested content included (table
+/// cells, text boxes, notes, list items). Iterative: IR trees can be deep.
+pub(crate) fn for_each_image_mut(elements: &mut [Element], mut f: impl FnMut(&mut Image)) {
+    enum Work<'a> {
+        Elems(&'a mut [Element]),
+        Items(&'a mut [ListItem]),
+    }
+    let mut stack = vec![Work::Elems(elements)];
+    while let Some(work) = stack.pop() {
+        match work {
+            Work::Elems(els) => {
+                for e in els {
+                    match e {
+                        Element::Image(i) => f(i),
+                        Element::TextBox(tb) => stack.push(Work::Elems(&mut tb.content)),
+                        Element::Footnote(n) | Element::Endnote(n) => {
+                            stack.push(Work::Elems(&mut n.content));
+                        },
+                        Element::Table(t) => {
+                            for row in &mut t.rows {
+                                for cell in &mut row.cells {
+                                    stack.push(Work::Elems(&mut cell.content));
+                                }
+                            }
+                        },
+                        Element::List(l) => stack.push(Work::Items(&mut l.items)),
+                        _ => {},
+                    }
+                }
+            },
+            Work::Items(items) => {
+                for item in items {
+                    stack.push(Work::Elems(&mut item.content));
+                    if let Some(n) = &mut item.nested {
+                        stack.push(Work::Items(&mut n.items));
+                    }
+                }
+            },
+        }
+    }
+}
+
 /// Move every `Element` (and `ListItem`) directly reachable from `elem`
 /// onto `stack`, leaving `elem`'s own recursive fields empty. Used by both
 /// `Drop for Element` and the `List` arm below — see that impl for why

@@ -20,7 +20,20 @@ pub struct StyleSheet {
     /// Paragraph styles whose name cannot be exposed (over-long, or holding a
     /// control character); reported once in `Metadata::warnings`.
     pub(crate) unusable_style_names: usize,
+    /// Styles past [`MAX_STYLES`], left out of the sheet; reported once in
+    /// `Metadata::warnings`.
+    pub(crate) styles_left_out: usize,
 }
+
+/// The most styles one style sheet keeps: 20,000, about five times the number
+/// Word itself allows (a little over 4,000).
+///
+/// A style is about a kilobyte in memory for a hundred bytes of XML, so a sheet
+/// of millions of them is a memory multiplier on its own; and a `w:basedOn`
+/// chain is only ever followed 20 links deep, so styles past the cap that
+/// extend a long chain add nothing a reader could resolve. Styles beyond the
+/// cap are left out and counted.
+pub(crate) const MAX_STYLES: usize = 20_000;
 
 /// Document-wide default properties.
 #[derive(Debug, Clone, Default)]
@@ -106,7 +119,13 @@ impl StyleSheet {
                     },
                     "style" => {
                         if let Some(style) = parse_style(&mut reader, e)? {
-                            sheet.styles.insert(style.style_id.clone(), style);
+                            if sheet.styles.len() < MAX_STYLES
+                                || sheet.styles.contains_key(&style.style_id)
+                            {
+                                sheet.styles.insert(style.style_id.clone(), style);
+                            } else {
+                                sheet.styles_left_out += 1;
+                            }
                         }
                     },
                     _ => {},

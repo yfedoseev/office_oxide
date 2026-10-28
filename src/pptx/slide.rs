@@ -433,7 +433,7 @@ fn parse_picture(
         .link
         .as_deref()
         .and_then(|rid| rels.get_by_id(rid))
-        .map(|rel| rel.target.clone());
+        .map(|rel| std::sync::Arc::clone(&rel.target));
 
     Ok(Shape::Picture(PictureShape {
         id: props.id,
@@ -754,7 +754,7 @@ fn parse_ole_graphic_data(
                         if let Some((bytes, ext)) =
                             read_blip_embed_attr(e)?.and_then(|rid| media.get(&rid))
                         {
-                            ole.preview_data = Some(bytes.to_vec());
+                            ole.preview_data = Some(std::sync::Arc::clone(bytes));
                             ole.preview_format = Some(ext.clone());
                         }
                     },
@@ -1154,7 +1154,7 @@ fn parse_nv_pic_props(
         let external = rel.target_mode == TargetMode::External;
         props.media = Some(MediaReference {
             kind,
-            target: rel.target.clone(),
+            target: std::sync::Arc::clone(&rel.target),
             external,
         });
     }
@@ -1685,13 +1685,13 @@ fn parse_hlink_click(
     let resolved = r_id.as_deref().and_then(|id| rels.get_by_id(id));
     let target = if let Some(rel) = resolved {
         if rel.target_mode == TargetMode::External {
-            HyperlinkTarget::External(rel.target.clone())
+            HyperlinkTarget::External(std::sync::Arc::clone(&rel.target))
         } else {
-            HyperlinkTarget::Internal(rel.target.clone())
+            HyperlinkTarget::Internal(std::sync::Arc::clone(&rel.target))
         }
     } else if let Some(ref action) = action {
         // Internal action like ppaction://hlinksldjump
-        HyperlinkTarget::Internal(action.to_string())
+        HyperlinkTarget::Internal(action.as_ref().into())
     } else {
         return Ok(None);
     };
@@ -2427,7 +2427,7 @@ mod tests {
         assert_eq!(auto.alt_text.as_deref(), Some("SRS_Globe_lr2"));
         let hl = auto.hyperlink.as_ref().expect("hyperlink must be captured");
         match &hl.target {
-            HyperlinkTarget::Internal(target) => assert_eq!(target, "slide2.xml"),
+            HyperlinkTarget::Internal(target) => assert_eq!(&**target, "slide2.xml"),
             other => panic!("expected an Internal target, got {other:?}"),
         }
     }
@@ -2521,7 +2521,7 @@ mod tests {
             .as_ref()
             .expect("an empty r:id must fall back to the action attribute");
         match &hl.target {
-            HyperlinkTarget::Internal(action) => assert_eq!(action, "ppaction://noaction"),
+            HyperlinkTarget::Internal(action) => assert_eq!(&**action, "ppaction://noaction"),
             other => panic!("expected an Internal action target, got {other:?}"),
         }
     }
@@ -2542,7 +2542,7 @@ mod tests {
         };
         match auto.hyperlink.as_ref().map(|h| &h.target) {
             Some(HyperlinkTarget::Internal(a)) => {
-                assert_eq!(a, "ppaction://hlinkshowjump?jump=nextslide")
+                assert_eq!(&**a, "ppaction://hlinkshowjump?jump=nextslide")
             },
             other => panic!("expected the action fallback, got {other:?}"),
         }

@@ -1423,7 +1423,7 @@ impl LinkTargets {
             // A character is at most four bytes, so a target of more than four
             // times the limit in bytes is over it without being counted.
             let too_long = rel.target.len() > max * 4 || rel.target.chars().count() > max;
-            (!too_long).then(|| std::sync::Arc::from(rel.target.as_str()))
+            (!too_long).then(|| std::sync::Arc::clone(&rel.target))
         });
         if target.is_none() {
             self.dropped += 1;

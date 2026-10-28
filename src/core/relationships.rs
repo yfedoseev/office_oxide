@@ -174,6 +174,17 @@ fn normalize_rel_type(rel_type: String) -> String {
     }
 }
 
+/// The longest relationship `Target` accepted, in bytes: 64 KiB.
+///
+/// A target is a part path or a URI. Word itself stops a hyperlink address at
+/// about 2,000 characters and browsers at 2 MiB or less; genuine documents stay
+/// far below 64 KiB even with a `data:` URI. A target is stored once but is
+/// referenced from every hyperlink that names it, so an unbounded one turns
+/// each such reference into a copy of its length: a 2 KB package naming a 1 MB
+/// target from 400 links reached 393 MB. A relationship part holding a longer
+/// target is refused with [`Error::PackageLimit`].
+pub const MAX_RELATIONSHIP_TARGET_BYTES: usize = 64 * 1024;
+
 /// Indicates whether a relationship target is inside or outside the package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetMode {
@@ -190,8 +201,9 @@ pub struct Relationship {
     pub id: String,
     /// Relationship type URI.
     pub rel_type: String,
-    /// Target path or URL.
-    pub target: String,
+    /// Target path or URL. Shared: a reference that resolves to it clones the
+    /// pointer, not the text.
+    pub target: std::sync::Arc<str>,
     /// Whether the target is internal or external.
     pub target_mode: TargetMode,
 }
@@ -220,7 +232,15 @@ impl Relationships {
                     let id = xml::required_attr_str(e, "Id")?.into_owned();
                     let rel_type =
                         normalize_rel_type(xml::required_attr_str(e, "Type")?.into_owned());
-                    let target = xml::required_attr_str(e, "Target")?.into_owned();
+                    let target = xml::required_attr_str(e, "Target")?;
+                    if target.len() > MAX_RELATIONSHIP_TARGET_BYTES {
+                        return Err(Error::PackageLimit(format!(
+                            "relationship '{id}' has a Target of {} bytes; the limit is \
+                             {MAX_RELATIONSHIP_TARGET_BYTES}",
+                            target.len()
+                        )));
+                    }
+                    let target: std::sync::Arc<str> = target.into();
                     let target_mode = match xml::optional_attr_str(e, "TargetMode")? {
                         Some(ref m) if m.eq_ignore_ascii_case("External") => TargetMode::External,
                         _ => TargetMode::Internal,
@@ -355,7 +375,7 @@ impl Relationships {
 
         // Package-level targets are relative to root
         let target = if rel.target.starts_with('/') {
-            rel.target.clone()
+            rel.target.to_string()
         } else {
             format!("/{}", rel.target)
         };
@@ -396,7 +416,7 @@ impl RelationshipsBuilder {
         self.rels.push(Relationship {
             id: id.clone(),
             rel_type: rel_type.to_string(),
-            target: target.to_string(),
+            target: target.into(),
             target_mode,
         });
         id
@@ -407,7 +427,7 @@ impl RelationshipsBuilder {
         self.rels.push(Relationship {
             id: id.to_string(),
             rel_type: rel_type.to_string(),
-            target: target.to_string(),
+            target: target.into(),
             target_mode,
         });
     }
@@ -505,7 +525,7 @@ mod tests {
     fn test_get_by_id() {
         let rels = Relationships::parse(SAMPLE_RELS).unwrap();
         let r = rels.get_by_id("rId1").unwrap();
-        assert_eq!(r.target, "word/document.xml");
+        assert_eq!(&*r.target, "word/document.xml");
         assert_eq!(r.target_mode, TargetMode::Internal);
     }
 
@@ -514,14 +534,14 @@ mod tests {
         let rels = Relationships::parse(SAMPLE_RELS).unwrap();
         let docs = rels.get_by_type(rel_types::OFFICE_DOCUMENT);
         assert_eq!(docs.len(), 1);
-        assert_eq!(docs[0].target, "word/document.xml");
+        assert_eq!(&*docs[0].target, "word/document.xml");
     }
 
     #[test]
     fn test_first_by_type() {
         let rels = Relationships::parse(SAMPLE_RELS).unwrap();
         let r = rels.first_by_type(rel_types::CORE_PROPERTIES).unwrap();
-        assert_eq!(r.target, "docProps/core.xml");
+        assert_eq!(&*r.target, "docProps/core.xml");
     }
 
     #[test]
@@ -555,7 +575,7 @@ mod tests {
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/second.png"/>
 </Relationships>"#;
         let rels = Relationships::parse(xml).unwrap();
-        assert_eq!(rels.get_by_id("rId1").unwrap().target, "media/first.png");
+        assert_eq!(rels.get_by_id("rId1").unwrap().target.as_ref(), "media/first.png");
         assert_eq!(rels.duplicate_ids(), ["rId1".to_string()]);
         // The edit path writes the relationships back verbatim.
         assert_eq!(rels.all().len(), 3);

@@ -59,7 +59,7 @@ pub struct PictureShape {
     /// Target of a *linked* picture — `<a:blip r:link="rIdN"/>`, whose
     /// relationship points outside the package (usually a URL). The image
     /// bytes are not in the file; this is where they live.
-    pub link_target: Option<String>,
+    pub link_target: Option<std::sync::Arc<str>>,
     /// The audio or video clip this picture stands for, when the picture is
     /// the poster frame of a media shape.
     pub media: Option<MediaReference>,
@@ -74,7 +74,7 @@ pub struct MediaReference {
     pub kind: MediaKind,
     /// The clip's location: a URL when `external`, otherwise the resolved
     /// part name inside the package (e.g. `/ppt/media/media1.mp4`).
-    pub target: String,
+    pub target: std::sync::Arc<str>,
     /// Whether the clip lives outside the package.
     pub external: bool,
 }
@@ -103,7 +103,7 @@ pub struct OleObject {
     pub rel_id: Option<String>,
     /// Bytes of the preview picture PowerPoint draws in place of the
     /// object, when the file carries one.
-    pub preview_data: Option<Vec<u8>>,
+    pub preview_data: Option<std::sync::Arc<[u8]>>,
     /// Format of `preview_data` (e.g. `"png"`, `"emf"`).
     pub preview_format: Option<String>,
 }
@@ -339,10 +339,11 @@ pub struct HyperlinkInfo {
 /// Hyperlink destination type.
 #[derive(Debug, Clone)]
 pub enum HyperlinkTarget {
-    /// External URL (resolved from the slide relationship).
-    External(String),
+    /// External URL (resolved from the slide relationship). Runs that name
+    /// the same relationship share one allocation.
+    External(std::sync::Arc<str>),
     /// Internal slide/anchor reference.
-    Internal(String),
+    Internal(std::sync::Arc<str>),
 }
 
 // ---------------------------------------------------------------------------

@@ -298,7 +298,7 @@ fn test_round_trip_hyperlink() {
         if let ParagraphContent::Hyperlink(ref hl) = p.content[0] {
             match &hl.target {
                 office_oxide::docx::HyperlinkTarget::External(url) => {
-                    assert_eq!(url, "https://example.com");
+                    assert_eq!(&**url, "https://example.com");
                 },
                 _ => panic!("expected external hyperlink"),
             }
