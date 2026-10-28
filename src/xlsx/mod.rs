@@ -388,7 +388,7 @@ impl XlsxDocument {
                     let mut texts = Vec::new();
                     for path in paths {
                         texts.extend(shared.chart_text(&mut archive, &entries, &path));
-                        chartsheet_charts.insert(path);
+                        chartsheet_charts.insert(part_key(&entries, &path));
                     }
                     texts
                 } else {
@@ -610,7 +610,7 @@ impl XlsxDocument {
                     .and_then(|f| f.name().ok().map(|n| n.into_owned()))
             })
             .filter(|n| n.starts_with("xl/charts/chart") && n.ends_with(".xml"))
-            .filter(|n| !chartsheet_charts.contains(n))
+            .filter(|n| !chartsheet_charts.contains(&part_key(&entries, n)))
             .collect();
         for name in chart_names {
             if let Some(data) =

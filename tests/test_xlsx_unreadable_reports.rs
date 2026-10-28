@@ -300,3 +300,48 @@ fn test_parts_that_cannot_be_read_or_parsed_are_reported_not_swallowed() {
         assert!(doc.to_ir().metadata.text_truncated, "{part}");
     }
 }
+
+/// A chart part named twice by different spellings of its path is one part.
+#[test]
+fn test_a_chart_named_by_another_spelling_is_not_read_twice() {
+    let _g = LimitScope::new();
+    let chart = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>UniqueTitle</a:t></a:r></a:p></c:rich></c:tx></c:title></c:chart></c:chartSpace>"#;
+    let mut parts = fixed_parts(
+        format!(
+            r#"<workbook xmlns="{NS}" xmlns:r="{R}"><sheets><sheet name="C" sheetId="1" r:id="rId1"/></sheets></workbook>"#
+        ),
+        format!(
+            r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/chartsheet" Target="chartsheets/sheet1.xml"/></Relationships>"#
+        ),
+    );
+    parts.push((
+        "xl/chartsheets/sheet1.xml".into(),
+        format!(r#"<chartsheet xmlns="{NS}" xmlns:r="{R}"><drawing r:id="rId1"/></chartsheet>"#),
+    ));
+    parts.push((
+        "xl/chartsheets/_rels/sheet1.xml.rels".into(),
+        format!(
+            r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#
+        ),
+    ));
+    parts.push(("xl/drawings/drawing1.xml".into(), format!("<xdr:wsDr {XDR}/>")));
+    // The relationship spells the chart's path in capitals and with a
+    // backslash; it is the part `xl/charts/chart1.xml` all the same.
+    parts.push((
+        "xl/drawings/_rels/drawing1.xml.rels".into(),
+        format!(
+            r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/chart" Target="..\Charts\CHART1.XML"/></Relationships>"#
+        ),
+    ));
+    parts.push(("xl/charts/chart1.xml".into(), chart.into()));
+    let doc = open(zip_of(parts));
+    assert_eq!(doc.plain_text().matches("UniqueTitle").count(), 1, "{}", doc.plain_text());
+    assert_eq!(doc.to_markdown().matches("UniqueTitle").count(), 1);
+    assert_eq!(
+        serde_json::to_string(&doc.to_ir())
+            .unwrap()
+            .matches("UniqueTitle")
+            .count(),
+        1
+    );
+}
