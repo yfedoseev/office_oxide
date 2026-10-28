@@ -90,6 +90,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Measured against the unmodified build on 10,060 unique `.doc`/`.docx`/`.xls`/`.xlsx`/`.ppt`/`.pptx` files: with the new key removed from paragraphs the IR is identical for every file that opens (9,736 files, and 313 that fail identically in both builds).
 
+### Changed
+
+- **`doc::HeaderFooterStories` fields are now `Option<Arc<str>>`** (they were `Option<String>`), so the stories a section inherits are shared with the section they come from instead of copied. Callers that read a field as a string keep working through `Deref<Target = str>` (`as_deref()`, `&**s`); code that moved a `String` out of a field, or built the struct with `String`s, needs `Arc::from`.
+
 ## [0.1.15] - 2026-10-15
 
 ### Added
