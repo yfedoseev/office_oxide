@@ -100,6 +100,28 @@ pub struct LinkRange {
     pub url: String,
 }
 
+/// What one formatting span or link range costs the budget besides any text
+/// it holds: the size of the record that stores it.
+const SPAN_COST: usize = 32;
+
+/// The size of the hyperlink target and placeholder role copied onto every
+/// text run a shape produces. A target can be kilobytes and the shape's many
+/// runs each hold their own copy, so the copies are charged with the text.
+fn copied_label_cost(hyperlink: Option<&str>, role: Option<&str>) -> usize {
+    hyperlink.map_or(0, str::len) + role.map_or(0, str::len)
+}
+
+/// The size of the formatting spans and link ranges (with their targets) a
+/// stored run carries and a clone of it copies.
+fn stored_spans_cost(run: &TextRun) -> usize {
+    (run.para_formats.len() + run.char_formats.len()) * SPAN_COST
+        + run
+            .link_ranges
+            .iter()
+            .map(|r| r.url.len() + SPAN_COST)
+            .sum::<usize>()
+}
+
 /// Extract per-slide text from a "PowerPoint Document" stream.
 ///
 /// `current_user` is the raw "Current User" stream, if present.
@@ -1253,7 +1275,9 @@ fn extract_shape_text_in(
             RT_TEXT_CHARS => {
                 let text = decode_utf16le(&rec.data);
                 if !text.is_empty() {
-                    if !budget.charge(text.len()) {
+                    if !budget.charge(
+                        text.len() + copied_label_cost(current_hyperlink, current_placeholder_role),
+                    ) {
                         return;
                     }
                     out.push(TextRun {
@@ -1269,7 +1293,9 @@ fn extract_shape_text_in(
             RT_TEXT_BYTES => {
                 let text = decode_text_bytes(&rec.data);
                 if !text.is_empty() {
-                    if !budget.charge(text.len()) {
+                    if !budget.charge(
+                        text.len() + copied_label_cost(current_hyperlink, current_placeholder_role),
+                    ) {
                         return;
                     }
                     out.push(TextRun {
@@ -1296,7 +1322,16 @@ fn extract_shape_text_in(
                         // stored once, so repeating the reference copies the
                         // run once per repeat: charge each copy before making
                         // it, and stop at the first one that does not fit.
-                        if !run.text.is_empty() && !budget.charge(run.text.len()) {
+                        if !run.text.is_empty()
+                            && !budget.charge(
+                                run.text.len()
+                                    + stored_spans_cost(run)
+                                    + copied_label_cost(
+                                        current_hyperlink,
+                                        current_placeholder_role,
+                                    ),
+                            )
+                        {
                             return;
                         }
                         if !run.text.is_empty() {
@@ -1332,6 +1367,10 @@ fn extract_shape_text_in(
                 {
                     if matches!(action, 0x03 | 0x04 | 0x07) {
                         if let Some(url) = hyperlinks.get(&ex_hyperlink_id_ref) {
+                            // Every range holds its own copy of the target.
+                            if !budget.charge(url.len() + SPAN_COST) {
+                                return;
+                            }
                             let begin = i32::from_le_bytes([
                                 rec.data[0],
                                 rec.data[1],
@@ -4134,6 +4173,39 @@ mod tests {
         let copied: usize = runs.iter().map(|r| r.text.len()).sum();
         assert!(copied <= 5_000, "{copied} characters copied under a 5,000 budget");
         assert!(budget.exhausted());
+    }
+
+    /// A shape's hyperlink target is copied onto each text run it holds, so
+    /// the copies are charged with the text: many short runs under a long
+    /// target stop with the budget instead of multiplying the target.
+    #[test]
+    fn test_hyperlink_copies_on_text_runs_are_charged_to_the_text_budget() {
+        let atoms: Vec<u8> = (0..2000)
+            .flat_map(|_| make_atom(RT_TEXT_CHARS, 0, &[b'a', 0]))
+            .collect();
+        let url = "u".repeat(1000);
+        let mut runs = Vec::new();
+        let mut budget = crate::limits::TextBudget::with_limit(10_000);
+        extract_shape_text_in(
+            &atoms,
+            0,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            Some(&url),
+            None,
+            &mut runs,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut budget,
+        );
+        let held: usize = runs
+            .iter()
+            .map(|r| r.text.len() + r.hyperlink.as_deref().map_or(0, str::len))
+            .sum();
+        assert!(held <= 10_000, "{held} bytes held under a 10,000 budget");
+        assert!(runs.len() < 20 && budget.exhausted(), "{} runs", runs.len());
     }
 
     /// A master reference cycle (title master naming itself through a
