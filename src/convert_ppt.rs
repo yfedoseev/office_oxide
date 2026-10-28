@@ -545,8 +545,13 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
             created: summary.and_then(|s| s.created.clone()),
             modified: summary.and_then(|s| s.modified.clone()),
             has_macros: doc.has_macros(),
-            text_truncated: !doc.text_complete(),
-            warnings: doc.warnings().to_vec(),
+            text_truncated: !doc.text_complete() || doc.images_left_out(),
+            warnings: doc
+                .warnings()
+                .iter()
+                .cloned()
+                .chain(doc.image_warnings())
+                .collect(),
             ..crate::core::core_properties::legacy_metadata_extras(summary)
         },
         sections,

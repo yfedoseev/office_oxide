@@ -8,7 +8,7 @@ use crate::cfb::{CfbReader, SummaryProperties};
 use super::chpx::{parse_chpx_runs, resolve_excluded_cp_ranges_from_runs};
 use super::error::{DocError, Result};
 use super::fib::Fib;
-use super::images::{DocImage, extract_images};
+use super::images::{DocImage, extract_images_diagnosed};
 use super::list_format::ListFormatting;
 use super::papx::{
     DocParagraph, build_paragraphs, parse_papx_paragraphs, resolve_huge_papx, runs_work_too_large,
@@ -17,6 +17,7 @@ use super::piece_table::{
     covers_declared_length, extract_text_range_excluding, parse_clx, sanitize_text,
 };
 use super::styles::parse_style_sheet;
+use crate::cfb::blip::BlipDiagnostics;
 
 /// A parsed legacy Word document.
 #[derive(Debug)]
@@ -28,7 +29,7 @@ pub struct DocDocument {
     /// image payload; decoding it eagerly made `plain_text()` on a
     /// picture-heavy file pay for pictures it never emits.
     data_stream: Vec<u8>,
-    images: std::sync::OnceLock<Vec<DocImage>>,
+    images: std::sync::OnceLock<(Vec<DocImage>, BlipDiagnostics)>,
     /// Structured main-text paragraphs with PAP (paragraph property) flags.
     /// Populated only when the FIB advertises a PlcfBtePapx (PAPX FKP index);
     /// empty for very old or minimal files, in which case `doc_to_ir` falls
@@ -593,7 +594,7 @@ impl DocDocument {
         // sit in the WordDocument stream itself. Scanned now, since the
         // stream is not kept.
         let images = std::sync::OnceLock::new();
-        let _ = images.set(extract_images(word_doc));
+        let _ = images.set(extract_images_diagnosed(word_doc));
         let summary_properties = crate::cfb::read_document_properties(cfb);
         let text_complete = text_complete && cfb.truncated_streams().is_empty();
         // The paragraph properties, for the tables they describe. A file with no
@@ -715,8 +716,25 @@ impl DocDocument {
 
     /// Get all extracted images.
     pub fn images(&self) -> &[DocImage] {
+        &self.decoded_images().0
+    }
+
+    /// Warnings about pictures left out because of a limit, if any; see
+    /// `Metadata::warnings`. Pictures are decoded on first use, so this
+    /// decodes them if nothing has yet.
+    pub(crate) fn image_warnings(&self) -> Vec<String> {
+        self.decoded_images().1.warnings()
+    }
+
+    /// `true` when a picture was left out because of a limit; see
+    /// `Metadata::text_truncated`.
+    pub(crate) fn images_left_out(&self) -> bool {
+        self.decoded_images().1.limit_hit()
+    }
+
+    fn decoded_images(&self) -> &(Vec<DocImage>, BlipDiagnostics) {
         self.images
-            .get_or_init(|| extract_images(&self.data_stream))
+            .get_or_init(|| extract_images_diagnosed(&self.data_stream))
     }
 
     /// Footnotes, headers, comments, endnotes and text boxes, in the order
@@ -1368,6 +1386,45 @@ mod tests {
         assert!(!md.contains("\n\n\n"), "{md:?}");
         assert!(md.contains("Second paragraph\n\n"));
         assert!(md.trim_end().ends_with("After gap"));
+    }
+
+    /// Pictures decode after the document is open, so a picture left out for
+    /// a limit has to reach `Metadata::warnings` and `text_truncated` through
+    /// the conversion that asks for the pictures.
+    #[test]
+    fn test_picture_left_out_for_a_limit_is_reported_in_metadata() {
+        use crate::cfb::blip::tests::make_metafile_blip;
+        let raw = vec![0u8; 1 << 20];
+        let mut data = make_metafile_blip(0xF01A, 0x3D4, &raw, true);
+        // cbSize claims 64 MiB over a stream that cannot hold it.
+        data[8 + 16..8 + 20].copy_from_slice(&(64u32 << 20).to_le_bytes());
+        let doc = DocDocument {
+            subdocuments: Vec::new(),
+            has_macros: false,
+            text_complete: true,
+            summary_properties: None,
+            list_formatting: crate::doc::list_format::ListFormatting::default(),
+            comment_authors: Vec::new(),
+            comments: Vec::new(),
+            ole_objects: Vec::new(),
+            header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
+            data_stream: data,
+            images: std::sync::OnceLock::new(),
+            text: "Body".into(),
+            paragraphs: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        assert!(ir.metadata.text_truncated);
+        assert!(
+            ir.metadata
+                .warnings
+                .iter()
+                .any(|w| w.contains("compressed picture(s) left out")),
+            "{:?}",
+            ir.metadata.warnings
+        );
     }
 
     /// An embedded object is named on the direct surfaces as on the IR

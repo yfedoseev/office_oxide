@@ -304,6 +304,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // document was silently dropped on conversion even though the bytes
     // were already in hand.
     crate::convert_xls::append_legacy_images(&mut sections, doc.images());
+    warnings.extend(doc.image_warnings());
 
     // Embedded OLE objects — at minimum, recognize each
     // object exists and surface its identity, even without extracting
@@ -344,7 +345,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             created: summary.and_then(|s| s.created.clone()),
             modified: summary.and_then(|s| s.modified.clone()),
             has_macros: doc.has_macros(),
-            text_truncated: !doc.text_complete() || headers_cut,
+            text_truncated: !doc.text_complete() || headers_cut || doc.images_left_out(),
             warnings,
             ..crate::core::core_properties::legacy_metadata_extras(summary)
         },

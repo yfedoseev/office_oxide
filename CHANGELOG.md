@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Compressed metafile pictures in a `.ppt` or `.doc` can no longer inflate to gigabytes.** A zlib-compressed EMF/WMF/PICT declares its uncompressed size, and each was inflated to it (up to 256 MiB apiece): four pictures in a 1 MB `.ppt` produced 3.3 GB from `to_ir`. A document's compressed metafiles now share an allowance of 256 MiB of inflated bytes (`limits::set_max_inflated_image_bytes`), the declared size is reserved before anything is inflated and the unused part is handed back, and a picture whose declared size exceeds 100 times its stored length (plus 1 MiB) is refused outright. A picture that is refused is left out of the image list and logged; genuine metafiles are far below both bounds.
+- **Compressed metafile pictures in a `.ppt` or `.doc` can no longer inflate to gigabytes.** A zlib-compressed EMF/WMF/PICT declares its uncompressed size, and each was inflated to it (up to 256 MiB apiece): four pictures in a 1 MB `.ppt` produced 3.3 GB from `to_ir`. A document's compressed metafiles now share an allowance of 256 MiB of inflated bytes (`limits::set_max_inflated_image_bytes`), the declared size is reserved before anything is inflated and the unused part is handed back, and a picture whose declared size exceeds 1,032 times its stored length (plus 1 MiB), the most a deflate stream can hold (RFC 1951), is refused outright. A picture that is refused is left out of the image list; genuine metafiles, flat-colour bitmaps included, are below both bounds.
 
 - **A `.ppt` text run with a non-BMP character and many style spans or hyperlink ranges no longer takes quadratic time.** Style-run counts and hyperlink offsets are UTF-16 code units, and each one was converted to a character index by scanning the run's text from the start: a 1.2 MB deck took 17 s. The conversion now builds one map of the run's non-BMP characters and answers each offset by binary search.
 
@@ -75,6 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Measured against the build just before it on 712 unique `.doc`/`.dot` files: all 712 are identical in the text output; the IR changes in exactly the 20 files that carried the flatten warning (58 tables), and in no file is a word lost or gained.
 
 - **A sparse `.xls` sheet that spends the padding allowance no longer empties later sheets that need no padding.** Once the per-document allowance of empty padding slots (`limits::set_max_grid_padding_cells`) was spent, even a row that needs no padding was refused, so every later dense or single-column sheet lost all its rows. A row that needs no padding now always fits; only a row that does need padding is left out (with the usual notice and `Metadata::text_truncated`).
+
+- **A compressed `.ppt`/`.doc` picture left out for a limit is now reported, and a flat-colour bitmap is no longer refused for its ratio.** The declared-size guard was 100:1 (plus 1 MiB), which refused legitimate flat-colour bitmaps (a 1920 x 1080 x 32-bit frame is 8.3 MB stored in about 8 KB, near 1000:1); it is now the deflate format's own bound, 1,032:1, with the per-picture cap and the per-document allowance doing the bounding. A picture refused for its declared size, or for not fitting the document's inflation allowance (`limits::set_max_inflated_image_bytes`), was only logged; it is now counted in `Metadata::warnings` (naming the limit) and sets `Metadata::text_truncated` when the document is converted to the IR.
 
 ### Added
 
