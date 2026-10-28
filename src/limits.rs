@@ -29,6 +29,12 @@
 //! sheets and table cells a writer will write ([`max_write_sheets`],
 //! [`max_write_table_cells`]).
 //!
+//! A package embedded in a `.docx` is opened to read its text, and may embed
+//! packages of its own. What they cost is charged to the one document that
+//! holds them: how deep they nest ([`max_embedded_depth`]), how many are
+//! opened ([`max_embedded_packages`]) and the bytes they take
+//! ([`max_embedded_bytes`]), with their text counted against the text budget.
+//!
 //! The default keeps every genuine workbook this crate has been tested
 //! against (the largest, 181 MB of cell text, with room to spare) and
 //! refuses the fan-out shapes. Processes that read larger workbooks raise
@@ -76,14 +82,80 @@ pub fn set_max_package_entries(entries: usize) {
 
 /// The maximum total of decompressed bytes read from one OOXML package.
 /// Each distinct part is charged once, however often it is read.
+///
+/// For a package embedded in a document this is what the document's
+/// [embedded-package allowance](max_embedded_bytes) has left, if that is
+/// less.
 pub fn max_package_bytes() -> u64 {
-    MAX_PACKAGE_BYTES.load(Ordering::Relaxed)
+    let configured = MAX_PACKAGE_BYTES.load(Ordering::Relaxed);
+    crate::core::embedded::package_bytes_cap().map_or(configured, |cap| configured.min(cap))
 }
 
 /// Set the package-wide decompressed-byte limit for every package opened
 /// afterwards. `u64::MAX` disables the bound.
 pub fn set_max_package_bytes(bytes: u64) {
     MAX_PACKAGE_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// The default depth to which embedded packages are opened: 3.
+///
+/// A `.docx` can embed an OOXML package (`<o:OLEObject Type="Embed">`) whose
+/// text is folded into the document's, and that package can embed another.
+/// Documents in the wild nest one level (a worksheet pasted into a letter);
+/// a package that embeds a package that embeds a package is already unusual.
+/// A package embedded deeper than this is not opened: it is reported in
+/// `unreadable_parts` and `Metadata::warnings`, and the document is flagged
+/// `text_truncated`.
+pub const DEFAULT_MAX_EMBEDDED_DEPTH: usize = 3;
+
+/// The default number of embedded packages opened for one document: 256.
+///
+/// A package reached again through another entry name is recognised by its
+/// content and opened once, so this counts distinct embedded packages,
+/// at every depth together.
+pub const DEFAULT_MAX_EMBEDDED_PACKAGES: usize = 256;
+
+/// The default total size of the embedded packages opened for one document,
+/// and of what opening them inflates: 512 MiB.
+pub const DEFAULT_MAX_EMBEDDED_BYTES: u64 = 512 << 20;
+
+static MAX_EMBEDDED_DEPTH: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_EMBEDDED_DEPTH);
+static MAX_EMBEDDED_PACKAGES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_EMBEDDED_PACKAGES);
+static MAX_EMBEDDED_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_EMBEDDED_BYTES);
+
+/// How many levels deep an embedded package is opened (the document itself is
+/// level 0, a package it embeds level 1).
+pub fn max_embedded_depth() -> usize {
+    MAX_EMBEDDED_DEPTH.load(Ordering::Relaxed)
+}
+
+/// Set the embedding depth limit for every document read afterwards. `0`
+/// opens no embedded package; `usize::MAX` disables the bound.
+pub fn set_max_embedded_depth(depth: usize) {
+    MAX_EMBEDDED_DEPTH.store(depth, Ordering::Relaxed);
+}
+
+/// The most distinct embedded packages opened for one document.
+pub fn max_embedded_packages() -> usize {
+    MAX_EMBEDDED_PACKAGES.load(Ordering::Relaxed)
+}
+
+/// Set the limit on embedded packages opened per document, for every
+/// document read afterwards. `usize::MAX` disables the bound.
+pub fn set_max_embedded_packages(packages: usize) {
+    MAX_EMBEDDED_PACKAGES.store(packages, Ordering::Relaxed);
+}
+
+/// The total bytes the embedded packages of one document may take, counting
+/// their sizes and what reading them inflates.
+pub fn max_embedded_bytes() -> u64 {
+    MAX_EMBEDDED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Set the embedded-package byte allowance for every document read
+/// afterwards. `u64::MAX` disables the bound.
+pub fn set_max_embedded_bytes(bytes: u64) {
+    MAX_EMBEDDED_BYTES.store(bytes, Ordering::Relaxed);
 }
 
 /// The default per-document text budget: 256 Mi characters.
@@ -93,7 +165,17 @@ static MAX_TEXT_CHARS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_TEXT_CHARS);
 
 /// The per-document text budget in characters, the amount of cell text a
 /// spreadsheet may render before output is truncated with a notice.
+///
+/// For a package embedded in a document this is what the document's
+/// other embedded packages leave of it, if that is less.
 pub fn max_text_chars() -> usize {
+    let configured = configured_max_text_chars();
+    crate::core::embedded::text_cap().map_or(configured, |cap| configured.min(cap))
+}
+
+/// The text budget as configured, whatever has been spent of it by the
+/// packages embedded in the document being read.
+pub(crate) fn configured_max_text_chars() -> usize {
     MAX_TEXT_CHARS.load(Ordering::Relaxed)
 }
 

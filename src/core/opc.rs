@@ -503,6 +503,20 @@ pub(crate) struct ZipEntryIndex {
     crc_mismatched: std::cell::RefCell<Vec<String>>,
 }
 
+impl Drop for ZipEntryIndex {
+    /// The bytes a package embedded in a document inflated count against
+    /// that document's allowance for its embedded packages; for any other
+    /// package this does nothing.
+    fn drop(&mut self) {
+        let inflated = self
+            .consumed
+            .get()
+            .saturating_add(self.reinflated.get())
+            .saturating_add(self.failed.get());
+        super::embedded::charge_inflated(inflated);
+    }
+}
+
 impl ZipEntryIndex {
     /// Record that `name` failed its CRC-32 check (once per entry).
     fn record_crc_mismatch(&self, name: &str) {

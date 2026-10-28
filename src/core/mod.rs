@@ -18,6 +18,7 @@ pub mod content_types;
 pub mod core_properties;
 /// In-place editing of OPC packages (preserves unchanged parts).
 pub mod editable;
+pub(crate) mod embedded;
 /// Helpers for embedding TrueType / OpenType font programs in DOCX,
 /// PPTX, and XLSX packages.
 pub mod embedded_fonts;
