@@ -766,6 +766,11 @@ impl XlsDocument {
                         let _ =
                             parse_cell_record(&rec, &sst, codepage, &mut cells, &mut text_budget);
                     },
+                    // The formula's expression record sits between its
+                    // `FORMULA` and the `STRING` that holds a text result
+                    // (MS-XLS `Formula [Array | ShrFmla | Table] [String]`): it is not a cell, and the
+                    // result it precedes still belongs to the formula.
+                    RT_ARRAY | RT_SHRFMLA | RT_TABLE => {},
                     _ => {
                         pending_formula_string = None;
                         // Skip LABEL/RSTRING parsing for non-BIFF8 (avoids slow unicode fallback).
@@ -3392,6 +3397,41 @@ mod tests {
         let doc = XlsDocument::parse_workbook_stream(&workbook_stream(&[("S", 0, body)]))
             .expect("parses");
         assert_eq!(doc.sheets[0].xf[0][0], 7);
+    }
+
+    /// MS-XLS: a formula cell is `FORMULA`, then optionally the
+    /// `ARRAY`, `SHRFMLA` or `TABLE` record that holds its expression, then
+    /// optionally `STRING` with its text result. The text came after such a
+    /// record and was dropped, because any record in between cleared the
+    /// pending result.
+    #[test]
+    fn test_formula_string_result_after_an_array_shared_or_table_record_is_kept() {
+        for (name, record) in [("ARRAY", 0x0221u16), ("SHRFMLA", 0x04BC), ("TABLE", 0x0236)] {
+            let mut st = 4u16.to_le_bytes().to_vec();
+            st.push(0);
+            st.extend_from_slice(b"text");
+            let mut body = string_formula(0, 0, 0);
+            body.extend(biff_rec(record, &[0u8; 14]));
+            body.extend(biff_rec(RT_STRING, &st));
+            let doc = XlsDocument::parse_workbook_stream(&workbook_stream(&[("S", 0, body)]))
+                .expect("parses");
+            assert_eq!(doc.sheets[0].display_text(0, 0).as_deref(), Some("text"), "{name}");
+        }
+    }
+
+    /// An unrelated record between `FORMULA` and `STRING` still ends the
+    /// pending result: the text must not be attached to another cell.
+    #[test]
+    fn test_formula_string_result_is_not_carried_across_an_unrelated_record() {
+        let mut st = 4u16.to_le_bytes().to_vec();
+        st.push(0);
+        st.extend_from_slice(b"text");
+        let mut body = string_formula(0, 0, 0);
+        body.extend(biff_rec(0x0203, &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])); // NUMBER
+        body.extend(biff_rec(RT_STRING, &st));
+        let doc = XlsDocument::parse_workbook_stream(&workbook_stream(&[("S", 0, body)]))
+            .expect("parses");
+        assert_ne!(doc.sheets[0].display_text(0, 0).as_deref(), Some("text"));
     }
 
     /// A `LABELSST` cell in column A referencing shared string `idx`.
