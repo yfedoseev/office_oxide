@@ -292,7 +292,13 @@ impl<R: Read + Seek> OpcReader<R> {
         let content_types = ContentTypes::parse(&ct_data)?;
 
         // Eagerly parse _rels/.rels
-        let rels_data = read_zip_entry(&mut archive, &entries, "_rels/.rels").unwrap_or_default();
+        // Absent is an empty set (the main part is then found through
+        // `[Content_Types].xml`); present and unreadable is an error.
+        let rels_data = match read_zip_entry(&mut archive, &entries, "_rels/.rels") {
+            Ok(data) => data,
+            Err(Error::MissingPart(_)) => Vec::new(),
+            Err(e) => return Err(e),
+        };
         let package_rels = if rels_data.is_empty() {
             Relationships::empty()
         } else {
@@ -377,10 +383,9 @@ impl<R: Read + Seek> OpcReader<R> {
                 trace!("read_rels_for '{}' ({} bytes)", part, data.len());
                 Relationships::parse(&data)
             },
-            Err(Error::Zip(zip::result::ZipError::FileNotFound)) => {
-                trace!("read_rels_for '{}': no rels file", part);
-                Ok(Relationships::empty())
-            },
+            // Only a part the package does not have is an empty set; one
+            // that is there and cannot be read is the caller's error to
+            // report.
             Err(Error::MissingPart(_)) => {
                 trace!("read_rels_for '{}': no rels file", part);
                 Ok(Relationships::empty())
@@ -821,9 +826,15 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
         .index_for_name(name)
         .or_else(|| entries.lookup(name))
         .ok_or_else(|| Error::MissingPart(name.to_string()))?;
-    let mut file = archive
-        .by_index(index)
-        .map_err(|_| Error::MissingPart(name.to_string()))?;
+    // The name is in the index, so a failure here is not an absent part: the
+    // entry exists and cannot be decoded (a compression method this reader
+    // does not implement, an encrypted entry, a bad header; APPNOTE 4.4.4
+    // and 4.4.5). It is a typed error, so that no caller can mistake a
+    // damaged part for one the package does not have.
+    let mut file = archive.by_index(index).map_err(|e| match e {
+        zip::result::ZipError::FileNotFound => Error::MissingPart(name.to_string()),
+        e => Error::Zip(e),
+    })?;
 
     // Reject decompression bombs before allocating for them. A ZIP entry
     // declares its uncompressed size in the central directory; a 2 MB
