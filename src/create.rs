@@ -39,6 +39,33 @@ pub fn create_from_markdown_to_writer<W: Write + Seek>(
     create_from_ir_to_writer(&ir, format, writer)
 }
 
+/// The cells the writer for `format` builds for `table`: its grid, not the
+/// number of cell entries. The `.pptx` writer pads every row to the widest
+/// row; the `.docx` writer lays the table on a grid as wide as the widest
+/// row's column spans (each span, and the width, clamped to
+/// `MAX_TABLE_COLS` as `convert_ir_table` clamps them) and gives every
+/// row that width, filling the cells a row span covers.
+fn written_table_cells(table: &Table, format: DocumentFormat) -> usize {
+    let width = if format == DocumentFormat::Docx {
+        let max_cols = crate::docx::write::MAX_TABLE_COLS;
+        table
+            .rows
+            .iter()
+            .map(|r| {
+                r.cells
+                    .iter()
+                    .map(|c| (c.col_span.max(1) as usize).min(max_cols))
+                    .fold(0usize, usize::saturating_add)
+                    .min(max_cols)
+            })
+            .max()
+            .unwrap_or(0)
+    } else {
+        table.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0)
+    };
+    table.rows.len().saturating_mul(width)
+}
+
 /// Refuse an IR whose tables hold more cells than
 /// [`crate::limits::max_write_table_cells`]: the `.docx` and `.pptx`
 /// writers build every cell in memory, so the count is the cost.
@@ -80,11 +107,9 @@ fn check_table_cell_budget(ir: &DocumentIR, format: DocumentFormat) -> Result<()
         for e in elements {
             match e {
                 Element::Table(t) => {
-                    for row in &t.rows {
-                        cells = cells.saturating_add(row.cells.len());
-                        for cell in &row.cells {
-                            stack.push(&cell.content);
-                        }
+                    cells = cells.saturating_add(written_table_cells(t, format));
+                    for cell in t.rows.iter().flat_map(|r| &r.cells) {
+                        stack.push(&cell.content);
                     }
                     if cells > limit {
                         return Err(crate::core::Error::PackageLimit(format!(

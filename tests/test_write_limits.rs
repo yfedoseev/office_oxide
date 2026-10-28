@@ -67,6 +67,47 @@ fn test_a_table_with_too_many_cells_is_refused_when_writing() {
     }
 }
 
+/// Rows padded to the widest row: 20 one-cell rows and one 20-cell row are
+/// only 40 cell entries, but the writers build 21 x 20 cells.
+#[test]
+fn test_one_wide_row_among_many_narrow_rows_is_charged_at_the_padded_width() {
+    office_oxide::limits::set_max_write_table_cells(CELL_LIMIT);
+    let mut t = table(20, 1);
+    t.rows.extend(table(1, 20).rows);
+    for format in [DocumentFormat::Docx, DocumentFormat::Pptx] {
+        let ir = ir_with(vec![Element::Table(t.clone())], format);
+        let err = write(&ir, format).expect_err("the padded grid is 420 cells");
+        assert!(
+            matches!(err, OfficeError::Core(CoreError::PackageLimit(_))),
+            "{format:?}: {err:?}"
+        );
+    }
+}
+
+/// A column span widens the grid the `.docx` writer lays out (clamped to
+/// its column limit), so three cells spanning 100 columns are 300 cells.
+/// The `.pptx` writer ignores spans: its table stays three cells.
+#[test]
+fn test_column_spans_are_charged_as_the_grid_they_widen() {
+    office_oxide::limits::set_max_write_table_cells(CELL_LIMIT);
+    let mut t = table(3, 1);
+    for row in &mut t.rows {
+        row.cells[0].col_span = 100;
+        row.cells[0].row_span = u32::MAX;
+    }
+    let docx = ir_with(vec![Element::Table(t.clone())], DocumentFormat::Docx);
+    assert!(write(&docx, DocumentFormat::Docx).is_err());
+    let pptx = ir_with(vec![Element::Table(t)], DocumentFormat::Pptx);
+    write(&pptx, DocumentFormat::Pptx).expect("the pptx table is 3 cells");
+
+    // A span far beyond any grid is clamped, not summed without bound.
+    let mut huge = table(1, 2);
+    huge.rows[0].cells[0].col_span = u32::MAX;
+    huge.rows[0].cells[1].col_span = u32::MAX;
+    let ir = ir_with(vec![Element::Table(huge)], DocumentFormat::Docx);
+    assert!(write(&ir, DocumentFormat::Docx).is_err());
+}
+
 #[test]
 fn test_cells_are_counted_across_tables_and_inside_nested_content() {
     office_oxide::limits::set_max_write_table_cells(CELL_LIMIT);

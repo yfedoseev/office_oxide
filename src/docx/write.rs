@@ -1777,7 +1777,7 @@ impl HfType {
 /// malicious/corrupt `col_span` (e.g. `u32::MAX` on one cell), which
 /// would otherwise blow up the `Vec<Vec<bool>>` grid allocation before
 /// the (already-clamped) per-cell span loop below ever runs.
-const MAX_TABLE_COLS: usize = 4096;
+pub(crate) const MAX_TABLE_COLS: usize = 4096;
 
 fn convert_ir_table(
     table: &crate::ir::Table,
