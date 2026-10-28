@@ -2355,25 +2355,87 @@ mod tests {
         assert!(!whole.truncated());
     }
 
+    /// Once the allowance is spent by a sparse sheet, a later sheet whose
+    /// rows need no padding (dense, or a single column) keeps every row; only
+    /// a row that needs padding is refused.
+    #[test]
+    fn test_spent_allowance_still_admits_rows_that_need_no_padding() {
+        let mut sparse = Vec::new();
+        for r in 0..10u16 {
+            sparse.extend(number(r, 255, 0, 1.0));
+        }
+        let mut dense = Vec::new();
+        for r in 0..4u16 {
+            for c in 0..8u16 {
+                dense.extend(number(r, c, 0, 1.0));
+            }
+        }
+        let mut tiny = Vec::new();
+        for r in 0..5u16 {
+            tiny.extend(number(r, 0, 0, 1.0));
+        }
+        let mut padded = Vec::new();
+        padded.extend(number(0, 1, 0, 1.0));
+        let stream = workbook_stream(&[
+            ("Sparse", 0, sparse),
+            ("Dense", 0, dense),
+            ("Tiny", 0, tiny),
+            ("Padded", 0, padded),
+        ]);
+        let doc = XlsDocument::parse_workbook_stream_with_limits(
+            &stream,
+            20_000_000,
+            crate::limits::GridBudget::with_limit(255 * 3),
+        )
+        .expect("parses");
+        assert_eq!(doc.sheets[0].rows.len(), 3);
+        assert_eq!(doc.sheets[1].rows.len(), 4, "a dense sheet needs no padding");
+        assert_eq!(doc.sheets[2].rows.len(), 5, "a one-column sheet needs no padding");
+        assert!(doc.sheets[3].rows.is_empty(), "a row that needs padding is still refused");
+        assert!(doc.truncated());
+        assert!(doc.plain_text().contains("empty cells of padding"));
+    }
+
     /// The default allowance keeps the sparse worst case small: six sheets of
     /// one number in the last column of 65,535 rows (a 7 MB file) reached
     /// 0.9 GB on open under the earlier 32 Mi allowance. Memory is the slots
     /// kept times what a slot costs, and the allowance is what bounds the
-    /// slots, whatever the number of sheets.
+    /// slots, whatever the number of sheets. Driving the real reader: six
+    /// such sheets at the default allowance keep fewer slots than the
+    /// allowance and are flagged truncated.
     #[test]
     fn test_default_padding_allowance_bounds_the_sparse_worst_case() {
         let slot = std::mem::size_of::<CellValue>() + std::mem::size_of::<u16>();
         let worst = crate::limits::DEFAULT_MAX_GRID_PADDING_CELLS * slot;
         assert!(worst <= 320 << 20, "{} MiB of padding at the default allowance", worst >> 20);
-        // A dense sheet is free and one sheet's rows reaching column 255
-        // over 32,000 rows still fit.
-        const { assert!(crate::limits::DEFAULT_MAX_GRID_PADDING_CELLS >= 32_000 * 255) };
+        let mut body = Vec::new();
+        for r in 0..=u16::MAX - 1 {
+            body.extend(number(r, 255, 0, 1.0));
+        }
+        let sheets: Vec<(&str, u8, Vec<u8>)> = ["A", "B", "C"]
+            .iter()
+            .map(|n| (*n, 0u8, body.clone()))
+            .collect();
+        let stream = workbook_stream(&sheets);
+        let doc = XlsDocument::parse_workbook_stream_with_limits(
+            &stream,
+            200_000_000,
+            crate::limits::GridBudget::new(),
+        )
+        .expect("parses");
+        let kept: usize = doc.sheets.iter().map(|s| s.rows.len()).sum();
+        assert!(
+            kept * 255 <= crate::limits::DEFAULT_MAX_GRID_PADDING_CELLS + 255 * doc.sheets.len(),
+            "{kept} sparse rows kept"
+        );
+        assert!(kept < 3 * 65_535, "the allowance cut the sparse sheets");
+        assert!(doc.truncated());
     }
 
-    /// Padding is charged for empty slots only: a dense row costs nothing,
-    /// whatever its width.
+    /// Control, not a regression test: padding is charged for empty slots
+    /// only, so a dense row costs nothing even with no allowance at all.
     #[test]
-    fn test_dense_rows_cost_no_padding() {
+    fn test_control_dense_rows_cost_no_padding() {
         let mut body = Vec::new();
         for r in 0..4u16 {
             for c in 0..256u16 {
