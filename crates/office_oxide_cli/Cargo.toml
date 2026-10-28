@@ -19,6 +19,9 @@ workspace = true
 [[bin]]
 name = "office-oxide"
 path = "src/main.rs"
+# The binary shares its name with the library, so documenting it writes into
+# the library's doc directory; a parallel doc build races on it.
+doc = false
 
 [dependencies]
 office_oxide = { version = "0.1.16", path = "../.." }
