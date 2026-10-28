@@ -348,7 +348,7 @@ impl DocDocument {
             &pieces,
             0,
             fib.text_len,
-            fib.lid,
+            fib.text_lid(),
             &deleted_ranges,
         );
         let text = sanitize_text(&raw_text);
@@ -383,7 +383,8 @@ impl DocDocument {
                 continue;
             }
             let end = cp.saturating_add(len);
-            let raw = super::piece_table::extract_text_range(&word_doc, &pieces, cp, end, fib.lid);
+            let raw =
+                super::piece_table::extract_text_range(&word_doc, &pieces, cp, end, fib.text_lid());
             // The header document opens with six fixed stories — the
             // footnote/endnote separators and "continued" notices Word
             // shows only when a note spans pages ([MS-DOC] "Headers").
@@ -511,7 +512,7 @@ impl DocDocument {
                     &pieces,
                     &fkp,
                     fib.text_len,
-                    fib.lid,
+                    fib.text_lid(),
                     &chpx_runs,
                     &section_ends,
                     &styles,

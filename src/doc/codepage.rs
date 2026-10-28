@@ -5,6 +5,12 @@
 //! this, so any compressed non-Western-European text was corrupted by
 //! construction, whether or not a real example was on hand to prove it.
 
+/// A pseudo language ID for a document whose FIB marks a Macintosh character
+/// set (`FibBase.chs` = 0x0100): its 8-bit text is Mac Roman whatever the
+/// document's language. `0xFFFF` is not a Windows LCID, so it cannot collide
+/// with a real `lid`; it travels wherever the `lid` does.
+pub(crate) const MAC_TEXT: u16 = 0xFFFF;
+
 /// Map a FIB `lid` (Windows LCID) to the codepage compressed text in
 /// that language is stored in. Only the primary language id (the low 10
 /// bits) determines the codepage — the sublanguage/region bits (e.g.
@@ -13,6 +19,9 @@
 /// unrecognized/neutral `lid`, matching Word's own default and every
 /// codepage-unaware caller's existing behavior.
 pub(crate) fn codepage_for_lid(lid: u16) -> u16 {
+    if lid == MAC_TEXT {
+        return 10000; // Mac Roman
+    }
     let primary = lid & 0x03FF;
     match primary {
         // Russian, Bulgarian, Ukrainian, Belarusian.
@@ -78,5 +87,18 @@ mod tests {
     fn test_default_lid_matches_the_old_cp1252_behavior() {
         assert_eq!(decode_byte(0x93, 0x0409), '\u{201C}');
         assert_eq!(decode_byte(0x93, 0x0409), super::super::piece_table::cp1252_to_char(0x93));
+    }
+
+    /// A Macintosh-authored document stores its 8-bit text in Mac Roman:
+    /// 0xD5 is the right single quote and 0x8E is e-acute, which Windows-1252
+    /// reads as `Õ` and `Ž`.
+    #[test]
+    fn test_macintosh_text_decodes_as_mac_roman() {
+        assert_eq!(decode_byte(0xD5, MAC_TEXT), '\u{2019}');
+        assert_eq!(decode_byte(0x8E, MAC_TEXT), '\u{e9}');
+        assert_eq!(decode_byte(b'a', MAC_TEXT), 'a');
+        assert_eq!(codepage_for_lid(MAC_TEXT), 10000);
+        // A byte that is the same in both is unchanged for a Windows document.
+        assert_eq!(decode_byte(0xD5, 0x0409), 'Õ');
     }
 }

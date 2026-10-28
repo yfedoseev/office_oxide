@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `.doc` saved with a Macintosh character set is decoded as Mac Roman.** The reader chose the codepage from the language ID alone, so a curly quote (0xD5) or an accented letter came out as `Õ` or `Ž`; antiword and catdoc decode them. The marker is `FibBase.chs` = 0x0100.
+
 - **A `.xls` formula cell whose text result follows its array, shared-formula or data-table record keeps that text.** The result was forgotten on any record other than `STRING`, so such a cell came out empty although xlrd, calamine and xls2csv return the text.
 
 - **A deflated package part whose length differs from the size its zip header declares is read and reported, instead of being dropped as unreadable.** Tools that rewrite line endings inside a package leave such headers; a wrong CRC-32 was already tolerated and 7-Zip and LibreOffice extract these entries. The bytes are kept, `Metadata::warnings` names the part, and an entry that inflates more than a quarter past its declared size is still refused as a decompression bomb. A stream that ends short of the declared size is reported too.
