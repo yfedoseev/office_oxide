@@ -825,20 +825,39 @@ fn ir_hyperlinks(ir: &office_oxide::DocumentIR) -> (usize, usize) {
 }
 
 #[test]
-fn test_a_hyperlink_target_longer_than_excels_limit_is_dropped_and_reported() {
+fn test_a_hyperlink_target_past_the_package_limit_is_reported_not_dropped_silently() {
     set_budgets();
-    // Excel stores at most 2,083 characters of a hyperlink address; a
-    // 1 MB target cannot come from it and was copied onto every link.
+    // A relationship target of 100,000 characters is past the 64 KiB every
+    // format accepts: the relationships part is refused, and the sheet's
+    // links with it. That is on record, not an empty set of relationships.
     let doc = open(hyperlink_fan_out_workbook(40, 100_000)).unwrap();
     let ir = doc.to_ir();
     assert_eq!(ir_hyperlinks(&ir), (0, 0), "an over-long target was copied into the IR");
     let text = doc.plain_text();
     assert!(text.contains("40"), "the cells stay: {text}");
+    assert!(ir.metadata.text_truncated, "the loss is not flagged");
     assert!(
-        ir.metadata.warnings.iter().any(|w| w.contains("hyperlink")),
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("sheet1.xml.rels")),
         "no warning: {:?}",
         ir.metadata.warnings
     );
+}
+
+#[test]
+fn test_a_hyperlink_target_within_the_package_limit_is_kept_and_charged() {
+    set_budgets();
+    // 40 links to a 30,000-character target (inside 64 KiB, as docx and
+    // pptx accept) is 1.2 million characters against a 60,000 budget: the
+    // links that fit are kept, the rest are cut, loudly.
+    let doc = open(hyperlink_fan_out_workbook(40, 30_000)).unwrap();
+    let ir = doc.to_ir();
+    let (bytes, count) = ir_hyperlinks(&ir);
+    assert!(count >= 1, "a legitimate long target is dropped");
+    assert!(bytes <= 120_000, "{bytes} bytes of target copied into the IR");
+    assert!(ir.metadata.text_truncated);
 }
 
 #[test]

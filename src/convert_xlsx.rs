@@ -829,14 +829,6 @@ impl<'d> SheetConverter<'d> {
                 crate::limits::MAX_FORMULA_CHARS
             ));
         }
-        if ws.hyperlinks_dropped > 0 {
-            warnings.push(format!(
-                "sheet {:?}: {} hyperlink(s) left out: their target is longer than {} characters",
-                ws.name,
-                ws.hyperlinks_dropped,
-                crate::limits::MAX_HYPERLINK_TARGET_CHARS
-            ));
-        }
         if budget.exhausted() {
             combined.push(Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain(budget.notice()))],
@@ -1073,6 +1065,22 @@ impl<'d> SheetConverter<'d> {
                 Some(&doc.package_properties),
             )
         };
+        // Relationship parts that could not be read: the sheet, drawing or
+        // pivot they belong to lacks what they name.
+        const PARTS_LISTED: usize = 50;
+        metadata.text_truncated |= !doc.unreadable_parts.is_empty();
+        metadata.warnings.extend(
+            doc.unreadable_parts
+                .iter()
+                .take(PARTS_LISTED)
+                .map(|(part, err)| format!("skipped unreadable part {part}: {err}")),
+        );
+        if doc.unreadable_parts.len() > PARTS_LISTED {
+            metadata.warnings.push(format!(
+                "{} more unreadable parts not listed",
+                doc.unreadable_parts.len() - PARTS_LISTED
+            ));
+        }
         metadata.warnings.extend(self.warnings.iter().cloned());
         metadata.warnings.extend(self.end_warnings());
         metadata

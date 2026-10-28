@@ -1035,6 +1035,7 @@ mod tests {
             package_properties: Default::default(),
             has_macros: false,
             unreadable_sheets: Vec::new(),
+            unreadable_parts: Vec::new(),
             styles_data: None,
             theme_data: None,
         };
@@ -1056,7 +1057,6 @@ mod tests {
             rows: Vec::new(),
             merged_cells: Vec::new(),
             hyperlinks: Vec::new(),
-            hyperlinks_dropped: 0,
             formulas_dropped: 0,
             page_setup: None,
             images: std::sync::Arc::from([]),
@@ -1102,6 +1102,7 @@ mod tests {
             package_properties: Default::default(),
             has_macros: false,
             unreadable_sheets: Vec::new(),
+            unreadable_parts: Vec::new(),
             styles_data: None,
             theme_data: None,
         };
@@ -1137,7 +1138,6 @@ mod tests {
             }],
             merged_cells: Vec::new(),
             hyperlinks: Vec::new(),
-            hyperlinks_dropped: 0,
             formulas_dropped: 0,
             page_setup: None,
             images: std::sync::Arc::from([]),
@@ -1171,6 +1171,7 @@ mod tests {
             package_properties: Default::default(),
             has_macros: false,
             unreadable_sheets: Vec::new(),
+            unreadable_parts: Vec::new(),
             styles_data: None,
             theme_data: None,
         };
@@ -1204,6 +1205,7 @@ mod tests {
             package_properties: Default::default(),
             has_macros: false,
             unreadable_sheets: Vec::new(),
+            unreadable_parts: Vec::new(),
             styles_data: None,
             theme_data: None,
         };

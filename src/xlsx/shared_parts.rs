@@ -19,7 +19,7 @@ use zip::read::ZipArchive;
 use super::worksheet::{self, SheetComment, SheetTable, WorksheetPicture, WorksheetTextShape};
 use super::{
     MediaCache, XlsxDocument, guess_image_format_from_bytes, parse_drawing_anchors, part_key,
-    read_media_cached, resolve_relative_zip_path, sheet_rels_path,
+    read_media_cached, read_rels_reporting, resolve_relative_zip_path, sheet_rels_path,
 };
 use crate::core::opc;
 use crate::core::relationships::{Relationships, rel_types};
@@ -43,6 +43,9 @@ pub(super) struct SharedParts {
     tables: HashMap<String, Option<Arc<SheetTable>>>,
     /// The text of chart parts, for the chartsheets that display them.
     charts: HashMap<String, Option<Arc<str>>>,
+    /// Relationship parts met on the way that could not be read, as
+    /// `(part, reason)`.
+    pub(super) unreadable: Vec<(String, String)>,
 }
 
 impl SharedParts {
@@ -64,7 +67,8 @@ impl SharedParts {
         if let Some(hit) = self.drawings.get(&key) {
             return hit.clone();
         }
-        let read = read_drawing(archive, entries, media, &drawing_path).map(Arc::new);
+        let read = read_drawing(archive, entries, media, &drawing_path, &mut self.unreadable)
+            .map(Arc::new);
         self.drawings.insert(key, read.clone());
         read
     }
@@ -187,6 +191,7 @@ fn read_drawing<R: Read + Seek>(
     entries: &opc::ZipEntryIndex,
     media: &mut MediaCache,
     drawing_path: &str,
+    unreadable: &mut Vec<(String, String)>,
 ) -> Option<SharedDrawing> {
     let drawing_xml = match XlsxDocument::read_xml_entry(archive, entries, drawing_path) {
         Ok(d) => d,
@@ -196,11 +201,8 @@ fn read_drawing<R: Read + Seek>(
         },
     };
 
-    let drawing_rels_path = sheet_rels_path(drawing_path);
-    let drawing_rels = match XlsxDocument::read_xml_entry(archive, entries, &drawing_rels_path) {
-        Ok(d) => Relationships::parse(&d).unwrap_or_else(|_| Relationships::empty()),
-        Err(_) => Relationships::empty(),
-    };
+    let drawing_rels =
+        read_rels_reporting(archive, entries, &sheet_rels_path(drawing_path), unreadable);
 
     let parsed = match parse_drawing_anchors(&drawing_xml) {
         Ok(a) => a,

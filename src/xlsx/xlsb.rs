@@ -27,7 +27,6 @@ use super::workbook::{SheetInfo, SheetState, WorkbookInfo};
 use super::worksheet::{Row, Worksheet};
 use super::{Result, XlsxDocument};
 use crate::core::opc::{self, ZipEntryIndex};
-use crate::core::relationships::Relationships;
 use crate::ir::SheetKind;
 
 // Record ids ([MS-XLSB] §2.3, decimal as the specification lists them).
@@ -72,10 +71,8 @@ pub(super) fn from_zip<R: Read + Seek>(
     entries: &ZipEntryIndex,
 ) -> Result<XlsxDocument> {
     let wb = opc::read_zip_entry(archive, entries, WORKBOOK)?;
-    let rels = match opc::read_zip_entry(archive, entries, WORKBOOK_RELS) {
-        Ok(d) => Relationships::parse(&d).unwrap_or_else(|_| Relationships::empty()),
-        Err(_) => Relationships::empty(),
-    };
+    let mut shared = super::shared_parts::SharedParts::default();
+    let rels = super::read_rels_reporting(archive, entries, WORKBOOK_RELS, &mut shared.unreadable);
     let (sheets, date1904) = parse_workbook(&wb);
     let shared_strings = match opc::read_zip_entry(archive, entries, SHARED_STRINGS) {
         Ok(d) => parse_shared_strings(&d),
@@ -89,7 +86,6 @@ pub(super) fn from_zip<R: Read + Seek>(
     let mut worksheets = Vec::with_capacity(sheets.len());
     let mut unreadable_sheets = Vec::new();
     let mut sheet_parts = super::SheetPartClaims::default();
-    let mut shared = super::shared_parts::SharedParts::default();
     for (i, info) in sheets.iter().enumerate() {
         let rel = rels.get_by_id(&info.rel_id);
         // A macro sheet has the same cell records as a worksheet (its part
@@ -111,7 +107,9 @@ pub(super) fn from_zip<R: Read + Seek>(
             let mut ws = Worksheet::without_cells(info.name.clone(), kind);
             ws.state = info.state;
             if kind == SheetKind::Chart {
-                for chart in super::chartsheet_chart_parts(archive, entries, &path) {
+                for chart in
+                    super::chartsheet_chart_parts(archive, entries, &path, &mut shared.unreadable)
+                {
                     ws.chart_text
                         .extend(shared.chart_text(archive, entries, &chart));
                 }
@@ -160,6 +158,7 @@ pub(super) fn from_zip<R: Read + Seek>(
         package_properties,
         has_macros,
         unreadable_sheets,
+        unreadable_parts: shared.unreadable,
         styles_data: None,
         theme_data: None,
     })

@@ -112,6 +112,13 @@ pub struct XlsxDocument {
     /// intact; those are returned now, and the loss is on record here,
     /// in every renderer's output and in `Metadata::text_truncated`.
     pub unreadable_sheets: Vec<(String, String)>,
+    /// Relationship parts that could not be read or parsed — `(part, error)`:
+    /// a target past the package limit, a part that is not XML. The sheet
+    /// (or drawing, pivot table, chart) they belong to is read without the
+    /// relationships they hold, so it lacks the hyperlinks, drawings,
+    /// comments, tables and pivots they name. The loss is on record here and
+    /// in `Metadata::warnings` and `Metadata::text_truncated`.
+    pub unreadable_parts: Vec<(String, String)>,
     // Raw bytes for lazy parsing (None after parsing or if not present)
     styles_data: Option<Vec<u8>>,
     theme_data: Option<Vec<u8>>,
@@ -339,7 +346,12 @@ impl XlsxDocument {
                 // No cells to read. A chartsheet's content is the text of
                 // the chart its drawing references.
                 let chart_text = if kind == crate::ir::SheetKind::Chart {
-                    let paths = chartsheet_chart_parts(&mut archive, &entries, &sheet_path);
+                    let paths = chartsheet_chart_parts(
+                        &mut archive,
+                        &entries,
+                        &sheet_path,
+                        &mut shared.unreadable,
+                    );
                     let mut texts = Vec::new();
                     for path in paths {
                         texts.extend(shared.chart_text(&mut archive, &entries, &path));
@@ -407,10 +419,8 @@ impl XlsxDocument {
 
             // Read worksheet relationships (for hyperlinks)
             let rels_path = sheet_rels_path(&sheet_path);
-            let ws_rels = match Self::read_xml_entry(&mut archive, &entries, &rels_path) {
-                Ok(data) => Relationships::parse(&data).unwrap_or_else(|_| Relationships::empty()),
-                Err(_) => Relationships::empty(),
-            };
+            let ws_rels =
+                read_rels_reporting(&mut archive, &entries, &rels_path, &mut shared.unreadable);
 
             // Resolve the worksheet's DRAWING rel up-front (Phase 1
             // has access to &mut archive). Each entry decodes
@@ -531,7 +541,8 @@ impl XlsxDocument {
         // metadata/richData chain is a real embedded image, not a
         // genuine formula error — swap its fabricated `#VALUE!` text
         // for the actual picture.
-        let rich_value_images = read_rich_value_images(&mut archive, &entries, &mut media);
+        let rich_value_images =
+            read_rich_value_images(&mut archive, &entries, &mut media, &mut shared.unreadable);
         if !rich_value_images.is_empty() {
             for ws in &mut worksheets {
                 for row in &mut ws.rows {
@@ -624,6 +635,7 @@ impl XlsxDocument {
             package_properties,
             has_macros,
             unreadable_sheets,
+            unreadable_parts: shared.unreadable,
             styles_data: None,
             theme_data,
         })
@@ -918,8 +930,16 @@ fn read_tables_and_pivots<R: Read + Seek>(
         let pivot = match pivot_ctx.pivots.get(&key) {
             Some(hit) => hit.clone(),
             None => {
-                let read = read_pivot_table(archive, entries, &path, workbook, pivot_ctx, budget)
-                    .map(std::sync::Arc::new);
+                let read = read_pivot_table(
+                    archive,
+                    entries,
+                    &path,
+                    workbook,
+                    pivot_ctx,
+                    budget,
+                    &mut shared.unreadable,
+                )
+                .map(std::sync::Arc::new);
                 pivot_ctx.pivots.insert(key, read.clone());
                 read
             },
@@ -937,6 +957,7 @@ fn read_pivot_table<R: Read + Seek>(
     workbook: &WorkbookInfo,
     pivot_ctx: &mut PivotContext,
     budget: &mut crate::limits::TextBudget,
+    unreadable: &mut Vec<(String, String)>,
 ) -> Option<worksheet::SheetPivotTable> {
     let mut pivot = match XlsxDocument::read_xml_entry(archive, entries, path)
         .map_err(|e| e.to_string())
@@ -948,13 +969,8 @@ fn read_pivot_table<R: Read + Seek>(
             return None;
         },
     };
-    let pivot_rels = XlsxDocument::read_xml_entry(archive, entries, &sheet_rels_path(path))
-        .ok()
-        .and_then(|d| Relationships::parse(&d).ok());
-    if let Some(cache) = pivot_rels
-        .as_ref()
-        .and_then(|r| r.first_by_type(PIVOT_CACHE_DEFINITION_REL))
-    {
+    let pivot_rels = read_rels_reporting(archive, entries, &sheet_rels_path(path), unreadable);
+    if let Some(cache) = pivot_rels.first_by_type(PIVOT_CACHE_DEFINITION_REL) {
         let cache_path = resolve_relative_zip_path(path, &cache.target);
         if let Ok(def) = XlsxDocument::read_xml_entry(archive, entries, &cache_path) {
             let src = worksheet::parse_pivot_cache_definition(&def).unwrap_or_default();
@@ -970,6 +986,7 @@ fn read_pivot_table<R: Read + Seek>(
                             &def,
                             &src,
                             budget,
+                            unreadable,
                         );
                         let data = data.map(std::sync::Arc::new);
                         pivot_ctx
@@ -1027,10 +1044,9 @@ fn read_pivot_cache_data<R: Read + Seek>(
     definition: &[u8],
     src: &worksheet::PivotCacheSource,
     budget: &mut crate::limits::TextBudget,
+    unreadable: &mut Vec<(String, String)>,
 ) -> Option<worksheet::PivotCacheData> {
-    let rels = XlsxDocument::read_xml_entry(archive, entries, &sheet_rels_path(cache_path))
-        .ok()
-        .and_then(|d| Relationships::parse(&d).ok())?;
+    let rels = read_rels_reporting(archive, entries, &sheet_rels_path(cache_path), unreadable);
     let rel = src
         .records_rel_id
         .as_deref()
@@ -1126,28 +1142,49 @@ pub(super) fn chartsheet_chart_parts<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &opc::ZipEntryIndex,
     sheet_path: &str,
+    unreadable: &mut Vec<(String, String)>,
 ) -> Vec<String> {
-    let read_rels = |archive: &mut ZipArchive<R>, part: &str| {
-        XlsxDocument::read_xml_entry(archive, entries, &sheet_rels_path(part))
-            .ok()
-            .and_then(|d| Relationships::parse(&d).ok())
-    };
-    let Some(sheet_rels) = read_rels(archive, sheet_path) else {
-        return Vec::new();
-    };
+    let sheet_rels =
+        read_rels_reporting(archive, entries, &sheet_rels_path(sheet_path), unreadable);
     let mut charts = Vec::new();
     for drawing in sheet_rels.get_by_type(rel_types::DRAWING) {
         let drawing_path = resolve_relative_zip_path(sheet_path, &drawing.target);
-        if let Some(drawing_rels) = read_rels(archive, &drawing_path) {
-            for chart in drawing_rels.get_by_type(rel_types::CHART) {
-                let path = resolve_relative_zip_path(&drawing_path, &chart.target);
-                if !charts.contains(&path) {
-                    charts.push(path);
-                }
+        let drawing_rels =
+            read_rels_reporting(archive, entries, &sheet_rels_path(&drawing_path), unreadable);
+        for chart in drawing_rels.get_by_type(rel_types::CHART) {
+            let path = resolve_relative_zip_path(&drawing_path, &chart.target);
+            if !charts.contains(&path) {
+                charts.push(path);
             }
         }
     }
     charts
+}
+
+/// Read and parse the relationships part at `path`. A package without the
+/// part has no relationships there; a part that is present but cannot be
+/// read or parsed (a target past the package limit, a part that is not XML)
+/// also yields none, but is recorded in `unreadable` as `(part, reason)` so
+/// the loss is reported rather than passing for a part with nothing in it.
+pub(super) fn read_rels_reporting<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &opc::ZipEntryIndex,
+    path: &str,
+    unreadable: &mut Vec<(String, String)>,
+) -> Relationships {
+    match XlsxDocument::read_xml_entry(archive, entries, path) {
+        Ok(data) => Relationships::parse(&data).unwrap_or_else(|e| {
+            log::warn!("xlsx: relationships part {path} unreadable: {e}");
+            unreadable.push((path.to_string(), e.to_string()));
+            Relationships::empty()
+        }),
+        Err(crate::core::Error::MissingPart(_)) => Relationships::empty(),
+        Err(e) => {
+            log::warn!("xlsx: relationships part {path} unreadable: {e}");
+            unreadable.push((path.to_string(), e.to_string()));
+            Relationships::empty()
+        },
+    }
 }
 
 fn sheet_rels_path(sheet_path: &str) -> String {
@@ -1250,6 +1287,7 @@ fn read_rich_value_images<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &opc::ZipEntryIndex,
     media: &mut MediaCache,
+    unreadable: &mut Vec<(String, String)>,
 ) -> std::collections::HashMap<u32, crate::xlsx::worksheet::WorksheetPicture> {
     let mut out = std::collections::HashMap::new();
 
@@ -1281,10 +1319,7 @@ fn read_rich_value_images<R: Read + Seek>(
     let rel_rids = parse_rich_value_rel(&rel_xml);
 
     let rel_rels_path = sheet_rels_path(rel_path);
-    let rel_rels = match XlsxDocument::read_xml_entry(archive, entries, &rel_rels_path) {
-        Ok(d) => Relationships::parse(&d).unwrap_or_else(|_| Relationships::empty()),
-        Err(_) => return out,
-    };
+    let rel_rels = read_rels_reporting(archive, entries, &rel_rels_path, unreadable);
 
     for (position, rvb_index) in value_metadata.iter().enumerate() {
         // `rc.t` must reference the metadataType we identified as

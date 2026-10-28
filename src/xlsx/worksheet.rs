@@ -25,10 +25,6 @@ pub struct Worksheet {
     /// the master would pass the document's text budget
     /// ([`crate::limits::set_max_text_chars`]). The cells keep their values.
     pub formulas_dropped: usize,
-    /// Hyperlinks left out because their relationship's target is longer than
-    /// [`crate::limits::MAX_HYPERLINK_TARGET_CHARS`] (2,083 characters, Excel's
-    /// own limit).
-    pub hyperlinks_dropped: usize,
     /// Per-sheet page geometry parsed from `<pageMargins>` + `<pageSetup>`.
     pub page_setup: Option<PageSetup>,
     /// Pictures anchored on this worksheet via `xl/drawings/drawingN.xml`.
@@ -879,7 +875,6 @@ impl Worksheet {
             rows: Vec::new(),
             merged_cells: Vec::new(),
             hyperlinks: Vec::new(),
-            hyperlinks_dropped: 0,
             formulas_dropped: 0,
             page_setup: None,
             images: std::sync::Arc::from([]),
@@ -928,7 +923,6 @@ impl Worksheet {
         let mut rows = Vec::new();
         let mut merged_cells = Vec::new();
         let mut hyperlinks = Vec::new();
-        let mut link_targets = LinkTargets::default();
         // Page setup is collected lazily because <pageMargins> and
         // <pageSetup> arrive as separate sibling elements and either may
         // appear without the other. We materialize the IR value at the
@@ -962,7 +956,7 @@ impl Worksheet {
                         reader.read_to_end(e.to_end().name())?;
                     },
                     "hyperlink" => {
-                        if let Some(hl) = parse_hyperlink(e, rels, &mut link_targets)? {
+                        if let Some(hl) = parse_hyperlink(e, rels)? {
                             hyperlinks.push(hl);
                         }
                         reader.read_to_end(e.to_end().name())?;
@@ -996,7 +990,7 @@ impl Worksheet {
                         }
                     },
                     "hyperlink" => {
-                        if let Some(hl) = parse_hyperlink(e, rels, &mut link_targets)? {
+                        if let Some(hl) = parse_hyperlink(e, rels)? {
                             hyperlinks.push(hl);
                         }
                     },
@@ -1029,7 +1023,6 @@ impl Worksheet {
             rows,
             merged_cells,
             hyperlinks,
-            hyperlinks_dropped: link_targets.dropped,
             formulas_dropped: 0,
             page_setup,
             images: std::sync::Arc::from([]),
@@ -1422,44 +1415,9 @@ fn build_page_setup(
     Some(ps)
 }
 
-/// The external targets of one sheet's hyperlinks, each read from its
-/// relationship once: every `<hyperlink>` naming the relationship shares the
-/// one allocation instead of copying the target.
-#[derive(Default)]
-struct LinkTargets {
-    /// Relationship id to its target, or `None` when the target is longer than
-    /// [`crate::limits::MAX_HYPERLINK_TARGET_CHARS`].
-    by_id: std::collections::HashMap<String, Option<std::sync::Arc<str>>>,
-    /// Links left out for naming an over-long target.
-    dropped: usize,
-}
-
-impl LinkTargets {
-    /// The shared target of relationship `rid`, or `None` when it is too long
-    /// (counted as a dropped link).
-    fn external(
-        &mut self,
-        rid: &str,
-        rel: &crate::core::relationships::Relationship,
-    ) -> Option<std::sync::Arc<str>> {
-        let target = self.by_id.entry(rid.to_string()).or_insert_with(|| {
-            let max = crate::limits::MAX_HYPERLINK_TARGET_CHARS;
-            // A character is at most four bytes, so a target of more than four
-            // times the limit in bytes is over it without being counted.
-            let too_long = rel.target.len() > max * 4 || rel.target.chars().count() > max;
-            (!too_long).then(|| std::sync::Arc::clone(&rel.target))
-        });
-        if target.is_none() {
-            self.dropped += 1;
-        }
-        target.clone()
-    }
-}
-
 fn parse_hyperlink(
     e: &quick_xml::events::BytesStart,
     rels: &crate::core::relationships::Relationships,
-    targets: &mut LinkTargets,
 ) -> crate::core::Result<Option<HyperlinkInfo>> {
     let cell_ref = match xml::optional_attr_str(e, "ref")? {
         Some(v) => v.into_owned(),
@@ -1473,10 +1431,11 @@ fn parse_hyperlink(
 
     let target = if let Some(rid) = r_id {
         if let Some(rel) = rels.get_by_id(&rid) {
-            match targets.external(&rid, rel) {
-                Some(target) => HyperlinkTarget::External(target),
-                None => return Ok(None),
-            }
+            // Shared with the relationship, not copied: every link that
+            // names it holds the one allocation, and the IR's copies are
+            // charged to the text budget. The package layer already refuses
+            // a target past 64 KiB, the limit of every format.
+            HyperlinkTarget::External(std::sync::Arc::clone(&rel.target))
         } else {
             return Ok(None);
         }
