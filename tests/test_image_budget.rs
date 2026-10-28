@@ -131,22 +131,48 @@ fn test_docx_pictures_sharing_one_image_stop_copying_at_the_budget() {
     );
 }
 
+/// A header carrying a logo, named by every section (a mail merge repeats the
+/// reference): the logo's bytes come off the image budget like a body picture's,
+/// not off the text budget, so the text of every section's header survives.
 #[test]
-fn test_docx_header_with_a_large_image_shared_by_many_sections_stays_bounded() {
+fn test_docx_header_with_a_large_image_shared_by_many_sections_charges_the_image_budget() {
     limits();
-    let sections: String = (0..30)
+    let sections: String = (0..20)
         .map(|i| {
             format!(
                 r#"<w:p><w:r><w:t>s{i}</w:t></w:r><w:pPr><w:sectPr><w:headerReference w:type="default" r:id="rId6"/></w:sectPr></w:pPr></w:p>"#
             )
         })
         .collect();
-    let bytes = docx(&sections, Some(&format!("<w:p>{}</w:p>", drawing("rId1"))));
+    let header = format!("<w:p><w:r><w:t>Letterhead</w:t></w:r>{}</w:p>", drawing("rId1"));
+    let bytes = docx(&sections, Some(&header));
     let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
     let ir = doc.to_ir();
-    let with_header = ir.sections.iter().filter(|s| s.header.is_some()).count();
-    assert_eq!(with_header, 1, "only the copy that fits the budget is made");
-    assert!(ir.metadata.text_truncated);
+    let headers: Vec<_> = ir
+        .sections
+        .iter()
+        .filter_map(|s| s.header.as_ref())
+        .collect();
+    assert_eq!(headers.len(), 20, "every section keeps its header");
+    let with_logo = headers
+        .iter()
+        .filter(|h| {
+            h.content.iter().any(|e| match e {
+                Element::Image(i) => i.data.is_some(),
+                Element::Paragraph(_) => false,
+                _ => false,
+            })
+        })
+        .count();
+    assert_eq!(with_logo, 1, "the logo is copied while the image budget lasts");
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("image bytes")),
+        "{:?}",
+        ir.metadata.warnings
+    );
 }
 
 #[test]

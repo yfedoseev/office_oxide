@@ -153,6 +153,19 @@ impl<'a, 'd> Cx<'a, 'd> {
     }
 }
 
+/// A header or footer converted once, with what a copy of it costs.
+#[derive(Clone)]
+struct SharedStory {
+    part: HeaderFooter,
+    /// The serialised size of a copy, pictures' bytes excluded.
+    text_chars: usize,
+    /// The bytes of the pictures a copy holds.
+    image_bytes: usize,
+    /// The same story with its pictures' bytes removed, and its serialised
+    /// size, made the first time a copy has to be made without them.
+    without_images: Option<(HeaderFooter, usize)>,
+}
+
 pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
     crate::limits::begin_image_budget();
     crate::limits::begin_copied_text_budget();
@@ -203,11 +216,13 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
     // header and footer refs, and gave every section every other section's
     // headers on top of that.
     // Each stored entry is converted once; a section that shares it gets a
-    // copy, whose text is charged to the document's text budget so that a
-    // package of many sections over one large header cannot multiply it
-    // without bound.
-    let mut hf_converted: Vec<Option<Option<(HeaderFooter, usize)>>> =
-        vec![None; doc.headers_footers.len()];
+    // copy. A copy is charged before it is made: its image bytes to the image
+    // budget, like a body picture's, and the rest of its serialised form (text,
+    // structure, link targets, tooltips) to the text budget, so that a package
+    // of many sections over one large header cannot multiply it without bound.
+    // When the image budget cannot take another copy of the images, the copy
+    // keeps its text and its pictures lose their bytes.
+    let mut hf_converted: Vec<Option<Option<SharedStory>>> = vec![None; doc.headers_footers.len()];
     let mut per_section: Vec<SectionHeaders> = Vec::new();
     for slots in &doc.hf_by_ref {
         let mut slot = SectionHeaders::default();
@@ -229,18 +244,45 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
                 {
                     None
                 } else {
-                    // The size of a copy: its serialised form, which holds the
-                    // text, the structure and the image bytes (as base64).
-                    let chars = serde_json::to_vec(&tmp).map_or(usize::MAX, |v| v.len());
-                    Some((HeaderFooter { content: tmp }, chars))
+                    // The pictures' bytes, and what they add to the serialised
+                    // form (base64).
+                    let (mut image_bytes, mut image_base64) = (0usize, 0usize);
+                    crate::ir::for_each_image_mut(&mut tmp, |i| {
+                        let n = i.data.as_ref().map_or(0, Vec::len);
+                        image_bytes = image_bytes.saturating_add(n);
+                        image_base64 = image_base64.saturating_add(n.div_ceil(3) * 4);
+                    });
+                    let json = serde_json::to_vec(&tmp).map_or(usize::MAX, |v| v.len());
+                    Some(SharedStory {
+                        part: HeaderFooter { content: tmp },
+                        text_chars: json.saturating_sub(image_base64),
+                        image_bytes,
+                        without_images: None,
+                    })
                 }
             });
-            let Some((part, chars)) = converted.clone() else {
+            let Some(story) = converted.as_mut() else {
                 continue;
             };
-            if !crate::limits::charge_copied_text(chars) {
-                continue;
-            }
+            let part = if crate::limits::charge_image_bytes(story.image_bytes) {
+                if !crate::limits::charge_copied_text(story.text_chars) {
+                    continue;
+                }
+                story.part.clone()
+            } else {
+                // No room for another copy of the pictures: the copy keeps
+                // its text, and its pictures their place without bytes.
+                let (stripped, chars) = story.without_images.get_or_insert_with(|| {
+                    let mut part = story.part.clone();
+                    crate::ir::for_each_image_mut(&mut part.content, |i| i.data = None);
+                    let chars = serde_json::to_vec(&part.content).map_or(usize::MAX, |v| v.len());
+                    (part, chars)
+                });
+                if !crate::limits::charge_copied_text(*chars) {
+                    continue;
+                }
+                stripped.clone()
+            };
             let target = match (hf.is_header, hf.hf_type) {
                 (true, crate::docx::HeaderFooterType::First) => &mut slot.first_header,
                 (true, crate::docx::HeaderFooterType::Even) => &mut slot.even_header,

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Pictures in a `.docx` header or footer shared by many sections are charged to the image budget, not the text budget.** A shared header's per-section IR copies were charged at their base64 JSON size to the text budget, so a 1 MB logo in a mail-merge document with about 190 sections exhausted it and later sections lost their headers, while body pictures used the image budget. The picture bytes of each copy now come off the image budget (`limits::set_max_image_bytes`) before the copy is made, and the rest of the copy (text, structure, link targets) off the text budget. When the image budget cannot take another copy of the pictures, the copy keeps its text and its pictures keep their place without bytes, and the image warning says so.
+
 - **A `.docx` hyperlink's hover text is charged with its target.** Each IR span inside a hyperlink received its own copy of the link's `w:tooltip` without counting it: one 20 KB tooltip over forty runs made 800 KB of IR. The tooltip is now charged to the text budget together with the URL before either is copied; past the budget the text stays unlinked and the usual truncation flag and warning are set.
 
 - **A picture's link target is charged where `.pptx` Markdown copies it.** `PptxDocument::to_markdown` wrote a linked picture's target once per picture without counting it, so the only bound was the slide's whole-output budget, which dropped the entire slide: forty pictures linked to one long target lost the slide's text too. The target is now charged to the text budget before it is copied; past it the pictures are named without their target, the rest of the slide stays, and the output ends with the truncation notice.
