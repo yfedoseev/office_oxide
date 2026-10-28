@@ -173,9 +173,17 @@ fn assert_budget_notice(ir: &DocumentIR) {
 #[test]
 fn test_relationship_target_beyond_the_length_cap_is_refused() {
     let _limits = limits();
+    // The document still opens, without the relationships it cannot read, and
+    // the part is reported (a refusal would turn a readable document into an
+    // error).
     let bytes = docx(&url(1 << 20), 400, false);
-    let err = DocxDocument::from_reader(Cursor::new(bytes)).unwrap_err();
-    assert!(err.to_string().contains("Target"), "{err}");
+    let doc = DocxDocument::from_reader(Cursor::new(bytes)).unwrap();
+    let found = doc
+        .unreadable_parts
+        .iter()
+        .find(|p| p.contains("document.xml.rels"))
+        .unwrap_or_else(|| panic!("not reported: {:?}", doc.unreadable_parts));
+    assert!(found.contains("Target"), "{found}");
     let bytes = pptx(&url(1 << 20), 300);
     // A slide whose relationships are refused is reported, not shown without
     // them in silence.

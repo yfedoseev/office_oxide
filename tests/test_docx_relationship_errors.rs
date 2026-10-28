@@ -108,10 +108,21 @@ fn test_readable_header_and_note_relationships_report_nothing() {
     assert!(doc.unreadable_parts.is_empty(), "{:?}", doc.unreadable_parts);
 }
 
-/// The main document's relationships name every other part, so a package
-/// whose own cannot be read has no document: refused, as for a presentation.
+/// The main document's relationships name the other parts, so a package whose
+/// own cannot be read has its body but not those parts. The document opens, as
+/// it did when such a part was read as an empty set of relationships, and the
+/// lost relationships part is reported.
 #[test]
-fn test_unreadable_main_relationships_refuse_the_package() {
+fn test_unreadable_main_relationships_open_the_document_and_are_reported() {
     let bytes = docx(&bad_link(), None, None);
-    assert!(DocxDocument::from_reader(Cursor::new(bytes)).is_err());
+    let doc = DocxDocument::from_reader(Cursor::new(bytes))
+        .expect("an unreadable main relationships part does not refuse the document");
+    assert!(doc.plain_text().contains("Body survives"));
+    assert!(
+        doc.unreadable_parts
+            .iter()
+            .any(|p| p.contains("document.xml.rels")),
+        "{:?}",
+        doc.unreadable_parts
+    );
 }

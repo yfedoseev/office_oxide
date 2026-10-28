@@ -364,14 +364,22 @@ fn test_a_theme_part_that_is_not_well_formed_is_reported_and_the_file_still_open
         parts.push((name, body));
     }
     parts.push(("word/theme/theme1.xml".into(), "<a:theme><a:x></a:theme>".into()));
-    let (doc, _) = open_docx_counting(zip_of(parts));
+    let bytes = zip_of(parts);
+    // A theme holds colours and fonts, no text: it is a warning in the
+    // metadata, never a loss of text (no notice, no truncation flag).
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
+        .expect("a malformed theme does not fail the open");
+    let ir = doc.to_ir();
     assert!(
-        doc.unreadable_parts
+        ir.metadata
+            .warnings
             .iter()
-            .any(|p| p.starts_with("/word/theme/theme1.xml")),
+            .any(|w| w.contains("/word/theme/theme1.xml")),
         "{:?}",
-        doc.unreadable_parts
+        ir.metadata.warnings
     );
+    assert!(!ir.metadata.text_truncated);
+    assert!(!doc.plain_text().contains("skipped unreadable part"));
 }
 
 /// Every rendering of `doc`: plain text, Markdown, HTML and the Markdown and
