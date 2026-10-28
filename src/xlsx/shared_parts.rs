@@ -40,9 +40,11 @@ const MAX_REPORT_CHARS: usize = 256;
 pub(crate) struct ReportList {
     pub(super) listed: Vec<(String, String)>,
     pub(super) omitted: usize,
-    /// Hashes of the parts recorded, so that the names of parts the file
-    /// makes up (a missing part has none but its path) are not all kept.
-    seen: std::collections::HashSet<u64>,
+    /// The normalised key of each part recorded (see [`part_key`]), compared
+    /// exactly: a part in the package costs `#index`, so the set is bounded by
+    /// the entries of the package and the relationship targets that name
+    /// something else, and no two parts can be taken for one.
+    seen: std::collections::HashSet<String>,
 }
 
 impl ReportList {
@@ -50,10 +52,7 @@ impl ReportList {
     /// already recorded (by the zip entry its path resolves to) is not
     /// recorded again, whether or not it was kept.
     pub(super) fn record(&mut self, entries: &opc::ZipEntryIndex, path: &str, reason: &str) {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        part_key(entries, path).hash(&mut hasher);
-        if !self.seen.insert(hasher.finish()) {
+        if !self.seen.insert(part_key(entries, path)) {
             return;
         }
         self.push(path, reason);
@@ -73,6 +72,12 @@ impl ReportList {
         let cut = |s: &str| s.chars().take(MAX_REPORT_CHARS).collect::<String>();
         self.listed.push((cut(name), cut(reason)));
     }
+}
+
+/// Whether a relationship names a part of the package: a target outside it
+/// ([ECMA-376] Part 2 §9.3.2, `TargetMode="External"`) is never looked up in it.
+pub(super) fn is_internal(rel: &crate::core::relationships::Relationship) -> bool {
+    rel.target_mode != crate::core::relationships::TargetMode::External
 }
 
 /// A drawing part, parsed: the pictures and text shapes its anchors place.
@@ -116,7 +121,9 @@ impl SharedParts {
         sheet_path: &str,
         sheet_rels: &Relationships,
     ) -> Option<Arc<SharedDrawing>> {
-        let rel = sheet_rels.first_by_type(rel_types::DRAWING)?;
+        let rel = sheet_rels
+            .first_by_type(rel_types::DRAWING)
+            .filter(|rel| is_internal(rel))?;
         let drawing_path = resolve_relative_zip_path(sheet_path, &rel.target);
         let key = part_key(entries, &drawing_path);
         if let Some(hit) = self.drawings.get(&key) {
@@ -142,9 +149,11 @@ impl SharedParts {
     ) -> (Arc<[SheetComment]>, bool) {
         let legacy_path = sheet_rels
             .first_by_type(rel_types::COMMENTS)
+            .filter(|rel| is_internal(rel))
             .map(|rel| resolve_relative_zip_path(sheet_path, &rel.target));
         let threaded_path = sheet_rels
             .first_by_type(rel_types::THREADED_COMMENTS)
+            .filter(|rel| is_internal(rel))
             .map(|rel| resolve_relative_zip_path(sheet_path, &rel.target));
         let legacy_key = legacy_path.as_deref().map(|p| part_key(entries, p));
         let threaded_key = threaded_path.as_deref().map(|p| part_key(entries, p));
@@ -217,7 +226,11 @@ impl SharedParts {
         );
         let mut charts: Vec<String> = Vec::new();
         let mut listed = std::collections::HashSet::new();
-        for drawing in sheet_rels.get_by_type(rel_types::DRAWING) {
+        for drawing in sheet_rels
+            .get_by_type(rel_types::DRAWING)
+            .into_iter()
+            .filter(|rel| is_internal(rel))
+        {
             let drawing_path = resolve_relative_zip_path(sheet_path, &drawing.target);
             let key = part_key(entries, &drawing_path);
             let named = match self.drawing_charts.get(&key) {
@@ -232,6 +245,7 @@ impl SharedParts {
                     let named: Arc<[String]> = drawing_rels
                         .get_by_type(rel_types::CHART)
                         .into_iter()
+                        .filter(|rel| is_internal(rel))
                         .map(|chart| resolve_relative_zip_path(&drawing_path, &chart.target))
                         .collect();
                     self.drawing_charts.insert(key, named.clone());
@@ -297,6 +311,10 @@ pub(super) fn read_reporting<R: Read + Seek>(
 ) -> Option<Vec<u8>> {
     match XlsxDocument::read_xml_entry(archive, entries, path) {
         Ok(data) => Some(data),
+        // A relationship to a part the package lacks is dangling, which is
+        // not a part that cannot be read: only a part that is there and
+        // cannot be read or parsed is reported.
+        Err(crate::core::Error::MissingPart(_)) => None,
         Err(e) => {
             log::warn!("xlsx: part {path} unreadable: {e}");
             unreadable.record(entries, path, &e.to_string());
@@ -401,4 +419,44 @@ fn read_drawing<R: Read + Seek>(
         pictures: pictures.into(),
         text_shapes: text_shapes.into(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn index(names: &[&str]) -> opc::ZipEntryIndex {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
+        for n in names {
+            zip.start_file(*n, opts).unwrap();
+            std::io::Write::write_all(&mut zip, b"x").unwrap();
+        }
+        let archive =
+            zip::ZipArchive::new(std::io::Cursor::new(zip.finish().unwrap().into_inner())).unwrap();
+        opc::ZipEntryIndex::new(&archive)
+    }
+
+    #[test]
+    fn test_parts_are_told_apart_by_their_exact_key_and_counted_exactly() {
+        let entries = index(&["xl/a.xml"]);
+        let mut sink = ReportList::default();
+        sink.record(&entries, "xl/a.xml", "bad");
+        sink.record(&entries, "XL\\A.xml", "worse");
+        for i in 0..MAX_REPORTS + 40 {
+            sink.record(&entries, &format!("xl/p{i}.xml"), "bad");
+            sink.record(&entries, &format!("XL/P{i}.xml"), "bad");
+        }
+        assert_eq!((sink.listed.len(), sink.omitted), (MAX_REPORTS, 41));
+        assert_eq!(sink.listed[0], ("xl/a.xml".to_string(), "bad".to_string()));
+    }
+
+    #[test]
+    fn test_names_and_reasons_are_cut() {
+        let entries = index(&[]);
+        let mut sink = ReportList::default();
+        sink.record(&entries, &"n".repeat(1000), &"r".repeat(1000));
+        assert_eq!(sink.listed[0].0.chars().count(), MAX_REPORT_CHARS);
+        assert_eq!(sink.listed[0].1.chars().count(), MAX_REPORT_CHARS);
+    }
 }

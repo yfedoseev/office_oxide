@@ -57,52 +57,129 @@ pub(crate) fn comment_marker(cell_ref: &str, author: Option<&str>) -> String {
     }
 }
 
-/// Per-render cell formatting state: the date styles found once
-/// (`date_style_indices`) and each custom `<numFmt>` compiled once, rather
-/// than a date re-check of the format code and a re-parse of it for every
-/// cell. Every direct renderer and `to_ir()` format through this.
+/// The workbook-level tables every cell render needs: which cell styles are
+/// dates, and the custom `<numFmt>` codes behind the others, each compiled the
+/// first time a cell needs it. They depend on the stylesheet alone, so they
+/// are built once per document and shared by every sheet's render (building
+/// them per sheet made a workbook of many sheets and many cell formats cost
+/// their product).
+#[derive(Debug, Clone)]
+pub(crate) struct FormatTables {
+    /// The stylesheet shape these were built from, to notice a stylesheet
+    /// changed through the public field since.
+    shape: (usize, usize),
+    date_indices: std::collections::HashSet<u32>,
+    /// Per number-format id, the first style that uses it (its code is looked
+    /// up through that style) and the code compiled on first use.
+    compiled:
+        std::collections::HashMap<u32, (u32, std::sync::OnceLock<Option<numfmt::CompiledFormat>>)>,
+}
+
+thread_local! {
+    /// How many times [`FormatTables`] were built on this thread.
+    #[cfg(test)]
+    pub(crate) static FORMAT_TABLE_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl FormatTables {
+    fn shape_of(doc: &XlsxDocument) -> (usize, usize) {
+        doc.styles
+            .as_ref()
+            .map_or((0, 0), |s| (s.cell_formats.len(), s.number_formats.len()))
+    }
+
+    fn build(doc: &XlsxDocument) -> Self {
+        #[cfg(test)]
+        FORMAT_TABLE_BUILDS.with(|n| n.set(n.get() + 1));
+        let mut compiled = std::collections::HashMap::new();
+        if let Some(styles) = doc.styles.as_ref() {
+            for idx in 0..styles.cell_formats.len() as u32 {
+                if let (Some(fmt_id), Some(_)) =
+                    (styles.number_format_id_for(idx), styles.number_format_override_for(idx))
+                {
+                    compiled
+                        .entry(fmt_id)
+                        .or_insert_with(|| (idx, std::sync::OnceLock::new()));
+                }
+            }
+        }
+        Self {
+            shape: Self::shape_of(doc),
+            date_indices: doc.date_style_indices(),
+            compiled,
+        }
+    }
+}
+
+/// What a document keeps between renders: the [`FormatTables`] and the
+/// theme parsed from its raw part.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RenderCache {
+    tables: std::sync::OnceLock<FormatTables>,
+    theme: std::sync::OnceLock<Option<crate::core::theme::Theme>>,
+}
+
+impl RenderCache {
+    pub(crate) fn theme(&self, raw: Option<&[u8]>) -> Option<&crate::core::theme::Theme> {
+        self.theme
+            .get_or_init(|| raw.and_then(|d| crate::core::theme::Theme::parse(d).ok()))
+            .as_ref()
+    }
+}
+
+/// Per-render cell formatting state over the document's [`FormatTables`]
+/// rather than a date re-check of the format code and a re-parse of it for
+/// every cell. Every direct renderer and `to_ir()` format through this.
 pub(crate) struct CellFormatter<'a> {
     doc: &'a XlsxDocument,
-    date_indices: std::collections::HashSet<u32>,
-    compiled: std::collections::HashMap<u32, Option<numfmt::CompiledFormat>>,
+    tables: std::borrow::Cow<'a, FormatTables>,
 }
 
 impl<'a> CellFormatter<'a> {
     pub(crate) fn new(doc: &'a XlsxDocument) -> Self {
-        Self {
-            doc,
-            date_indices: doc.date_style_indices(),
-            compiled: std::collections::HashMap::new(),
-        }
+        let cached = doc
+            .render_cache
+            .tables
+            .get_or_init(|| FormatTables::build(doc));
+        // `styles` is a public field: tables built for a stylesheet that has
+        // since changed shape are not used.
+        let tables = if cached.shape == FormatTables::shape_of(doc) {
+            std::borrow::Cow::Borrowed(cached)
+        } else {
+            std::borrow::Cow::Owned(FormatTables::build(doc))
+        };
+        Self { doc, tables }
     }
 
     pub(crate) fn date_indices(&self) -> &std::collections::HashSet<u32> {
-        &self.date_indices
+        &self.tables.date_indices
     }
 
     /// Append `cell`'s display text to `buf`.
-    pub(crate) fn write(&mut self, cell: &Cell, buf: &mut String) {
+    pub(crate) fn write(&self, cell: &Cell, buf: &mut String) {
         let doc = self.doc;
-        let date_indices = &self.date_indices;
-        let compiled = &mut self.compiled;
+        let tables = &*self.tables;
         doc.write_value_with(
             cell,
             buf,
-            |idx| date_indices.contains(&idx),
-            |n, idx, fmt_id| {
-                let styles = doc.styles.as_ref();
-                let code = compiled.entry(fmt_id).or_insert_with(|| {
-                    styles
-                        .and_then(|s| s.number_format_override_for(idx))
-                        .and_then(numfmt::compile_custom)
+            |idx| tables.date_indices.contains(&idx),
+            |n, _idx, fmt_id| {
+                let code = tables.compiled.get(&fmt_id).and_then(|(first, once)| {
+                    once.get_or_init(|| {
+                        doc.styles
+                            .as_ref()
+                            .and_then(|s| s.number_format_override_for(*first))
+                            .and_then(numfmt::compile_custom)
+                    })
+                    .as_ref()
                 });
-                numfmt::apply_format_compiled(n, fmt_id, code.as_ref())
+                numfmt::apply_format_compiled(n, fmt_id, code)
             },
         );
     }
 
     /// `cell`'s display text.
-    pub(crate) fn text(&mut self, cell: &Cell) -> String {
+    pub(crate) fn text(&self, cell: &Cell) -> String {
         let mut buf = String::new();
         self.write(cell, &mut buf);
         buf
@@ -283,7 +360,7 @@ impl XlsxDocument {
         let Some(ws) = self.worksheets.get(sheet_index) else {
             return Ok(false);
         };
-        let mut fmt = CellFormatter::new(self);
+        let fmt = CellFormatter::new(self);
         // The tabs in front of a cell and the cell, the largest piece held.
         let mut piece = String::new();
         for (row_idx, row) in ws.rows.iter().enumerate() {
@@ -360,7 +437,7 @@ impl XlsxDocument {
         let col_count = compute_column_count(&ws.rows);
         let mut lines = Vec::new();
         let mut budget = TextBudget::new();
-        let mut fmt = CellFormatter::new(self);
+        let fmt = CellFormatter::new(self);
 
         // Rows the sheet does not store are empty lines, so every value
         // keeps its row number (§18.3.1.73 `r`); the padding is charged to
@@ -594,7 +671,7 @@ impl XlsxDocument {
         }
         // Every cell text passes through here; a spent budget ends the
         // sheet at the cell that spent it.
-        let mut fmt = CellFormatter::new(self);
+        let fmt = CellFormatter::new(self);
 
         // A "document style" sheet (see `rows_read_as_prose`) is emitted a
         // paragraph per row instead of a tall, narrow GFM table that reads
@@ -607,7 +684,7 @@ impl XlsxDocument {
                 .filter(|&n| n > 0)
                 .collect::<Vec<_>>()
         }));
-        let mut cell_text = |cell: &Cell, budget: &mut TextBudget| -> Option<String> {
+        let cell_text = |cell: &Cell, budget: &mut TextBudget| -> Option<String> {
             let text = fmt.text(cell);
             budget
                 .charge(text.len())
@@ -675,7 +752,7 @@ impl XlsxDocument {
         // row does not use are output too: " | " for each one. They are
         // charged like text, which bounds a sheet whose cells sit at A1
         // and XFD1 however many rows it stores, as `to_csv` does.
-        let mut row_line = |row: &Row, budget: &mut TextBudget| -> (Option<String>, bool) {
+        let row_line = |row: &Row, budget: &mut TextBudget| -> (Option<String>, bool) {
             let mut cells: Vec<String> = vec![String::new(); col_count];
             if !budget.charge(col_count.saturating_mul(MARKDOWN_PAD_CHARS)) {
                 return (None, true);
@@ -911,7 +988,23 @@ fn csv_escape(field: &str) -> String {
 /// The line every renderer emits for a sheet that could not be read, so
 /// a workbook missing a sheet never passes for a complete one.
 pub(crate) fn unreadable_notice(name: &str, err: &str) -> String {
-    format!("[unreadable sheet {name:?}: {err}]")
+    inert(&format!("[unreadable sheet {name:?}: {err}]"))
+}
+
+/// `s` as one line: every control character, and the Unicode line and
+/// paragraph separators, become a space. A notice echoes names and reasons
+/// the file controls, and one that could end its line could start another
+/// (a heading, a list item) in any rendering.
+pub(crate) fn inert(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// What could not be read, as every renderer reports it: one entry for each
@@ -920,8 +1013,8 @@ pub(crate) fn unreadable_notice(name: &str, err: &str) -> String {
 /// parts). They are bounded (see [`XlsxDocument::unreadable_sheets`]), cut and
 /// charged to the text budget by every renderer before it writes them.
 pub(crate) struct ReportNotice {
-    /// The heading of the entry's section: the sheet's name, or what the
-    /// entry lists.
+    /// The heading of the entry's section: a fixed label, never text from the
+    /// file.
     pub(crate) title: String,
     /// The in-band lines, each a bracketed notice.
     pub(crate) lines: Vec<String>,
@@ -930,11 +1023,13 @@ pub(crate) struct ReportNotice {
 }
 
 impl ReportNotice {
-    /// What the entry costs to write: its heading and lines.
+    /// What the entry costs to write, in characters like the rest of the
+    /// text budget: its heading and lines. (Each is cut at 256 characters
+    /// and there are at most 201 of them, so counting is bounded.)
     pub(crate) fn chars(&self) -> usize {
-        self.lines
-            .iter()
-            .fold(self.title.len(), |n, l| n.saturating_add(l.len()).saturating_add(4))
+        self.lines.iter().fold(self.title.chars().count(), |n, l| {
+            n.saturating_add(l.chars().count()).saturating_add(4)
+        })
     }
 }
 
@@ -946,7 +1041,9 @@ impl XlsxDocument {
             .unreadable_sheets
             .iter()
             .map(|(name, err)| ReportNotice {
-                title: name.clone(),
+                // The name is in the line, where every rendering writes it as
+                // text; a heading would write it as markup.
+                title: "Unreadable sheet".to_string(),
                 lines: vec![unreadable_notice(name, err)],
                 warnings: vec![format!("skipped unreadable sheet {name:?}: {err}")],
             })
@@ -974,7 +1071,7 @@ impl XlsxDocument {
             }
             out.push(ReportNotice {
                 title: "Unreadable parts".to_string(),
-                lines: warnings.iter().map(|w| format!("[{w}]")).collect(),
+                lines: warnings.iter().map(|w| inert(&format!("[{w}]"))).collect(),
                 warnings,
             });
         }
@@ -1003,7 +1100,12 @@ fn write_report_notices<W: Write + ?Sized>(
         }
         if markdown {
             begin(out)?;
-            write!(out, "## {}\n\n{}", n.title, n.lines.join("\n\n"))?;
+            let lines: Vec<String> = n
+                .lines
+                .iter()
+                .map(|l| crate::core::markdown::escape_text(l))
+                .collect();
+            write!(out, "## {}\n\n{}", n.title, lines.join("\n\n"))?;
         } else {
             for line in &n.lines {
                 begin(out)?;
@@ -1132,6 +1234,7 @@ mod tests {
             unreadable_parts_omitted: 0,
             styles_data: None,
             theme_data: None,
+            render_cache: Default::default(),
         };
         let idx = doc.date_style_indices();
         assert!(!idx.contains(&0), "id 50 overridden to a numeric code is not a date");
@@ -1201,6 +1304,7 @@ mod tests {
             unreadable_parts_omitted: 0,
             styles_data: None,
             theme_data: None,
+            render_cache: Default::default(),
         };
         let text = doc.plain_text();
         assert!(text.starts_with("Notes\nLorem ipsum drawn"), "{text:?}");
@@ -1272,6 +1376,7 @@ mod tests {
             unreadable_parts_omitted: 0,
             styles_data: None,
             theme_data: None,
+            render_cache: Default::default(),
         };
         let text = doc.plain_text();
         assert!(text.starts_with("Revenue\nnorth"), "{text:?}");
@@ -1308,6 +1413,7 @@ mod tests {
             unreadable_parts_omitted: 0,
             styles_data: None,
             theme_data: None,
+            render_cache: Default::default(),
         };
         assert!(
             doc.plain_text().contains("Rotated Title"),
@@ -1347,5 +1453,85 @@ mod tests {
         ] {
             assert!(n <= 2, "{name} scanned date formats {n} times for 100 cells");
         }
+    }
+
+    /// A workbook of many sheets over a stylesheet of many cell formats: the
+    /// date styles and compiled number formats are workbook-level, so every
+    /// rendering builds them once, not once per sheet.
+    #[test]
+    fn test_workbook_level_format_tables_are_built_once_for_all_sheets() {
+        use crate::xlsx::test_support::{open_bytes, zip_parts};
+        const SHEETS: usize = 40;
+        const FORMATS: usize = 60;
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let mut workbook = format!(r#"<workbook xmlns="{ns}" xmlns:r="{rel}"><sheets>"#);
+        let mut rels = String::from(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        );
+        let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 1..=SHEETS {
+            workbook.push_str(&format!(r#"<sheet name="S{i}" sheetId="{i}" r:id="rId{i}"/>"#));
+            rels.push_str(&format!(
+                r#"<Relationship Id="rId{i}" Type="{rel}/worksheet" Target="worksheets/sheet{i}.xml"/>"#
+            ));
+            parts.push((
+                format!("xl/worksheets/sheet{i}.xml"),
+                format!(
+                    r#"<worksheet xmlns="{ns}"><sheetData><row r="1"><c r="A1" s="{}"><v>{}</v></c></row></sheetData></worksheet>"#,
+                    i % FORMATS + 1,
+                    38000 + i
+                )
+                .into_bytes(),
+            ));
+        }
+        workbook.push_str("</sheets></workbook>");
+        rels.push_str(&format!(
+            r#"<Relationship Id="rIdS" Type="{rel}/styles" Target="styles.xml"/></Relationships>"#
+        ));
+        let mut styles = format!(r#"<styleSheet xmlns="{ns}"><numFmts count="{FORMATS}">"#);
+        for i in 0..FORMATS {
+            styles.push_str(&format!(
+                r#"<numFmt numFmtId="{}" formatCode="yyyy-mm-dd;@;0.0{i}"/>"#,
+                164 + i
+            ));
+        }
+        styles
+            .push_str(&format!(r#"</numFmts><cellXfs count="{}"><xf numFmtId="0"/>"#, FORMATS + 1));
+        for i in 0..FORMATS {
+            styles.push_str(&format!(r#"<xf numFmtId="{}" applyNumberFormat="1"/>"#, 164 + i));
+        }
+        styles.push_str("</cellXfs></styleSheet>");
+        parts.push(("xl/workbook.xml".into(), workbook.into_bytes()));
+        parts.push(("xl/_rels/workbook.xml.rels".into(), rels.into_bytes()));
+        parts.push(("xl/styles.xml".into(), styles.into_bytes()));
+        let refs: Vec<(&str, &[u8])> = parts
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.as_slice()))
+            .collect();
+        let doc = open_bytes(zip_parts(&refs));
+
+        FORMAT_TABLE_BUILDS.with(|n| n.set(0));
+        let plain = doc.plain_text();
+        assert!(plain.contains("2004-01-"), "{plain}");
+        let _ = doc.to_markdown();
+        let _ = doc.to_csv();
+        let _ = crate::convert_xlsx::xlsx_to_ir(&doc);
+        for i in 0..SHEETS {
+            assert!(doc.sheet_ir(i).is_some());
+            assert!(doc.sheet_plain_text(i).is_some());
+            assert!(doc.sheet_to_markdown(i).is_some());
+            assert!(doc.sheet_to_csv(i).is_some());
+        }
+        assert_eq!(doc.sheets_ir().count(), SHEETS);
+        let builds = FORMAT_TABLE_BUILDS.with(|n| n.get());
+        assert_eq!(builds, 1, "format tables built {builds} times for {SHEETS} sheets");
+
+        // A stylesheet changed through the public field is not served from
+        // the tables built for the old one.
+        let mut changed = doc.clone();
+        changed.styles.as_mut().unwrap().cell_formats.truncate(1);
+        assert!(changed.plain_text().contains("38001"), "{}", changed.plain_text());
+        assert!(!changed.plain_text().contains("2004-01-"));
     }
 }

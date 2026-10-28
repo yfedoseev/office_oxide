@@ -260,15 +260,8 @@ fn test_parts_that_cannot_be_read_or_parsed_are_reported_not_swallowed() {
                 )],
             ),
         ),
-        // Parts that are named and not in the package.
-        (
-            "gone.xml",
-            sheet_with(
-                r#"<drawing r:id="r1"/>"#,
-                &rel("r1", "drawing", "../drawings/gone.xml"),
-                vec![],
-            ),
-        ),
+        // A part that is named, present and not an image is a damaged part;
+        // one that is named and absent is below.
         (
             "gone.png",
             sheet_with(
@@ -343,5 +336,186 @@ fn test_a_chart_named_by_another_spelling_is_not_read_twice() {
             .matches("UniqueTitle")
             .count(),
         1
+    );
+}
+
+/// The relationship of `kind` to `target`, internal or external.
+fn rel_to(kind: &str, target: &str, external: bool) -> String {
+    let mode = if external {
+        r#" TargetMode="External""#
+    } else {
+        ""
+    };
+    format!(r#"<Relationship Id="r1" Type="{R}/{kind}" Target="{target}"{mode}/>"#)
+}
+
+fn assert_silent(label: &str, bytes: Vec<u8>) {
+    let doc = open(bytes);
+    assert_eq!(reported(&doc), Vec::<String>::new(), "{label}");
+    let ir = doc.to_ir();
+    assert!(!ir.metadata.text_truncated, "{label}: {:?}", ir.metadata.warnings);
+    assert!(ir.metadata.warnings.is_empty(), "{label}: {:?}", ir.metadata.warnings);
+    assert!(!doc.plain_text().contains("skipped"), "{label}");
+}
+
+/// An optional part a relationship names but the package lacks is a dangling
+/// reference, as it always was: nothing is reported. Only a part that exists
+/// and cannot be read or parsed is.
+#[test]
+fn test_a_relationship_to_an_absent_optional_part_is_not_reported() {
+    let _g = LimitScope::new();
+    let drawing = r#"<drawing r:id="r1"/>"#;
+    let table = r#"<tableParts count="1"><tablePart r:id="r1"/></tableParts>"#;
+    for (label, tail, rels) in [
+        ("drawing", drawing, rel_to("drawing", "../drawings/gone.xml", false)),
+        ("table", table, rel_to("table", "../tables/gone.xml", false)),
+        ("comments", "", rel_to("comments", "../gone.xml", false)),
+        (
+            "threaded",
+            "",
+            rel_to("threadedComment", "../threadedComments/gone.xml", false).replace(
+                &format!("{R}/threadedComment"),
+                "http://schemas.microsoft.com/office/2017/10/relationships/threadedComment",
+            ),
+        ),
+        ("pivot", "", rel_to("pivotTable", "../pivotTables/gone.xml", false)),
+    ] {
+        assert_silent(label, sheet_with(tail, &rels, vec![]));
+    }
+}
+
+/// A target outside the package is never looked up in it, whatever part of
+/// the package happens to share its name.
+#[test]
+fn test_an_external_target_is_not_looked_up_in_the_package() {
+    let _g = LimitScope::new();
+    for (label, tail, rels, name) in [
+        (
+            "drawing",
+            r#"<drawing r:id="r1"/>"#,
+            rel_to("drawing", "../d.xml", true),
+            "xl/d.xml",
+        ),
+        (
+            "table",
+            r#"<tableParts count="1"><tablePart r:id="r1"/></tableParts>"#,
+            rel_to("table", "../d.xml", true),
+            "xl/d.xml",
+        ),
+        ("comments", "", rel_to("comments", "../d.xml", true), "xl/d.xml"),
+        ("pivot", "", rel_to("pivotTable", "../d.xml", true), "xl/d.xml"),
+    ] {
+        // The name is a part that would be reported were it read.
+        assert_silent(label, sheet_with(tail, &rels, vec![(name.into(), "<broken".into())]));
+    }
+}
+
+/// A name that would be markup, a link, an image or a heading if written as it is.
+const HOSTILE: &str = "x](http:evil)<img src=x onerror=1>`\n\n# Heading";
+const HOSTILE_XML: &str = "x](http:evil)&lt;img src=x onerror=1&gt;`&#10;&#10;# Heading";
+
+/// Every string in the part of the IR that reports losses (the sections after
+/// the sheet's own).
+fn report_strings(doc: &Document) -> Vec<String> {
+    fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(a) => a.iter().for_each(|v| walk(v, out)),
+            serde_json::Value::Object(o) => o.values().for_each(|v| walk(v, out)),
+            _ => {},
+        }
+    }
+    let mut out = Vec::new();
+    for section in doc.to_ir().sections.iter().skip(1) {
+        walk(&serde_json::to_value(section).unwrap(), &mut out);
+    }
+    out
+}
+
+/// What the file says about a sheet or part is echoed in the notices, and
+/// stays one inert line in every rendering: not a heading, a link or markup.
+#[test]
+fn test_names_echoed_in_the_notices_are_inert_in_every_rendering() {
+    let _g = LimitScope::new();
+    let mut parts = fixed_parts(
+        format!(
+            r#"<workbook xmlns="{NS}" xmlns:r="{R}"><sheets><sheet name="S" sheetId="1" r:id="rId1"/><sheet name="{HOSTILE_XML}" sheetId="2" r:id="rId1"/></sheets></workbook>"#
+        ),
+        format!(
+            r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#
+        ),
+    );
+    parts.push((
+        "xl/worksheets/sheet1.xml".into(),
+        SHEET
+            .replace("</worksheet>", r#"<legacyDrawing r:id="r1"/></worksheet>"#)
+            .replace("<worksheet ", &format!(r#"<worksheet xmlns:r="{R}" "#)),
+    ));
+    parts.push((
+        "xl/worksheets/_rels/sheet1.xml.rels".into(),
+        format!(
+            r#"<Relationships xmlns="{REL_NS}"><Relationship Id="r1" Type="{R}/comments" Target="../{HOSTILE_XML}.xml"/></Relationships>"#
+        ),
+    ));
+    parts.push((format!("xl/{HOSTILE}.xml"), "<comments".into()));
+    let doc = open(zip_of(parts));
+    let xlsx = doc.as_xlsx().unwrap();
+    assert!(!xlsx.unreadable_sheets.is_empty() && !xlsx.unreadable_parts.is_empty());
+    for (what, out) in renderings(&doc) {
+        if what.starts_with("ir_") {
+            continue;
+        }
+        for line in out.lines() {
+            assert!(!line.starts_with("# Heading"), "{what}: a heading from a name: {out}");
+            assert!(!line.starts_with("## x]"), "{what}: a heading from a name: {out}");
+        }
+        if what.contains("markdown") {
+            assert_eq!(
+                out.matches("](http:evil)").count(),
+                out.matches("\\](http:evil)").count(),
+                "{what}: a link from a name: {out}"
+            );
+            let tags = out.matches("<img").count();
+            assert_eq!(tags, out.matches("\\<img").count(), "{what}: markup from a name: {out}");
+        }
+        if what == "to_html" {
+            assert!(!out.contains("<img"), "{what}: markup from a name: {out}");
+        }
+    }
+    for s in report_strings(&doc) {
+        assert!(!s.chars().any(char::is_control), "a control character in the IR: {s:?}");
+    }
+    // The metadata keeps the bounded text as it is.
+    let ir = doc.to_ir();
+    assert!(
+        ir.metadata.warnings.iter().any(|w| w.contains("evil")),
+        "{:?}",
+        ir.metadata.warnings
+    );
+}
+
+/// A notice the text budget cannot pay is replaced by the budget's notice in
+/// the content, and its warning still reaches a caller who drops each sheet.
+#[test]
+fn test_a_notice_the_budget_cannot_pay_keeps_its_warning_in_the_streamed_sheet() {
+    let mut limits = LimitScope::new();
+    limits.set(max_text_chars, set_max_text_chars, 3_000);
+    let doc = open(duplicate_sheets(300, 200));
+    let xlsx = doc.as_xlsx().unwrap();
+    let mut warnings = Vec::new();
+    for sheet in xlsx.sheets_ir() {
+        warnings.extend(sheet.warnings);
+    }
+    let sheets = warnings
+        .iter()
+        .filter(|w| w.starts_with("skipped unreadable sheet"))
+        .count();
+    assert_eq!(sheets, xlsx.unreadable_sheets.len(), "{} warnings", warnings.len());
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("199 more unreadable sheets")),
+        "{}",
+        warnings.len()
     );
 }

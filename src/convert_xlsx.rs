@@ -51,7 +51,6 @@ pub(crate) struct SheetConverter<'d> {
     doc: &'d crate::xlsx::XlsxDocument,
     scope: IrScope,
     formatter: crate::xlsx::text::CellFormatter<'d>,
-    date_indices: std::collections::HashSet<u32>,
     // Theme colours resolve cell fills; parsed once per document.
     theme: Option<std::borrow::Cow<'d, crate::core::theme::Theme>>,
     // Single String buffer reused across all cells — clear() keeps the heap
@@ -101,14 +100,12 @@ impl<'d> SheetConverter<'d> {
         // Date styles found once and custom number formats compiled once, not
         // re-scanned and re-parsed per cell.
         let formatter = crate::xlsx::text::CellFormatter::new(doc);
-        let date_indices = formatter.date_indices().clone();
         let total_image =
             usize::try_from(crate::limits::max_total_image_bytes()).unwrap_or(usize::MAX);
         Self {
             doc,
             scope,
             formatter,
-            date_indices,
             theme: doc.theme_for_render(),
             buf: String::new(),
             budget: crate::limits::TextBudget::new(),
@@ -294,7 +291,6 @@ impl<'d> SheetConverter<'d> {
         let doc = self.doc;
         let Self {
             formatter,
-            date_indices,
             theme,
             buf,
             budget,
@@ -409,7 +405,7 @@ impl<'d> SheetConverter<'d> {
                     std::mem::take(buf)
                 };
                 let (data_type, raw_number, number_format, number_format_id) =
-                    cell_semantics(doc, cell, date_indices, format_code_omitted);
+                    cell_semantics(doc, cell, formatter.date_indices(), format_code_omitted);
                 cells.push(CellData {
                     col: cell.reference.col,
                     hyperlink: link.map(|(target, _)| target.clone()),
@@ -1018,7 +1014,10 @@ impl<'d> SheetConverter<'d> {
     /// text budget before it is copied; one the budget cannot pay for is
     /// left out, with the budget's notice in its place, and the metadata
     /// still lists it.
-    pub(crate) fn unreadable_section(&mut self, index: usize) -> Option<(Section, Vec<String>)> {
+    pub(crate) fn unreadable_section(
+        &mut self,
+        index: usize,
+    ) -> Option<(Option<Section>, Vec<String>)> {
         let notices = self
             .reports
             .get_or_insert_with(|| self.doc.report_notices());
@@ -1027,22 +1026,19 @@ impl<'d> SheetConverter<'d> {
         self.item_truncated = true;
         let was_spent = self.budget.exhausted();
         if !self.budget.charge(notice.chars()) {
-            // Said once, in the content, unless something already said it.
-            return (!was_spent).then(|| {
-                (
-                    Section {
-                        title: Some("Output truncated".to_string()),
-                        elements: vec![Element::Paragraph(Paragraph {
-                            content: vec![InlineContent::Text(TextSpan::plain(
-                                self.budget.notice(),
-                            ))],
-                            ..Default::default()
-                        })],
-                        ..Default::default()
-                    },
-                    Vec::new(),
-                )
+            // The budget's notice is said once, in the content, unless
+            // something already said it. The warnings (bounded: see
+            // `report_notices`) are kept either way, so that a caller who
+            // drops each sheet still has what could not be read.
+            let section = (!was_spent).then(|| Section {
+                title: Some("Output truncated".to_string()),
+                elements: vec![Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(self.budget.notice()))],
+                    ..Default::default()
+                })],
+                ..Default::default()
             });
+            return Some((section, notice.warnings.clone()));
         }
         let section = Section {
             title: Some(notice.title.clone()),
@@ -1058,7 +1054,7 @@ impl<'d> SheetConverter<'d> {
                 .collect(),
             ..Default::default()
         };
-        Some((section, notice.warnings.clone()))
+        Some((Some(section), notice.warnings.clone()))
     }
 
     /// The document's metadata as of the sections built so far: the
@@ -1316,7 +1312,13 @@ impl Iterator for SheetIrs<'_> {
                         continue;
                     }
                     if let Some((section, extra)) = self.converter.unreadable_section(i) {
-                        return Some(self.item_with(section, end_before, extra));
+                        // A notice the budget cannot pay and has already said
+                        // so leaves no content, only its warnings.
+                        return Some(self.item_with(
+                            section.unwrap_or_default(),
+                            end_before,
+                            extra,
+                        ));
                     }
                 },
                 Stage::Done => return None,
@@ -1365,7 +1367,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         sections.extend(
             converter
                 .unreadable_section(index)
-                .map(|(section, _)| section),
+                .and_then(|(section, _)| section),
         );
     }
     let metadata = converter.metadata(sections.first().and_then(|s| s.title.clone()));
