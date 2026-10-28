@@ -1249,17 +1249,32 @@ fn parse_alternate_content(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<
     Ok(if chosen.is_empty() { fallback } else { chosen })
 }
 
-/// Decode `<w:sym w:font="Wingdings" w:char="F0B7"/>` into a character.
+/// Decode `<w:sym w:font="Symbol" w:char="F0B7"/>` into a character.
 ///
 /// The code point is hex. Values in `F000..F0FF` are the Windows
-/// symbol-font private-use encoding of a single byte; map them down to the
-/// bullet-ish equivalent rather than emitting an unrenderable PUA code
-/// point, and pass everything else through unchanged.
+/// symbol-font private-use encoding of a single byte, and what that byte
+/// means is the font's own encoding, so the font decides:
+///
+/// * `Symbol` has a published encoding (Adobe's `Symbol.afm` with the Adobe
+///   Glyph List), applied by [`crate::core::symbol_font`]. A code the font
+///   has no glyph for is the replacement character, never a Latin letter.
+/// * Any other font has no standard table here, so the byte is mapped to the
+///   bullet-ish equivalent for the two codes Word's galleries use and passed
+///   down as before otherwise; everything outside the private-use range
+///   passes through unchanged.
 fn parse_sym_char(e: &quick_xml::events::BytesStart) -> Option<char> {
     let raw = xml::optional_attr_str(e, "w:char").ok().flatten()?;
     let code = u32::from_str_radix(raw.trim(), 16).ok()?;
+    let font = xml::optional_attr_str(e, "w:font").ok().flatten();
+    if let (Some(font), 0xF000..=0xF0FF) = (font.as_deref(), code) {
+        if font.trim().eq_ignore_ascii_case("Symbol") {
+            return Some(
+                crate::core::symbol_font::symbol_char((code - 0xF000) as u8).unwrap_or('\u{FFFD}'),
+            );
+        }
+    }
     let mapped = match code {
-        0xF0B7 | 0xF0A7 => 0x2022, // Wingdings/Symbol bullet
+        0xF0B7 | 0xF0A7 => 0x2022, // Wingdings bullet
         0xF0D8 => 0x25BA,          // Wingdings arrowhead
         c @ 0xF000..=0xF0FF => c - 0xF000,
         c => c,

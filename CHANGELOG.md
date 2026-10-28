@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `.doc` reads the text of the Word documents embedded in it.** A document made of embedded Word objects came out as `[Embedded Microsoft Word Document]` placeholders and nothing else, although catdoc recovers the article text. The text of each object follows its placeholder in every rendering. It is read through the document's embedded-package account: the objects are counted, their streams share the byte allowance, the text is charged to the text budget (a cut is reported), and an object that cannot be read keeps its placeholder and is named in the warnings. Objects inside an embedded document are not followed.
+
+- **A `<w:sym>` character in the Symbol font is read by the Symbol encoding.** The code (`F0xx`) was read as Latin-1, so the Symbol font's nabla printed as `Ñ` and its club as `§`. The table is generated from Adobe's `Symbol.afm` and the Adobe Glyph List; a code the font has no glyph for is the replacement character. Other fonts keep their reading.
+
 - **A Word 6/95 `.doc` saved with a Macintosh character set is decoded as Mac Roman.** The reader chose the codepage from the language ID alone, so a curly quote (0xD5) or an accented letter came out as `Õ` or `Ž`; antiword decodes them. The marker is `FibBase.chs` = 0x0100. Word 97 and later files keep Windows-1252: they store compressed text that way even when they carry the marker.
 
 - **A `.xls` formula cell whose text result follows its array, shared-formula or data-table record keeps that text.** The result was forgotten on any record other than `STRING`, so such a cell came out empty although xlrd, calamine and xls2csv return the text.

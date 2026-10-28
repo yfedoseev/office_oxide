@@ -34,6 +34,8 @@ pub mod parallel;
 pub mod properties;
 /// Relationship parsing, lookup, and serialization (`.rels` files).
 pub mod relationships;
+
+pub(crate) mod symbol_font;
 /// DrawingML theme parsing: color schemes, font schemes, color resolution.
 pub mod theme;
 /// `OfficeDocument` trait implemented by all document types.
