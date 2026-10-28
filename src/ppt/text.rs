@@ -1236,6 +1236,9 @@ fn extract_shape_text_in(
     // giving the character range, within the *most recently pushed* text
     // run, that the hyperlink actually covers.
     let mut last_text_run_idx: Option<usize> = None;
+    // The UTF-16 offset map of the run the link ranges are being applied to,
+    // built once per run rather than once per range.
+    let mut link_offsets: Option<(usize, Utf16Offsets)> = None;
     let mut pending_interactive: Option<(u32, u8)> = None;
 
     for rec in RecordIter::new(data) {
@@ -1343,7 +1346,12 @@ fn extract_shape_text_in(
                                 rec.data[7],
                             ])
                             .max(0) as usize;
-                            add_link_range(out, idx, begin, end, url);
+                            if link_offsets.as_ref().map(|(i, _)| *i) != Some(idx) {
+                                link_offsets = Some((idx, Utf16Offsets::new(&out[idx].text)));
+                            }
+                            if let Some((_, offsets)) = &link_offsets {
+                                add_link_range(out, idx, offsets, begin, end, url);
+                            }
                         }
                     }
                 }
@@ -1960,11 +1968,18 @@ fn resolve_shape_pib(shape_data: &[u8]) -> Option<usize> {
 /// The run is not split: splitting it into prefix/link/suffix runs made
 /// each piece its own paragraph downstream, breaking the sentence around
 /// the link into three lines and dropping the spaces at the joins.
-fn add_link_range(out: &mut [TextRun], idx: usize, begin: usize, end: usize, url: &str) {
+fn add_link_range(
+    out: &mut [TextRun],
+    idx: usize,
+    offsets: &Utf16Offsets,
+    begin: usize,
+    end: usize,
+    url: &str,
+) {
     let Some(run) = out.get_mut(idx) else { return };
-    let len = run.text.chars().count();
-    let begin = utf16_to_char_index(&run.text, begin).min(len);
-    let end = utf16_to_char_index(&run.text, end).clamp(begin, len);
+    let len = offsets.chars;
+    let begin = offsets.char_index(begin).min(len);
+    let end = offsets.char_index(end).clamp(begin, len);
     if begin >= end {
         return; // empty or invalid range — leave the run untouched
     }
@@ -1987,34 +2002,64 @@ fn add_link_range(out: &mut [TextRun], idx: usize, begin: usize, end: usize, url
 /// stored in; the spans are parsed in those units and then converted to
 /// `char` indices, which is what every consumer slices by.
 fn apply_style_text_prop(run: &mut TextRun, data: &[u8]) {
-    let text_utf16_len = run.text.encode_utf16().count();
-    let (mut para_spans, mut char_spans) = style::parse_style_text_prop(data, text_utf16_len);
-    if text_utf16_len != run.text.chars().count() {
+    let offsets = Utf16Offsets::new(&run.text);
+    let (mut para_spans, mut char_spans) = style::parse_style_text_prop(data, offsets.units);
+    if offsets.units != offsets.chars {
         for s in &mut para_spans {
-            s.start = utf16_to_char_index(&run.text, s.start);
-            s.end = utf16_to_char_index(&run.text, s.end);
+            s.start = offsets.char_index(s.start);
+            s.end = offsets.char_index(s.end);
         }
         for s in &mut char_spans {
-            s.start = utf16_to_char_index(&run.text, s.start);
-            s.end = utf16_to_char_index(&run.text, s.end);
+            s.start = offsets.char_index(s.start);
+            s.end = offsets.char_index(s.end);
         }
     }
     run.para_formats = para_spans;
     run.char_formats = char_spans;
 }
 
-/// The `char` index of UTF-16 code unit offset `units` in `text` (an offset
-/// inside a surrogate pair rounds up to the next character; past the end
-/// clamps to the length).
-fn utf16_to_char_index(text: &str, units: usize) -> usize {
-    let mut seen = 0usize;
-    for (i, c) in text.chars().enumerate() {
-        if seen >= units {
-            return i;
+/// Maps UTF-16 code-unit offsets to `char` indices for one text, in one pass
+/// over it to build and a binary search per lookup. Only the characters
+/// outside the basic plane (two units each) make the two unit systems
+/// differ, so only those are recorded. A scan of the text per offset was
+/// quadratic in the number of style spans and link ranges.
+struct Utf16Offsets {
+    /// Number of `char`s in the text.
+    chars: usize,
+    /// Number of UTF-16 code units in the text.
+    units: usize,
+    /// For each non-BMP character, the unit offset just past it, ascending.
+    astral_ends: Vec<usize>,
+}
+
+impl Utf16Offsets {
+    fn new(text: &str) -> Self {
+        let mut units = 0usize;
+        let mut chars = 0usize;
+        let mut astral_ends = Vec::new();
+        for c in text.chars() {
+            units += c.len_utf16();
+            chars += 1;
+            if c.len_utf16() == 2 {
+                astral_ends.push(units);
+            }
         }
-        seen += c.len_utf16();
+        Self {
+            chars,
+            units,
+            astral_ends,
+        }
     }
-    text.chars().count()
+
+    /// The `char` index of UTF-16 code unit offset `units` (an offset inside
+    /// a surrogate pair rounds up to the next character; past the end clamps
+    /// to the length).
+    fn char_index(&self, units: usize) -> usize {
+        // Each non-BMP character wholly before `units` is one unit shorter
+        // in chars than in units.
+        let wholly_before = self.astral_ends.partition_point(|&end| end <= units);
+        units.saturating_sub(wholly_before).min(self.chars)
+    }
 }
 
 /// Text content of a single slide.
@@ -2255,11 +2300,63 @@ mod tests {
             ..Default::default()
         }];
         // Emoji = 2 units, space = 1: "link" is units 3..7, chars 2..6.
-        add_link_range(&mut out, 0, 3, 7, "http://example.com/");
+        let offsets = Utf16Offsets::new(text);
+        add_link_range(&mut out, 0, &offsets, 3, 7, "http://example.com/");
         assert_eq!((out[0].link_ranges[0].start, out[0].link_ranges[0].end), (2, 6));
-        assert_eq!(utf16_to_char_index(text, 2), 1);
-        assert_eq!(utf16_to_char_index(text, 1), 1, "inside the pair rounds up");
-        assert_eq!(utf16_to_char_index(text, 99), text.chars().count());
+        assert_eq!(offsets.char_index(2), 1);
+        assert_eq!(offsets.char_index(1), 1, "inside the pair rounds up");
+        assert_eq!(offsets.char_index(99), text.chars().count());
+    }
+
+    /// The offset map agrees with a plain scan at every offset, for text
+    /// mixing basic-plane and astral characters.
+    #[test]
+    fn test_utf16_offset_map_matches_a_linear_scan() {
+        let text = "a\u{1F600}b\u{1F601}\u{1F602}c\u{e9}";
+        let scan = |units: usize| {
+            let mut seen = 0usize;
+            for (i, c) in text.chars().enumerate() {
+                if seen >= units {
+                    return i;
+                }
+                seen += c.len_utf16();
+            }
+            text.chars().count()
+        };
+        let offsets = Utf16Offsets::new(text);
+        for u in 0..40 {
+            assert_eq!(offsets.char_index(u), scan(u), "offset {u}");
+        }
+    }
+
+    /// Thousands of style spans over text with an emoji in it are mapped
+    /// without rescanning the text for each: the work is counted by the
+    /// map being built once, and a large run finishes at once.
+    #[test]
+    fn test_many_spans_over_astral_text_do_not_rescan_the_text() {
+        let text = format!("\u{1F600}{}", "x".repeat(400_000));
+        let mut run = TextRun {
+            text: text.clone(),
+            ..Default::default()
+        };
+        // 100,000 character runs of 4 units each (CF_BOLD).
+        let spans = 100_000u32;
+        let mut data = Vec::new();
+        data.extend_from_slice(&((text.encode_utf16().count() + 1) as u32).to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        for i in 0..spans {
+            let count = if i == 0 { 6 } else { 4 };
+            data.extend_from_slice(&(count as u32).to_le_bytes());
+            data.extend_from_slice(&1u32.to_le_bytes());
+            data.extend_from_slice(&((i % 2) as u16).to_le_bytes());
+        }
+        let started = std::time::Instant::now();
+        apply_style_text_prop(&mut run, &data);
+        assert!(!run.char_formats.is_empty());
+        // A rescan per span is 100,000 x 400,000 character steps (tens of
+        // seconds); the map takes milliseconds.
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
     }
 
     /// `StyleTextPropAtom` run counts are UTF-16 units too: formatting on
