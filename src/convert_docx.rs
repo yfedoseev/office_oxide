@@ -493,7 +493,8 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
     // each, as a spreadsheet's report does; charged to the text budget before
     // the budget's notice is read below.
     let unreadable_warnings = doc.unreadable_warnings();
-    let unreadable_lines = crate::core::unreadable::report_ir_lines(&unreadable_warnings);
+    let unreadable_lines =
+        crate::core::unreadable::report_ir_lines(&doc.unreadable_text_warnings());
     if !unreadable_lines.is_empty() {
         if ir_sections.is_empty() {
             ir_sections.push(Section::default());
@@ -531,8 +532,7 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
-            text_truncated: !doc.unreadable_parts.is_empty()
-                || doc.unreadable_parts_omitted > 0
+            text_truncated: doc.unreadable_loses_text()
                 || copied_text_notice.is_some()
                 || doc.link_notice.is_some()
                 || image_cut.is_some(),

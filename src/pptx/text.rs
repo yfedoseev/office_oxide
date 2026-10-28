@@ -19,6 +19,32 @@ impl PptxDocument {
             .collect()
     }
 
+    /// The warnings for the unreadable parts that can change the text, and
+    /// for the rest left out of the list: what every rendering writes in
+    /// band. A part that holds no text (a theme, a font) is only in
+    /// [`Self::unreadable_warnings`].
+    pub(crate) fn unreadable_text_warnings(&self) -> Vec<String> {
+        self.unreadable_parts
+            .iter()
+            .filter(|(part, _)| crate::core::unreadable::part_affects_text(part))
+            .map(|(part, err)| format!("skipped unreadable part {part}: {err}"))
+            .chain(
+                (self.unreadable_parts_omitted > 0).then(|| {
+                    crate::core::unreadable::omitted_warning(self.unreadable_parts_omitted)
+                }),
+            )
+            .collect()
+    }
+
+    /// Whether a part that can change the text could not be read.
+    pub(crate) fn unreadable_loses_text(&self) -> bool {
+        self.unreadable_parts_omitted > 0
+            || self
+                .unreadable_parts
+                .iter()
+                .any(|(part, _)| crate::core::unreadable::part_affects_text(part))
+    }
+
     /// Extract plain text from the entire presentation.
     ///
     /// Shapes are spatially sorted (top-to-bottom, left-to-right) per slide.
@@ -50,7 +76,7 @@ impl PptxDocument {
         // The parts that could not be read, charged to the budget before
         // the budget's own notice is read.
         let unreadable = crate::core::unreadable::report_lines(
-            &self.unreadable_warnings(),
+            &self.unreadable_text_warnings(),
             crate::core::unreadable::ReportTarget::Plain,
         );
         if !unreadable.is_empty() {
@@ -148,7 +174,7 @@ impl PptxDocument {
         }
         // The parts that could not be read, as in plain_text().
         let unreadable = crate::core::unreadable::report_lines(
-            &self.unreadable_warnings(),
+            &self.unreadable_text_warnings(),
             crate::core::unreadable::ReportTarget::Markdown,
         );
         if !unreadable.is_empty() {

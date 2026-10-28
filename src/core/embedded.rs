@@ -20,8 +20,8 @@
 //!   allowance ([`crate::limits::max_embedded_bytes`]), and an embedded
 //!   package's own package-byte limit is what is left of it;
 //! * **text** — the text the embedded packages yield is charged to the text
-//!   budget ([`crate::limits::max_text_chars`]), whose value an embedded
-//!   package sees is what is left.
+//!   budget ([`crate::limits::max_text_chars`]); while a package is open, that
+//!   limit reads as what is left of the allowance.
 //!
 //! The state is thread-local and travels with the nested parse to the thread
 //! that runs it (see `Document::from_reader_nested`), which never waits for a

@@ -40,6 +40,10 @@ const MAX_REPORT_CHARS: usize = 256;
 pub(crate) struct ReportList {
     pub(super) listed: Vec<(String, String)>,
     pub(super) omitted: usize,
+    /// Parts that hold no text (a theme): reported in the metadata warnings
+    /// only, never as a notice in the text or a truncation. Bounded like
+    /// `listed`.
+    pub(super) cosmetic: Vec<(String, String)>,
     /// The normalised key of each part recorded (see [`part_key`]), compared
     /// exactly: a part in the package costs `#index`, so the set is bounded by
     /// the entries of the package and the relationship targets that name
@@ -53,6 +57,13 @@ impl ReportList {
     /// recorded again, whether or not it was kept.
     pub(super) fn record(&mut self, entries: &opc::ZipEntryIndex, path: &str, reason: &str) {
         if !self.seen.insert(part_key(entries, path)) {
+            return;
+        }
+        if !crate::core::unreadable::part_affects_text(path) {
+            if self.cosmetic.len() < MAX_REPORTS {
+                let cut = |s: &str| s.chars().take(MAX_REPORT_CHARS).collect::<String>();
+                self.cosmetic.push((cut(path), cut(reason)));
+            }
             return;
         }
         self.push(path, reason);

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `.docx` or `.pptx` whose package-level or main-part relationships part the zip cannot decode opens again, with the loss reported.** A damaged `_rels/.rels`, `word/_rels/document.xml.rels` or `ppt/_rels/presentation.xml.rels` (an unsupported compression method, an encrypted entry) was read as an empty set of relationships and the document opened; an earlier change in this release made such a document refuse to open. It opens as it always did (the main part is found through `[Content_Types].xml`), and the part is listed in `unreadable_parts`, in the metadata warnings and in the text, with `text_truncated` set. Editing such a document is still refused, because saving it would write out a package without its relationships.
+
+- **A damaged theme, embedded font, document property, custom XML or printer-settings part no longer adds a notice to a document's text or sets `text_truncated`.** None of them holds text, so the document yields every word it did before; the part is still listed in the metadata warnings (`.xlsx`, `.docx`, `.pptx`).
+
+- **The notices for unreadable parts in a spreadsheet keep bidirectional-override characters out of the text, as the other formats do, and a copy of an `.xlsx` document derives its date styles and number formats again rather than sharing the original's.**
+
 - **A `.docx` or `.pptx` part that cannot be read is reported in the text, not only in the metadata.** A malformed header, footer, note or layout part left `plain_text`, Markdown, HTML and the IR byte-identical to a good file's, with the loss only in `Metadata::warnings`, while an `.xlsx` wrote a notice. The same bounded list (at most 100 parts, each cut at 256 characters, and the count of the rest) now ends the text of every rendering and the last IR section, charged to the text budget before it is written. Part names and reasons come from the file, so a line is one line with its control characters replaced, and Markdown escapes it (the IR's renderers escape it for HTML as for any text). A file that lost nothing is unchanged.
 
 - **A `.docx` header, footer or picture part that relationships spell in different cases is read, parsed and reported once.** The per-part caches of headers and pictures compared names exactly while a zip lookup and a part name compare without regard to case, so `header1.xml` and `Header1.xml` were inflated twice and a readable header was kept as two entries. They now compare as a lookup does.

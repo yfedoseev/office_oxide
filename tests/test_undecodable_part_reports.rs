@@ -163,7 +163,6 @@ fn test_a_workbook_part_that_cannot_be_decoded_is_reported_not_taken_for_absent(
     for part in [
         "xl/sharedStrings.xml",
         "xl/styles.xml",
-        "xl/theme/theme1.xml",
         "xl/_rels/workbook.xml.rels",
     ] {
         for how in DAMAGES {
@@ -246,27 +245,50 @@ fn test_a_docx_part_that_cannot_be_decoded_is_reported() {
 }
 
 #[test]
-fn test_a_docx_relationships_part_that_cannot_be_decoded_is_not_taken_for_absent() {
+fn test_a_docx_relationships_part_that_cannot_be_decoded_still_opens_with_the_loss_reported() {
+    // The document opened when such a part was taken for absent; refusing it
+    // now would turn a readable document into an error. It opens, with no
+    // relationships, and says so.
     for how in DAMAGES {
         let bytes = damage(docx(), "word/_rels/document.xml.rels", how);
-        // Loud either way: the open fails, or the loss is reported.
-        match Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx) {
-            Err(_) => {},
-            Ok(doc) => {
-                let found = reported(&doc);
-                assert_reported_damaged(&found, "document.xml.rels", &format!("{how:?}"));
-            },
-        }
+        let doc = open(bytes, DocumentFormat::Docx);
+        assert_reported_damaged(&reported(&doc), "document.xml.rels", &format!("{how:?}"));
+        assert!(doc.plain_text().contains("body"), "{how:?}");
+        assert!(doc.to_ir().metadata.text_truncated, "{how:?}");
     }
 }
 
 #[test]
-fn test_a_package_relationships_part_that_cannot_be_decoded_fails_the_open() {
+fn test_a_package_relationships_part_that_cannot_be_decoded_still_opens_with_the_loss_reported() {
+    // The main part is found through `[Content_Types].xml` all the same.
     for how in DAMAGES {
-        let bytes = damage(docx(), "_rels/.rels", how);
+        let doc = open(damage(docx(), "_rels/.rels", how), DocumentFormat::Docx);
+        assert_reported_damaged(&reported(&doc), ".rels", &format!("{how:?}"));
+        assert!(doc.plain_text().contains("body"), "{how:?}");
+        let doc = open(damage(pptx(), "_rels/.rels", how), DocumentFormat::Pptx);
+        assert_reported_damaged(&reported(&doc), ".rels", &format!("{how:?}"));
+    }
+}
+
+#[test]
+fn test_a_damaged_theme_is_a_warning_and_not_a_loss_of_text() {
+    // A theme holds colours and fonts, no text: the document reads exactly as
+    // an intact one, with no notice in the text and no truncation; the
+    // metadata still lists the part.
+    let intact = Document::from_reader(Cursor::new(xlsx()), DocumentFormat::Xlsx).unwrap();
+    for how in DAMAGES {
+        let doc = open(damage(xlsx(), "xl/theme/theme1.xml", how), DocumentFormat::Xlsx);
+        assert_eq!(doc.plain_text(), intact.plain_text(), "{how:?}");
+        assert_eq!(doc.to_markdown(), intact.to_markdown(), "{how:?}");
+        let ir = doc.to_ir();
+        assert!(!ir.metadata.text_truncated, "{how:?}");
         assert!(
-            Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).is_err(),
-            "{how:?}"
+            ir.metadata
+                .warnings
+                .iter()
+                .any(|w| w.contains("theme1.xml")),
+            "{how:?}: {:?}",
+            ir.metadata.warnings
         );
     }
 }

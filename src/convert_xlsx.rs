@@ -1109,6 +1109,12 @@ impl<'d> SheetConverter<'d> {
         metadata
             .warnings
             .extend(notices.into_iter().flat_map(|n| n.warnings));
+        metadata.warnings.extend(
+            self.doc
+                .cosmetic_parts
+                .iter()
+                .map(|(part, err)| format!("skipped unreadable part {part}: {err}")),
+        );
         metadata.warnings.extend(self.warnings.iter().cloned());
         metadata.warnings.extend(self.end_warnings());
         metadata

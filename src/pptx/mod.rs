@@ -156,7 +156,21 @@ impl PptxDocument {
         let app_properties = crate::core::properties::read_app_properties(&mut opc);
         let mut package_properties = crate::core::properties::read_package_properties(&mut opc);
         let main_part = opc.main_document_part()?;
-        let pres_rels = opc.read_rels_for(&main_part)?;
+        // A package or presentation relationships part the zip cannot decode
+        // does not refuse the document: it reads as it did when such a part
+        // was taken for absent (no relationships), with the loss reported
+        // below, among the parts the reader could not use.
+        let mut early_problems: Vec<(String, String)> = Vec::new();
+        if let Some(why) = opc.package_rels_problem() {
+            early_problems.push(("/_rels/.rels".to_string(), why.to_string()));
+        }
+        let pres_rels = match opc.read_rels_for(&main_part) {
+            Ok(rels) => rels,
+            Err(e) => {
+                early_problems.push((main_part.rels_path(), e.to_string()));
+                crate::core::relationships::Relationships::empty()
+            },
+        };
         let has_macros = pres_rels.has_vba_project();
 
         // Parse presentation.xml
@@ -474,6 +488,9 @@ impl PptxDocument {
             unreadable: mut unreadable_parts,
             ..
         } = parts;
+        for (part, why) in &early_problems {
+            unreadable_parts.record(part, why);
+        }
 
         // Phase 2: parse slides (parallel when feature enabled). Each slide
         // yields its parts that could not be used, merged in order below.

@@ -113,10 +113,19 @@ impl FormatTables {
 
 /// What a document keeps between renders: the [`FormatTables`] and the
 /// theme parsed from its raw part.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct RenderCache {
     tables: std::sync::OnceLock<FormatTables>,
     theme: std::sync::OnceLock<Option<crate::core::theme::Theme>>,
+}
+
+/// A copy of a document starts with an empty cache: its tables are derived
+/// again from the copy's own `styles` and theme, so editing a copy cannot
+/// leave it with the tables of the original.
+impl Clone for RenderCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 impl RenderCache {
@@ -996,15 +1005,7 @@ pub(crate) fn unreadable_notice(name: &str, err: &str) -> String {
 /// the file controls, and one that could end its line could start another
 /// (a heading, a list item) in any rendering.
 pub(crate) fn inert(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect()
+    crate::core::unreadable::one_line(s)
 }
 
 /// What could not be read, as every renderer reports it: one entry for each
@@ -1232,6 +1233,7 @@ mod tests {
             unreadable_sheets_omitted: 0,
             unreadable_parts: Vec::new(),
             unreadable_parts_omitted: 0,
+            cosmetic_parts: Vec::new(),
             styles_data: None,
             theme_data: None,
             render_cache: Default::default(),
@@ -1302,6 +1304,7 @@ mod tests {
             unreadable_sheets_omitted: 0,
             unreadable_parts: Vec::new(),
             unreadable_parts_omitted: 0,
+            cosmetic_parts: Vec::new(),
             styles_data: None,
             theme_data: None,
             render_cache: Default::default(),
@@ -1374,6 +1377,7 @@ mod tests {
             unreadable_sheets_omitted: 0,
             unreadable_parts: Vec::new(),
             unreadable_parts_omitted: 0,
+            cosmetic_parts: Vec::new(),
             styles_data: None,
             theme_data: None,
             render_cache: Default::default(),
@@ -1411,6 +1415,7 @@ mod tests {
             unreadable_sheets_omitted: 0,
             unreadable_parts: Vec::new(),
             unreadable_parts_omitted: 0,
+            cosmetic_parts: Vec::new(),
             styles_data: None,
             theme_data: None,
             render_cache: Default::default(),

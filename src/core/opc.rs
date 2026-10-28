@@ -256,6 +256,9 @@ pub struct OpcReader<R: Read + Seek> {
     entries: ZipEntryIndex,
     content_types: ContentTypes,
     package_rels: Relationships,
+    /// Why `_rels/.rels` was taken for empty although the package has it, when
+    /// it could not be read (see [`Self::package_rels_problem`]).
+    package_rels_problem: Option<String>,
 }
 
 impl OpcReader<File> {
@@ -294,10 +297,18 @@ impl<R: Read + Seek> OpcReader<R> {
         // Eagerly parse _rels/.rels
         // Absent is an empty set (the main part is then found through
         // `[Content_Types].xml`); present and unreadable is an error.
+        // A `_rels/.rels` the package has but the zip cannot decode is no
+        // reason to refuse the document: the main part is found through
+        // `[Content_Types].xml` all the same, as it always was. The loss is
+        // kept for the reader to report (`package_rels_problem`).
+        let mut package_rels_problem = None;
         let rels_data = match read_zip_entry(&mut archive, &entries, "_rels/.rels") {
             Ok(data) => data,
             Err(Error::MissingPart(_)) => Vec::new(),
-            Err(e) => return Err(e),
+            Err(e) => {
+                package_rels_problem = Some(e.to_string());
+                Vec::new()
+            },
         };
         let package_rels = if rels_data.is_empty() {
             Relationships::empty()
@@ -310,7 +321,16 @@ impl<R: Read + Seek> OpcReader<R> {
             entries,
             content_types,
             package_rels,
+            package_rels_problem,
         })
+    }
+
+    /// Why the package's `_rels/.rels` could not be read, when the package
+    /// has one that the zip cannot decode: the relationships are then empty
+    /// and the main part is found through `[Content_Types].xml`. A reader
+    /// that opens anyway reports it, so that the loss is not silent.
+    pub(crate) fn package_rels_problem(&self) -> Option<&str> {
+        self.package_rels_problem.as_deref()
     }
 
     /// Return the parsed `[Content_Types].xml` table.

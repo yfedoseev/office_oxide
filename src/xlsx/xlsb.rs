@@ -168,6 +168,7 @@ pub(super) fn from_zip<R: Read + Seek>(
         unreadable_sheets_omitted: unreadable_sheets.omitted,
         unreadable_parts: shared.unreadable.listed,
         unreadable_parts_omitted: shared.unreadable.omitted,
+        cosmetic_parts: shared.unreadable.cosmetic,
         styles_data: None,
         theme_data: None,
         render_cache: Default::default(),

@@ -76,6 +76,11 @@ pub struct XlsxDocument {
     /// Shared string table.
     pub shared_strings: SharedStringTable,
     /// Stylesheet (lazily parsed; access via `ensure_styles()`).
+    ///
+    /// The date styles and number formats derived from it are built once, on
+    /// the first render, and shared by every sheet: change it before the
+    /// first render, or not at all. (A clone of the document derives them
+    /// again.)
     pub styles: Option<StyleSheet>,
     /// DrawingML theme (lazily parsed; access via `ensure_theme()`).
     pub theme: Option<Theme>,
@@ -130,6 +135,9 @@ pub struct XlsxDocument {
     /// listed in [`Self::unreadable_parts`] (each part is listed once, and
     /// at most 100 are kept).
     pub unreadable_parts_omitted: usize,
+    /// Unreadable parts that hold no text (a theme): in the metadata
+    /// warnings only, they change neither the text nor `text_truncated`.
+    pub(crate) cosmetic_parts: Vec<(String, String)>,
     // Raw bytes for lazy parsing (None after parsing or if not present)
     styles_data: Option<Vec<u8>>,
     theme_data: Option<Vec<u8>>,
@@ -143,6 +151,7 @@ impl XlsxDocument {
         if self.styles.is_none() {
             if let Some(data) = self.styles_data.take() {
                 self.styles = StyleSheet::parse(&data).ok();
+                self.render_cache = Default::default();
             }
         }
         self.styles.as_ref()
@@ -165,6 +174,7 @@ impl XlsxDocument {
         if self.theme.is_none() {
             if let Some(data) = self.theme_data.take() {
                 self.theme = Theme::parse(&data).ok();
+                self.render_cache = Default::default();
             }
         }
         self.theme.as_ref()
@@ -677,6 +687,7 @@ impl XlsxDocument {
             unreadable_sheets_omitted: unreadable_sheets.omitted,
             unreadable_parts: shared.unreadable.listed,
             unreadable_parts_omitted: shared.unreadable.omitted,
+            cosmetic_parts: shared.unreadable.cosmetic,
             styles_data: None,
             theme_data,
             render_cache: Default::default(),

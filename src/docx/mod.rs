@@ -226,8 +226,6 @@ impl DocxDocument {
         let app_properties = crate::core::properties::read_app_properties(&mut opc);
         let mut package_properties = crate::core::properties::read_package_properties(&mut opc);
         let main_part = opc.main_document_part()?;
-        let doc_rels = opc.read_rels_for(&main_part)?;
-        let has_macros = doc_rels.has_vba_project();
 
         // Parts the reader skips are recorded here: each once, at most 100
         // kept, the rest counted (see `core::unreadable`).
@@ -236,6 +234,20 @@ impl DocxDocument {
         let skip_unreadable = |part: &str, e: &dyn std::fmt::Display| {
             unreadable_parts.borrow_mut().record(part, e);
         };
+        // A package or main-part relationships part the zip cannot decode
+        // does not refuse the document: it reads as it did when such a part
+        // was taken for absent (no relationships), with the loss reported.
+        if let Some(why) = opc.package_rels_problem() {
+            skip_unreadable("/_rels/.rels", &why);
+        }
+        let doc_rels = match opc.read_rels_for(&main_part) {
+            Ok(rels) => rels,
+            Err(e) => {
+                skip_unreadable(&main_part.rels_path(), &e);
+                crate::core::relationships::Relationships::empty()
+            },
+        };
+        let has_macros = doc_rels.has_vba_project();
 
         // Parse theme
         // A theme is decoration: it supplies colour-scheme lookups and

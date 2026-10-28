@@ -95,7 +95,6 @@ fn test_a_part_with_an_unsupported_compression_method_is_reported_not_taken_for_
         "xl/sharedStrings.xml",
         "xl/styles.xml",
         "xl/_rels/workbook.xml.rels",
-        "xl/theme/theme1.xml",
         "xl/persons/person.xml",
     ] {
         let bytes = with_method_99(workbook(), part);

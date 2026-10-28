@@ -84,6 +84,37 @@ impl UnreadableParts {
     }
 }
 
+/// Whether losing `part` can change the text a document yields.
+///
+/// A theme, an embedded font, the package properties, custom XML and printer
+/// settings colour, size or describe a document but hold none of its text, so
+/// a document that lost one still yields every word it did before: that is
+/// reported in the metadata warnings, but it is not a truncation and it adds
+/// no notice to the text. The name is compared as a zip lookup compares it
+/// (case and `\` against `/` aside).
+pub(crate) fn part_affects_text(part: &str) -> bool {
+    let name: String = part
+        .chars()
+        .map(|c| {
+            if c == '\\' {
+                '/'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    let name = name.trim_start_matches('/');
+    !(name.contains("/theme/")
+        || name.starts_with("theme/")
+        || name.contains("/fonts/")
+        || name.starts_with("fonts/")
+        || name.starts_with("docprops/")
+        || name.starts_with("customxml/")
+        || name.contains("/customxml/")
+        || name.contains("printersettings")
+        || name.contains("thumbnail"))
+}
+
 /// The warning for `omitted` parts left out of a list.
 pub(crate) fn omitted_warning(omitted: usize) -> String {
     format!("and {omitted} more unreadable parts not listed")
@@ -103,7 +134,7 @@ pub(crate) enum ReportTarget {
 /// A warning on one line: a control character, a line break (also U+2028
 /// and U+2029) or a bidirectional override is replaced by a space, so a
 /// name that holds one cannot start a new block or reorder the line.
-fn one_line(text: &str) -> String {
+pub(crate) fn one_line(text: &str) -> String {
     text.chars()
         .map(|c| {
             if c.is_control()
