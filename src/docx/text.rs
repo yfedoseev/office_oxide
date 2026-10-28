@@ -19,6 +19,7 @@ impl DocxDocument {
     /// renderers. All three used to disagree, so a consumer's word count
     /// changed depending on which method they called.
     pub fn plain_text(&self) -> String {
+        crate::limits::begin_copied_text_budget();
         let mut out = String::new();
         let styles = self.styles.as_ref();
         for hf in self
@@ -63,6 +64,13 @@ impl DocxDocument {
         // Trim trailing newlines
         while out.ends_with('\n') {
             out.pop();
+        }
+        // A chart's text is stored once and written once per drawing that
+        // names it; when the copies outgrew the text budget the drawings past
+        // it were written without it, and the output says so.
+        if let Some(notice) = crate::limits::copied_text_notice() {
+            out.push_str("\n\n");
+            out.push_str(&notice);
         }
         out
     }
@@ -139,6 +147,14 @@ impl DocxDocument {
         }
         out
     }
+}
+
+/// Charge the lines of a chart or diagram, which a drawing writes out again
+/// for every drawing that names the same part, to the copied-text budget.
+/// `false` when they do not fit: the drawing is written without them.
+fn charge_drawing_text(lines: &[&str]) -> bool {
+    let chars: usize = lines.iter().map(|l| l.len() + 1).sum();
+    crate::limits::charge_copied_text(chars)
 }
 
 /// Split parsed `HeaderFooter` entries into headers vs footers and
@@ -263,7 +279,8 @@ fn plain_text_run(run: &Run, ctx: HiddenCtx<'_>, out: &mut String) {
                     .chain(d.dgm_text.iter())
                     .map(String::as_str)
                     .collect();
-                if !lines.is_empty() {
+                // Charged before it is written: the text is stored once.
+                if !lines.is_empty() && charge_drawing_text(&lines) {
                     if !out.is_empty() && !out.ends_with(['\n', ' ', '\t']) {
                         out.push('\n');
                     }
@@ -806,7 +823,7 @@ fn markdown_drawing(drawing: &DrawingInfo, out: &mut String) {
         .chain(drawing.dgm_text.iter())
         .map(String::as_str)
         .collect();
-    if !lines.is_empty() {
+    if !lines.is_empty() && charge_drawing_text(&lines) {
         if !out.is_empty() && !out.ends_with(['\n', ' ', '\t']) {
             out.push('\n');
         }

@@ -129,6 +129,30 @@ fn numbering(level_text: &str) -> String {
     )
 }
 
+fn chart_part(text: &str) -> String {
+    format!(
+        r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>{text}</a:t></a:r></a:p></c:rich></c:tx></c:title></c:chart></c:chartSpace>"#
+    )
+}
+
+/// `n` paragraphs, each holding a drawing of the chart `rId9`.
+fn chart_body(n: usize) -> String {
+    r#"<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="100" cy="100"/><wp:docPr id="1" name="c"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rId9"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#.repeat(n)
+}
+
+/// A `.docx` with `drawings` drawings of one chart whose title is `text`.
+fn chart_docx(text: &str, drawings: usize) -> Vec<u8> {
+    let body = chart_body(drawings);
+    let mut all = vec![
+        ("[Content_Types].xml".to_string(), r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/></Types>"#.to_string()),
+        ("_rels/.rels".to_string(), format!(r#"<Relationships xmlns="{PKG_REL}"><Relationship Id="rId1" Type="{REL}/officeDocument" Target="word/document.xml"/></Relationships>"#)),
+        ("word/_rels/document.xml.rels".to_string(), format!(r#"<Relationships xmlns="{PKG_REL}"><Relationship Id="rId9" Type="{REL}/chart" Target="charts/chart1.xml"/></Relationships>"#)),
+        ("word/document.xml".to_string(), format!(r#"<w:document {NS}><w:body>{body}</w:body></w:document>"#)),
+        ("word/charts/chart1.xml".to_string(), chart_part(text)),
+    ];
+    zip_of(std::mem::take(&mut all))
+}
+
 /// `lists` one-item lists, each ended by an ordinary paragraph.
 fn list_body(lists: usize) -> String {
     r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>x</w:t></w:r></w:p><w:p><w:r><w:t>y</w:t></w:r></w:p>"#
@@ -253,4 +277,54 @@ fn test_few_style_tab_stops_are_kept_on_every_paragraph() {
     assert_eq!(paras.len(), USERS);
     assert!(paras.iter().all(|p| p.tabs.len() == 3));
     assert!(!ir.metadata.text_truncated);
+}
+
+#[test]
+fn test_chart_text_copies_per_drawing_are_charged() {
+    limits();
+    let bytes = chart_docx(&"c".repeat(BIG), USERS);
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
+    let ir = doc.to_ir();
+    let copied: usize = paragraphs(&ir)
+        .iter()
+        .flat_map(|p| p.content.iter())
+        .map(|c| match c {
+            InlineContent::Text(t) => t.text.len(),
+            _ => 0,
+        })
+        .sum();
+    assert!(copied >= BIG, "the budget holds a few copies");
+    assert!(
+        copied <= TEXT_BUDGET,
+        "{copied} characters of chart text were copied against a budget of {TEXT_BUDGET}"
+    );
+    assert_reported(&ir);
+    for rendering in [doc.plain_text(), doc.to_markdown()] {
+        assert!(
+            rendering.len() <= TEXT_BUDGET + 2_000,
+            "{} characters rendered against a budget of {TEXT_BUDGET}",
+            rendering.len()
+        );
+        assert!(rendering.contains("set_max_text_chars"), "the cut is announced");
+    }
+}
+
+#[test]
+fn test_small_chart_text_is_kept_in_every_drawing() {
+    limits();
+    let doc =
+        Document::from_reader(Cursor::new(chart_docx("Revenue", USERS)), DocumentFormat::Docx)
+            .unwrap();
+    let ir = doc.to_ir();
+    let with_text = paragraphs(&ir)
+        .iter()
+        .filter(|p| {
+            p.content
+                .iter()
+                .any(|c| matches!(c, InlineContent::Text(t) if t.text.contains("Revenue")))
+        })
+        .count();
+    assert_eq!(with_text, USERS);
+    assert!(!ir.metadata.text_truncated);
+    assert_eq!(doc.plain_text().matches("Revenue").count(), USERS);
 }

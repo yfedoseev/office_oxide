@@ -19,6 +19,10 @@ struct Counting;
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
+/// Bytes requested by every thread. Opening a `.docx` parses on a thread of
+/// its own, which the per-thread count cannot see.
+static PROCESS_BYTES: AtomicUsize = AtomicUsize::new(0);
+
 thread_local! {
     /// Bytes requested by this thread, so a byte budget is not disturbed
     /// by tests running in parallel.
@@ -35,6 +39,7 @@ fn count_bytes(n: usize) {
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        PROCESS_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         count_bytes(layout.size());
         // SAFETY: same layout contract as the caller's.
         unsafe { System.alloc(layout) }
@@ -45,6 +50,7 @@ unsafe impl GlobalAlloc for Counting {
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        PROCESS_BYTES.fetch_add(new_size, Ordering::Relaxed);
         count_bytes(new_size);
         // SAFETY: forwarded unchanged.
         unsafe { System.realloc(ptr, layout, new_size) }
@@ -68,6 +74,14 @@ fn allocations_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let before = ALLOCATIONS.load(Ordering::SeqCst);
     let out = f();
     (out, ALLOCATIONS.load(Ordering::SeqCst) - before)
+}
+
+/// Bytes any thread requested from the allocator while running `f`. Only
+/// meaningful while holding [`serial`].
+fn process_bytes_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let before = PROCESS_BYTES.load(Ordering::SeqCst);
+    let out = f();
+    (out, PROCESS_BYTES.load(Ordering::SeqCst) - before)
 }
 
 /// Bytes this thread requested from the allocator while running `f`.
@@ -748,5 +762,48 @@ fn test_docx_markdown_does_not_copy_a_styles_tab_stops_per_paragraph() {
     assert!(
         bytes < 8 << 20,
         "{bytes} bytes requested rendering {PARAS} paragraphs under a style with 20,000 tab stops"
+    );
+}
+
+/// A chart part's 1 MiB of text, named by 100 drawings, used to be copied
+/// into every drawing at open: drawings x 1 MiB requested.
+#[test]
+fn test_docx_open_does_not_copy_a_charts_text_per_drawing() {
+    let _serial = serial();
+    const DRAWINGS: usize = 100;
+    let drawing = r#"<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="100" cy="100"/><wp:docPr id="1" name="c"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rId9"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#;
+    let doc = format!(
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>{}</w:body></w:document>"#,
+        drawing.repeat(DRAWINGS)
+    );
+    let chart = format!(
+        r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>{}</a:t></a:r></a:p></c:rich></c:tx></c:title></c:chart></c:chartSpace>"#,
+        "c".repeat(1 << 20)
+    );
+    let bytes = zip_of(&[
+        (
+            "[Content_Types].xml",
+            br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/></Types>"#,
+        ),
+        (
+            "_rels/.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+        ),
+        (
+            "word/_rels/document.xml.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="charts/chart1.xml"/></Relationships>"#,
+        ),
+        ("word/document.xml", doc.as_bytes()),
+        ("word/charts/chart1.xml", chart.as_bytes()),
+    ]);
+    let (opened, bytes_requested) = process_bytes_during(|| {
+        office_oxide::Document::from_reader(Cursor::new(bytes), office_oxide::DocumentFormat::Docx)
+    });
+    let opened = opened.unwrap();
+    assert!(opened.plain_text().len() >= 1 << 20, "the chart text was read");
+    // Far under one copy of the text per drawing (100 MiB before).
+    assert!(
+        bytes_requested < 16 << 20,
+        "{bytes_requested} bytes requested opening {DRAWINGS} drawings of one 1 MiB chart"
     );
 }

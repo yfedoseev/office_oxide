@@ -1180,6 +1180,12 @@ fn collect_paragraph_chart_text(p: &crate::docx::Paragraph, out: &mut Vec<Elemen
                     continue;
                 };
                 for line in d.chart_text.iter().chain(d.dgm_text.iter()) {
+                    // The part's text is stored once and copied for every
+                    // drawing that names the part: charged before it is
+                    // copied, and left out once the budget is spent.
+                    if !crate::limits::charge_copied_text(line.len()) {
+                        break;
+                    }
                     out.push(Element::Paragraph(Paragraph {
                         content: vec![InlineContent::Text(TextSpan::plain(line.clone()))],
                         ..Default::default()
