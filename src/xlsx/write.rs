@@ -300,6 +300,11 @@ pub struct XlsxWriter {
     defined_names: Vec<crate::ir::DefinedName>,
     /// The names of `sheets`, for making the next one unique.
     names: SheetNames,
+    /// Where the cells of a sheet past [`crate::limits::max_write_sheets`] go
+    /// (the handle `add_sheet` must return); never written out.
+    refused_sheet: Option<SheetDataInner>,
+    /// How many sheets were refused; writing the workbook is an error then.
+    refused_sheets: usize,
 }
 
 /// Per-worksheet page geometry.
@@ -655,13 +660,17 @@ fn sanitize_image_extension(format: &str) -> String {
 /// unique costs time in the length of that name, not in the number of sheets.
 ///
 /// Names are compared ASCII case-insensitively (`used` holds them
-/// lower-cased), as Excel does. `next_suffix` remembers, for each base name,
-/// the first `" (n)"` suffix not yet known to be taken: the set only grows,
-/// so every smaller suffix stays taken and need not be probed again.
+/// lower-cased), as Excel does. `next_suffix` remembers, for
+/// each cut prefix and suffix width the first `" (n)"` not yet known to
+/// be taken: the set only grows, so every smaller suffix stays taken and need
+/// not be probed again.
 #[derive(Default)]
 struct SheetNames {
     used: std::collections::HashSet<String>,
-    next_suffix: HashMap<String, usize>,
+    next_suffix: HashMap<(String, usize), usize>,
+    /// Suffix candidates tried, for the tests that bound the probing.
+    #[cfg(test)]
+    probes: usize,
 }
 
 impl SheetNames {
@@ -696,22 +705,40 @@ impl SheetNames {
             base
         } else {
             // Disambiguate with a numeric suffix, keeping within the 31-char
-            // limit.
-            let hint = self
-                .next_suffix
-                .entry(base.to_ascii_lowercase())
-                .or_insert(2);
-            let mut n = *hint;
+            // limit. The candidate is the base cut to `keep` characters plus
+            // `" (n)"`, so bases that share that cut share their candidates:
+            // progress is remembered per cut prefix and suffix width.
+            let mut digits = 1usize;
             loop {
-                let suffix = format!(" ({n})");
-                let keep = 31usize.saturating_sub(suffix.len());
-                let candidate =
-                    format!("{}{}", base.chars().take(keep).collect::<String>(), suffix);
-                if !self.used.contains(&candidate.to_ascii_lowercase()) {
-                    *hint = n + 1;
-                    break candidate;
+                let keep = 31usize.saturating_sub(digits + 3);
+                let prefix: String = base.chars().take(keep).collect();
+                let key = (prefix.to_ascii_lowercase(), digits);
+                // The numbers with `digits` digits, from 2 for one digit.
+                let lo = if digits == 1 {
+                    2
+                } else {
+                    10usize.pow(digits as u32 - 1)
+                };
+                let hi = 10usize.saturating_pow(digits as u32) - 1;
+                let hint = self.next_suffix.entry(key).or_insert(lo);
+                let mut n = *hint;
+                while n <= hi {
+                    #[cfg(test)]
+                    {
+                        self.probes += 1;
+                    }
+                    let candidate = format!("{prefix} ({n})");
+                    if !self.used.contains(&candidate.to_ascii_lowercase()) {
+                        *hint = n + 1;
+                        break;
+                    }
+                    n += 1;
                 }
-                n += 1;
+                if n <= hi {
+                    break format!("{prefix} ({n})");
+                }
+                *hint = hi.saturating_add(1);
+                digits += 1;
             }
         };
         self.used.insert(chosen.to_ascii_lowercase());
@@ -943,6 +970,8 @@ impl XlsxWriter {
             metadata: None,
             defined_names: Vec::new(),
             names: SheetNames::default(),
+            refused_sheet: None,
+            refused_sheets: 0,
         }
     }
 
@@ -989,17 +1018,48 @@ impl XlsxWriter {
     /// no `[ ] : * ? / \\`, non-empty and unique in the workbook. A name that
     /// collides with an existing sheet gains a numeric suffix rather than
     /// silently replacing it.
+    ///
+    /// A workbook holds at most [`crate::limits::max_write_sheets`] sheets.
+    /// The sheet that would exceed it is not added: the returned handle
+    /// writes into a scratch sheet that is discarded, and
+    /// [`save`](Self::save) / [`write_to`](Self::write_to) return an error
+    /// naming the limit.
     pub fn add_sheet(&mut self, name: &str) -> SheetData<'_> {
+        if self.sheet_limit_reached() {
+            return SheetData(
+                self.refused_sheet
+                    .get_or_insert_with(|| SheetDataInner::new("-")),
+            );
+        }
         let name = self.names.claim(name);
         self.sheets.push(SheetDataInner::new(&name));
         SheetData(self.sheets.last_mut().unwrap())
     }
 
     /// Add a sheet and return its 0-based index (for use with index-based API).
+    ///
+    /// Past [`crate::limits::max_write_sheets`] no sheet is added and the
+    /// returned index is out of range (the index-based setters then return
+    /// `false`); writing the workbook is an error. See [`Self::add_sheet`].
     pub fn add_sheet_get_index(&mut self, name: &str) -> usize {
+        if self.sheet_limit_reached() {
+            return self.sheets.len();
+        }
         let name = self.names.claim(name);
         self.sheets.push(SheetDataInner::new(&name));
         self.sheets.len() - 1
+    }
+
+    /// Whether one more sheet would exceed the limit; counts the refusal.
+    fn sheet_limit_reached(&mut self) -> bool {
+        if self.sheets.len() < crate::limits::max_write_sheets() {
+            return false;
+        }
+        if self.refused_sheets == 0 {
+            log::warn!("xlsx: the workbook is at its sheet limit; further sheets are not added");
+        }
+        self.refused_sheets += 1;
+        true
     }
 
     /// Set a cell value by sheet index.
@@ -1104,6 +1164,15 @@ impl XlsxWriter {
     // -----------------------------------------------------------------------
 
     fn write_parts<W: Write + Seek>(&self, opc: &mut OpcWriter<W>) -> Result<()> {
+        if self.refused_sheets > 0 {
+            return Err(crate::core::Error::PackageLimit(format!(
+                "{} sheets were added beyond the {} a workbook may be written with; the limit is \
+                 office_oxide::limits::set_max_write_sheets",
+                self.refused_sheets,
+                crate::limits::max_write_sheets()
+            ))
+            .into());
+        }
         // CT_Sheets requires at least one sheet. Writing <sheets/> produced a
         // workbook no reader accepts, and save() still returned Ok, so add a
         // blank sheet rather than emitting an invalid file.
@@ -3162,6 +3231,31 @@ mod validity_tests {
             assert!(seen.insert(s.name.to_ascii_lowercase()), "repeated {}", s.name);
             assert!(s.name.chars().count() <= 31);
         }
+    }
+
+    /// Names that differ only after the cut `" (n)"` leaves room for share
+    /// their candidates, so probing must share progress across them.
+    #[test]
+    fn test_sheet_names_sharing_a_cut_prefix_do_not_reprobe_each_other() {
+        let mut writer = XlsxWriter::new();
+        // 31-character names differing only in their last four characters:
+        // each one clashes once, and all cut to the same 27-character prefix
+        // for their suffixed candidates.
+        for i in 0..5_000 {
+            let name = format!("{}{i:04}", "p".repeat(27));
+            writer.add_sheet(&name);
+            writer.add_sheet(&name);
+        }
+        let mut seen = std::collections::HashSet::new();
+        for s in &writer.sheets {
+            assert!(seen.insert(s.name.to_ascii_lowercase()), "repeated {}", s.name);
+            assert!(s.name.chars().count() <= 31, "{}", s.name);
+        }
+        assert!(
+            writer.names.probes <= 2 * 5_000,
+            "{} suffix probes for 5,000 clashes",
+            writer.names.probes
+        );
     }
 
     /// Adding thousands of sheets costs time in the sheet count only once:
