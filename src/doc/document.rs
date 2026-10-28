@@ -71,7 +71,9 @@ pub struct DocDocument {
     header_footers: Vec<HeaderFooterStories>,
     /// What is left of the document's text budget after the piece table and
     /// the header/footer stories were read; the IR conversion spends the
-    /// same budget on the per-section copies it makes of those stories.
+    /// same budget on the repeated per-section copies it makes of those
+    /// stories (the first copy of each is covered by the piece table's
+    /// charge).
     text_budget: crate::limits::TextBudget,
     /// Individual comments, split from the merged Comments substory using
     /// `PlcfandTxt`'s CP boundaries and attributed via `PlcfandRef`'s
@@ -643,7 +645,7 @@ impl DocDocument {
             list_formatting: ListFormatting::default(),
             comment_authors: Vec::new(),
             header_footers: Vec::new(),
-            text_budget: crate::limits::TextBudget::new(),
+            text_budget,
             comments: Vec::new(),
             ole_objects: super::ole_objects::extract_ole_objects(cfb),
             warnings,
@@ -743,8 +745,8 @@ impl DocDocument {
         &self.subdocuments
     }
 
-    /// What is left of the document's text budget once the text and the
-    /// header/footer stories are read (see the field).
+    /// What is left of the document's text budget once the text is decoded
+    /// (see the field).
     pub(crate) fn text_budget(&self) -> crate::limits::TextBudget {
         self.text_budget
     }
@@ -966,15 +968,22 @@ fn parse_plcf_hdd_stories(
     starts.push(raw_header_text.len());
     let chars = starts.len() - 1;
 
-    // A story's characters are charged against the document's text budget
-    // before they are copied out; ranges that overlap are charged each time.
+    // The header document's own text was charged to the budget when the
+    // piece table was read, so the first `chars` characters copied out of it
+    // are already paid for; only what the stories copy beyond that (ranges
+    // that overlap, in a PLC whose CPs run backwards) is charged here, before
+    // it is copied.
     let cut = std::cell::Cell::new(false);
+    let mut copied = 0usize;
     let mut char_range = |lo: usize, hi: usize| -> Option<Arc<str>> {
         if hi <= lo || lo >= chars || cut.get() {
             return None;
         }
         let hi = hi.min(chars);
-        if !budget.charge(hi - lo) {
+        let before = copied;
+        copied = copied.saturating_add(hi - lo);
+        let extra = copied.saturating_sub(chars) - before.saturating_sub(chars);
+        if !budget.charge(extra) {
             cut.set(true);
             return None;
         }
@@ -2222,7 +2231,9 @@ mod tests {
         let ir = crate::convert_doc::doc_to_ir(&doc);
         assert_eq!(ir.sections.len(), 100);
         let with_header = ir.sections.iter().filter(|s| s.header.is_some()).count();
-        assert_eq!(with_header, 5, "the budget covers five copies of 1,000 bytes");
+        // The first copy is the text the piece table already paid for; the
+        // budget covers five further copies of 1,000 bytes.
+        assert_eq!(with_header, 6);
         assert!(ir.metadata.text_truncated);
         assert!(
             ir.metadata
@@ -2230,6 +2241,62 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("character budget"))
         );
+    }
+
+    /// The header document's text was charged when the piece table was read,
+    /// so slicing it into stories charges nothing more: a budget that was
+    /// spent exactly by the pieces still yields every header and footer.
+    #[test]
+    fn test_header_stories_are_not_charged_again_for_text_already_counted() {
+        // Six separators, then one section whose six stories split 1,000
+        // characters between them.
+        let mut cps: Vec<u32> = vec![0; 6];
+        cps.extend_from_slice(&[0, 200, 400, 600, 800, 900]);
+        cps.extend_from_slice(&[1000, 1000]);
+        let mut table_stream = Vec::new();
+        for cp in &cps {
+            table_stream.extend_from_slice(&cp.to_le_bytes());
+        }
+        let raw = "y".repeat(1000);
+        let mut budget = crate::limits::TextBudget::with_limit(0);
+        let (stories, cut) = parse_plcf_hdd_stories(
+            &table_stream,
+            &raw,
+            0,
+            table_stream.len() as u32,
+            1,
+            &mut budget,
+        );
+        assert!(!cut, "disjoint stories add nothing to what the pieces cost");
+        assert_eq!(stories.len(), 1);
+        assert_eq!(stories[0].first_header.as_deref().map(str::len), Some(100));
+        assert!(!budget.exhausted());
+    }
+
+    /// Distinct headers of distinct sections are each the text the piece table
+    /// already paid for: none is charged again when the IR makes its copy, even
+    /// with nothing left of the budget.
+    #[test]
+    fn test_distinct_section_headers_are_not_charged_again_in_the_ir() {
+        let mut paras: Vec<DocParagraph> = Vec::new();
+        for _ in 0..3 {
+            let mut p = pap("x", crate::doc::sprm::PapProps::default());
+            p.terminator = '\u{C}';
+            paras.push(p);
+        }
+        let mut doc = make_doc_with_paragraphs(paras);
+        doc.header_footers = ["a", "b", "c"]
+            .iter()
+            .map(|t| HeaderFooterStories {
+                odd_header: Some(t.repeat(1000).into()),
+                ..Default::default()
+            })
+            .collect();
+        doc.text_budget = crate::limits::TextBudget::with_limit(0);
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        assert_eq!(ir.sections.len(), 3);
+        assert!(ir.sections.iter().all(|s| s.header.is_some()));
+        assert!(!ir.metadata.text_truncated);
     }
 
     /// Stories whose ranges overlap are charged each time they are copied
