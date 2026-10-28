@@ -129,6 +129,32 @@ pub fn handle_tools_call(id: &Value, params: &Value) -> Value {
 /// silently truncated.
 const MAX_EXTRACT_BYTES: usize = 32 * 1024 * 1024;
 
+/// Largest total of image bytes one document conversion may carry, in bytes.
+///
+/// Images reach a result only as base64 (`markdown-with-images`, `ir`), which
+/// is four thirds of the bytes, so this keeps them near [`MAX_EXTRACT_BYTES`].
+const MAX_EXTRACT_IMAGE_BYTES: usize = 24 * 1024 * 1024;
+
+/// Bring the library's per-document budgets down to what one tool result can
+/// hold, once at startup.
+///
+/// The renderers build their whole output before it can be measured, and the
+/// library's default text budget (256 Mi characters) lets a spreadsheet run
+/// to gigabytes before the size check could refuse it. With the budget at
+/// [`MAX_EXTRACT_BYTES`] characters a spreadsheet's output stops there with
+/// the library's usual truncation notice, and so does the IR that `info`
+/// reads; the image budget is lowered the same way. A budget that is already
+/// lower is kept.
+pub fn bound_resource_budgets() {
+    bound_resource_budgets_to(MAX_EXTRACT_BYTES, MAX_EXTRACT_IMAGE_BYTES);
+}
+
+fn bound_resource_budgets_to(text_chars: usize, image_bytes: usize) {
+    use office_oxide::limits;
+    limits::set_max_text_chars(limits::max_text_chars().min(text_chars));
+    limits::set_max_image_bytes(limits::max_image_bytes().min(image_bytes));
+}
+
 fn call_extract(id: &Value, args: &Value) -> Value {
     let Some(file_path) = args["file_path"].as_str() else {
         return error_response(id, INVALID_PARAMS, "missing file_path");
@@ -388,6 +414,44 @@ mod tests {
             // At exactly its own size it still fits.
             assert_eq!(render(&doc, format, full.len()).unwrap(), full, "{format}");
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A spreadsheet whose text outgrows the text budget is cut at it with the
+    /// library's notice, in the rendering and in `info`, instead of being
+    /// built whole and then refused.
+    #[test]
+    fn test_budgets_bound_what_a_spreadsheet_renders_before_the_size_check() {
+        use office_oxide::xlsx::write::{CellData, XlsxWriter};
+        let dir = scratch_dir("budget");
+        let path = dir.join("book.xlsx");
+        let mut w = XlsxWriter::new();
+        {
+            let mut sheet = w.add_sheet("S");
+            for _ in 0..400 {
+                sheet.add_row(vec![CellData::String("x".repeat(50))]);
+            }
+        }
+        w.save(&path).unwrap();
+        let before =
+            (office_oxide::limits::max_text_chars(), office_oxide::limits::max_image_bytes());
+        let doc = office_oxide::Document::open(&path).unwrap();
+        let full = render(&doc, "text", usize::MAX).unwrap();
+        assert!(full.len() >= 20_000);
+
+        bound_resource_budgets_to(2_000, 1_000);
+        let cut = render(&doc, "markdown", usize::MAX);
+        let info = call_info(&json!(1), &json!({ "file_path": path.to_str().unwrap() }));
+        office_oxide::limits::set_max_text_chars(before.0);
+        office_oxide::limits::set_max_image_bytes(before.1);
+
+        let cut = cut.unwrap();
+        assert!(cut.len() < full.len() / 2, "{} bytes of {}", cut.len(), full.len());
+        let info = info["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(info.contains("\"text_truncated\":true"), "{info}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -524,6 +524,29 @@ pub fn set_max_write_table_cells(cells: usize) {
     MAX_WRITE_TABLE_CELLS.store(cells, Ordering::Relaxed);
 }
 
+/// The default most worksheets an IR written to `.xlsx` may hold: 32,767.
+///
+/// Every sheet is a part of its own with a relationships part beside it, so
+/// this keeps the package under the 65,535 entries a zip without ZIP64
+/// extensions can hold. Excel itself has no fixed sheet limit (memory
+/// decides) and openpyxl none at all, but a genuine workbook has tens or
+/// hundreds of sheets, not tens of thousands.
+pub const DEFAULT_MAX_WRITE_SHEETS: usize = 32_767;
+
+static MAX_WRITE_SHEETS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_WRITE_SHEETS);
+
+/// The most sections (worksheets) an IR written to `.xlsx` may hold before
+/// the write is refused.
+pub fn max_write_sheets() -> usize {
+    MAX_WRITE_SHEETS.load(Ordering::Relaxed)
+}
+
+/// Set the worksheet limit for every write afterwards. `usize::MAX`
+/// disables the bound.
+pub fn set_max_write_sheets(sheets: usize) {
+    MAX_WRITE_SHEETS.store(sheets, Ordering::Relaxed);
+}
+
 /// The default most list items one Markdown document may parse into:
 /// 100,000. Each item becomes about 250 bytes of IR.
 pub const DEFAULT_MAX_MARKDOWN_LIST_ITEMS: usize = 100_000;
@@ -540,6 +563,31 @@ pub fn max_markdown_list_items() -> usize {
 /// `usize::MAX` disables the bound.
 pub fn set_max_markdown_list_items(items: usize) {
     MAX_MARKDOWN_LIST_ITEMS.store(items, Ordering::Relaxed);
+}
+
+/// The default most blocks one Markdown document may parse into: 100,000.
+///
+/// A block costs a section, a paragraph, a heading, a code block, a break,
+/// a list or a table as 1, and each table cell as 4 (a cell is about four
+/// times the IR of a paragraph). Each is 0.5-1.4 KB of IR from a few bytes
+/// of Markdown: 100,000 sections were 214 MB, 200,000 paragraphs 285 MB and
+/// one table row of 100,000 columns 490 MB. List items have a limit of their
+/// own, [`max_markdown_list_items`].
+pub const DEFAULT_MAX_MARKDOWN_ELEMENTS: usize = 100_000;
+
+static MAX_MARKDOWN_ELEMENTS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_MARKDOWN_ELEMENTS);
+
+/// The most blocks (sections, paragraphs, headings, code blocks, breaks,
+/// lists and tables at 1, table cells at 4) `DocumentIR::from_markdown`
+/// keeps; the rest of the document is dropped with a notice.
+pub fn max_markdown_elements() -> usize {
+    MAX_MARKDOWN_ELEMENTS.load(Ordering::Relaxed)
+}
+
+/// Set the Markdown block limit for every parse afterwards. `usize::MAX`
+/// disables the bound.
+pub fn set_max_markdown_elements(elements: usize) {
+    MAX_MARKDOWN_ELEMENTS.store(elements, Ordering::Relaxed);
 }
 
 /// A document's remaining text budget.

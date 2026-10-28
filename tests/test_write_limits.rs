@@ -122,3 +122,40 @@ fn test_cells_are_counted_across_tables_and_inside_nested_content() {
     let nested = ir_with(vec![Element::Table(outer)], DocumentFormat::Docx);
     assert!(write(&nested, DocumentFormat::Docx).is_err());
 }
+
+#[test]
+fn test_a_workbook_with_too_many_sections_is_refused_when_writing() {
+    office_oxide::limits::set_max_write_sheets(3);
+    let sections = |n: usize| DocumentIR {
+        metadata: Metadata {
+            format: DocumentFormat::Xlsx,
+            ..Default::default()
+        },
+        sections: (0..n).map(|_| Section::default()).collect(),
+    };
+    let err =
+        write(&sections(4), DocumentFormat::Xlsx).expect_err("4 sections exceed a limit of 3");
+    assert!(matches!(err, OfficeError::Core(CoreError::PackageLimit(_))), "{err:?}");
+    assert!(err.to_string().contains("set_max_write_sheets"));
+    write(&sections(3), DocumentFormat::Xlsx).expect("3 sections are within the limit");
+}
+
+#[test]
+fn test_a_direct_writer_caller_past_the_sheet_limit_gets_an_error() {
+    use office_oxide::xlsx::write::{CellData, XlsxWriter};
+    office_oxide::limits::set_max_write_sheets(3);
+    let mut w = XlsxWriter::new();
+    for i in 0..3 {
+        w.add_sheet(&format!("s{i}"));
+    }
+    w.write_to(Cursor::new(Vec::new()))
+        .expect("3 sheets are within the limit");
+    // The fourth is not kept; the handle still accepts writes.
+    w.add_sheet("extra")
+        .set_cell(0, 0, CellData::String("x".into()));
+    assert_eq!(w.add_sheet_get_index("more"), 3, "no index is handed out past the limit");
+    let err = w
+        .write_to(Cursor::new(Vec::new()))
+        .expect_err("two sheets were refused");
+    assert!(err.to_string().contains("set_max_write_sheets"), "{err}");
+}

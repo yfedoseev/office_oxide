@@ -66,13 +66,26 @@ fn written_table_cells(table: &Table, format: DocumentFormat) -> usize {
     table.rows.len().saturating_mul(width)
 }
 
-/// Refuse an IR whose tables hold more cells than
+/// Refuse an IR that exceeds the write limits: more sections than
+/// [`crate::limits::max_write_sheets`] for `.xlsx`, or tables holding more cells than
 /// [`crate::limits::max_write_table_cells`]: the `.docx` and `.pptx`
 /// writers build every cell in memory, so the count is the cost.
 ///
 /// Counted with an explicit stack: the IR is `Deserialize` and can nest
 /// deeper than the call stack allows.
-fn check_table_cell_budget(ir: &DocumentIR, format: DocumentFormat) -> Result<()> {
+fn check_write_budget(ir: &DocumentIR, format: DocumentFormat) -> Result<()> {
+    if format == DocumentFormat::Xlsx {
+        // One sheet per section; refused before any sheet is built.
+        let limit = crate::limits::max_write_sheets();
+        if ir.sections.len() > limit {
+            return Err(crate::core::Error::PackageLimit(format!(
+                "the document holds {} sections, more than the {limit} worksheets a workbook \
+                 may be written with; the limit is office_oxide::limits::set_max_write_sheets",
+                ir.sections.len()
+            ))
+            .into());
+        }
+    }
     if !matches!(format, DocumentFormat::Docx | DocumentFormat::Pptx) {
         return Ok(());
     }
@@ -135,7 +148,7 @@ pub fn create_from_ir(
     format: DocumentFormat,
     path: impl AsRef<Path>,
 ) -> Result<()> {
-    check_table_cell_budget(ir, format)?;
+    check_write_budget(ir, format)?;
     match format {
         DocumentFormat::Docx => {
             let writer = ir_to_docx(ir);
@@ -160,7 +173,7 @@ pub fn create_from_ir_to_writer<W: Write + Seek>(
     format: DocumentFormat,
     writer: W,
 ) -> Result<()> {
-    check_table_cell_budget(ir, format)?;
+    check_write_budget(ir, format)?;
     match format {
         DocumentFormat::Docx => {
             let w = ir_to_docx(ir);

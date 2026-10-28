@@ -63,7 +63,12 @@ Extract content from an Office document (DOCX, XLSX, PPTX, DOC, XLS, PPT).
 `markdown-with-images` embeds each image inline as `[image-base64:...]` at its
 position in the flow; `ir` is the document IR as JSON. A result larger than
 32 MiB is refused with an error rather than truncated — use a more compact
-format, or the `office-oxide` CLI, which streams its output.
+format, or the `office-oxide` CLI, which streams its output. To keep a result
+that large from being built first, the server lowers the library's text budget
+to 32 Mi characters (and its image budget to 24 MiB) at startup: a spreadsheet
+longer than that is cut with the library's truncation notice, which `info`
+reports as a warning. A request line longer than 16 MiB is rejected with a
+JSON-RPC `-32600` error and skipped.
 
 ### `replace_text`
 
