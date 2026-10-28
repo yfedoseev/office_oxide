@@ -197,3 +197,77 @@ fn test_an_embedded_package_that_opens_is_opened_once() {
     assert!(doc.plain_text().contains("inner text"));
     assert_read_once(&bytes, read);
 }
+
+/// The `i`th spelling of `name`: the case of each letter follows a bit of
+/// `i`, so spellings `0..2^n` are all different and name one part.
+fn spelling(name: &str, i: usize) -> String {
+    let mut bit = 0;
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphabetic() {
+                let upper = (i >> (bit % usize::BITS as usize)) & 1 == 1;
+                bit += 1;
+                if upper {
+                    c.to_ascii_uppercase()
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// A body of one section per spelling `i` of a header, each section naming
+/// the header through relationship `rId{100 + i}`.
+fn sections_naming_header(n: usize) -> String {
+    (0..n)
+        .map(|i| {
+            format!(
+                r#"<w:p><w:pPr><w:sectPr><w:headerReference w:type="default" r:id="rId{}"/></w:sectPr></w:pPr><w:r><w:t>p</w:t></w:r></w:p>"#,
+                100 + i
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn test_a_header_part_named_by_different_spellings_is_read_once() {
+    let padded = format!(
+        r#"<w:hdr xmlns:w="{WML}"><w:p><w:r><w:t>x</w:t></w:p></w:r>{}</w:hdr"#,
+        " ".repeat(PART_BYTES)
+    );
+    let bytes = docx_with(
+        &sections_naming_header(COPIES),
+        &rels_to(COPIES, "header", |i| spelling("header1.xml", i)),
+        vec![("word/header1.xml".into(), padded.into_bytes())],
+    );
+    let (doc, read) = open_counting(bytes.clone());
+    assert_eq!(doc.unreadable_parts.len(), 1, "{:?}", doc.unreadable_parts);
+    assert_read_once(&bytes, read);
+}
+
+#[test]
+fn test_a_header_part_that_reads_is_kept_once_whatever_the_spelling() {
+    let header = format!(r#"<w:hdr xmlns:w="{WML}"><w:p><w:r><w:t>Top</w:t></w:r></w:p></w:hdr>"#);
+    let bytes = docx_with(
+        &sections_naming_header(8),
+        &rels_to(8, "header", |i| spelling("header1.xml", i)),
+        vec![("word/header1.xml".into(), header.into_bytes())],
+    );
+    let (doc, _) = open_counting(bytes);
+    assert_eq!(doc.headers_footers.len(), 1);
+}
+
+#[test]
+fn test_an_image_part_named_by_different_spellings_is_read_once() {
+    let bytes = docx_with(
+        "<w:p/>",
+        &rels_to(COPIES, "image", |i| spelling("media/image1.png", i)),
+        vec![("word/media/image1.png".into(), vec![7u8; PART_BYTES])],
+    );
+    let (doc, read) = open_counting(bytes.clone());
+    assert_eq!(doc.images.len(), COPIES);
+    assert_read_once(&bytes, read);
+}

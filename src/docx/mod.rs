@@ -462,7 +462,7 @@ impl DocxDocument {
         // and re-parsing it per reference multiplied its size by the
         // section count. `hf_by_ref` records which stored entry each
         // reference resolved to.
-        let mut hf_cache: std::collections::HashMap<(String, u8, bool), usize> =
+        let mut hf_cache: std::collections::HashMap<(crate::core::opc::PartName, u8, bool), usize> =
             std::collections::HashMap::new();
         let mut hf_by_ref: Vec<Vec<Option<usize>>> = Vec::new();
         // Image parts already read, by part name, `None` when a part could not
@@ -471,7 +471,8 @@ impl DocxDocument {
         // tried again by each.
         let mut image_by_part: ImageParts = std::collections::HashMap::new();
         // Header and footer parts that could not be read or parsed.
-        let mut hf_failed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut hf_failed: std::collections::HashSet<crate::core::opc::PartName> =
+            std::collections::HashSet::new();
         let mut parse_hf = |hf_ref: &HeaderFooterRef,
                             is_header: bool,
                             title_page: bool|
@@ -482,11 +483,11 @@ impl DocxDocument {
                     if opc.has_part(&part_name) {
                         // Failed once, failed for every reference: it is not
                         // read again, nor reported again.
-                        if hf_failed.contains(part_name.as_str()) {
+                        if hf_failed.contains(&part_name) {
                             return Ok(None);
                         }
                         let active = title_page || hf_ref.hf_type != HeaderFooterType::First;
-                        let key = (part_name.as_str().to_string(), hf_ref.hf_type as u8, is_header);
+                        let key = (part_name.clone(), hf_ref.hf_type as u8, is_header);
                         if let Some(&idx) = hf_cache.get(&key) {
                             // Shown wherever any reference to it is.
                             headers_footers[idx].active |= active;
@@ -500,7 +501,7 @@ impl DocxDocument {
                             Ok(d) => d,
                             Err(e) => {
                                 skip_unreadable(part_name.as_str(), &e);
-                                hf_failed.insert(part_name.as_str().to_string());
+                                hf_failed.insert(part_name.clone());
                                 return Ok(None);
                             },
                         };
@@ -508,7 +509,7 @@ impl DocxDocument {
                             Ok(c) => c,
                             Err(e) => {
                                 skip_unreadable(part_name.as_str(), &e);
-                                hf_failed.insert(part_name.as_str().to_string());
+                                hf_failed.insert(part_name.clone());
                                 return Ok(None);
                             },
                         };
@@ -2293,9 +2294,11 @@ fn qualify_part_images<R: Read + Seek>(
     }
 }
 
-/// Image parts already read, by part name: the bytes, or `None` when the part
+/// Image parts already read, by part name (compared as a zip lookup is, without
+/// regard to case): the bytes, or `None` when the part
 /// could not be read.
-type ImageParts = std::collections::HashMap<String, Option<std::sync::Arc<[u8]>>>;
+type ImageParts =
+    std::collections::HashMap<crate::core::opc::PartName, Option<std::sync::Arc<[u8]>>>;
 
 /// The bytes of the image part `part`, read once however many relationships
 /// name it. A part that cannot be read is reported once and not tried again.
@@ -2305,7 +2308,7 @@ fn read_image_part<R: Read + Seek>(
     read: &mut ImageParts,
     skip: &dyn Fn(&str, &dyn std::fmt::Display),
 ) -> Option<std::sync::Arc<[u8]>> {
-    if let Some(found) = read.get(part.as_str()) {
+    if let Some(found) = read.get(part) {
         return found.clone();
     }
     let data: Option<std::sync::Arc<[u8]>> = match opc.read_part(part) {
@@ -2315,7 +2318,7 @@ fn read_image_part<R: Read + Seek>(
             None
         },
     };
-    read.insert(part.as_str().to_string(), data.clone());
+    read.insert(part.clone(), data.clone());
     data
 }
 
