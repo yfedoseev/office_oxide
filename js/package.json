@@ -40,7 +40,7 @@
     "test": "node --test test/*.mjs"
   },
   "dependencies": {
-    "koffi": "^3.3.3"
+    "koffi": "^3.3.5"
   },
   "optionalDependencies": {
     "office-oxide-darwin-arm64": "0.1.15",
