@@ -512,10 +512,8 @@ impl<'d> SheetConverter<'d> {
             // for: the pictures past the budget are left out, and said so.
             // Its alternative text and the elements around it are paid for
             // as text.
-            if !budget.charge(picture_chars(pic))
-                || !image_budget.charge(pic.data.len())
-                || (*scope == IrScope::Sheet && !total_image_budget.charge(pic.data.len()))
-            {
+            let total = (*scope == IrScope::Sheet).then_some(&mut *total_image_budget);
+            if !charge_picture(budget, image_budget, total, picture_chars(pic), pic.data.len()) {
                 break;
             }
             let format = image_format_from_ext(&pic.format);
@@ -1139,6 +1137,43 @@ fn picture_chars(pic: &crate::xlsx::worksheet::WorksheetPicture) -> usize {
         .saturating_add(pic.alt_text.as_ref().map_or(0, String::len))
 }
 
+/// Pay for a picture from every budget that bounds it, or from none: a
+/// picture that is not produced costs nothing, whichever budget refuses it.
+/// The budget (or budgets) that cannot pay is charged all the same, which is
+/// what marks it spent for the notice that says so.
+fn charge_picture(
+    text: &mut crate::limits::TextBudget,
+    image: &mut crate::limits::TextBudget,
+    total: Option<&mut crate::limits::TextBudget>,
+    chars: usize,
+    bytes: usize,
+) -> bool {
+    let fits =
+        text.fits(chars) && image.fits(bytes) && total.as_deref().is_none_or(|t| t.fits(bytes));
+    if fits {
+        // Each fits, so each charge succeeds.
+        let _ = text.charge(chars);
+        let _ = image.charge(bytes);
+        if let Some(t) = total {
+            let _ = t.charge(bytes);
+        }
+        return true;
+    }
+    // Only the budgets that cannot pay are touched.
+    if !text.fits(chars) {
+        let _ = text.charge(chars);
+    }
+    if !image.fits(bytes) {
+        let _ = image.charge(bytes);
+    }
+    if let Some(t) = total {
+        if !t.fits(bytes) {
+            let _ = t.charge(bytes);
+        }
+    }
+    false
+}
+
 /// The notice for picture bytes copied past the total the whole run may copy.
 fn total_image_notice(budget: &crate::limits::TextBudget) -> String {
     format!(
@@ -1745,5 +1780,44 @@ fn image_format_from_ext(ext: &str) -> Option<ImageFormat> {
         "emf" => Some(ImageFormat::Emf),
         "wmf" => Some(ImageFormat::Wmf),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::charge_picture;
+    use crate::limits::TextBudget;
+
+    /// A picture that one budget refuses costs the others nothing, whichever
+    /// of them refuses it.
+    #[test]
+    fn test_a_refused_picture_costs_no_budget_anything() {
+        let (mut text, mut image, mut total) = (
+            TextBudget::with_limit(100),
+            TextBudget::with_limit(10),
+            TextBudget::with_limit(100),
+        );
+        assert!(!charge_picture(&mut text, &mut image, Some(&mut total), 60, 50));
+        assert!(image.exhausted());
+        assert!(!text.exhausted() && !total.exhausted());
+        assert!(text.charge(100) && total.charge(100), "the refused picture spent budget");
+
+        let (mut text, mut image, mut total) = (
+            TextBudget::with_limit(100),
+            TextBudget::with_limit(100),
+            TextBudget::with_limit(10),
+        );
+        assert!(!charge_picture(&mut text, &mut image, Some(&mut total), 60, 50));
+        assert!(total.exhausted());
+        assert!(text.charge(100) && image.charge(100), "the refused picture spent budget");
+
+        let (mut text, mut image) = (TextBudget::with_limit(10), TextBudget::with_limit(100));
+        assert!(!charge_picture(&mut text, &mut image, None, 60, 50));
+        assert!(text.exhausted());
+        assert!(image.charge(100), "the refused picture spent budget");
+
+        let (mut text, mut image) = (TextBudget::with_limit(100), TextBudget::with_limit(100));
+        assert!(charge_picture(&mut text, &mut image, None, 60, 50));
+        assert!(!text.charge(60) && image.charge(50), "an accepted picture is charged to each");
     }
 }
