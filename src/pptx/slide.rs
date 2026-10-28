@@ -1885,10 +1885,13 @@ fn parse_table_cell(
 /// a comment of their own, after the comment they answer. `authors` maps an
 /// author id to its display name — read from the presentation's
 /// comment-authors / authors part, see [`parse_comment_authors`].
+///
+/// A part that is not well-formed gives the comments read before the damage
+/// and, second, why reading stopped.
 pub(crate) fn parse_comments(
     xml_data: &[u8],
     authors: &std::collections::HashMap<String, String>,
-) -> Vec<SlideComment> {
+) -> (Vec<SlideComment>, Option<String>) {
     /// One open `cm` or `reply` element.
     struct Frame {
         author_id: Option<String>,
@@ -1910,6 +1913,7 @@ pub(crate) fn parse_comments(
     let mut reader = make_content_reader(xml_data);
     let mut out = Vec::new();
     let mut frames: Vec<Frame> = Vec::new();
+    let mut error = None;
 
     loop {
         match reader.read_event() {
@@ -1973,20 +1977,30 @@ pub(crate) fn parse_comments(
                 },
                 _ => {},
             },
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                error = Some(e.to_string());
+                break;
+            },
             _ => {},
         }
     }
-    out
+    (out, error)
 }
 
 /// Parse a comment-authors part into `id → name`: the legacy
 /// `<p:cmAuthorLst><p:cmAuthor id="0" name="…"/>` (ECMA-376 Part 1
 /// §19.4.2) or the modern `<p188:authorLst><p188:author id="{guid}"
 /// name="…"/>` ([MS-PPTX] authors part).
-pub(crate) fn parse_comment_authors(xml_data: &[u8]) -> std::collections::HashMap<String, String> {
+///
+/// A part that is not well-formed gives the authors read before the damage
+/// and, second, why reading stopped.
+pub(crate) fn parse_comment_authors(
+    xml_data: &[u8],
+) -> (std::collections::HashMap<String, String>, Option<String>) {
     let mut reader = make_content_reader(xml_data);
     let mut authors = std::collections::HashMap::new();
+    let mut error = None;
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e))
@@ -1998,11 +2012,15 @@ pub(crate) fn parse_comment_authors(xml_data: &[u8]) -> std::collections::HashMa
                     authors.insert(id.into_owned(), name.into_owned());
                 }
             },
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                error = Some(e.to_string());
+                break;
+            },
             _ => {},
         }
     }
-    authors
+    (authors, error)
 }
 
 /// Extract the speaker notes body from a notes slide XML. Finds the
@@ -2223,6 +2241,7 @@ mod tests {
             app_properties: None,
             has_macros: false,
             unreadable_parts: Vec::new(),
+            unreadable_parts_omitted: 0,
             layouts: Vec::new(),
             masters: Vec::new(),
             package_properties: Default::default(),
@@ -2270,6 +2289,7 @@ mod tests {
             app_properties: None,
             has_macros: false,
             unreadable_parts: Vec::new(),
+            unreadable_parts_omitted: 0,
             layouts: Vec::new(),
             masters: Vec::new(),
             package_properties: Default::default(),

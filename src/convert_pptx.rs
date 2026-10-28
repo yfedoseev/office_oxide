@@ -203,6 +203,7 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
             text_truncated: !doc.unreadable_parts.is_empty()
+                || doc.unreadable_parts_omitted > 0
                 || copied_text_notice.is_some()
                 || image_notice.is_some(),
             ..crate::core::core_properties::ooxml_metadata_extras(
@@ -220,6 +221,11 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             .iter()
             .map(|(part, err)| format!("skipped unreadable part {part}: {err}")),
     );
+    if doc.unreadable_parts_omitted > 0 {
+        ir.metadata
+            .warnings
+            .push(crate::core::unreadable::omitted_warning(doc.unreadable_parts_omitted));
+    }
     ir.metadata.warnings.extend(copied_text_notice);
     ir.metadata
         .warnings

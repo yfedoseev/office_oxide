@@ -123,6 +123,9 @@ pub struct DocxDocument {
     /// part and the error. They are skipped so the body still opens —
     /// the policy Tika/POI follow — and reported here instead of vanishing.
     pub unreadable_parts: Vec<String>,
+    /// How many unreadable parts beyond the first 100 in [`Self::unreadable_parts`]
+    /// were left out of the list.
+    pub unreadable_parts_omitted: usize,
     /// Set when hyperlink target text copied while reading exceeded the text
     /// budget and some link lost its fragment or its target.
     pub(crate) link_notice: Option<String>,
@@ -226,6 +229,14 @@ impl DocxDocument {
         let doc_rels = opc.read_rels_for(&main_part)?;
         let has_macros = doc_rels.has_vba_project();
 
+        // Parts the reader skips are recorded here: each once, at most 100
+        // kept, the rest counted (see `core::unreadable`).
+        let unreadable_parts =
+            std::cell::RefCell::new(crate::core::unreadable::UnreadableParts::new("docx"));
+        let skip_unreadable = |part: &str, e: &dyn std::fmt::Display| {
+            unreadable_parts.borrow_mut().record(part, e);
+        };
+
         // Parse theme
         // A theme is decoration: it supplies colour-scheme lookups and
         // nothing more. A malformed or missing theme part used to fail the
@@ -234,13 +245,25 @@ impl DocxDocument {
         // the inconsistency that gave it away.
         let theme = doc_rels
             .first_by_type(rel_types::THEME)
-            .and_then(|rel| main_part.resolve_relative(&rel.target).ok())
+            .and_then(|rel| match main_part.resolve_relative(&rel.target) {
+                Ok(pn) => Some(pn),
+                Err(e) => {
+                    skip_unreadable(&rel.target, &e);
+                    None
+                },
+            })
             .filter(|pn| opc.has_part(pn))
-            .and_then(|pn| opc.read_part(&pn).ok())
-            .and_then(|data| match Theme::parse(&data) {
+            .and_then(|pn| match opc.read_part(&pn) {
+                Ok(data) => Some((pn, data)),
+                Err(e) => {
+                    skip_unreadable(pn.as_str(), &e);
+                    None
+                },
+            })
+            .and_then(|(pn, data)| match Theme::parse(&data) {
                 Ok(t) => Some(t),
                 Err(e) => {
-                    debug!("DocxDocument: ignoring unreadable theme part: {e}");
+                    skip_unreadable(pn.as_str(), &e);
                     None
                 },
             });
@@ -259,7 +282,12 @@ impl DocxDocument {
             let part_name = main_part.resolve_relative(&rel.target)?;
             match opc.read_part(&part_name) {
                 Ok(data) => Some(NumberingDefinitions::parse(&data)?),
-                Err(_) => None,
+                // Numbering is optional, so the document opens without it;
+                // the list markers lost are reported.
+                Err(e) => {
+                    skip_unreadable(part_name.as_str(), &e);
+                    None
+                },
             }
         } else {
             None
@@ -292,8 +320,12 @@ impl DocxDocument {
                 if !opc.has_part(&part) {
                     continue;
                 }
-                let Ok(data) = opc.read_part(&part) else {
-                    continue;
+                let data = match opc.read_part(&part) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        skip_unreadable(part.as_str(), &e);
+                        continue;
+                    },
                 };
                 let paras = parse_alt_chunk(&data, part.as_str());
                 if !paras.is_empty() {
@@ -316,44 +348,82 @@ impl DocxDocument {
         // that text reached any consumer.
         let mut chart_text_by_rid: std::collections::HashMap<String, std::sync::Arc<[String]>> =
             std::collections::HashMap::new();
+        // Several relationships can name one part: it is read and parsed
+        // once, whether or not it could be.
+        let mut chart_text_by_part: std::collections::HashMap<
+            crate::core::opc::PartName,
+            std::sync::Arc<[String]>,
+        > = std::collections::HashMap::new();
         for rel in doc_rels.all() {
             if rel.rel_type != rel_types::CHART || rel.target_mode != TargetMode::Internal {
                 continue;
             }
-            let Ok(part) = main_part.resolve_relative(&rel.target) else {
-                continue;
+            let part = match main_part.resolve_relative(&rel.target) {
+                Ok(part) => part,
+                Err(e) => {
+                    skip_unreadable(&rel.target, &e);
+                    continue;
+                },
             };
             if !opc.has_part(&part) {
                 continue;
             }
-            let Ok(data) = opc.read_part(&part) else {
-                continue;
+            let lines = match chart_text_by_part.get(&part) {
+                Some(lines) => lines.clone(),
+                None => {
+                    let lines: std::sync::Arc<[String]> = match opc.read_part(&part) {
+                        Ok(data) => crate::core::chart::chart_text_lines(&data).into(),
+                        Err(e) => {
+                            skip_unreadable(part.as_str(), &e);
+                            std::sync::Arc::from(Vec::new())
+                        },
+                    };
+                    chart_text_by_part.insert(part, lines.clone());
+                    lines
+                },
             };
-            let lines = crate::core::chart::chart_text_lines(&data);
             if !lines.is_empty() {
-                chart_text_by_rid.insert(rel.id.clone(), lines.into());
+                chart_text_by_rid.insert(rel.id.clone(), lines);
             }
         }
         // Resolve every SmartArt diagram the body references, the same
         // way charts are resolved just above.
         let mut dgm_text_by_rid: std::collections::HashMap<String, std::sync::Arc<[String]>> =
             std::collections::HashMap::new();
+        let mut dgm_text_by_part: std::collections::HashMap<
+            crate::core::opc::PartName,
+            std::sync::Arc<[String]>,
+        > = std::collections::HashMap::new();
         for rel in doc_rels.all() {
             if rel.rel_type != rel_types::DIAGRAM_DATA || rel.target_mode != TargetMode::Internal {
                 continue;
             }
-            let Ok(part) = main_part.resolve_relative(&rel.target) else {
-                continue;
+            let part = match main_part.resolve_relative(&rel.target) {
+                Ok(part) => part,
+                Err(e) => {
+                    skip_unreadable(&rel.target, &e);
+                    continue;
+                },
             };
             if !opc.has_part(&part) {
                 continue;
             }
-            let Ok(data) = opc.read_part(&part) else {
-                continue;
+            let lines = match dgm_text_by_part.get(&part) {
+                Some(lines) => lines.clone(),
+                None => {
+                    let lines: std::sync::Arc<[String]> = match opc.read_part(&part) {
+                        Ok(data) => diagram_text_lines(&data).into(),
+                        Err(e) => {
+                            skip_unreadable(part.as_str(), &e);
+                            std::sync::Arc::from(Vec::new())
+                        },
+                    };
+                    dgm_text_by_part.insert(part, lines.clone());
+                    lines
+                },
             };
-            let lines = diagram_text_lines(&data);
             if !lines.is_empty() {
-                dgm_text_by_rid.insert(rel.id.clone(), lines.into());
+                dgm_text_by_rid.insert(rel.id.clone(), lines);
             }
         }
         if !chart_text_by_rid.is_empty() || !dgm_text_by_rid.is_empty() {
@@ -363,7 +433,15 @@ impl DocxDocument {
         // Resolve every embedded native OOXML package object
         // (`<o:OLEObject Type="Embed">`) by opening its bytes
         // with the appropriate format reader and folding in its text.
-        resolve_deferred_parts(&mut body.elements, &mut opc, &main_part, &doc_rels);
+        let mut deferred = DeferredParts::default();
+        resolve_deferred_parts(
+            &mut body.elements,
+            &mut opc,
+            &main_part,
+            &doc_rels,
+            &mut deferred,
+            &skip_unreadable,
+        );
 
         // Parse headers and footers. Walk header refs and footer refs
         // separately so each parsed `HeaderFooter` can record its own
@@ -387,11 +465,13 @@ impl DocxDocument {
         let mut hf_cache: std::collections::HashMap<(String, u8, bool), usize> =
             std::collections::HashMap::new();
         let mut hf_by_ref: Vec<Vec<Option<usize>>> = Vec::new();
-        let unreadable_parts = std::cell::RefCell::new(Vec::<String>::new());
-        let skip_unreadable = |part: &str, e: &dyn std::fmt::Display| {
-            log::warn!("docx: skipping unreadable {part}: {e}");
-            unreadable_parts.borrow_mut().push(format!("{part}: {e}"));
-        };
+        // Image parts already read, by part name, `None` when a part could not
+        // be: shared by the main document, headers, footers and notes, so
+        // that a picture many parts name is read once and a failure is not
+        // tried again by each.
+        let mut image_by_part: ImageParts = std::collections::HashMap::new();
+        // Header and footer parts that could not be read or parsed.
+        let mut hf_failed: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut parse_hf = |hf_ref: &HeaderFooterRef,
                             is_header: bool,
                             title_page: bool|
@@ -400,6 +480,11 @@ impl DocxDocument {
                 if rel.target_mode == TargetMode::Internal {
                     let part_name = main_part.resolve_relative(&rel.target)?;
                     if opc.has_part(&part_name) {
+                        // Failed once, failed for every reference: it is not
+                        // read again, nor reported again.
+                        if hf_failed.contains(part_name.as_str()) {
+                            return Ok(None);
+                        }
                         let active = title_page || hf_ref.hf_type != HeaderFooterType::First;
                         let key = (part_name.as_str().to_string(), hf_ref.hf_type as u8, is_header);
                         if let Some(&idx) = hf_cache.get(&key) {
@@ -415,6 +500,7 @@ impl DocxDocument {
                             Ok(d) => d,
                             Err(e) => {
                                 skip_unreadable(part_name.as_str(), &e);
+                                hf_failed.insert(part_name.as_str().to_string());
                                 return Ok(None);
                             },
                         };
@@ -422,6 +508,7 @@ impl DocxDocument {
                             Ok(c) => c,
                             Err(e) => {
                                 skip_unreadable(part_name.as_str(), &e);
+                                hf_failed.insert(part_name.as_str().to_string());
                                 return Ok(None);
                             },
                         };
@@ -437,6 +524,8 @@ impl DocxDocument {
                                     &hf_rels,
                                     &mut opc,
                                     &mut part_images,
+                                    &mut image_by_part,
+                                    &skip_unreadable,
                                 );
                             },
                             Err(e) => skip_unreadable(&part_name.rels_path(), &e),
@@ -494,8 +583,12 @@ impl DocxDocument {
             let Some(rel) = doc_rels.first_by_type(rel_type) else {
                 return Vec::new();
             };
-            let Ok(part) = main_part.resolve_relative(&rel.target) else {
-                return Vec::new();
+            let part = match main_part.resolve_relative(&rel.target) {
+                Ok(part) => part,
+                Err(e) => {
+                    skip_unreadable(&rel.target, &e);
+                    return Vec::new();
+                },
             };
             if !opc.has_part(&part) {
                 return Vec::new();
@@ -533,6 +626,8 @@ impl DocxDocument {
                             &note_rels,
                             &mut opc,
                             &mut part_images,
+                            &mut image_by_part,
+                            &skip_unreadable,
                         );
                     }
                 },
@@ -559,7 +654,14 @@ impl DocxDocument {
             if !(lower.ends_with(".ttf") || lower.ends_with(".otf")) {
                 continue;
             }
-            if let Ok(data) = opc.read_part(&name) {
+            let data = match opc.read_part(&name) {
+                Ok(data) => Some(data),
+                Err(e) => {
+                    skip_unreadable(&s, &e);
+                    None
+                },
+            };
+            if let Some(data) = data {
                 // Extract a usable face name from the OPC part. Writers
                 // ship fonts as `font_<n>_<face_name>.<ext>` (the
                 // `embedded_fonts` writer convention used by all three
@@ -586,30 +688,25 @@ impl DocxDocument {
         // without re-sniffing magic bytes.
         let mut images: std::collections::HashMap<String, (std::sync::Arc<[u8]>, Option<String>)> =
             std::collections::HashMap::new();
-        let mut image_by_part: std::collections::HashMap<String, std::sync::Arc<[u8]>> =
-            std::collections::HashMap::new();
         for rel in doc_rels.get_by_type(rel_types::IMAGE) {
             if rel.target_mode != TargetMode::Internal {
                 continue;
             }
             let part_name = match main_part.resolve_relative(&rel.target) {
                 Ok(p) => p,
-                Err(_) => continue,
+                Err(e) => {
+                    skip_unreadable(&rel.target, &e);
+                    continue;
+                },
             };
             if !opc.has_part(&part_name) {
                 continue;
             }
             // Relationships that name one image part share its bytes.
-            let data = match image_by_part.get(part_name.as_str()) {
-                Some(d) => std::sync::Arc::clone(d),
-                None => {
-                    let d: std::sync::Arc<[u8]> = match opc.read_part(&part_name) {
-                        Ok(d) => d.into(),
-                        Err(_) => continue,
-                    };
-                    image_by_part.insert(part_name.as_str().to_string(), std::sync::Arc::clone(&d));
-                    d
-                },
+            let Some(data) =
+                read_image_part(&part_name, &mut opc, &mut image_by_part, &skip_unreadable)
+            else {
+                continue;
             };
             let ext = part_name
                 .as_str()
@@ -628,6 +725,7 @@ impl DocxDocument {
             images.len()
         );
         package_properties.crc_mismatched_parts = opc.crc_mismatched_parts();
+        let (unreadable_parts, unreadable_parts_omitted) = unreadable_parts.into_inner().finish();
         Ok(DocxDocument {
             body,
             styles,
@@ -636,7 +734,11 @@ impl DocxDocument {
             sections,
             headers_footers,
             hf_by_ref,
-            unreadable_parts: unreadable_parts.into_inner(),
+            unreadable_parts: unreadable_parts
+                .into_iter()
+                .map(|(part, reason)| format!("{part}: {reason}"))
+                .collect(),
+            unreadable_parts_omitted,
             link_notice: links.notice(),
             embedded_fonts,
             images,
@@ -2156,6 +2258,8 @@ fn qualify_part_images<R: Read + Seek>(
     rels: &crate::core::relationships::Relationships,
     opc: &mut OpcReader<R>,
     images: &mut std::collections::HashMap<String, (std::sync::Arc<[u8]>, Option<String>)>,
+    read: &mut ImageParts,
+    skip: &dyn Fn(&str, &dyn std::fmt::Display),
 ) {
     let prefix = format!("{}:", part.as_str().rsplit('/').next().unwrap_or(""));
     let mut any = false;
@@ -2163,13 +2267,17 @@ fn qualify_part_images<R: Read + Seek>(
         if rel.target_mode != TargetMode::Internal {
             continue;
         }
-        let Ok(image_part) = part.resolve_relative(&rel.target) else {
-            continue;
+        let image_part = match part.resolve_relative(&rel.target) {
+            Ok(image_part) => image_part,
+            Err(e) => {
+                skip(&rel.target, &e);
+                continue;
+            },
         };
         if !opc.has_part(&image_part) {
             continue;
         }
-        let Ok(data) = opc.read_part(&image_part) else {
+        let Some(data) = read_image_part(&image_part, opc, read, skip) else {
             continue;
         };
         let ext = image_part
@@ -2177,12 +2285,38 @@ fn qualify_part_images<R: Read + Seek>(
             .rsplit('.')
             .next()
             .map(|s| s.to_lowercase());
-        images.insert(format!("{prefix}{}", rel.id), (data.into(), ext));
+        images.insert(format!("{prefix}{}", rel.id), (data, ext));
         any = true;
     }
     if any {
         prefix_drawing_rids(elements, &prefix);
     }
+}
+
+/// Image parts already read, by part name: the bytes, or `None` when the part
+/// could not be read.
+type ImageParts = std::collections::HashMap<String, Option<std::sync::Arc<[u8]>>>;
+
+/// The bytes of the image part `part`, read once however many relationships
+/// name it. A part that cannot be read is reported once and not tried again.
+fn read_image_part<R: Read + Seek>(
+    part: &crate::core::opc::PartName,
+    opc: &mut OpcReader<R>,
+    read: &mut ImageParts,
+    skip: &dyn Fn(&str, &dyn std::fmt::Display),
+) -> Option<std::sync::Arc<[u8]>> {
+    if let Some(found) = read.get(part.as_str()) {
+        return found.clone();
+    }
+    let data: Option<std::sync::Arc<[u8]>> = match opc.read_part(part) {
+        Ok(data) => Some(data.into()),
+        Err(e) => {
+            skip(part.as_str(), &e);
+            None
+        },
+    };
+    read.insert(part.as_str().to_string(), data.clone());
+    data
 }
 
 fn prefix_drawing_rids(elements: &mut [BlockElement], prefix: &str) {
@@ -2282,6 +2416,8 @@ fn resolve_deferred_parts<R: Read + Seek>(
     opc: &mut OpcReader<R>,
     main_part: &crate::core::opc::PartName,
     doc_rels: &crate::core::relationships::Relationships,
+    done: &mut DeferredParts,
+    skip: &dyn Fn(&str, &dyn std::fmt::Display),
 ) {
     for elem in elements {
         match elem {
@@ -2295,12 +2431,14 @@ fn resolve_deferred_parts<R: Read + Seek>(
                         for rc in &mut run.content {
                             match rc {
                                 RunContent::TextBox(blocks) => {
-                                    resolve_deferred_parts(blocks, opc, main_part, doc_rels);
+                                    resolve_deferred_parts(
+                                        blocks, opc, main_part, doc_rels, done, skip,
+                                    );
                                 },
                                 RunContent::DeferredPart(rid) => {
-                                    if let Some(blocks) =
-                                        resolve_one_deferred_part(rid, opc, main_part, doc_rels)
-                                    {
+                                    if let Some(blocks) = resolve_one_deferred_part(
+                                        rid, opc, main_part, doc_rels, done, skip,
+                                    ) {
                                         *rc = RunContent::TextBox(blocks);
                                     }
                                 },
@@ -2313,7 +2451,14 @@ fn resolve_deferred_parts<R: Read + Seek>(
             BlockElement::Table(t) => {
                 for row in &mut t.rows {
                     for cell in &mut row.cells {
-                        resolve_deferred_parts(&mut cell.content, opc, main_part, doc_rels);
+                        resolve_deferred_parts(
+                            &mut cell.content,
+                            opc,
+                            main_part,
+                            doc_rels,
+                            done,
+                            skip,
+                        );
                     }
                 }
             },
@@ -2321,26 +2466,63 @@ fn resolve_deferred_parts<R: Read + Seek>(
     }
 }
 
+/// The embedded packages already opened, by part: their paragraphs, or
+/// `None` when the part could not be read or opened. Several objects can name
+/// one part; it is opened once, and a failure is remembered as a success is.
+type DeferredParts =
+    std::collections::HashMap<crate::core::opc::PartName, Option<Vec<BlockElement>>>;
+
 fn resolve_one_deferred_part<R: Read + Seek>(
     rid: &str,
     opc: &mut OpcReader<R>,
     main_part: &crate::core::opc::PartName,
     doc_rels: &crate::core::relationships::Relationships,
+    done: &mut DeferredParts,
+    skip: &dyn Fn(&str, &dyn std::fmt::Display),
 ) -> Option<Vec<BlockElement>> {
     let rel = doc_rels.get_by_id(rid)?;
     if rel.target_mode != TargetMode::Internal {
         return None;
     }
-    let part = main_part.resolve_relative(&rel.target).ok()?;
+    let part = match main_part.resolve_relative(&rel.target) {
+        Ok(part) => part,
+        Err(e) => {
+            skip(&rel.target, &e);
+            return None;
+        },
+    };
     if !opc.has_part(&part) {
         return None;
     }
+    if let Some(found) = done.get(&part) {
+        return found.clone();
+    }
+    let found = open_deferred_part(&part, opc, skip);
+    done.insert(part, found.clone());
+    found
+}
+
+fn open_deferred_part<R: Read + Seek>(
+    part: &crate::core::opc::PartName,
+    opc: &mut OpcReader<R>,
+    skip: &dyn Fn(&str, &dyn std::fmt::Display),
+) -> Option<Vec<BlockElement>> {
     let ext = part.as_str().rsplit('.').next()?;
     let format = crate::format::DocumentFormat::from_extension(ext)?;
-    let data = opc.read_part(&part).ok()?;
-    let text = crate::Document::from_reader(std::io::Cursor::new(data), format)
-        .ok()?
-        .plain_text();
+    let data = match opc.read_part(part) {
+        Ok(data) => data,
+        Err(e) => {
+            skip(part.as_str(), &e);
+            return None;
+        },
+    };
+    let text = match crate::Document::from_reader(std::io::Cursor::new(data), format) {
+        Ok(doc) => doc.plain_text(),
+        Err(e) => {
+            skip(part.as_str(), &e);
+            return None;
+        },
+    };
     let paragraphs: Vec<BlockElement> = text
         .lines()
         .filter(|l| !l.trim().is_empty())

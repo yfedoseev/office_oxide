@@ -39,6 +39,8 @@ pub mod theme;
 pub mod traits;
 /// Unit types: `Emu`, `Twip`, `HalfPoint`, `Percentage1000`, `Angle60k`.
 pub mod units;
+/// The bounded record of the parts a reader could not use.
+pub(crate) mod unreadable;
 /// XML reading utilities, namespace constants, and attribute helpers.
 pub mod xml;
 

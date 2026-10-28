@@ -512,6 +512,7 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
             text_truncated: !doc.unreadable_parts.is_empty()
+                || doc.unreadable_parts_omitted > 0
                 || copied_text_notice.is_some()
                 || doc.link_notice.is_some()
                 || image_cut.is_some(),
@@ -519,6 +520,9 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
                 .unreadable_parts
                 .iter()
                 .map(|p| format!("skipped unreadable part {p}"))
+                .chain((doc.unreadable_parts_omitted > 0).then(|| {
+                    crate::core::unreadable::omitted_warning(doc.unreadable_parts_omitted)
+                }))
                 .chain(copied_text_notice)
                 .chain(doc.link_notice.clone())
                 .chain(image_cut)

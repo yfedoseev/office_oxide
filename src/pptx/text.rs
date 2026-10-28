@@ -604,6 +604,7 @@ mod tests {
             theme: None,
             embedded_fonts: Vec::new(),
             unreadable_parts: Vec::new(),
+            unreadable_parts_omitted: 0,
             layouts: Vec::new(),
             masters: Vec::new(),
         }
