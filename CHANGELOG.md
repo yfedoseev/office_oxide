@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A `.xls` formula cell whose text result follows its array, shared-formula or data-table record keeps that text.** The result was forgotten on any record other than `STRING`, so such a cell came out empty although the file holds the text.
 
-- **A deflated package part whose length differs from the size its zip header declares is read and reported, instead of being dropped as unreadable.** Tools that rewrite line endings inside a package leave such headers; a wrong CRC-32 was already tolerated. The bytes are kept, `Metadata::warnings` names the part, and an entry that inflates more than a quarter past its declared size is still refused as a decompression bomb. A stream that ends short of the declared size is reported too.
+- **A deflated package part whose length differs from the size its zip header declares is read and reported, instead of being dropped as unreadable.** A wrong CRC-32 was already tolerated; a complete deflate stream whose header length is wrong is the same kind of damage to the header, not to the content. The bytes are kept, `Metadata::warnings` names the part, and an entry that inflates more than a quarter past its declared size is still refused as a decompression bomb. A stream that ends short of the declared size is reported too.
 
 - **A Markdown table no longer carries grid columns that only continue column spans.** A table whose rows each have their own cell boundaries (typical of Word 6/95 tables) was written as one column per boundary, mostly empty; a column in which no row starts a cell holds no text and is now left out.
 
