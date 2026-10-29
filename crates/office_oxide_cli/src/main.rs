@@ -18,6 +18,12 @@ use std::process;
     about = "Fast Office document processing"
 )]
 struct Cli {
+    /// Keep text formatted as hidden (left out by default)
+    #[arg(long, global = true)]
+    include_hidden: bool,
+    /// Keep text a tracked change deleted (left out by default)
+    #[arg(long, global = true)]
+    include_deleted: bool,
     #[command(subcommand)]
     command: commands::Command,
 }
@@ -35,6 +41,8 @@ fn main() {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let cli = Cli::parse();
+    office_oxide::read_options::set_include_hidden_text(cli.include_hidden);
+    office_oxide::read_options::set_include_deleted_text(cli.include_deleted);
     if let Err(e) = commands::run(cli.command) {
         eprintln!("error: {e}");
         process::exit(1);

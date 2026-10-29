@@ -1570,20 +1570,21 @@ fn resolve_hyperlinks_in_run(
 /// `w:rubyBase` text, not in the line, and inlining it doubled every
 /// annotated word (東京 read as とうきょう東京).
 fn is_transparent_paragraph_wrapper(local: &str) -> bool {
-    matches!(
-        local,
-        "ins"
-            | "moveTo"
-            | "fldSimple"
-            | "smartTag"
-            | "sdt"
-            | "sdtContent"
-            | "ruby"
-            | "rubyBase"
-            | "bdo"
-            | "dir"
-            | "customXml"
-    )
+    (local == "del" && crate::read_options::include_deleted_text())
+        || matches!(
+            local,
+            "ins"
+                | "moveTo"
+                | "fldSimple"
+                | "smartTag"
+                | "sdt"
+                | "sdtContent"
+                | "ruby"
+                | "rubyBase"
+                | "bdo"
+                | "dir"
+                | "customXml"
+        )
 }
 
 /// Record a `w:commentRangeStart` (ECMA-376 §17.13.4) in paragraph
@@ -1668,7 +1669,13 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
                         }));
                     }
                 },
-                "del" | "moveFrom" => {
+                // With deletions included, `w:del` is a transparent wrapper
+                // (below) and its runs keep their text in `w:delText`.
+                "moveFrom" => {
+                    // Tracked deletions are not document content.
+                    xml::skip_element_fast(reader)?;
+                },
+                "del" if !crate::read_options::include_deleted_text() => {
                     // Tracked deletions are not document content.
                     xml::skip_element_fast(reader)?;
                 },
@@ -1953,6 +1960,12 @@ fn parse_run(
                 // draws, so it is kept.
                 "softHyphen" => {
                     xml::skip_element_fast(reader)?;
+                },
+                "delText" if crate::read_options::include_deleted_text() => {
+                    let text = xml::read_text_content_fast(reader)?;
+                    if !text.is_empty() {
+                        run.content.push(RunContent::Text(text));
+                    }
                 },
                 "delText" => {
                     // Deleted revision text is not document content.

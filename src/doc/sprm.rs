@@ -969,7 +969,8 @@ impl ChpProps {
     /// Text Word does not show in the accepted view: deleted revision
     /// text or hidden (`sprmCFVanish`) text.
     pub fn is_excluded(&self) -> bool {
-        self.f_rmark_del || self.vanish
+        (self.f_rmark_del && !crate::read_options::include_deleted_text())
+            || (self.vanish && !crate::read_options::include_hidden_text())
     }
 }
 

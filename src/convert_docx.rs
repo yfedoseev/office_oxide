@@ -1597,7 +1597,9 @@ fn convert_run_content(
     // and the CLI's JSON projection automatically in agreement, instead
     // of risking a 5th instance of this crate's "two renderers disagree"
     // flaw.
-    if effective.and_then(|rp| rp.hidden).unwrap_or(false) {
+    if effective.and_then(|rp| rp.hidden).unwrap_or(false)
+        && !crate::read_options::include_hidden_text()
+    {
         return;
     }
     let no_properties;
@@ -2217,7 +2219,8 @@ fn convert_table(table: &crate::docx::Table, doc: &Cx<'_, '_>) -> Element {
             // (spans are resolved per cell above), exactly like a
             // vMerge-continue cell's, so later real cells in the row don't
             // shift into the wrong column.
-            let is_deleted = cell.properties.as_ref().is_some_and(|p| p.deleted);
+            let is_deleted = cell.properties.as_ref().is_some_and(|p| p.deleted)
+                && !crate::read_options::include_deleted_text();
             if is_continue || is_deleted {
                 continue;
             }

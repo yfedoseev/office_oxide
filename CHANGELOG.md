@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.16] - 2026-10-29
 
+### Added
+
+- **Hidden text and tracked deletions can be kept.** New process-wide settings `read_options::set_include_hidden_text` and `set_include_deleted_text` (and `office-oxide --include-hidden` / `--include-deleted` on every command) bring back text a run hides (`w:vanish`, `sprmCFVanish`) and text a tracked change deleted (`w:del` runs and `w:cellDel` cells, `sprmCFRMarkDel`), in `.docx` and `.doc`, for every output. Both are off by default, so nothing read before changes; text under `w:moveFrom` stays out because the move's destination carries it.
+
 ### Fixed
 
 - **A worksheet whose XML is malformed part-way through keeps the rows before the damage.** The whole sheet was reported unreadable although everything before the damage parsed. The sheet is now read up to the end of the last complete row (a row the damage reaches is dropped whole, so no row is cut in two), a notice in every rendering and a warning say the sheet was cut short, and `text_truncated` is set. A sheet with no complete row stays unreadable. Parts of a `.docx` or `.pptx` are not salvaged yet.

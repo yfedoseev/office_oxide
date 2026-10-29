@@ -260,6 +260,9 @@ struct HiddenCtx<'a> {
 
 impl HiddenCtx<'_> {
     fn is_hidden(&self, run: &Run) -> bool {
+        if crate::read_options::include_hidden_text() {
+            return false;
+        }
         match self.styles {
             Some(sheet) => sheet.effective_hidden_in(
                 self.table,
@@ -413,7 +416,10 @@ fn plain_text_table(table: &Table, styles: Option<&StyleSheet>, out: &mut String
             .cells
             .iter()
             .enumerate()
-            .filter(|(_, c)| !c.properties.as_ref().is_some_and(|p| p.deleted))
+            .filter(|(_, c)| {
+                crate::read_options::include_deleted_text()
+                    || !c.properties.as_ref().is_some_and(|p| p.deleted)
+            })
             .collect();
         for (i, (cell_idx, cell)) in cells.iter().enumerate() {
             if i > 0 {
@@ -949,12 +955,10 @@ fn markdown_table(table: &Table, ctx: &MarkdownCtx, out: &mut String) {
     for (row_idx, row) in table.rows.iter().enumerate() {
         let mut cells: Vec<String> = Vec::new();
         // Same tracked-changes policy as plain_text_table.
-        for (cell_idx, cell) in row
-            .cells
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| !c.properties.as_ref().is_some_and(|p| p.deleted))
-        {
+        for (cell_idx, cell) in row.cells.iter().enumerate().filter(|(_, c)| {
+            crate::read_options::include_deleted_text()
+                || !c.properties.as_ref().is_some_and(|p| p.deleted)
+        }) {
             // Cells keep their inline formatting, as the IR renderer's
             // cells do; rendering them as plain text dropped every bold
             // and italic span inside a table on this surface alone.

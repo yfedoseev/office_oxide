@@ -74,6 +74,9 @@ pub mod ir_render;
 /// Resource limits for untrusted input (the per-document text budget and
 /// the package-wide entry-count and decompressed-size bounds).
 pub mod limits;
+
+/// Which text readers return: hidden text and tracked deletions.
+pub mod read_options;
 mod stream;
 
 #[cfg(not(target_family = "wasm"))]

@@ -374,6 +374,7 @@ office-oxide ir document.docx                    # Dump IR as JSON
 office-oxide info report.docx                    # Show format and metadata
 office-oxide replace report.docx OLD NEW         # Find/replace text (DOCX/PPTX), in place
 office-oxide replace report.docx OLD NEW --output edited.docx   # …written to a new file
+office-oxide text report.docx --include-hidden --include-deleted  # also hidden text and tracked deletions
 ```
 
 All six formats are supported for reading (docx, xlsx, pptx, doc, xls, ppt); `replace` writes
