@@ -66,24 +66,21 @@ fn written_table_cells(table: &Table, format: DocumentFormat) -> usize {
     table.rows.len().saturating_mul(width)
 }
 
-/// The cost of a table cell to the writer for `format`, in percent of a
-/// `.docx` cell: the limit [`crate::limits::max_write_table_cells`] is in
-/// `.docx` cells, and a `.pptx` writer holds about a third of the memory for a
-/// cell (measured at 100,000 cells: 1,832 bytes a cell for `.docx`, 632 for
-/// `.pptx`, 161 for `.xlsx`). A `.xlsx` cell is counted whole against its own
-/// limit.
-fn cell_cost_percent(format: DocumentFormat) -> usize {
+/// What one cell costs the writer for `format`, in bytes (see
+/// [`crate::limits::max_write_bytes`]).
+fn bytes_per_cell(format: DocumentFormat) -> u64 {
     match format {
-        DocumentFormat::Pptx => 35,
-        _ => 100,
+        DocumentFormat::Docx => crate::limits::WRITE_BYTES_PER_DOCX_CELL,
+        DocumentFormat::Pptx => crate::limits::WRITE_BYTES_PER_PPTX_CELL,
+        _ => crate::limits::WRITE_BYTES_PER_XLSX_CELL,
     }
 }
 
 /// Refuse an IR that exceeds the write limits: more sections than
-/// [`crate::limits::max_write_sheets`] for `.xlsx`, or tables holding more cells than
-/// [`crate::limits::max_write_table_cells`] (`.docx`, `.pptx`) or
-/// [`crate::limits::max_write_sheet_cells`] (`.xlsx`): the writers build every
-/// cell in memory, so the count is the cost.
+/// [`crate::limits::max_write_sheets`] for `.xlsx`, or tables whose cells the
+/// writer would need more than [`crate::limits::max_write_bytes`] to build: the
+/// writers build every cell in memory, so the count, weighed by what a cell of
+/// the format costs, is the cost.
 ///
 /// Counted with an explicit stack: the IR is `Deserialize` and can nest
 /// deeper than the call stack allows.
@@ -100,17 +97,12 @@ fn check_write_budget(ir: &DocumentIR, format: DocumentFormat) -> Result<()> {
             .into());
         }
     }
-    let (limit, setter) = match format {
-        DocumentFormat::Docx | DocumentFormat::Pptx => {
-            (crate::limits::max_write_table_cells(), "set_max_write_table_cells")
-        },
-        DocumentFormat::Xlsx => {
-            (crate::limits::max_write_sheet_cells(), "set_max_write_sheet_cells")
-        },
-        _ => return Ok(()),
-    };
-    let cost = cell_cost_percent(format);
-    let mut cells = 0usize;
+    if !matches!(format, DocumentFormat::Docx | DocumentFormat::Pptx | DocumentFormat::Xlsx) {
+        return Ok(());
+    }
+    let limit = crate::limits::max_write_bytes();
+    let per_cell = bytes_per_cell(format);
+    let mut cells = 0u64;
     let mut stack: Vec<&[Element]> = Vec::new();
     for s in &ir.sections {
         stack.push(&s.elements);
@@ -140,18 +132,16 @@ fn check_write_budget(ir: &DocumentIR, format: DocumentFormat) -> Result<()> {
         for e in elements {
             match e {
                 Element::Table(t) => {
-                    cells = cells.saturating_add(
-                        written_table_cells(t, format)
-                            .saturating_mul(cost)
-                            .div_ceil(100),
-                    );
+                    cells = cells.saturating_add(written_table_cells(t, format) as u64);
                     for cell in t.rows.iter().flat_map(|r| &r.cells) {
                         stack.push(&cell.content);
                     }
-                    if cells > limit {
+                    if cells.saturating_mul(per_cell) > limit {
                         return Err(crate::core::Error::PackageLimit(format!(
-                            "the document holds more than {limit} table cells; the limit is \
-                             office_oxide::limits::{setter}"
+                            "the document holds more than {} table cells, about {limit} bytes \
+                             to write as {format:?}; the limit is \
+                             office_oxide::limits::set_max_write_bytes",
+                            limit / per_cell
                         ))
                         .into());
                     }

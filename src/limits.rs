@@ -25,8 +25,8 @@
 //! [`crate::limits::max_sheet_ir_padding_bytes`] for the IR); the blocks, list items and
 //! table cells of parsed Markdown ([`crate::limits::max_markdown_elements`],
 //! [`crate::limits::max_markdown_list_items`], [`crate::limits::max_markdown_table_cells`]); and the
-//! sheets and table cells a writer will write ([`crate::limits::max_write_sheets`],
-//! [`crate::limits::max_write_table_cells`]).
+//! sheets and the memory a writer will use for cells ([`crate::limits::max_write_sheets`],
+//! [`crate::limits::max_write_bytes`]).
 //!
 //! A package embedded in a `.docx` is opened to read its text, and may embed
 //! packages of its own. What they cost is charged to the one document that
@@ -871,56 +871,42 @@ pub(crate) fn image_budget_notice() -> Option<String> {
         })
 }
 
-/// The default most table cells one IR may hold when it is written to
-/// `.docx` or `.pptx`: 250,000, counted in `.docx` cells; a `.pptx` cell weighs
-/// about a third as much to the writer (632 bytes against 1,832, measured at
-/// 100,000 cells), so a `.pptx` may hold about three times as many.
+/// The default most memory the writers may be estimated to need for the cells
+/// of one IR: 512 MiB.
 ///
-/// The writers build every cell in memory; a million-cell table took
-/// 2.2 GB to write, about 2 KB a cell, so 250,000 cells is about half a
-/// gigabyte. Genuine tables in these formats stay far below this. A worksheet
-/// is bounded by [`max_write_sheet_cells`] instead, which is far higher
-/// because the `.xlsx` writer costs far less a cell.
-pub const DEFAULT_MAX_WRITE_TABLE_CELLS: usize = 250_000;
+/// The writers build every cell in memory, and what a cell costs differs by
+/// format, so the limit is in bytes and each cell is charged what its format's
+/// writer takes: [`WRITE_BYTES_PER_DOCX_CELL`], [`WRITE_BYTES_PER_PPTX_CELL`]
+/// and [`WRITE_BYTES_PER_XLSX_CELL`] (measured at 100,000 cells: 1,832, 632 and
+/// 161 bytes, charged rounded up). At the default that is about 280,000
+/// `.docx` cells, 825,000 `.pptx` cells or 3.1 million worksheet cells. A
+/// million-cell `.docx` table took 2.2 GB to write; genuine tables in these
+/// formats stay far below the default. A process that writes larger ones raises
+/// it with [the setter](set_max_write_bytes).
+pub const DEFAULT_MAX_WRITE_BYTES: u64 = 512 << 20;
 
-static MAX_WRITE_TABLE_CELLS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_WRITE_TABLE_CELLS);
+/// What a table cell costs the `.docx` writer, in bytes (measured 1,832).
+pub const WRITE_BYTES_PER_DOCX_CELL: u64 = 1_900;
 
-/// The most table cells (nested tables included) an IR written to `.docx` or
-/// `.pptx` may hold before the write is refused.
-pub fn max_write_table_cells() -> usize {
-    MAX_WRITE_TABLE_CELLS.load(Ordering::Relaxed)
+/// What a table cell costs the `.pptx` writer, in bytes (measured 632).
+pub const WRITE_BYTES_PER_PPTX_CELL: u64 = 650;
+
+/// What a worksheet cell costs the `.xlsx` writer, in bytes (measured 161).
+pub const WRITE_BYTES_PER_XLSX_CELL: u64 = 170;
+
+static MAX_WRITE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_WRITE_BYTES);
+
+/// The most memory, in bytes, the cells (nested tables included, each table
+/// padded to its widest row) of an IR written to `.docx`, `.pptx` or `.xlsx`
+/// may be estimated to need before the write is refused.
+pub fn max_write_bytes() -> u64 {
+    MAX_WRITE_BYTES.load(Ordering::Relaxed)
 }
 
-/// Set the table-cell limit for every write afterwards. `usize::MAX`
-/// disables the bound.
-pub fn set_max_write_table_cells(cells: usize) {
-    MAX_WRITE_TABLE_CELLS.store(cells, Ordering::Relaxed);
-}
-
-/// The default most cells one IR may hold when it is written to `.xlsx`:
-/// 10,000,000.
-///
-/// A worksheet is not counted against [`max_write_table_cells`]: the `.xlsx`
-/// writer costs well under 0.3 KB a cell on top of the IR it is handed
-/// (measured at 250,000, 1,000,000 and 2,000,000 cells), so the limit for a
-/// document, which has to hold the IR already, is two orders higher: ten
-/// million cells is about 1.5 GB for the writer and a workbook of some 25 MB.
-/// Excel's own sheet is 17 billion cells; a process that writes more raises
-/// the limit with [the setter](set_max_write_sheet_cells).
-pub const DEFAULT_MAX_WRITE_SHEET_CELLS: usize = 10_000_000;
-
-static MAX_WRITE_SHEET_CELLS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_WRITE_SHEET_CELLS);
-
-/// The most cells (padded to each table's widest row) an IR written to `.xlsx`
-/// may hold before the write is refused.
-pub fn max_write_sheet_cells() -> usize {
-    MAX_WRITE_SHEET_CELLS.load(Ordering::Relaxed)
-}
-
-/// Set the worksheet-cell limit for every write afterwards. `usize::MAX`
-/// disables the bound.
-pub fn set_max_write_sheet_cells(cells: usize) {
-    MAX_WRITE_SHEET_CELLS.store(cells, Ordering::Relaxed);
+/// Set the write-memory limit for every write afterwards. `u64::MAX` disables
+/// the bound.
+pub fn set_max_write_bytes(bytes: u64) {
+    MAX_WRITE_BYTES.store(bytes, Ordering::Relaxed);
 }
 
 /// The default most worksheets an IR written to `.xlsx` may hold: 32,767.

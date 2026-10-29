@@ -9,14 +9,15 @@ use office_oxide::core::Error as CoreError;
 use office_oxide::create::create_from_ir_to_writer;
 use office_oxide::ir::*;
 use office_oxide::limits::{
-    max_write_sheet_cells, max_write_sheets, max_write_table_cells, set_max_write_sheet_cells,
-    set_max_write_sheets, set_max_write_table_cells,
+    DEFAULT_MAX_WRITE_BYTES, WRITE_BYTES_PER_DOCX_CELL, WRITE_BYTES_PER_XLSX_CELL, max_write_bytes,
+    max_write_sheets, set_max_write_bytes, set_max_write_sheets,
 };
 
 mod common;
 use common::LimitScope;
 
-const CELL_LIMIT: usize = 50;
+/// The write-memory limit these tests lower to: what 50 `.docx` cells cost.
+const BYTE_LIMIT: u64 = 50 * WRITE_BYTES_PER_DOCX_CELL;
 
 fn table(rows: usize, cols: usize) -> Table {
     let cell = || TableCell {
@@ -59,7 +60,7 @@ fn write(ir: &DocumentIR, format: DocumentFormat) -> Result<(), OfficeError> {
 #[test]
 fn test_a_table_with_too_many_cells_is_refused_when_writing() {
     let mut limits = LimitScope::new();
-    limits.set(max_write_table_cells, set_max_write_table_cells, CELL_LIMIT);
+    limits.set(max_write_bytes, set_max_write_bytes, BYTE_LIMIT);
     for format in [DocumentFormat::Docx, DocumentFormat::Pptx] {
         // A `.pptx` cell weighs about a third of a `.docx` cell to the writer,
         // so the same limit holds three times as many of them.
@@ -74,7 +75,7 @@ fn test_a_table_with_too_many_cells_is_refused_when_writing() {
             matches!(err, OfficeError::Core(CoreError::PackageLimit(_))),
             "{format:?}: {err:?}"
         );
-        assert!(err.to_string().contains("set_max_write_table_cells"));
+        assert!(err.to_string().contains("set_max_write_bytes"));
 
         // Within the limit the document is written as before.
         let small = ir_with(vec![Element::Table(table(5, 5))], format);
@@ -82,29 +83,12 @@ fn test_a_table_with_too_many_cells_is_refused_when_writing() {
     }
 }
 
-/// A `.pptx` writer holds about 632 bytes a cell against 1,832 for a `.docx`
-/// one, so the table-cell limit lets a `.pptx` hold about three times as many
-/// cells: 100 cells are past a limit of 50 in a `.docx` and within it in a
-/// `.pptx`, which counts them as 35; and many tiny tables are not free.
-#[test]
-fn test_a_pptx_cell_costs_the_writer_less_than_a_docx_cell() {
-    let mut limits = LimitScope::new();
-    limits.set(max_write_table_cells, set_max_write_table_cells, CELL_LIMIT);
-    let hundred = |format| ir_with(vec![Element::Table(table(10, 10))], format);
-    assert!(write(&hundred(DocumentFormat::Docx), DocumentFormat::Docx).is_err());
-    write(&hundred(DocumentFormat::Pptx), DocumentFormat::Pptx).expect("35 cell-equivalents fit");
-    // One-cell tables round up, so a crowd of them is charged.
-    let crowd =
-        ir_with((0..200).map(|_| Element::Table(table(1, 1))).collect(), DocumentFormat::Pptx);
-    assert!(write(&crowd, DocumentFormat::Pptx).is_err());
-}
-
 /// Rows padded to the widest row: 20 one-cell rows and one 20-cell row are
 /// only 40 cell entries, but the writers build 21 x 20 cells.
 #[test]
 fn test_one_wide_row_among_many_narrow_rows_is_charged_at_the_padded_width() {
     let mut limits = LimitScope::new();
-    limits.set(max_write_table_cells, set_max_write_table_cells, CELL_LIMIT);
+    limits.set(max_write_bytes, set_max_write_bytes, BYTE_LIMIT);
     let mut t = table(20, 1);
     t.rows.extend(table(1, 20).rows);
     for format in [DocumentFormat::Docx, DocumentFormat::Pptx] {
@@ -123,7 +107,7 @@ fn test_one_wide_row_among_many_narrow_rows_is_charged_at_the_padded_width() {
 #[test]
 fn test_column_spans_are_charged_as_the_grid_they_widen() {
     let mut limits = LimitScope::new();
-    limits.set(max_write_table_cells, set_max_write_table_cells, CELL_LIMIT);
+    limits.set(max_write_bytes, set_max_write_bytes, BYTE_LIMIT);
     let mut t = table(3, 1);
     for row in &mut t.rows {
         row.cells[0].col_span = 100;
@@ -145,7 +129,7 @@ fn test_column_spans_are_charged_as_the_grid_they_widen() {
 #[test]
 fn test_cells_are_counted_across_tables_and_inside_nested_content() {
     let mut limits = LimitScope::new();
-    limits.set(max_write_table_cells, set_max_write_table_cells, CELL_LIMIT);
+    limits.set(max_write_bytes, set_max_write_bytes, BYTE_LIMIT);
     // Three 20-cell tables: none is over the limit alone, together they are.
     let three =
         ir_with((0..3).map(|_| Element::Table(table(4, 5))).collect(), DocumentFormat::Docx);
@@ -197,30 +181,30 @@ fn test_a_direct_writer_caller_past_the_sheet_limit_gets_an_error() {
     assert!(err.to_string().contains("set_max_write_sheets"), "{err}");
 }
 
-/// The `.docx` and `.pptx` writers cost a couple of kilobytes a table cell,
-/// which is why a table is held to 250,000; the `.xlsx` writer's cost is a
-/// small multiple of the IR it is handed, so a worksheet has a limit of its
-/// own, far higher (`max_write_sheet_cells`), and the table-cell limit does
-/// not apply to it.
+/// What a cell costs the writer differs by format, so the one limit is in
+/// bytes and a cell is charged what its format takes: 100 cells are past a
+/// limit of 50 `.docx` cells in a `.docx`, and within it in a `.pptx` (about a
+/// third the cost) and in a worksheet (about a tenth).
 #[test]
-fn test_the_table_cell_limit_does_not_apply_to_a_worksheet() {
+fn test_a_cell_is_charged_what_its_formats_writer_costs() {
     let mut limits = LimitScope::new();
-    limits.set(max_write_table_cells, set_max_write_table_cells, CELL_LIMIT);
-    let sheet = ir_with(vec![Element::Table(table(10, 10))], DocumentFormat::Xlsx);
-    write(&sheet, DocumentFormat::Xlsx).expect("100 cells in a worksheet are written");
-    let doc = ir_with(vec![Element::Table(table(10, 10))], DocumentFormat::Docx);
-    assert!(write(&doc, DocumentFormat::Docx).is_err());
+    limits.set(max_write_bytes, set_max_write_bytes, BYTE_LIMIT);
+    let hundred = |format| ir_with(vec![Element::Table(table(10, 10))], format);
+    assert!(write(&hundred(DocumentFormat::Docx), DocumentFormat::Docx).is_err());
+    write(&hundred(DocumentFormat::Pptx), DocumentFormat::Pptx).expect("a pptx cell costs less");
+    write(&hundred(DocumentFormat::Xlsx), DocumentFormat::Xlsx)
+        .expect("a worksheet cell costs less");
 }
 
 #[test]
 fn test_a_worksheet_with_too_many_cells_is_refused_when_writing() {
     let mut limits = LimitScope::new();
-    limits.set(max_write_sheet_cells, set_max_write_sheet_cells, CELL_LIMIT);
-    assert_eq!(max_write_sheet_cells(), CELL_LIMIT);
+    limits.set(max_write_bytes, set_max_write_bytes, 50 * WRITE_BYTES_PER_XLSX_CELL);
+    assert_eq!(max_write_bytes(), 50 * WRITE_BYTES_PER_XLSX_CELL);
     let big = ir_with(vec![Element::Table(table(10, 10))], DocumentFormat::Xlsx);
     let err = write(&big, DocumentFormat::Xlsx).expect_err("100 cells exceed a limit of 50");
     assert!(matches!(err, OfficeError::Core(CoreError::PackageLimit(_))), "{err:?}");
-    assert!(err.to_string().contains("set_max_write_sheet_cells"), "{err}");
+    assert!(err.to_string().contains("set_max_write_bytes"), "{err}");
     // Cells are counted across the workbook's sheets, padded to the widest row.
     let two = DocumentIR {
         metadata: Metadata {
@@ -241,9 +225,15 @@ fn test_a_worksheet_with_too_many_cells_is_refused_when_writing() {
 }
 
 #[test]
-fn test_the_default_worksheet_limit_leaves_ordinary_workbooks_alone() {
+fn test_the_default_write_limit_leaves_ordinary_documents_alone() {
     let _defaults = common::default_limits();
-    assert_eq!(max_write_sheet_cells(), 10_000_000);
-    let sheet = ir_with(vec![Element::Table(table(1_000, 20))], DocumentFormat::Xlsx);
-    write(&sheet, DocumentFormat::Xlsx).expect("20,000 cells are written");
+    assert_eq!(max_write_bytes(), DEFAULT_MAX_WRITE_BYTES);
+    for format in [
+        DocumentFormat::Docx,
+        DocumentFormat::Pptx,
+        DocumentFormat::Xlsx,
+    ] {
+        let ir = ir_with(vec![Element::Table(table(1_000, 20))], format);
+        write(&ir, format).unwrap_or_else(|e| panic!("{format:?}: 20,000 cells: {e}"));
+    }
 }
