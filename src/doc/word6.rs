@@ -69,6 +69,9 @@ pub(super) struct Word6Fib {
     /// `wIdent`: `0xA5DC` for Windows, `0xA697..=0xA699` for the Macintosh variants.
     pub wident: u16,
     pub lid: u16,
+    /// `nFib`, the version of the FIB (offset 0x02); see
+    /// [`super::fib::is_word_version`].
+    pub n_fib: u16,
     /// FibBase `chs` (offset 0x0014) is 0x0100: the file was saved with a
     /// Macintosh character set, so its 8-bit text is Mac Roman.
     pub mac_charset: bool,
@@ -139,6 +142,7 @@ pub(super) fn parse_fib(data: &[u8]) -> Result<Word6Fib> {
     Ok(Word6Fib {
         wident: u16_at(0x00),
         lid: u16_at(0x06),
+        n_fib: u16_at(0x02),
         mac_charset: u16_at(0x14) == 0x0100,
         complex: flags & 0x0004 != 0,
         ext_char: flags & 0x1000 != 0,

@@ -315,6 +315,9 @@ impl DocDocument {
         if cps_out_of_order {
             work_warnings.push(PIECE_TABLE_OUT_OF_ORDER.into());
         }
+        if !super::fib::is_word_version(fib.n_fib) {
+            work_warnings.push(super::fib::damaged_version_warning(fib.n_fib));
+        }
         if super::piece_table::bound_piece_reads(&mut pieces, word_doc.len(), &mut text_budget)? {
             work_warnings.push(text_budget.notice());
         }
@@ -634,6 +637,9 @@ impl DocDocument {
         };
         let mut warnings = container_warnings(cfb);
         warnings.extend(papx.warnings);
+        if !super::fib::is_word_version(fib.n_fib) {
+            warnings.push(super::fib::damaged_version_warning(fib.n_fib));
+        }
         if budget_cut {
             warnings.push(text_budget.notice());
         }
@@ -1038,6 +1044,9 @@ fn embedded_word_main_text<R: Read + Seek>(
     } = parse_clx_diagnosed(&table_stream[clx_start..clx_end]).map_err(|e| e.to_string())?;
     let mut budget = crate::limits::TextBudget::new();
     let mut notes = Vec::new();
+    if !super::fib::is_word_version(fib.n_fib) {
+        notes.push(super::fib::damaged_version_warning(fib.n_fib));
+    }
     if irregular {
         notes.push(PIECE_TABLE_OUT_OF_ORDER.to_string());
     }

@@ -5,6 +5,23 @@
 
 use super::error::{DocError, Result};
 
+/// Whether `n_fib` is a version of Word. Word 6.0 wrote 0x0065 and Word 95
+/// 0x0068; Word 97 and later 0x00C1 up to 0x0112 (Word 2010). A FIB whose
+/// version is outside that range was overwritten (a damaged header), and the
+/// language ID next to it, which decides how 8-bit text is read, means nothing.
+pub(crate) fn is_word_version(n_fib: u16) -> bool {
+    (0x0065..=0x0200).contains(&n_fib)
+}
+
+/// What to tell the reader about a header whose version is not a Word version.
+pub(crate) fn damaged_version_warning(n_fib: u16) -> String {
+    format!(
+        "the file header's version number (nFib 0x{n_fib:04X}) is not a Word version, so the \
+         header is damaged and the language of the document's 8-bit text is unknown; that text \
+         was read as Windows-1252"
+    )
+}
+
 /// Parsed FIB fields needed for text extraction.
 #[derive(Debug, Clone, Default)]
 pub struct Fib {
@@ -14,6 +31,9 @@ pub struct Fib {
     /// every compressed run was decoded as CP1252 regardless of the
     /// document's actual authoring locale.
     pub lid: u16,
+    /// FibBase `nFib`, the version of the file's FIB (absolute offset 0x02).
+    /// See [`is_word_version`].
+    pub n_fib: u16,
     /// Which table stream to use: true = "1Table", false = "0Table".
     pub use_table1: bool,
     /// Offset of the CLX (piece table) in the Table stream.
@@ -145,6 +165,7 @@ impl Fib {
         // FibBase.lid, absolute offset 0x06 (u16 LE) — verified against
         // FibBase's field layout (wIdent, nFib, unused, lid, ...).
         let lid = u16::from_le_bytes([data[0x06], data[0x07]]);
+        let n_fib = u16::from_le_bytes([data[0x02], data[0x03]]);
 
         // Flags at offset 0x0A (u16): [MS-DOC] §2.5.1 FibBase.
         //   bit 8  = fEncrypted
@@ -315,6 +336,7 @@ impl Fib {
 
         Ok(Self {
             lid,
+            n_fib,
             use_table1,
             clx_offset,
             clx_size,
@@ -459,6 +481,23 @@ mod tests {
         let fib = Fib::parse(&data).unwrap();
         assert_eq!(fib.lid, 0x040C);
         assert_eq!(super::super::codepage::codepage_for_lid(fib.lid), 1252);
+    }
+
+    /// Real Word wrote `nFib` 0x65 (Word 6) up to 0x112 (Word 2010 and later); a
+    /// value outside that is a damaged header, whose language ID means nothing.
+    #[test]
+    fn test_only_word_versions_are_word_versions() {
+        for n in [
+            0x0065u16, 0x0068, 0x00C1, 0x00C2, 0x00D9, 0x0101, 0x010C, 0x0110, 0x0112,
+        ] {
+            assert!(is_word_version(n), "{n:#06x}");
+        }
+        for n in [0u16, 0x0064, 0x005A, 0x0200 + 1, 0x2020, 0x20FF, 0xFFFF] {
+            assert!(!is_word_version(n), "{n:#06x}");
+        }
+        let mut data = build_minimal_fib();
+        data[2..4].copy_from_slice(&0x2020u16.to_le_bytes());
+        assert_eq!(Fib::parse(&data).unwrap().n_fib, 0x2020);
     }
 
     #[test]
