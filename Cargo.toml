@@ -101,6 +101,11 @@ pyo3 = { version = "0.29", features = [
 wasm-bindgen = { version = "0.2", optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 
+# Test-only: building synthetic WPS-downrev ZIP fixtures in code (same
+# crate/features as the main `zip` dependency — no extra download).
+[dev-dependencies]
+zip = { version = "9.0", default-features = false, features = ["deflate"] }
+
 [features]
 default = []
 python = ["dep:pyo3"]

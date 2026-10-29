@@ -1354,3 +1354,338 @@ pub fn cfb_with_streams(streams: &[(&str, &[u8])]) -> Vec<u8> {
     }
     file
 }
+
+// ---------------------------------------------------------------------------
+// Synthetic legacy-PPT builders (MS-PPT record stream + WPS downrev packages)
+// ---------------------------------------------------------------------------
+
+/// `DocumentContainer` ([MS-PPT] 2.1.2, record type 1000).
+#[allow(dead_code)]
+pub const RT_DOCUMENT: u16 = 0x03E8;
+/// `DocumentAtom` ([MS-PPT] 2.1.1, record type 1001).
+#[allow(dead_code)]
+pub const RT_DOCUMENT_ATOM: u16 = 0x03E9;
+/// `SlideContainer` ([MS-PPT] 2.5.1, record type 1006).
+#[allow(dead_code)]
+pub const RT_SLIDE: u16 = 0x03EE;
+/// `SlideAtom` ([MS-PPT] 2.4.2, record type 1007).
+#[allow(dead_code)]
+pub const RT_SLIDE_ATOM: u16 = 0x03EF;
+/// `MainMasterContainer` ([MS-PPT] 2.5.3, record type 1016).
+#[allow(dead_code)]
+pub const RT_MAIN_MASTER: u16 = 0x03F8;
+/// `SlideListWithTextContainer` ([MS-PPT] 2.4.14, record type 4080).
+#[allow(dead_code)]
+pub const RT_SLIDE_LIST_WITH_TEXT: u16 = 0x0FF0;
+/// `SlidePersistAtom` ([MS-PPT] 2.4.14, record type 1011).
+#[allow(dead_code)]
+pub const RT_SLIDE_PERSIST_ATOM: u16 = 0x03F3;
+/// `UserEditAtom` ([MS-PPT] 2.3.2, record type 4085).
+#[allow(dead_code)]
+pub const RT_USER_EDIT_ATOM: u16 = 0x0FF5;
+/// `PersistDirectoryAtom` ([MS-PPT] 2.3.4, record type 6002).
+#[allow(dead_code)]
+pub const RT_PERSIST_DIRECTORY_ATOM: u16 = 0x1772;
+/// `OfficeArtSpContainer` — one shape ([MS-ODRAW] 2.2.14, record type
+/// 0xF004).
+#[allow(dead_code)]
+pub const RT_SP_CONTAINER: u16 = 0xF004;
+/// `OfficeArtDgContainer` — the drawing container that holds a drawing's
+/// shape groups ([MS-ODRAW] 2.2.13, record type 0xF002).
+#[allow(dead_code)]
+pub const RT_DG_CONTAINER: u16 = 0xF002;
+/// `OfficeArtSpgrContainer` — a group of shapes ([MS-ODRAW] 2.2.16,
+/// record type 0xF003).
+#[allow(dead_code)]
+pub const RT_SPGR_CONTAINER: u16 = 0xF003;
+/// `TextCharsAtom` (record type 4000 = 0x0FA0) — the UTF-16LE text atom.
+#[allow(dead_code)]
+pub const RT_TEXT_CHARS: u16 = 0x0FA0;
+/// Record type carrying a WPS "downrev" package. `0xF122` is
+/// `msofbtTertiaryOpt` ([MS-ODRAW] 2.2.11), a general tertiary property
+/// table; WPS (like Office itself) hangs the package off it as the
+/// `metroBlob` complex property — `opid` `0x03A9` with `fComplex` set,
+/// followed by the 4-byte byte count of the complex data
+/// ([MS-ODRAW] 2.3.4.41). Verified against a real WPS file: 383/383
+/// packages carry `0x83A9` and an exact declared length.
+#[allow(dead_code)]
+pub const RT_DOWNREV_CARRIER: u16 = 0xF122;
+
+/// `metroBlob` `opid` with `fComplex` set: the low 15 bits are the property
+/// id (`0x03A9` per [MS-ODRAW] 2.3.4.41), the high bit is `fComplex`, which
+/// requires the complex data to be present.
+#[allow(dead_code)]
+pub const METROBLOB_OPID_COMPLEX: u16 = 0x8000 | 0x03A9;
+
+/// A complex (non-metroBlob) tertiary property id, used to hang a decoy
+/// package in front of the real one.
+#[allow(dead_code)]
+pub const DECOY_COMPLEX_OPID: u16 = 0x8000 | 0x0180;
+
+/// One MS-PPT record: 8-byte header (`recVer`/`recInstance`, `recType`,
+/// `recLen`) followed by the payload. `ver` 0x0F marks a container
+/// ([MS-PPT] 2.1.1 record header).
+#[allow(dead_code)]
+pub fn ppt_record(rec_type: u16, rec_instance: u16, ver: u8, payload: &[u8]) -> Vec<u8> {
+    let ver_instance = ((rec_instance & 0x0FFF) << 4) | (ver & 0x0F) as u16;
+    let mut v = Vec::with_capacity(8 + payload.len());
+    v.extend_from_slice(&ver_instance.to_le_bytes());
+    v.extend_from_slice(&rec_type.to_le_bytes());
+    v.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    v.extend_from_slice(payload);
+    v
+}
+
+/// Container record (`recVer` = 0xF) wrapping `children` record bytes.
+#[allow(dead_code)]
+pub fn ppt_container(rec_type: u16, rec_instance: u16, children: &[Vec<u8>]) -> Vec<u8> {
+    let body: Vec<u8> = children.concat();
+    ppt_record(rec_type, rec_instance, 0x0F, &body)
+}
+
+/// A DrawingML shape fragment — one `<p:sp>` whose `<a:p>` paragraphs
+/// carry `paragraphs` as `<a:t>` runs. This is the payload WPS stores in
+/// the `drs/shapexml.xml` entry of a downrev package.
+#[allow(dead_code)]
+pub fn downrev_shape_xml(paragraphs: &[&str]) -> String {
+    let paras: String = paragraphs
+        .iter()
+        .map(|p| format!("<a:p><a:r><a:t>{p}</a:t></a:r></a:p>"))
+        .collect();
+    format!(
+        "<p:sp xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" \
+         xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
+         <p:txBody>{paras}</p:txBody></p:sp>"
+    )
+}
+
+/// A WPS-style downrev package: a deflate ZIP holding one
+/// `drs/shapexml.xml` entry (the shape fragment) plus the `drs/`
+/// directory entry WPS writes alongside it.
+#[allow(dead_code)]
+pub fn downrev_zip(shape_xml: &str) -> Vec<u8> {
+    use std::io::Write;
+    let mut buf = Vec::new();
+    {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        w.add_directory("drs/", opts).expect("zip dir entry");
+        w.start_file("drs/shapexml.xml", opts)
+            .expect("zip file entry");
+        w.write_all(shape_xml.as_bytes()).expect("zip payload");
+        w.finish().expect("zip finish");
+    }
+    buf
+}
+
+/// A record carrying a downrev package as the spec-shaped `metroBlob`
+/// complex property: the `0xF122` payload is a tertiary property table
+/// whose single entry is `opid 0x03A9` with `fComplex` set, the 4-byte byte
+/// count of the complex data, then the package itself ([MS-ODRAW] 2.3.4.41).
+/// This is the shape real WPS files write — a census of a real file found
+/// 383/383 packages carrying `0x83A9` followed by an exact declared length.
+#[allow(dead_code)]
+pub fn downrev_carrier(zip: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(6 + zip.len());
+    payload.extend_from_slice(&METROBLOB_OPID_COMPLEX.to_le_bytes());
+    payload.extend_from_slice(&(zip.len() as u32).to_le_bytes());
+    payload.extend_from_slice(zip);
+    ppt_record(RT_DOWNREV_CARRIER, 1, 3, &payload)
+}
+
+/// A carrier whose payload starts with a ZIP local-header signature but is
+/// garbage after it — malformed input must be skipped, never panic.
+#[allow(dead_code)]
+pub fn broken_downrev_carrier() -> Vec<u8> {
+    let mut payload = b"PK\x03\x04truncated".to_vec();
+    payload.extend_from_slice(&[0xFF; 96]);
+    ppt_record(RT_DOWNREV_CARRIER, 1, 3, &payload)
+}
+
+/// A carrier holding a well-formed ZIP with no `drs/shapexml.xml` entry
+/// (a package that is not a shape downrev — e.g. a theme part).
+#[allow(dead_code)]
+pub fn non_shape_downrev_carrier() -> Vec<u8> {
+    use std::io::Write;
+    let mut buf = Vec::new();
+    {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        w.start_file("theme/theme1.xml", opts)
+            .expect("zip file entry");
+        w.write_all(b"<a:theme/>").expect("zip payload");
+        w.finish().expect("zip finish");
+    }
+    downrev_carrier(&buf)
+}
+
+/// One shape-tree group: an `OfficeArtSpContainer` holding a downrev
+/// carrier (the nesting real WPS files use).
+#[allow(dead_code)]
+pub fn downrev_shape_group(zip: &[u8]) -> Vec<u8> {
+    ppt_container(RT_SP_CONTAINER, 0, &[downrev_carrier(zip)])
+}
+
+/// Wrap an already-built carrier record in the shape-tree nesting.
+#[allow(dead_code)]
+pub fn downrev_group_from_carrier(carrier: Vec<u8>) -> Vec<u8> {
+    ppt_container(RT_SP_CONTAINER, 0, &[carrier])
+}
+
+/// A carrier whose property table opens with a non-metroBlob **complex**
+/// property holding a complete, valid ZIP that carries the *wrong* text,
+/// followed by the real metroBlob package. A signature scan stops at the
+/// first ZIP and loses the real text; a property-table walk reads the real
+/// package.
+#[allow(dead_code)]
+pub fn downrev_carrier_with_decoy(zip: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut decoy = Vec::new();
+    {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut decoy));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        w.add_directory("drs/", opts).expect("decoy zip dir entry");
+        w.start_file("drs/filler.bin", opts)
+            .expect("decoy zip filler entry");
+        w.write_all(&vec![b'x'; 4096])
+            .expect("decoy zip filler payload");
+        w.start_file("drs/shapexml.xml", opts)
+            .expect("decoy zip entry");
+        w.write_all(b"<p:sp><a:p><a:r><a:t>Decoy package text</a:t></a:r></a:p></p:sp>")
+            .expect("decoy zip payload");
+        w.finish().expect("decoy zip finish");
+    }
+    let mut payload = Vec::with_capacity(12 + decoy.len() + zip.len());
+    payload.extend_from_slice(&DECOY_COMPLEX_OPID.to_le_bytes()); // complex, not metroBlob
+    payload.extend_from_slice(&(decoy.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&decoy);
+    payload.extend_from_slice(&METROBLOB_OPID_COMPLEX.to_le_bytes());
+    payload.extend_from_slice(&(zip.len() as u32).to_le_bytes());
+    payload.extend_from_slice(zip);
+    ppt_record(RT_DOWNREV_CARRIER, 1, 3, &payload)
+}
+
+/// A carrier whose metroBlob declares fewer bytes than the package holds —
+/// a corrupt length that must bound the read rather than be carved around.
+#[allow(dead_code)]
+pub fn downrev_carrier_short_length(zip: &[u8], shortfall: usize) -> Vec<u8> {
+    let declared = zip.len() - shortfall;
+    let mut payload = Vec::with_capacity(6 + zip.len());
+    payload.extend_from_slice(&METROBLOB_OPID_COMPLEX.to_le_bytes());
+    payload.extend_from_slice(&(declared as u32).to_le_bytes());
+    payload.extend_from_slice(zip); // the full package still follows
+    ppt_record(RT_DOWNREV_CARRIER, 1, 3, &payload)
+}
+
+/// A `SlideContainer` whose children are `extra` records followed by the
+/// given shape groups.
+#[allow(dead_code)]
+pub fn ppt_slide(shape_groups: &[Vec<u8>]) -> Vec<u8> {
+    let mut children = vec![ppt_record(RT_SLIDE_ATOM, 0, 0, &[0u8; 32])];
+    children.extend_from_slice(shape_groups);
+    ppt_container(RT_SLIDE, 0, &children)
+}
+
+/// A synthetic "PowerPoint Document" stream wired through a real persist
+/// chain: `DocumentContainer` (holding the slide list) → `UserEditAtom` →
+/// `PersistDirectoryAtom` → the slide and master containers, mirroring the
+/// top-level layout a PowerPoint 97 save produces ([MS-PPT] 2.1.2).
+///
+/// `slide_groups[i]` becomes slide `i + 1`'s shape-tree groups;
+/// `master_groups` hang under the `MainMasterContainer` (their text must
+/// not reach the slides).
+#[allow(dead_code)]
+pub fn ppt_stream_with_persist(
+    slide_groups: &[Vec<Vec<u8>>],
+    master_groups: &[Vec<u8>],
+) -> Vec<u8> {
+    let n = slides_count(slide_groups);
+    // Persist ids: DocumentContainer = 1, slides = 2..=n+1, master = n+2.
+    let master_id = (n + 2) as u32;
+
+    let slide_list = ppt_container(
+        RT_SLIDE_LIST_WITH_TEXT,
+        0, // SLWT_SLIDES ([MS-PPT] 2.4.14)
+        &(0..n)
+            .map(|i| ppt_record(RT_SLIDE_PERSIST_ATOM, 0, 0, &((i + 2) as u32).to_le_bytes()))
+            .collect::<Vec<_>>(),
+    );
+    let doc_container = ppt_container(
+        RT_DOCUMENT,
+        0,
+        &[ppt_record(RT_DOCUMENT_ATOM, 0, 0, &[0u8; 48]), slide_list],
+    );
+
+    let master = ppt_container(RT_MAIN_MASTER, 0, master_groups);
+    let slide_containers: Vec<Vec<u8>> = slide_groups.iter().map(|g| ppt_slide(g)).collect();
+
+    // Top-level layout and the byte offsets the persist directory needs.
+    let doc_len = doc_container.len();
+    let user_edit_len = 8 + 20;
+    let pda_len = 8 + 4 * (n + 2); // one (id, offset) group per object
+    let user_edit_off = doc_len;
+    let pda_off = user_edit_off + user_edit_len;
+    let mut slide_offs = Vec::with_capacity(n);
+    let mut cursor = pda_off + pda_len;
+    for sc in &slide_containers {
+        slide_offs.push(cursor as u32);
+        cursor += sc.len();
+    }
+    let master_off = cursor as u32;
+
+    let user_edit_payload = {
+        let mut p = vec![0u8; 20];
+        p[8..12].copy_from_slice(&0u32.to_le_bytes()); // offsetLastEdit: none
+        p[12..16].copy_from_slice(&(pda_off as u32).to_le_bytes());
+        p[16..20].copy_from_slice(&1u32.to_le_bytes()); // docPersistIdRef
+        p
+    };
+    let pda_payload = {
+        let mut p = Vec::new();
+        let group = |id: u32, off: u32, p: &mut Vec<u8>| {
+            // persist id in the low 20 bits, entry count (1) in the high 12
+            // ([MS-PPT] 2.3.4 PersistDirectoryAtom entry header).
+            let word = (id & 0x000F_FFFF) | (1 << 20);
+            p.extend_from_slice(&word.to_le_bytes());
+            p.extend_from_slice(&off.to_le_bytes());
+        };
+        group(1, 0, &mut p); // DocumentContainer at offset 0
+        for (i, &off) in slide_offs.iter().enumerate() {
+            group((i + 2) as u32, off, &mut p);
+        }
+        group(master_id, master_off, &mut p);
+        p
+    };
+
+    let mut stream = Vec::new();
+    stream.extend_from_slice(&doc_container);
+    stream.extend_from_slice(&ppt_record(RT_USER_EDIT_ATOM, 0, 0, &user_edit_payload));
+    stream.extend_from_slice(&ppt_record(RT_PERSIST_DIRECTORY_ATOM, 0, 0, &pda_payload));
+    for sc in &slide_containers {
+        stream.extend_from_slice(sc);
+    }
+    stream.extend_from_slice(&master);
+    stream
+}
+
+/// The same slide/master containers, but as a bare top-level sequence with
+/// no persist records — the no-directory fallback path.
+#[allow(dead_code)]
+pub fn ppt_stream_without_persist(
+    slide_groups: &[Vec<Vec<u8>>],
+    master_groups: &[Vec<u8>],
+) -> Vec<u8> {
+    let mut stream = Vec::new();
+    for groups in slide_groups {
+        stream.extend_from_slice(&ppt_slide(groups));
+    }
+    stream.extend_from_slice(&ppt_container(RT_MAIN_MASTER, 0, master_groups));
+    stream
+}
+
+fn slides_count(slide_groups: &[Vec<Vec<u8>>]) -> usize {
+    slide_groups.len()
+}

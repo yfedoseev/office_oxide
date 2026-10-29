@@ -1,4 +1,16 @@
 target/
-corpus/
+# The fuzzer grows corpus/ as it runs; only the committed seeds are tracked.
+corpus/*
+!corpus/fuzz_parse/
+!corpus/fuzz_ppt_downrev/
+corpus/fuzz_parse/*
+!corpus/fuzz_parse/ppt_wps_downrev
+!corpus/fuzz_parse/ppt_wps_downrev_malformed
+corpus/fuzz_ppt_downrev/*
+!corpus/fuzz_ppt_downrev/ppt_downrev_valid
+!corpus/fuzz_ppt_downrev/ppt_downrev_decoy
+!corpus/fuzz_ppt_downrev/ppt_downrev_degenerate
+!corpus/fuzz_ppt_downrev/ppt_downrev_short_length
+!corpus/fuzz_ppt_downrev/ppt_downrev_two_carriers
 artifacts/
 coverage/

@@ -24,6 +24,13 @@ libfuzzer-sys = "0.4"
 [dependencies.office_oxide]
 path = ".."
 
+# The PPT deck builders in tests/common (shared with this target via #[path])
+# assemble real ZIP packages; same version and features as the main dependency.
+[dependencies.zip]
+version = "9.0"
+default-features = false
+features = ["deflate"]
+
 [[bin]]
 name = "fuzz_parse"
 path = "fuzz_targets/fuzz_parse.rs"
@@ -34,6 +41,13 @@ bench = false
 [[bin]]
 name = "fuzz_doc_stsh"
 path = "fuzz_targets/fuzz_doc_stsh.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ppt_downrev"
+path = "fuzz_targets/fuzz_ppt_downrev.rs"
 test = false
 doc = false
 bench = false

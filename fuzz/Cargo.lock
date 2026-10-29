@@ -211,6 +211,7 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "office_oxide",
+ "zip",
 ]
 
 [[package]]

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use super::downrev;
 use super::persist::{self, PersistDirectory};
 use super::records::*;
 use super::style::{self, CharFormatSpan, ParaFormatSpan};
@@ -132,8 +133,9 @@ pub struct DeckText {
 /// `extract_slides_text`) and its masters' static text.
 pub fn extract_deck_text(stream: &[u8], current_user: Option<&[u8]>) -> DeckText {
     let mut resolved = DeckText::default();
+    let mut budget = downrev::DownrevBudget::new();
     if let Some(dir) = persist::build(stream, current_user) {
-        if let Some(deck) = extract_slides_via_persist(stream, &dir) {
+        if let Some(deck) = extract_slides_via_persist(stream, &dir, &mut budget) {
             // A resolved-but-entirely-textless result is ambiguous: it's the
             // correct answer for a genuinely text-free deck (image-only
             // slides, or slides whose only text is on their master), but
@@ -148,7 +150,7 @@ pub fn extract_deck_text(stream: &[u8], current_user: Option<&[u8]>) -> DeckText
             resolved = deck;
         }
     }
-    let slides = extract_slides_without_persist(stream);
+    let slides = extract_slides_without_persist(stream, &mut budget);
     DeckText {
         slides: if slides.is_empty() {
             resolved.slides
@@ -164,7 +166,10 @@ pub fn extract_deck_text(stream: &[u8], current_user: Option<&[u8]>) -> DeckText
 /// The slide-text heuristics used when the persist directory yields no
 /// text: the slide list's inline text cache, then every `Slide` container
 /// in the stream, then every text atom outside the masters and notes.
-fn extract_slides_without_persist(stream: &[u8]) -> Vec<SlideText> {
+fn extract_slides_without_persist(
+    stream: &[u8],
+    budget: &mut downrev::DownrevBudget,
+) -> Vec<SlideText> {
     // A best-effort fallback scope for the weaker paths below, which have
     // no persist-resolved DocumentContainer to search within at all.
     let stream_wide_hyperlinks = parse_ex_hyperlinks(stream);
@@ -190,6 +195,7 @@ fn extract_slides_without_persist(stream: &[u8]) -> Vec<SlideText> {
         &stream_wide_hyperlinks,
         &stream_wide_ole_objects,
         &mut slides,
+        budget,
     );
     if slides.iter().any(|s| !s.text_runs.is_empty()) {
         return slides;
@@ -249,6 +255,7 @@ fn collect_slide_containers(
     hyperlinks: &HashMap<u32, String>,
     ole_objects: &HashMap<u32, OleObjectInfo>,
     out: &mut Vec<SlideText>,
+    budget: &mut downrev::DownrevBudget,
 ) {
     if depth > MAX_SHAPE_DEPTH {
         return;
@@ -274,6 +281,7 @@ fn collect_slide_containers(
                 &mut ole_object_refs,
             );
             runs.retain(|r| !is_field_placeholder_only(&r.text));
+            downrev::append_slide_downrev(&rec.data, &mut runs, budget);
             let hidden = slide_is_hidden(&rec.data);
             out.push(SlideText {
                 text_runs: runs,
@@ -285,7 +293,7 @@ fn collect_slide_containers(
             continue;
         }
         if rec.header.is_container() {
-            collect_slide_containers(&rec.data, depth + 1, hyperlinks, ole_objects, out);
+            collect_slide_containers(&rec.data, depth + 1, hyperlinks, ole_objects, out, budget);
         }
     }
 }
@@ -312,7 +320,11 @@ fn is_field_placeholder_only(text: &str) -> bool {
 /// Returns `None` if the `DocumentContainer` or its slide list can't be
 /// resolved at all (directory present but unusable); returns `Some(vec![])`
 /// if the slide list resolves but is empty.
-fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<DeckText> {
+fn extract_slides_via_persist(
+    stream: &[u8],
+    dir: &PersistDirectory,
+    budget: &mut downrev::DownrevBudget,
+) -> Option<DeckText> {
     let doc_offset = dir.resolve(dir.doc_persist_id)?;
     let doc_children = bounded_container_children(stream, doc_offset, RT_DOCUMENT)?;
     let slide_list = find_child(&doc_children, RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES)?;
@@ -347,6 +359,7 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<D
             &entry.outline_texts,
             &hyperlinks,
             &ole_objects,
+            budget,
         );
         let hf_texts = links
             .headers_footers
@@ -871,6 +884,7 @@ fn resolve_slide(
     outline_texts: &[TextRun],
     hyperlinks: &HashMap<u32, String>,
     ole_objects: &HashMap<u32, OleObjectInfo>,
+    budget: &mut downrev::DownrevBudget,
 ) -> (SlideText, SlideLinks) {
     let mut text_runs = Vec::new();
     let mut tables = Vec::new();
@@ -907,6 +921,10 @@ fn resolve_slide(
                 &mut ole_object_refs,
             );
             hidden = slide_is_hidden(&children);
+
+            // Shapes WPS wrote back as OOXML downrev packages keep their
+            // text in those packages, not in the legacy text atoms.
+            downrev::append_slide_downrev(&children, &mut text_runs, budget);
 
             // Placeholder character/paragraph formatting a direct
             // StyleTextPropAtom left unset falls back to the slide's

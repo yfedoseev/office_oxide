@@ -83,6 +83,17 @@ jobs:
           if [ "$EVENT_NAME" = "schedule" ]; then secs=600; fi
           cargo fuzz run fuzz_doc_stsh -- -max_total_time="$secs" -rss_limit_mb=4096
 
+      # Whole-file fuzzing rarely reaches the WPS downrev packages either —
+      # they sit behind a valid deck and a valid ZIP. This target builds the
+      # deck and hands the fuzzer's bytes in as the carrier payloads.
+      - name: Fuzz the PPT WPS downrev carriers
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          secs=60
+          if [ "$EVENT_NAME" = "schedule" ]; then secs=600; fi
+          cargo fuzz run fuzz_ppt_downrev -- -max_total_time="$secs" -rss_limit_mb=4096
+
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
