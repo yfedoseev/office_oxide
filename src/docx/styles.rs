@@ -358,6 +358,46 @@ impl StyleSheet {
         hidden.unwrap_or(false)
     }
 
+    /// The font a run uses for characters outside ASCII (`w:hAnsi`, else
+    /// `w:ascii`), from the document defaults, the paragraph style chain, the
+    /// character style chain and the run's own properties, the later
+    /// overriding the earlier. It borrows: nothing is copied for a run.
+    pub(crate) fn effective_font_name<'a>(
+        &'a self,
+        paragraph_style_id: Option<&str>,
+        direct: Option<&'a RunProperties>,
+    ) -> Option<&'a str> {
+        fn layer(rp: &RunProperties) -> Option<&str> {
+            rp.script
+                .as_ref()
+                .and_then(|s| s.font_h_ansi.as_deref())
+                .or(rp.font_name.as_deref())
+        }
+        let mut font = self
+            .doc_defaults
+            .as_ref()
+            .and_then(|d| d.run_properties.as_ref())
+            .and_then(layer);
+        let chain_font = |sid: &str| {
+            self.chain(sid)
+                .rev()
+                .find_map(|style| style.run_properties.as_ref().and_then(layer))
+        };
+        if let Some(f) = paragraph_style_id.and_then(chain_font) {
+            font = Some(f);
+        }
+        if let Some(f) = direct
+            .and_then(|d| d.style_id.as_deref())
+            .and_then(chain_font)
+        {
+            font = Some(f);
+        }
+        if let Some(f) = direct.and_then(layer) {
+            font = Some(f);
+        }
+        font
+    }
+
     /// Fold the effective paragraph formatting: document defaults, then the
     /// style chain, then the paragraph's own `w:pPr`.
     pub fn effective_paragraph_properties(

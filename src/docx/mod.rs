@@ -669,9 +669,9 @@ impl DocxDocument {
             }
             notes
         };
-        let footnotes = read_notes(rel_types::FOOTNOTES, "footnote");
-        let endnotes = read_notes(rel_types::ENDNOTES, "endnote");
-        let comments = read_notes(rel_types::COMMENTS, "comment");
+        let mut footnotes = read_notes(rel_types::FOOTNOTES, "footnote");
+        let mut endnotes = read_notes(rel_types::ENDNOTES, "endnote");
+        let mut comments = read_notes(rel_types::COMMENTS, "comment");
 
         // Scan `word/fonts/` for embedded font programs. Files there are
         // typically `font_<n>_<name>.ttf` (written by our own `DocxWriter`)
@@ -757,6 +757,18 @@ impl DocxDocument {
             images.len()
         );
         package_properties.crc_mismatched_parts = opc.crc_mismatched_parts();
+        // Private-use text in a symbol-font run, now that the styles are known.
+        map_symbol_fonts(&mut body.elements, styles.as_ref());
+        for part in &mut headers_footers {
+            map_symbol_fonts(&mut part.content, styles.as_ref());
+        }
+        for note in footnotes
+            .iter_mut()
+            .chain(endnotes.iter_mut())
+            .chain(comments.iter_mut())
+        {
+            map_symbol_fonts(&mut note.content, styles.as_ref());
+        }
         let (unreadable_parts, unreadable_parts_omitted, cosmetic_parts) =
             unreadable_parts.into_inner().finish_with_cosmetic();
         Ok(DocxDocument {
@@ -1993,44 +2005,87 @@ fn parse_run(
             _ => {},
         }
     }
-    map_symbol_font_text(&mut run);
     run.content.shrink_to_fit();
     Ok(run)
 }
 
 /// Text typed in a symbol font is stored as private-use characters
 /// (`U+F000` plus the font's byte), so `μ` in the Symbol font is `U+F06D`. In a
-/// run whose own font is Symbol, Wingdings, Wingdings 2 or 3 or Webdings, those
-/// characters are the font's, and are replaced by them; a character the font
-/// has no mapping for stays as it is. Runs in any other font, and runs whose
-/// font comes only from a style, are not touched.
-fn map_symbol_font_text(run: &mut Run) {
-    let Some(props) = &run.properties else {
+/// run whose effective font is Symbol, Wingdings, Wingdings 2 or 3 or Webdings,
+/// those characters are the font's, and are replaced by them; a character the
+/// font has no mapping for stays as it is. The effective font is the run's own,
+/// else its character style's, its paragraph style's, or the document default.
+/// It is applied once, to the parsed document, so every rendering agrees.
+fn map_symbol_fonts(root: &mut [BlockElement], styles: Option<&StyleSheet>) {
+    // An explicit worklist: table cells nest, and a crafted file nests them deep.
+    let mut stack: Vec<&mut [BlockElement]> = vec![root];
+    while let Some(blocks) = stack.pop() {
+        for block in blocks {
+            match block {
+                BlockElement::Paragraph(Paragraph {
+                    properties,
+                    content,
+                }) => {
+                    let style = properties.as_ref().and_then(|p| p.style_id.as_deref());
+                    for item in content {
+                        match item {
+                            ParagraphContent::Run(run) => map_symbol_font_run(run, style, styles),
+                            ParagraphContent::Hyperlink(link) => {
+                                for run in &mut link.runs {
+                                    map_symbol_font_run(run, style, styles);
+                                }
+                            },
+                        }
+                    }
+                },
+                BlockElement::Table(table) => {
+                    for row in &mut table.rows {
+                        for cell in &mut row.cells {
+                            stack.push(&mut cell.content);
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
+fn map_symbol_font_run(run: &mut Run, paragraph_style: Option<&str>, styles: Option<&StyleSheet>) {
+    let in_range = |c: char| ('\u{F020}'..='\u{F0FF}').contains(&c);
+    // Most runs hold no such character: the style chain is not read for them.
+    if !run
+        .content
+        .iter()
+        .any(|c| matches!(c, RunContent::Text(t) if t.chars().any(in_range)))
+    {
         return;
+    }
+    let direct = run.properties.as_ref();
+    let named = match styles {
+        Some(sheet) => sheet.effective_font_name(paragraph_style, direct),
+        None => direct.and_then(|rp| {
+            rp.script
+                .as_ref()
+                .and_then(|s| s.font_h_ansi.as_deref())
+                .or(rp.font_name.as_deref())
+        }),
     };
-    let named = props
-        .font_name
-        .as_deref()
-        .or_else(|| props.script.as_ref().and_then(|s| s.font_h_ansi.as_deref()));
     let Some(font) = named.and_then(crate::core::symbol_font::symbol_font) else {
         return;
     };
-    let in_range = |c: char| ('\u{F020}'..='\u{F0FF}').contains(&c);
     for content in &mut run.content {
         if let RunContent::Text(text) = content {
-            if text.chars().any(in_range) {
-                *text = text
-                    .chars()
-                    .map(|c| {
-                        if in_range(c) {
-                            crate::core::symbol_font::char_for(font, (c as u32 - 0xF000) as u8)
-                                .unwrap_or(c)
-                        } else {
-                            c
-                        }
-                    })
-                    .collect();
-            }
+            *text = text
+                .chars()
+                .map(|c| {
+                    if in_range(c) {
+                        crate::core::symbol_font::char_for(font, (c as u32 - 0xF000) as u8)
+                            .unwrap_or(c)
+                    } else {
+                        c
+                    }
+                })
+                .collect();
         }
     }
 }

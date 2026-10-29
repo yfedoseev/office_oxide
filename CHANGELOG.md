@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `.docx` run whose symbol font comes from a style is read by the font's table too.** The mapping looked only at the run's own `w:rFonts`; Word writes a font on a run only when it differs from the style's, so a Symbol or Wingdings paragraph or character style, a style based on one, or a document default left the private-use characters as they were. The effective font (document defaults, paragraph style chain, character style chain, then the run) is now resolved once over the parsed document (body, tables, hyperlinks, headers, footers, notes and comments), without copying a face name per run.
+
 - **Text typed in a symbol font is read by the font's table in a `.doc` too.** The reader did not read the font table or a run's font at all, so `μM` stayed `U+F06D` followed by `M` (86 corpus files hold symbol runs). A character outside U+0020..U+007F takes its font from `sprmCRgFtc2` ([MS-DOC] §2.6.1), an index into the font table (`SttbfFfn`, §2.9.286); in a run whose font is Symbol, Wingdings, Wingdings 2 or 3 or Webdings the private-use characters are now the font's, in the flat text and the structured paragraphs alike. Documents whose font table names no such font are not touched.
 
 - **Text typed in a symbol font is read by the font's table in a `.docx` run.** Symbol, Wingdings, Wingdings 2 and 3 and Webdings store their text as private-use characters (`U+F000` plus the byte), so `μM` was written as `U+F06D` and `M`, which render as nothing. In a run whose own font is one of those, the characters are now the font's; a character without a mapping, and every run in another font, is untouched.
