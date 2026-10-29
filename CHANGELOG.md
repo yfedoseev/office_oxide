@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A compound file whose byte-order field is wrong but whose other header fields are intact is read.** `CfbHeader::parse` refused any value but `0xFFFE`, although [MS-CFB] 2.2 states that as a requirement on writers and gives readers no rule; a workbook with the marker swapped and a fuzzed `.doc` header were refused while calamine, xls2csv and catdoc read them. The file is read as little-endian and the container warnings name the field. A header that is really big-endian still fails, because its other fields do not validate.
+
 - **A `.doc` reads the text of the Word documents embedded in it.** A document made of embedded Word objects came out as `[Embedded Microsoft Word Document]` placeholders and nothing else, although catdoc recovers the article text. The text of each object follows its placeholder in every rendering. It is read through the document's embedded-package account: the objects are counted, their streams share the byte allowance, the text is charged to the text budget (a cut is reported), and an object that cannot be read keeps its placeholder and is named in the warnings. Objects inside an embedded document are not followed.
 
 - **A `<w:sym>` character in the Symbol font is read by the Symbol encoding.** The code (`F0xx`) was read as Latin-1, so the Symbol font's nabla printed as `Ñ` and its club as `§`. The table is generated from Adobe's `Symbol.afm` and the Adobe Glyph List; a code the font has no glyph for is the replacement character. Other fonts keep their reading.
