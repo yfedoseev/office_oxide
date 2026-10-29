@@ -424,8 +424,12 @@ impl Document {
             && is_encrypted_ooxml_cfb(path)
         {
             #[cfg(feature = "default-password")]
-            if let Some(package) = decrypt_default_password(std::fs::File::open(path).ok()) {
-                return Self::from_reader_inner(std::io::Cursor::new(package), ext_format);
+            match decrypt_default_password(std::fs::File::open(path).ok()) {
+                Ok(Some(package)) => {
+                    return Self::from_reader_inner(std::io::Cursor::new(package), ext_format);
+                },
+                Err(why) => return Err(OfficeError::UnsupportedFormat(why)),
+                Ok(None) => {},
             }
             return Err(OfficeError::UnsupportedFormat(
                 "the file is a password-protected (encrypted) OOXML package; \
@@ -552,8 +556,12 @@ impl Document {
             && is_cfb_container(&mut reader)?
         {
             #[cfg(feature = "default-password")]
-            if let Some(package) = decrypt_default_password(Some(&mut reader)) {
-                return Self::from_reader_inner(std::io::Cursor::new(package), format);
+            match decrypt_default_password(Some(&mut reader)) {
+                Ok(Some(package)) => {
+                    return Self::from_reader_inner(std::io::Cursor::new(package), format);
+                },
+                Err(why) => return Err(OfficeError::UnsupportedFormat(why)),
+                Ok(None) => {},
             }
             return Err(OfficeError::UnsupportedFormat(
                 "the file is a password-protected (encrypted) OOXML package; \
@@ -933,26 +941,47 @@ fn is_encrypted_ooxml_cfb(path: &Path) -> bool {
 /// is not encrypted, or uses a scheme this reader does not implement (the
 /// caller then refuses it as before).
 #[cfg(feature = "default-password")]
-fn decrypt_default_password<R: Read + Seek>(source: Option<R>) -> Option<Vec<u8>> {
-    let mut reader = crate::cfb::CfbReader::new(source?).ok()?;
+fn decrypt_default_password<R: Read + Seek>(
+    source: Option<R>,
+) -> std::result::Result<Option<Vec<u8>>, String> {
+    use core::offcrypto::Failure;
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let Ok(mut reader) = crate::cfb::CfbReader::new(source) else {
+        return Ok(None);
+    };
     if !(reader.has_stream("EncryptionInfo") && reader.has_stream("EncryptedPackage")) {
-        return None;
+        return Ok(None);
     }
-    let info = reader.open_stream("EncryptionInfo").ok()?;
-    let package = reader.open_stream("EncryptedPackage").ok()?;
+    let (Ok(info), Ok(package)) =
+        (reader.open_stream("EncryptionInfo"), reader.open_stream("EncryptedPackage"))
+    else {
+        return Err(
+            "the file is an encrypted OOXML package whose encryption streams cannot be read".into(),
+        );
+    };
     match core::offcrypto::decrypt_package(&info, &package) {
         // The payload must be the zip itself. Reopening it goes through the
         // same entry point, so a payload that is another encrypted container
         // would be decrypted again, to a depth the file chooses.
-        Ok(zip) if zip.starts_with(b"PK") => Some(zip),
-        Ok(_) => {
-            info!("default-password decryption: the decrypted payload is not a zip package");
-            None
-        },
-        Err(why) => {
-            info!("default-password decryption not possible: {why:?}");
-            None
-        },
+        Ok(zip) if zip.starts_with(b"PK") => Ok(Some(zip)),
+        Ok(_) => Err(
+            "the file is an encrypted OOXML package whose decrypted payload is not a zip package"
+                .into(),
+        ),
+        Err(Failure::NeedsPassword) => Err(
+            "the file is a password-protected (encrypted) OOXML package; its password is not \
+             Office's default one, so it cannot be opened"
+                .into(),
+        ),
+        Err(Failure::Unsupported(what)) => Err(format!(
+            "the file is an encrypted OOXML package that uses encryption this reader does not \
+             support ({what})"
+        )),
+        Err(Failure::Malformed(what)) => Err(format!(
+            "the file is an encrypted OOXML package whose encryption header is damaged ({what})"
+        )),
     }
 }
 
@@ -1108,9 +1137,12 @@ mod tests {
         std::fs::remove_file(&path).ok();
         let err = result.err().expect("expected an Err");
         let msg = err.to_string();
+        // The fixture's encryption streams are empty: without the
+        // `default-password` feature the file is "password-protected"; with
+        // it, the reader looks at the streams and says they are damaged.
         assert!(
-            msg.contains("password-protected"),
-            "expected a friendly password-protected message, got: {msg}"
+            msg.contains("password-protected") || msg.contains("encrypted OOXML package"),
+            "expected a friendly encrypted-package message, got: {msg}"
         );
     }
 
@@ -1133,9 +1165,12 @@ mod tests {
             .err()
             .expect("expected an Err, not a silently empty presentation");
         let msg = err.to_string();
+        // The fixture's encryption streams are empty: without the
+        // `default-password` feature the file is "password-protected"; with
+        // it, the reader looks at the streams and says they are damaged.
         assert!(
-            msg.contains("password-protected"),
-            "expected a friendly password-protected message, got: {msg}"
+            msg.contains("password-protected") || msg.contains("encrypted OOXML package"),
+            "expected a friendly encrypted-package message, got: {msg}"
         );
     }
 

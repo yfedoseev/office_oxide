@@ -17,6 +17,13 @@
 //!   decrypted in place.
 //!
 //! Compiled only with the `default-password` feature.
+//!
+//! **Not for protecting anything, and not FIPS-validated.** The password tried
+//! is public, so nothing here keeps a secret: the code only reads files whose
+//! "protection" is a formality. Its MD5, SHA-1, SHA-2, AES and RC4 are written
+//! for this one purpose (see `core::crypto`), are not constant-time and are not
+//! a validated cryptographic module; MD5 and RC4 cannot be part of a FIPS 140
+//! build, so a build that must be FIPS-compliant leaves the feature off.
 
 use super::crypto::{Aes, Hash, Rc4, md5, sha1};
 
@@ -25,8 +32,9 @@ const DEFAULT_PASSWORDS: [&str; 2] = ["VelvetSweatshop", ""];
 
 /// The most hash iterations an Agile `spinCount` may ask for. Office writes
 /// 100,000; the bound keeps a crafted file from holding the reader (at most
-/// two derivations, one per default password, of this many hashes).
-const MAX_SPIN_COUNT: u32 = 500_000;
+/// two derivations, one per default password, of this many hashes: well under
+/// a second).
+const MAX_SPIN_COUNT: u32 = 200_000;
 
 /// Why a file was not decrypted.
 #[derive(Debug, PartialEq, Eq)]
@@ -94,8 +102,13 @@ pub(crate) fn decrypt_package(info: &[u8], package: &[u8]) -> Result<Vec<u8>> {
         (2..=4, 2) => standard(info, body)?,
         _ => return Err(Failure::Unsupported("this encryption version")),
     };
-    // The stream size is the package's; the rest is padding.
-    plain.truncate(usize::try_from(size).unwrap_or(usize::MAX));
+    // The stream size is the package's; the rest is padding. A size larger
+    // than what decrypted is a damaged header, not a short package.
+    let size = usize::try_from(size)
+        .ok()
+        .filter(|&size| size <= plain.len())
+        .ok_or(Failure::Malformed("the encrypted package is shorter than its declared size"))?;
+    plain.truncate(size);
     Ok(plain)
 }
 
@@ -164,7 +177,7 @@ fn parse_agile(info: &[u8]) -> Result<Agile> {
         match reader.read_event() {
             Ok(quick_xml::events::Event::Start(e) | quick_xml::events::Event::Empty(e)) => {
                 match e.local_name().as_ref() {
-                    "keyData" => {
+                    "keyData" if data.is_none() => {
                         require_aes_cbc(&e)?;
                         data = Some((attr_bytes(&e, "saltValue")?, hash_named(&e)?));
                     },
@@ -185,7 +198,10 @@ fn parse_agile(info: &[u8]) -> Result<Agile> {
                     _ => {},
                 }
             },
-            Ok(quick_xml::events::Event::Eof) | Err(_) => break,
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(_) => {
+                return Err(Failure::Malformed("the encryption descriptor is not well-formed XML"));
+            },
             Ok(_) => {},
         }
     }
@@ -910,10 +926,21 @@ pub(crate) mod tests {
             decrypt_package(&hostile, &package),
             Err(Failure::Unsupported("this password spin count"))
         );
-        // A stream size larger than the data gives what there is.
+        // A stream size larger than the data is a damaged header, not a short package.
         let (info, mut package) = encrypt_agile(&pattern(100, 24), "VelvetSweatshop");
         package[..8].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert!(decrypt_package(&info, &package).unwrap().len() <= 112);
+        assert_eq!(
+            decrypt_package(&info, &package),
+            Err(Failure::Malformed("the encrypted package is shorter than its declared size"))
+        );
+        // A descriptor that is not well-formed XML says so, not "key data missing".
+        let (mut info, package) = encrypt_agile(b"x", "VelvetSweatshop");
+        info.truncate(8);
+        info.extend_from_slice(b"<encryption><keyData <<");
+        assert_eq!(
+            decrypt_package(&info, &package),
+            Err(Failure::Malformed("the encryption descriptor is not well-formed XML"))
+        );
     }
 
     // -- the RC4 workbook --
@@ -1035,7 +1062,7 @@ pub(crate) mod tests {
             crate::Document::from_reader(std::io::Cursor::new(outer), crate::DocumentFormat::Docx)
                 .err()
                 .expect("refused");
-        assert!(error.to_string().contains("password-protected"), "{error}");
+        assert!(error.to_string().contains("not a zip package"), "{error}");
     }
 
     #[test]
@@ -1051,5 +1078,25 @@ pub(crate) mod tests {
             decrypt_package(&hostile, &package),
             Err(Failure::Unsupported("this password spin count"))
         );
+    }
+
+    #[test]
+    fn test_a_file_that_cannot_be_opened_says_why() {
+        let open = |file: Vec<u8>| {
+            crate::Document::from_reader(std::io::Cursor::new(file), crate::DocumentFormat::Docx)
+                .err()
+                .expect("refused")
+                .to_string()
+        };
+        // A real password is needed.
+        let (info, package) = encrypt_agile(b"x", "hunter2");
+        assert!(open(encrypted_file((info, package))).contains("not Office's default one"));
+        // A scheme the reader does not implement (an encryption version it does not know).
+        let (mut info, package) = encrypt_agile(b"x", "VelvetSweatshop");
+        info[..4].copy_from_slice(&[9, 0, 9, 0]);
+        assert!(open(encrypted_file((info, package))).contains("does not support"));
+        // A damaged header.
+        let (info, package) = encrypt_standard(b"x", "VelvetSweatshop");
+        assert!(open(encrypted_file((info[..20].to_vec(), package))).contains("damaged"));
     }
 }

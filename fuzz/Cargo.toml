@@ -23,6 +23,8 @@ libfuzzer-sys = "0.4"
 
 [dependencies.office_oxide]
 path = ".."
+# Opt-in feature, so the decryption paths are fuzzed too.
+features = ["default-password"]
 
 [[bin]]
 name = "fuzz_parse"
@@ -63,6 +65,27 @@ bench = false
 [[bin]]
 name = "fuzz_xls_sparse"
 path = "fuzz_targets/fuzz_xls_sparse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ooxml_salvage"
+path = "fuzz_targets/fuzz_ooxml_salvage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_default_password"
+path = "fuzz_targets/fuzz_default_password.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_doc_header_fonts"
+path = "fuzz_targets/fuzz_doc_header_fonts.rs"
 test = false
 doc = false
 bench = false

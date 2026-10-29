@@ -109,7 +109,8 @@ mmap = ["dep:memmap2"]
 parallel = ["dep:rayon"]
 # Open the documents Office protects with its fixed default password
 # (`VelvetSweatshop`, or an empty one): RC4 workbooks and OOXML encryption.
-# Off by default; adds no dependency. MD5 and RC4 are not FIPS 140 approved.
+# Off by default; adds no dependency. Not for protecting anything and not
+# FIPS-validated: MD5 and RC4 cannot be part of a FIPS 140 build.
 default-password = []
 
 [package.metadata.docs.rs]

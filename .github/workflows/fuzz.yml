@@ -72,6 +72,12 @@ jobs:
           secs=60
           if [ "$EVENT_NAME" = "schedule" ]; then secs=600; fi
           cargo fuzz run fuzz_parse -- -max_total_time="$secs" -rss_limit_mb=4096
+          # The structure-aware targets reach parsers whole-file fuzzing rarely
+          # gets to (salvage of damaged parts, default-password decryption, the
+          # .doc font table); a short run each.
+          for target in fuzz_ooxml_salvage fuzz_default_password fuzz_doc_header_fonts; do
+            cargo fuzz run "$target" -- -max_total_time=$((secs / 3)) -rss_limit_mb=4096
+          done
 
       # Whole-file fuzzing rarely reaches the legacy style sheet; this target
       # builds a valid .doc around the fuzzer's bytes so every run does.

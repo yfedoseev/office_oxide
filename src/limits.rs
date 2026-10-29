@@ -16,6 +16,12 @@
 //! shared headers, notes, a paragraph style's name — `classify_style_name`
 //! bounds that one).
 //!
+//! **These are process-wide settings.** Each setter changes the limit for every
+//! document read or written afterwards, on every thread, so set them once at
+//! start-up, before any document is opened; they are not a per-request or
+//! per-tenant control. (The tuning constants behind the scaled text budget and
+//! the write-memory estimate are `doc(hidden)`: they may change.)
+//!
 //! The text budget is one of several, each for the thing that multiplies:
 //! pictures ([`crate::limits::max_image_bytes`], [`crate::limits::max_total_image_bytes`] and, for the
 //! compressed metafiles of the legacy formats,
@@ -173,10 +179,12 @@ pub fn set_max_embedded_bytes(bytes: u64) {
 pub const DEFAULT_MAX_TEXT_CHARS: usize = 256 << 20;
 
 /// The least a small input is allowed to produce: 64 Mi characters.
+#[doc(hidden)]
 pub const TEXT_BUDGET_FLOOR_CHARS: usize = 64 << 20;
 
 /// The characters an input may produce for each of its bytes before the limit
 /// ([`DEFAULT_MAX_TEXT_CHARS`]) applies: 4,096.
+#[doc(hidden)]
 pub const TEXT_BUDGET_CHARS_PER_INPUT_BYTE: u64 = 4096;
 
 thread_local! {
@@ -895,12 +903,15 @@ pub(crate) fn image_budget_notice() -> Option<String> {
 pub const DEFAULT_MAX_WRITE_BYTES: u64 = 512 << 20;
 
 /// What a table cell costs the `.docx` writer, in bytes (measured 1,832).
+#[doc(hidden)]
 pub const WRITE_BYTES_PER_DOCX_CELL: u64 = 1_900;
 
 /// What a table cell costs the `.pptx` writer, in bytes (measured 632).
+#[doc(hidden)]
 pub const WRITE_BYTES_PER_PPTX_CELL: u64 = 650;
 
 /// What a worksheet cell costs the `.xlsx` writer, in bytes (measured 161).
+#[doc(hidden)]
 pub const WRITE_BYTES_PER_XLSX_CELL: u64 = 170;
 
 static MAX_WRITE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_WRITE_BYTES);
