@@ -866,7 +866,7 @@ pub(crate) mod tests {
         let payload = pattern(10_000, 20);
         for password in DEFAULT_PASSWORDS {
             let (info, package) = encrypt_agile(&payload, password);
-            assert_eq!(decrypt_package(&info, &package), Ok(payload.clone()), "{password:?}");
+            assert_eq!(decrypt_package(&info, &package), Ok(payload.clone()), "a default password");
         }
     }
 
@@ -875,7 +875,7 @@ pub(crate) mod tests {
         let payload = pattern(5000, 21);
         for password in DEFAULT_PASSWORDS {
             let (info, package) = encrypt_standard(&payload, password);
-            assert_eq!(decrypt_package(&info, &package), Ok(payload.clone()), "{password:?}");
+            assert_eq!(decrypt_package(&info, &package), Ok(payload.clone()), "a default password");
         }
     }
 
@@ -923,7 +923,7 @@ pub(crate) mod tests {
         for password in DEFAULT_PASSWORDS {
             let (plain, mut stream) = rc4_md5_stream(password, &plain_records());
             assert_ne!(plain, stream);
-            assert_eq!(decrypt_workbook(&mut stream), Ok(true), "{password:?}");
+            assert_eq!(decrypt_workbook(&mut stream), Ok(true), "a default password");
             // Everything but the record that said "encrypted" is the original.
             let fp = 4 + 16;
             assert_eq!(&stream[..fp], &plain[..fp]);
