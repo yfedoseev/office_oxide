@@ -26,8 +26,9 @@
 //! constants behind the scaled text budget and the write-memory estimate are
 //! `doc(hidden)`: they may change.)
 //!
-//! **Eight settings, grouped by what they guard.** The zip layer has the four
-//! POI's `ZipSecureFile` has: a part's decompressed size
+//! **Eight settings, grouped by what they guard.** The zip layer bounds (as
+//! Apache POI's `ZipSecureFile` does with its entry size and inflate ratio) a
+//! part's decompressed size
 //! ([`max_part_bytes()`](crate::limits::max_part_bytes)), a package's
 //! ([`max_package_bytes()`](crate::limits::max_package_bytes)), its entries
 //! ([`max_package_entries()`](crate::limits::max_package_entries)) and a
@@ -48,6 +49,17 @@
 //! holds them: how deep they nest, how many are opened, and the bytes they take
 //! (a quarter of the package budget), with their text counted against the text
 //! budget.
+//!
+//! **Where they apply.** Options given to [`Document::open_with`](crate::Document::open_with)
+//! bind to that document: every conversion of it, on whichever thread calls
+//! it, and the embedded packages it opens, read under them. The format readers
+//! called directly (`Document::as_docx()`, `DocxDocument::open`) and code that
+//! runs on threads of your own read under the process-wide settings. The
+//! `set_max_*` functions and `Limits::apply` change those for everything, one
+//! value at a time (not as an atomic set), so call them once at start-up.
+//! [`ParseOptions::default`](crate::options::ParseOptions) copies the
+//! process-wide values when it is created. There is no time bound: for hostile
+//! input also run the reader under a process timeout.
 //!
 //! The default keeps every genuine workbook this crate has been tested
 //! against (the largest, 181 MB of cell text, with room to spare) and
@@ -167,8 +179,15 @@ pub(crate) fn part_inflate_cap(compressed: u64) -> u64 {
     let size = max_part_bytes();
     let by_ratio = compressed
         .saturating_mul(max_inflate_ratio())
-        .max(INFLATE_RATIO_FLOOR_BYTES);
+        .max(inflate_ratio_floor());
     size.min(by_ratio)
+}
+
+/// The size below which a part is never refused for its ratio: 64 MiB, or an
+/// eighth of the part limit when that is lower, so that a tightened part limit
+/// (`Limits::strict` has 64 MiB) still has a ratio check above it.
+pub(crate) fn inflate_ratio_floor() -> u64 {
+    INFLATE_RATIO_FLOOR_BYTES.min(max_part_bytes() / 8)
 }
 
 /// The default depth to which embedded packages are opened: 3.
@@ -297,11 +316,19 @@ fn text_limit_for_input(limit: usize, input: Option<u64>) -> usize {
 ///
 /// The one knob behind every bound on copies and padding, in the manner of
 /// `image::Limits::max_alloc`. Each internal bound is a fixed fraction of it
-/// (pictures copied: an eighth; their total: four times; a compressed metafile
-/// inflated: a quarter; the empty cells padding a sparse sheet: a 64th in cells
-/// of 64 bytes; the IR's padding: half, a whole sheet's: all; what a writer
-/// builds: half), so that the defaults are the values this crate was
-/// tested with and lowering the one number lowers them together.
+/// (pictures copied into one IR: half, 512 MiB; the pictures a sheet-by-sheet
+/// run copies in all: four times; a compressed metafile inflated: a quarter;
+/// the empty cells padding a sparse sheet: a 64th, in cells; the IR's padding:
+/// half, a whole sheet's: all; what a writer builds: half), so that lowering
+/// the one number lowers them together.
+///
+/// **This is a scale, not a ceiling on the process's memory.** Those bounds
+/// apply to different things and a conversion can spend several of them (and
+/// the document's own decompressed parts, bounded by `package_bytes`) at
+/// once, so the worst case resident memory is a small multiple of it, not it.
+/// Opening a 22 MB `.docx` whose 39 page images are 336 MiB, for example,
+/// holds those images once while the document is open, and again for each
+/// IR built from it.
 pub const DEFAULT_MAX_MEMORY_BYTES: u64 = 1 << 30;
 
 static MAX_MEMORY_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_MEMORY_BYTES);
@@ -682,7 +709,7 @@ impl IrPaddingBudget {
 /// once for every anchor that draws it: the workbook stores a media part once,
 /// and the IR gives each image its own copy.
 pub(crate) fn max_image_bytes() -> usize {
-    usize::try_from(max_memory_bytes() / 8).unwrap_or(usize::MAX)
+    usize::try_from(max_memory_bytes() / 2).unwrap_or(usize::MAX)
 }
 
 /// The most picture bytes all the sheets of one workbook may copy into the IR
@@ -1246,6 +1273,18 @@ mod tests {
         let mut limits = test_support::LimitScope::new();
         // Stored bytes few: the floor governs, so a modest part is allowed.
         assert_eq!(part_inflate_cap(10), INFLATE_RATIO_FLOOR_BYTES);
+        // A tightened part limit keeps a ratio check: the floor shrinks with it.
+        limits.set(max_part_bytes, set_max_part_bytes, 64 << 20);
+        assert_eq!(inflate_ratio_floor(), 8 << 20);
+        assert_eq!(part_inflate_cap(1 << 10), 8 << 20);
+        limits.set(max_inflate_ratio, set_max_inflate_ratio, 100);
+        assert_eq!(
+            part_inflate_cap(1 << 10),
+            8 << 20,
+            "a 1 KiB part is held to the floor, not 64 MiB"
+        );
+        limits.set(max_part_bytes, set_max_part_bytes, DEFAULT_MAX_PART_BYTES);
+        limits.set(max_inflate_ratio, set_max_inflate_ratio, DEFAULT_MAX_INFLATE_RATIO);
         // Many stored bytes: the ratio allows more than the floor, up to the size limit.
         let stored = 100 << 10;
         assert_eq!(part_inflate_cap(stored), stored * DEFAULT_MAX_INFLATE_RATIO);
@@ -1280,8 +1319,8 @@ mod tests {
 /// changes; other threads are unaffected.
 ///
 /// Eight settings, grouped by what they guard: the zip layer (`part_bytes`,
-/// `package_bytes`, `package_entries`, `inflate_ratio`, the same four Apache
-/// POI's `ZipSecureFile` has), the output (`text_chars`, as POI's
+/// `package_bytes`, `package_entries`, `inflate_ratio`; POI's `ZipSecureFile`
+/// has an entry size and an inflate ratio), the output (`text_chars`, as POI's
 /// `setMaxTextSize`), embedded packages (`embedded_depth`,
 /// `embedded_packages`) and one memory budget (`memory_bytes`, as
 /// `image::Limits::max_alloc`) from which every bound on copies, padding and
@@ -1305,7 +1344,9 @@ pub struct Limits {
     pub embedded_depth: usize,
     /// Embedded packages opened for one document. See [`max_embedded_packages`].
     pub embedded_packages: usize,
-    /// Characters of text one document may produce. See [`max_text_chars`].
+    /// Characters of text one document may produce, with a floor of 64 Mi
+    /// characters for a small input (the budget scales down with the size of
+    /// the input, never below that). See [`max_text_chars`].
     pub text_chars: usize,
     /// Memory the conversion of one document may spend on what a small file can multiply: pictures copied or inflated, the empty cells that pad a sparse grid, and what a writer builds. Every such bound is a fixed fraction of it. See [`max_memory_bytes`].
     pub memory_bytes: u64,
@@ -1345,7 +1386,10 @@ impl Limits {
     /// A tighter set for input from a source nobody vouches for: an eighth of
     /// each size default, at most one level of embedded packages, and a
     /// part may not inflate more than 100 times its stored size. Documents
-    /// of ordinary size read as usual.
+    /// of ordinary size read as usual; a very large picture-heavy or sparse
+    /// one is cut sooner (the picture and padding bounds are shares of an
+    /// eighth of the memory budget). Use it with `OnIncomplete::Error`, which
+    /// converts the document once more at open.
     pub fn strict() -> Self {
         let d = Self::default();
         Self {

@@ -4,6 +4,8 @@
 //! Every fixture is a minimal synthetic package built in code. None of
 //! these tests touches the process-wide limits, so they may run in parallel.
 
+mod common;
+
 use std::io::{Cursor, Write};
 
 use office_oxide::pptx::PptxDocument;
@@ -239,11 +241,18 @@ fn test_header_shared_by_many_sections_is_stored_once() {
 // ---------------------------------------------------------------------------
 
 /// A 5 KB package that draws one 1 MiB zero-filled image 200 times converted
-/// to 200 MiB of IR. The default image budget must stop the copies well short
-/// of that, keep every picture's place and say so.
+/// to 200 MiB of IR. The image budget (half the memory budget; 128 MiB here,
+/// so the test does not spend the 512 MiB of the default) must stop the copies
+/// well short of that, keep every picture's place and say so.
 #[test]
-fn test_one_image_drawn_many_times_stops_copying_at_the_default_budget() {
+fn test_one_image_drawn_many_times_stops_copying_at_the_image_budget() {
     use office_oxide::ir::Element;
+    let mut limits = common::LimitScope::new();
+    limits.set(
+        office_oxide::limits::max_memory_bytes,
+        office_oxide::limits::set_max_memory_bytes,
+        256 << 20,
+    );
     let drawing = |i: usize| {
         format!(
             r#"<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="100" cy="100"/><wp:docPr id="{i}" name="p"/><a:graphic xmlns:a="{DML}"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:blipFill><a:blip r:embed="rId5"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#

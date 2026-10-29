@@ -416,8 +416,8 @@ fn ir_image_count(ir: &office_oxide::DocumentIR) -> usize {
 #[test]
 fn test_one_picture_drawn_from_many_anchors_shares_its_bytes_and_is_bounded_in_the_ir() {
     let mut limits = set_budgets();
-    // A picture's allowance is an eighth of the memory budget.
-    limits.set(max_memory_bytes, set_max_memory_bytes, 8 * IMAGE_BUDGET as u64);
+    // A picture's allowance is half of the memory budget.
+    limits.set(max_memory_bytes, set_max_memory_bytes, 2 * IMAGE_BUDGET as u64);
     // 100 anchors of a 1,000-byte picture: 100,000 bytes of IR images
     // against a 10,000-byte budget.
     let doc = open(picture_fan_out_workbook(100, 1_000)).unwrap();
@@ -436,8 +436,8 @@ fn test_one_picture_drawn_from_many_anchors_shares_its_bytes_and_is_bounded_in_t
 #[test]
 fn test_the_picture_notice_is_given_once_not_on_every_later_sheet() {
     let mut limits = set_budgets();
-    // A picture's allowance is an eighth of the memory budget.
-    limits.set(max_memory_bytes, set_max_memory_bytes, 8 * IMAGE_BUDGET as u64);
+    // A picture's allowance is half of the memory budget.
+    limits.set(max_memory_bytes, set_max_memory_bytes, 2 * IMAGE_BUDGET as u64);
     // The first sheet spends the picture budget; the two sheets after it have
     // no pictures and nothing to be told about.
     let doc = open(picture_workbook(100, 1_000, 2)).unwrap();
@@ -457,8 +457,8 @@ fn test_the_picture_notice_is_given_once_not_on_every_later_sheet() {
 #[test]
 fn test_many_distinct_small_pictures_within_the_budget_are_all_kept() {
     let mut limits = set_budgets();
-    // A picture's allowance is an eighth of the memory budget.
-    limits.set(max_memory_bytes, set_max_memory_bytes, 8 * IMAGE_BUDGET as u64);
+    // A picture's allowance is half of the memory budget.
+    limits.set(max_memory_bytes, set_max_memory_bytes, 2 * IMAGE_BUDGET as u64);
     let doc = open(picture_fan_out_workbook(5, 1_000)).unwrap();
     let ir = doc.to_ir();
     assert_eq!(ir_image_count(&ir), 5);

@@ -48,12 +48,12 @@ fn set_budgets() -> LimitScope {
 }
 
 /// A memory budget under which a picture of [`PICTURE`] bytes fits a sheet's
-/// allowance one and a half times over (an eighth of the budget), and the run
-/// may copy 48 of them (four times the budget).
+/// allowance one and a half times over (half of the budget), and the run may
+/// copy 12 of them (four times the budget).
 fn set_picture_budgets() -> LimitScope {
     let mut scope = LimitScope::new();
     scope.set(max_text_chars, set_max_text_chars, 200_000);
-    scope.set(max_memory_bytes, set_max_memory_bytes, 12 * PICTURE as u64);
+    scope.set(max_memory_bytes, set_max_memory_bytes, 3 * PICTURE as u64);
     scope
 }
 
@@ -292,28 +292,28 @@ fn images(section: &office_oxide::ir::Section) -> usize {
 #[test]
 fn test_a_sheets_pictures_are_its_own_allowance_and_the_run_has_a_total() {
     let _limits = set_picture_budgets();
-    let doc = open(picture_sheets(60));
-    // Held at once, 60 pictures of 200 bytes do not fit 300.
+    let doc = open(picture_sheets(20));
+    // Held at once, 20 pictures of 200 bytes do not fit 300.
     let eager = doc.to_ir();
     let eager_images: usize = eager.sections.iter().map(images).sum();
     assert_eq!(eager_images, 1, "the whole-document IR keeps one picture");
     assert!(eager.metadata.text_truncated);
     // One sheet at a time, each picture fits its sheet's allowance, until
-    // the total the run may copy (9,600 bytes) is spent: 48 pictures.
+    // the total the run may copy (2,400 bytes) is spent: 12 pictures.
     let items: Vec<_> = doc.as_xlsx().unwrap().sheets_ir().collect();
     let counts: Vec<usize> = items.iter().map(|i| images(&i.section)).collect();
-    let expected: Vec<usize> = (0..60).map(|i| usize::from(i < 48)).collect();
+    let expected: Vec<usize> = (0..20).map(|i| usize::from(i < 12)).collect();
     assert_eq!(counts, expected, "{counts:?}");
-    assert!(!items[47].text_truncated);
-    assert!(items[48].text_truncated, "the sheet that spent the total is not flagged");
-    assert!(mentions(&items[48].section, "set_max_memory_bytes"), "no notice");
+    assert!(!items[11].text_truncated);
+    assert!(items[12].text_truncated, "the sheet that spent the total is not flagged");
+    assert!(mentions(&items[12].section, "set_max_memory_bytes"), "no notice");
     assert!(
-        items[48]
+        items[12]
             .warnings
             .iter()
             .any(|w| w.contains("set_max_memory_bytes")),
         "{:?}",
-        items[48].warnings
+        items[12].warnings
     );
-    assert!(!mentions(&items[49].section, "set_max_memory_bytes"), "the notice repeats");
+    assert!(!mentions(&items[13].section, "set_max_memory_bytes"), "the notice repeats");
 }

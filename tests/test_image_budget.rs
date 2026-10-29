@@ -29,8 +29,8 @@ const TEXT_BUDGET: usize = 8_000;
 
 fn limits() -> LimitScope {
     let mut scope = LimitScope::new();
-    // A picture's allowance is an eighth of the memory budget.
-    scope.set(max_memory_bytes, set_max_memory_bytes, 8 * IMAGE_BUDGET as u64);
+    // A picture's allowance is half of the memory budget.
+    scope.set(max_memory_bytes, set_max_memory_bytes, 2 * IMAGE_BUDGET as u64);
     scope.set(max_text_chars, set_max_text_chars, TEXT_BUDGET);
     scope
 }

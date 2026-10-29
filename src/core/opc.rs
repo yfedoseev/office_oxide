@@ -945,13 +945,13 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
         .unwrap_or(0);
     let ratio = crate::limits::max_inflate_ratio();
     let compressed = if ratio != u64::MAX
-        && claimed.saturating_mul(ratio) > crate::limits::INFLATE_RATIO_FLOOR_BYTES
+        && claimed.saturating_mul(ratio) > crate::limits::inflate_ratio_floor()
     {
         // A layout that cannot be read is not believed either: the claim is
         // cut to what would not raise the cap past the floor.
         let believed = entries
             .stored_span(archive, index)
-            .unwrap_or(crate::limits::INFLATE_RATIO_FLOOR_BYTES / ratio.max(1));
+            .unwrap_or(crate::limits::inflate_ratio_floor() / ratio.max(1));
         claimed.min(believed)
     } else {
         claimed
