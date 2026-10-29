@@ -643,9 +643,14 @@ pub(crate) type PartText = std::collections::HashMap<String, std::sync::Arc<[Str
 /// paragraph of each point's `<dgm:t>` body, in point-list order. The runs
 /// of one paragraph are joined without a separator — a word split across
 /// runs stays one word.
-pub(crate) fn diagram_data_text_lines(xml_data: &[u8]) -> Vec<String> {
+///
+/// Also says why the part could not be read to its end (`None` when it
+/// could): the lines are then what came before the damage.
+pub(crate) fn diagram_data_text_lines(xml_data: &[u8]) -> (Vec<String>, Option<String>) {
     let mut reader = make_content_reader(xml_data);
     let mut lines = Vec::new();
+    let mut depth = 0usize;
+    let damage;
     let mut in_point_text = 0u32;
     let mut current = String::new();
     loop {
@@ -653,16 +658,24 @@ pub(crate) fn diagram_data_text_lines(xml_data: &[u8]) -> Vec<String> {
             Ok(Event::Start(ref e)) => match e.local_name().as_ref() {
                 // `t` is both the point's text body (`dgm:t`) and a run's
                 // text (`a:t`); the outer one is told apart by nesting.
-                "t" if in_point_text == 0 => in_point_text = 1,
+                "t" if in_point_text == 0 => {
+                    in_point_text = 1;
+                    depth += 1;
+                },
                 "t" => {
                     if let Ok(t) = xml::read_text_content_fast(&mut reader) {
                         current.push_str(&t);
                     }
                 },
-                _ if in_point_text > 0 => in_point_text += 1,
-                _ => {},
+                _ if in_point_text > 0 => {
+                    in_point_text += 1;
+                    depth += 1;
+                },
+                _ => depth += 1,
             },
+            Ok(Event::End(_)) if in_point_text == 0 => depth = depth.saturating_sub(1),
             Ok(Event::End(ref e)) if in_point_text > 0 => {
+                depth = depth.saturating_sub(1);
                 in_point_text -= 1;
                 if matches!(e.local_name().as_ref(), "p" | "t") {
                     let line = current.trim();
@@ -672,11 +685,19 @@ pub(crate) fn diagram_data_text_lines(xml_data: &[u8]) -> Vec<String> {
                     current.clear();
                 }
             },
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => {
+                damage = (depth > 0 || in_point_text > 0)
+                    .then(|| "the XML ends inside an open element".to_string());
+                break;
+            },
+            Err(e) => {
+                damage = Some(format!("the XML is malformed: {e}"));
+                break;
+            },
             _ => {},
         }
     }
-    lines
+    (lines, damage)
 }
 
 /// Find a part reference inside a `<a:graphicData>` subtree — the first
@@ -1876,6 +1897,12 @@ fn parse_table_cell(
 // Notes text extraction (used by lib.rs)
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+thread_local! {
+    /// How many comments parts this thread has parsed (tests only).
+    pub(crate) static COMMENT_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Parse a slide comments part.
 ///
 /// Handles both shapes PowerPoint writes: the legacy
@@ -1892,6 +1919,8 @@ pub(crate) fn parse_comments(
     xml_data: &[u8],
     authors: &std::collections::HashMap<String, String>,
 ) -> (Vec<SlideComment>, Option<String>) {
+    #[cfg(test)]
+    COMMENT_PARSES.with(|n| n.set(n.get() + 1));
     /// One open `cm` or `reply` element.
     struct Frame {
         author_id: Option<String>,
@@ -2096,6 +2125,26 @@ pub(crate) fn extract_plain_text_from_body(body: &TextBody) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    const DIAGRAM_HEAD: &str = r#"<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><dgm:ptLst><dgm:pt><dgm:t><a:p><a:r><a:t>first point</a:t></a:r></a:p></dgm:t></dgm:pt>"#;
+
+    #[test]
+    fn test_a_sound_diagram_part_reports_no_damage() {
+        let xml = format!("{DIAGRAM_HEAD}</dgm:ptLst></dgm:dataModel>");
+        let (lines, damage) = diagram_data_text_lines(xml.as_bytes());
+        assert_eq!(lines, vec!["first point".to_string()]);
+        assert_eq!(damage, None);
+    }
+
+    #[test]
+    fn test_a_damaged_diagram_part_keeps_what_came_first_and_says_it_was_cut() {
+        for tail in ["<dgm:pt><dgm:t><a:p><a:r", "<dgm:pt><<", "<dgm:pt>"] {
+            let xml = format!("{DIAGRAM_HEAD}{tail}");
+            let (lines, damage) = diagram_data_text_lines(xml.as_bytes());
+            assert_eq!(lines, vec!["first point".to_string()], "{tail}");
+            assert!(damage.is_some(), "{tail}");
+        }
+    }
     use super::*;
 
     fn make_slide_xml(body: &str) -> Vec<u8> {

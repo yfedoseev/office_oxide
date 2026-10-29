@@ -1050,7 +1050,14 @@ impl PartCache {
                             }
                             lines
                         } else {
-                            slide::diagram_data_text_lines(&data)
+                            let (lines, damage) = slide::diagram_data_text_lines(&data);
+                            if let Some(damage) = damage {
+                                self.unreadable.record(
+                                    target.as_str(),
+                                    &format!("{damage}; the rest of its text is missing"),
+                                );
+                            }
+                            lines
                         })
                     });
             if !lines.is_empty() {
@@ -1346,6 +1353,73 @@ mod part_cache_tests {
         );
         assert_eq!(parts.layouts.len(), 1);
         assert_eq!(parts.masters.len(), 1);
+    }
+
+    /// Three slides that name one comments part, which holds two comments.
+    fn shared_comments_package() -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default();
+        let mut add = |name: &str, data: &[u8]| {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(data).unwrap();
+        };
+        add(
+            "[Content_Types].xml",
+            br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/></Types>"#,
+        );
+        add(
+            "_rels/.rels",
+            &rels(&[("rId1", rel_types::OFFICE_DOCUMENT, "ppt/presentation.xml")]),
+        );
+        add(
+            "ppt/presentation.xml",
+            br#"<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/><p:sldId id="257" r:id="rId2"/><p:sldId id="258" r:id="rId3"/></p:sldIdLst></p:presentation>"#,
+        );
+        add(
+            "ppt/_rels/presentation.xml.rels",
+            &rels(&[
+                ("rId1", rel_types::SLIDE, "slides/slide1.xml"),
+                ("rId2", rel_types::SLIDE, "slides/slide2.xml"),
+                ("rId3", rel_types::SLIDE, "slides/slide3.xml"),
+            ]),
+        );
+        let ns = r#"xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main""#;
+        for n in 1..=3 {
+            add(
+                &format!("ppt/slides/slide{n}.xml"),
+                format!(r#"<p:sld {ns}><p:cSld><p:spTree/></p:cSld></p:sld>"#).as_bytes(),
+            );
+            add(
+                &format!("ppt/slides/_rels/slide{n}.xml.rels"),
+                &rels(&[(
+                    "rId1",
+                    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments",
+                    "../comments/comment1.xml",
+                )]),
+            );
+        }
+        add(
+            "ppt/comments/comment1.xml",
+            format!(
+                r#"<p:cmLst {ns}><p:cm authorId="0"><p:text>first remark</p:text></p:cm><p:cm authorId="0"><p:text>second remark</p:text></p:cm></p:cmLst>"#
+            )
+            .as_bytes(),
+        );
+        zip.finish().unwrap().into_inner()
+    }
+
+    /// A comments part several slides name was parsed again for each of
+    /// them. It is parsed once, and every slide still gets its comments.
+    #[test]
+    fn test_a_comments_part_shared_by_slides_is_parsed_once() {
+        slide::COMMENT_PARSES.with(|n| n.set(0));
+        let doc = PptxDocument::from_reader(Cursor::new(shared_comments_package())).unwrap();
+        assert_eq!(doc.slides.len(), 3);
+        for slide in &doc.slides {
+            let texts: Vec<_> = slide.comments.iter().map(|c| c.text.as_str()).collect();
+            assert_eq!(texts, ["first remark", "second remark"]);
+        }
+        assert_eq!(slide::COMMENT_PARSES.with(|n| n.get()), 1);
     }
 
     /// Byte-sniffed image formats, used when a relationship target has no

@@ -158,6 +158,15 @@ pub fn set_max_embedded_bytes(bytes: u64) {
 }
 
 /// The default per-document text budget: 256 Mi characters.
+///
+/// The default is one flat number, not a multiple of the input's size. The
+/// size of the input is not known where the text is copied (a reader hands the
+/// converters parsed parts, not the file), and a repeated shared string or an
+/// embedded package legitimately turns a small file into far more text than
+/// its size: a bound that moved with the file would cut genuine small files
+/// and still let a large crafted one through. A flat bound is predictable;
+/// a process that reads only small documents lowers it with
+/// [`set_max_text_chars`], one that reads huge workbooks raises it.
 pub const DEFAULT_MAX_TEXT_CHARS: usize = 256 << 20;
 
 static MAX_TEXT_CHARS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_TEXT_CHARS);
@@ -302,6 +311,74 @@ impl InflateBudget {
     }
 }
 
+/// A remaining allowance of some unit (empty grid slots, bytes of IR padding):
+/// the one concept behind the document-wide and the per-sheet allowances,
+/// which are two instances of it. A refusal spends what was left, so every
+/// later nonzero charge is refused too.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Allowance {
+    total: usize,
+    remaining: usize,
+    exhausted: bool,
+}
+
+impl Allowance {
+    pub(crate) fn new(total: usize) -> Self {
+        Self {
+            total,
+            remaining: total,
+            exhausted: false,
+        }
+    }
+
+    /// The amount this allowance started with.
+    pub(crate) fn total(&self) -> usize {
+        self.total
+    }
+
+    /// Give a new owner (the next sheet) the whole allowance again.
+    pub(crate) fn refill(&mut self) {
+        *self = Self::new(self.total);
+    }
+
+    /// What is left after charging `amount`, or `None` when it does not fit
+    /// or the allowance is already spent. Charges nothing.
+    fn left_after(&self, amount: usize) -> Option<usize> {
+        if self.exhausted {
+            None
+        } else {
+            self.remaining.checked_sub(amount)
+        }
+    }
+
+    /// Charge `amount`; `false` (and the allowance is spent) when it does not
+    /// fit. A charge of nothing always succeeds.
+    pub(crate) fn charge(&mut self, amount: usize) -> bool {
+        if amount == 0 {
+            return true;
+        }
+        match self.left_after(amount) {
+            Some(rest) => {
+                self.remaining = rest;
+                true
+            },
+            None => {
+                self.spend();
+                false
+            },
+        }
+    }
+
+    fn spend(&mut self) {
+        self.remaining = 0;
+        self.exhausted = true;
+    }
+
+    pub(crate) fn is_spent(&self) -> bool {
+        self.exhausted
+    }
+}
+
 /// How many cut sheets a notice names before it counts the rest.
 const GRID_CUTS_NAMED: usize = 5;
 
@@ -309,16 +386,10 @@ const GRID_CUTS_NAMED: usize = 5;
 /// document, and one for the sheet being read.
 #[derive(Debug, Clone)]
 pub(crate) struct GridBudget {
-    total: usize,
-    remaining: usize,
-    sheet_total: usize,
-    sheet_remaining: usize,
-    /// The sheet being read has spent its own allowance.
-    sheet_exhausted: bool,
-    /// The document's allowance is spent.
-    exhausted: bool,
+    document: Allowance,
+    sheet: Allowance,
     /// Name of the sheet being read.
-    sheet: String,
+    sheet_name: String,
     /// Sheets cut so far: `(name, cut by the document's allowance)`.
     cuts: Vec<(String, bool)>,
 }
@@ -337,13 +408,9 @@ impl GridBudget {
 
     pub(crate) fn with_limits(total: usize, per_sheet: usize) -> Self {
         Self {
-            total,
-            remaining: total,
-            sheet_total: per_sheet,
-            sheet_remaining: per_sheet,
-            sheet_exhausted: false,
-            exhausted: false,
-            sheet: String::new(),
+            document: Allowance::new(total),
+            sheet: Allowance::new(per_sheet),
+            sheet_name: String::new(),
             cuts: Vec::new(),
         }
     }
@@ -351,10 +418,9 @@ impl GridBudget {
     /// Start a sheet: it gets its own allowance, within what is left of the
     /// document's.
     pub(crate) fn begin_sheet(&mut self, name: &str) {
-        self.sheet_remaining = self.sheet_total;
-        self.sheet_exhausted = false;
-        self.sheet.clear();
-        self.sheet.push_str(name);
+        self.sheet.refill();
+        self.sheet_name.clear();
+        self.sheet_name.push_str(name);
     }
 
     /// Charge `slots` empty slots. Returns `false` when they do not fit the
@@ -366,27 +432,25 @@ impl GridBudget {
         if slots == 0 {
             return true;
         }
-        if self.exhausted || self.sheet_exhausted {
+        if self.document.is_spent() || self.sheet.is_spent() {
             return false;
         }
-        match (self.remaining.checked_sub(slots), self.sheet_remaining.checked_sub(slots)) {
-            (Some(rest), Some(sheet_rest)) => {
-                self.remaining = rest;
-                self.sheet_remaining = sheet_rest;
+        match (self.document.left_after(slots), self.sheet.left_after(slots)) {
+            (Some(_), Some(_)) => {
+                self.document.charge(slots);
+                self.sheet.charge(slots);
                 true
             },
-            (rest, _) => {
+            (document_rest, _) => {
                 // The document's allowance is what ran out when it cannot
                 // pay; otherwise the sheet's own.
-                let by_document = rest.is_none();
+                let by_document = document_rest.is_none();
                 if by_document {
-                    self.remaining = 0;
-                    self.exhausted = true;
+                    self.document.spend();
                 } else {
-                    self.sheet_remaining = 0;
-                    self.sheet_exhausted = true;
+                    self.sheet.spend();
                 }
-                self.cuts.push((self.sheet.clone(), by_document));
+                self.cuts.push((self.sheet_name.clone(), by_document));
                 false
             },
         }
@@ -408,7 +472,7 @@ impl GridBudget {
                  (office_oxide::limits::set_max_sheet_grid_padding_cells) — later rows of \
                  {} are missing]",
                 Self::name_list(&by_sheet),
-                self.sheet_total,
+                self.sheet.total(),
                 if by_sheet.len() == 1 {
                     "this sheet"
                 } else {
@@ -421,7 +485,7 @@ impl GridBudget {
                 "[workbook truncated: its sparse rows need more than {} empty cells of padding \
                  (office_oxide::limits::set_max_grid_padding_cells) — rows from sheet '{name}' \
                  on are missing]",
-                self.total
+                self.document.total()
             ));
         }
         out
@@ -504,9 +568,7 @@ pub fn set_max_sheet_ir_padding_bytes(bytes: usize) {
 /// one sheet's.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct IrPaddingBudget {
-    total: usize,
-    remaining: usize,
-    exhausted: bool,
+    allowance: Allowance,
     per_sheet: bool,
 }
 
@@ -525,9 +587,7 @@ impl IrPaddingBudget {
 
     pub(crate) fn with_limit(total: usize) -> Self {
         Self {
-            total,
-            remaining: total,
-            exhausted: false,
+            allowance: Allowance::new(total),
             per_sheet: false,
         }
     }
@@ -547,20 +607,10 @@ impl IrPaddingBudget {
         if cells == 0 {
             return true;
         }
-        if self.exhausted {
-            return false;
-        }
-        match cells
-            .checked_mul(Self::cell_bytes())
-            .and_then(|bytes| self.remaining.checked_sub(bytes))
-        {
-            Some(rest) => {
-                self.remaining = rest;
-                true
-            },
+        match cells.checked_mul(Self::cell_bytes()) {
+            Some(bytes) => self.allowance.charge(bytes),
             None => {
-                self.remaining = 0;
-                self.exhausted = true;
+                self.allowance.spend();
                 false
             },
         }
@@ -568,24 +618,23 @@ impl IrPaddingBudget {
 
     #[cfg(test)]
     pub(crate) fn exhausted(&self) -> bool {
-        self.exhausted
+        self.allowance.is_spent()
     }
 
     pub(crate) fn notice(&self) -> String {
+        let total = self.allowance.total();
         if self.per_sheet {
             return format!(
-                "[sheet truncated: its rows are padded to the sheet's width with more than {} \
+                "[sheet truncated: its rows are padded to the sheet's width with more than {total} \
                  bytes of empty table cells (office_oxide::limits::set_max_sheet_ir_padding_bytes) \
-                 — later rows of this sheet are missing]",
-                self.total
+                 — later rows of this sheet are missing]"
             );
         }
         format!(
-            "[workbook truncated: its rows are padded to the sheet's width with more than {} \
+            "[workbook truncated: its rows are padded to the sheet's width with more than {total} \
              bytes of empty table cells (office_oxide::limits::set_max_ir_padding_bytes) — \
              this sheet's later rows, and the rows of each later sheet that needs padding, are \
-             missing]",
-            self.total
+             missing]"
         )
     }
 }
@@ -1039,6 +1088,34 @@ pub(crate) fn classify_style_name(raw: &str) -> StyleName {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_an_allowance_spends_what_is_left_on_a_refusal_and_refills_for_the_next_owner() {
+        let mut a = Allowance::new(10);
+        assert!(a.charge(4) && a.charge(0) && a.charge(6));
+        assert!(!a.charge(1), "nothing is left");
+        assert!(a.charge(0), "a charge of nothing is always allowed");
+        let mut b = Allowance::new(10);
+        assert!(!b.charge(11), "a charge that does not fit is refused");
+        assert!(!b.charge(1), "and spends the rest, so a smaller one is refused too");
+        assert!(b.is_spent());
+        b.refill();
+        assert!(!b.is_spent() && b.charge(10));
+    }
+
+    #[test]
+    fn test_both_padding_budgets_are_the_same_allowance_at_two_scales() {
+        // Grid slots: the sheet's own allowance ends before the document's.
+        let mut grid = GridBudget::with_limits(100, 30);
+        grid.begin_sheet("a");
+        assert!(grid.charge(30) && !grid.charge(1));
+        grid.begin_sheet("b");
+        assert!(grid.charge(30), "the next sheet has its own allowance");
+        // IR padding cells: a charge past the allowance spends it.
+        let cells = 3;
+        let mut ir = IrPaddingBudget::with_limit(cells * IrPaddingBudget::cell_bytes());
+        assert!(ir.charge_cells(cells) && !ir.charge_cells(1) && ir.exhausted());
+    }
     use super::*;
 
     #[test]

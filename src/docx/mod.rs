@@ -469,7 +469,16 @@ impl DocxDocument {
                 Some(lines) => lines.clone(),
                 None => {
                     let lines: std::sync::Arc<[String]> = match opc.read_part(&part) {
-                        Ok(data) => diagram_text_lines(&data).into(),
+                        Ok(data) => {
+                            let (lines, damage) = diagram_text_lines(&data);
+                            if let Some(damage) = damage {
+                                skip_unreadable(
+                                    part.as_str(),
+                                    &format!("{damage}; the rest of its text is missing"),
+                                );
+                            }
+                            lines.into()
+                        },
                         Err(e) => {
                             skip_unreadable(part.as_str(), &e);
                             std::sync::Arc::from(Vec::new())
@@ -2848,9 +2857,16 @@ fn open_deferred_part<R: Read + Seek>(
 
 /// Collect every `<a:t>` text node inside a SmartArt data part
 /// (`word/diagrams/dataN.xml`), in document order, one per line.
-fn diagram_text_lines(xml: &[u8]) -> Vec<String> {
-    let mut reader = xml::make_fast_reader(xml);
+///
+/// Also says why the part could not be read to its end (`None` when it
+/// could): the lines are then what came before the damage.
+fn diagram_text_lines(xml: &[u8]) -> (Vec<String>, Option<String>) {
+    let mut reader = quick_xml::Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+    reader.config_mut().check_comments = false;
     let mut lines = Vec::new();
+    let mut open = 0usize;
+    let damage;
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) if e.local_name().as_ref() == "t" => {
@@ -2861,11 +2877,20 @@ fn diagram_text_lines(xml: &[u8]) -> Vec<String> {
                     }
                 }
             },
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Start(_)) => open += 1,
+            Ok(Event::End(_)) => open = open.saturating_sub(1),
+            Ok(Event::Eof) => {
+                damage = (open > 0).then(|| "the XML ends inside an open element".to_string());
+                break;
+            },
+            Err(e) => {
+                damage = Some(format!("the XML is malformed: {e}"));
+                break;
+            },
             _ => {},
         }
     }
-    lines
+    (lines, damage)
 }
 
 // ---------------------------------------------------------------------------
@@ -4265,6 +4290,18 @@ impl crate::core::OfficeDocument for DocxDocument {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_a_damaged_diagram_part_is_reported_and_keeps_its_first_text() {
+        let head = r#"<dgm:dataModel xmlns:dgm="d" xmlns:a="a"><dgm:ptLst><dgm:pt><dgm:t><a:p><a:r><a:t>kept point</a:t></a:r></a:p></dgm:t></dgm:pt>"#;
+        let sound = format!("{head}</dgm:ptLst></dgm:dataModel>");
+        assert_eq!(diagram_text_lines(sound.as_bytes()), (vec!["kept point".to_string()], None));
+        for tail in ["<dgm:pt><dgm:t><a:p><a:r", "<dgm:pt><<", "<dgm:pt>"] {
+            let (lines, damage) = diagram_text_lines(format!("{head}{tail}").as_bytes());
+            assert_eq!(lines, vec!["kept point".to_string()], "{tail}");
+            assert!(damage.is_some(), "{tail}");
+        }
+    }
     use super::*;
 
     /// A plain one-run paragraph in a one-paragraph cell cost ~4 KB even
