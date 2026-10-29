@@ -1,5 +1,5 @@
 //! Choices about *which* text a reader returns, as opposed to the
-//! [`limits`](crate::limits) that bound how much.
+//! [`limits`] that bound how much.
 //!
 //! By default a document is read as Word shows it with revisions accepted:
 //! text a run hides (`w:vanish`, `sprmCFVanish`) and text a tracked change
