@@ -417,10 +417,7 @@ fn build_downrev_ppt_bytes() -> Vec<u8> {
 #[test]
 fn test_downrev_real_file_fixture_regression() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/wps_downrev.ppt"
-    );
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/wps_downrev.ppt");
     if !std::path::Path::new(path).exists() {
         std::fs::create_dir_all(dir).expect("create fixtures dir");
         std::fs::write(path, build_downrev_ppt_bytes()).expect("write fixture");

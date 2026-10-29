@@ -175,7 +175,9 @@ fn extract_deck_text_with_budget(
     let mut resolved = DeckText::default();
     let mut downrev_budget = downrev::DownrevBudget::new();
     if let Some(dir) = persist::build(stream, current_user) {
-        if let Some(deck) = extract_slides_via_persist(stream, &dir, &mut text_budget, &mut downrev_budget) {
+        if let Some(deck) =
+            extract_slides_via_persist(stream, &dir, &mut text_budget, &mut downrev_budget)
+        {
             // A resolved-but-entirely-textless result is ambiguous: it's the
             // correct answer for a genuinely text-free deck (image-only
             // slides, or slides whose only text is on their master), but
@@ -347,7 +349,15 @@ fn collect_slide_containers(
             continue;
         }
         if rec.header.is_container() {
-            collect_slide_containers(&rec.data, depth + 1, hyperlinks, ole_objects, out, text_budget, downrev_budget);
+            collect_slide_containers(
+                &rec.data,
+                depth + 1,
+                hyperlinks,
+                ole_objects,
+                out,
+                text_budget,
+                downrev_budget,
+            );
         }
     }
 }
