@@ -110,12 +110,58 @@ fn classify_objects_under(
     (out, objects.steps)
 }
 
-/// The objects inside the embedded document whose storage is `container`.
-pub(super) fn objects_under(
-    entries: &[DirEntry],
-    container: usize,
-) -> Vec<(EmbeddedOleObject, usize)> {
-    classify_objects_under(entries, container, MAX_ENTRIES_WALKED).0
+/// The most objects the walk into embedded documents lists in all, however the
+/// directory is laid out.
+const MAX_NESTED_OBJECTS: usize = 4096;
+
+/// The walk into the objects inside embedded documents. A directory is a graph
+/// the file's author drew, so many storages can name one subtree, and a storage
+/// can name an ancestor. The walk lists each object storage once, spends one
+/// budget of directory steps over every level together, and stops listing at a
+/// fixed total, so such a layout costs what its distinct entries cost.
+pub(super) struct ObjectWalk {
+    listed: std::collections::HashSet<usize>,
+    steps_left: usize,
+    cap: usize,
+}
+
+impl ObjectWalk {
+    /// A walk that has already listed the document's own `top` objects.
+    pub(super) fn new(top: &[(EmbeddedOleObject, usize)]) -> Self {
+        Self::with_limits(top, MAX_ENTRIES_WALKED, MAX_NESTED_OBJECTS)
+    }
+
+    fn with_limits(top: &[(EmbeddedOleObject, usize)], steps: usize, cap: usize) -> Self {
+        Self {
+            listed: top.iter().map(|(_, storage)| *storage).collect(),
+            steps_left: steps,
+            cap,
+        }
+    }
+
+    /// The objects not yet listed inside the embedded document whose storage is
+    /// `container`.
+    pub(super) fn under(
+        &mut self,
+        entries: &[DirEntry],
+        container: usize,
+    ) -> Vec<(EmbeddedOleObject, usize)> {
+        if self.steps_left == 0 || self.listed.len() >= self.cap {
+            return Vec::new();
+        }
+        let (found, steps) = classify_objects_under(entries, container, self.steps_left);
+        self.steps_left = self.steps_left.saturating_sub(steps.max(1));
+        let mut out = Vec::new();
+        for (object, storage) in found {
+            if self.listed.len() >= self.cap {
+                break;
+            }
+            if self.listed.insert(storage) {
+                out.push((object, storage));
+            }
+        }
+        out
+    }
 }
 
 /// Classify one embedded object's storage by the well-known stream
@@ -394,5 +440,98 @@ mod tests {
             "the shared chain was walked {steps} steps for {chain} entries"
         );
         assert!(out.len() <= 1, "an entry is claimed by one object only");
+    }
+
+    /// A storage that lists itself again under its own object pool is listed
+    /// once, and following it again finds nothing new.
+    #[test]
+    fn test_an_object_pool_that_names_an_ancestor_adds_nothing() {
+        let entries = vec![
+            entry("Root Entry", EntryType::RootStorage, 1, NO_ENTRY, NO_ENTRY),
+            entry("ObjectPool", EntryType::Storage, 2, NO_ENTRY, NO_ENTRY),
+            entry("_A", EntryType::Storage, 3, NO_ENTRY, NO_ENTRY),
+            entry("WordDocument", EntryType::Stream, NO_ENTRY, NO_ENTRY, 4),
+            entry("ObjectPool", EntryType::Storage, 2, NO_ENTRY, NO_ENTRY), // names _A again
+        ];
+        let top = classify_objects(&entries, MAX_ENTRIES_WALKED).0;
+        assert_eq!(top.len(), 1);
+        let mut walk = ObjectWalk::new(&top);
+        for _ in 0..50 {
+            assert!(walk.under(&entries, 2).is_empty());
+        }
+    }
+
+    /// Many storages that name one large pool list its objects once, and the
+    /// steps they take are bounded by the budget, not by how often it is named.
+    #[test]
+    fn test_one_pool_named_from_many_storages_is_walked_once() {
+        let objects: u32 = 300;
+        let mut entries = vec![
+            entry("Root Entry", EntryType::RootStorage, 1, NO_ENTRY, NO_ENTRY),
+            entry("ObjectPool", EntryType::Storage, 2, NO_ENTRY, NO_ENTRY),
+        ];
+        // The pool's objects 2..2+objects, chained by right siblings, each with
+        // a Workbook stream of its own.
+        for i in 0..objects {
+            let right = if i + 1 < objects { 3 + i } else { NO_ENTRY };
+            entries.push(entry(
+                &format!("_{i}"),
+                EntryType::Storage,
+                2 + objects + i,
+                NO_ENTRY,
+                right,
+            ));
+        }
+        for _ in 0..objects {
+            entries.push(entry("Workbook", EntryType::Stream, NO_ENTRY, NO_ENTRY, NO_ENTRY));
+        }
+        // Holders: storages whose ObjectPool is the pool above.
+        let pool_holder = entries.len() as u32;
+        entries.push(entry("ObjectPool", EntryType::Storage, 2, NO_ENTRY, NO_ENTRY));
+        let holders = 100u32;
+        let first_holder = entries.len() as u32;
+        for i in 0..holders {
+            entries.push(entry(
+                &format!("H{i}"),
+                EntryType::Storage,
+                pool_holder,
+                NO_ENTRY,
+                NO_ENTRY,
+            ));
+        }
+        let mut walk = ObjectWalk::with_limits(&[], 10_000, MAX_NESTED_OBJECTS);
+        let mut total = 0;
+        for i in 0..holders {
+            total += walk.under(&entries, (first_holder + i) as usize).len();
+        }
+        assert_eq!(total, objects as usize, "each object is listed exactly once");
+    }
+
+    /// The listing stops at the total cap, and a spent step budget stops the walk.
+    #[test]
+    fn test_the_walk_stops_at_its_caps() {
+        let objects: u32 = 50;
+        let mut entries = vec![
+            entry("Root Entry", EntryType::RootStorage, 1, NO_ENTRY, NO_ENTRY),
+            entry("ObjectPool", EntryType::Storage, 2, NO_ENTRY, NO_ENTRY),
+        ];
+        for i in 0..objects {
+            let right = if i + 1 < objects { 3 + i } else { NO_ENTRY };
+            entries.push(entry(
+                &format!("_{i}"),
+                EntryType::Storage,
+                2 + objects + i,
+                NO_ENTRY,
+                right,
+            ));
+        }
+        for _ in 0..objects {
+            entries.push(entry("Workbook", EntryType::Stream, NO_ENTRY, NO_ENTRY, NO_ENTRY));
+        }
+        let mut capped = ObjectWalk::with_limits(&[], 10_000, 10);
+        assert_eq!(capped.under(&entries, 0).len(), 10);
+        assert!(capped.under(&entries, 0).is_empty());
+        let mut spent = ObjectWalk::with_limits(&[], 0, 10);
+        assert!(spent.under(&entries, 0).is_empty());
     }
 }

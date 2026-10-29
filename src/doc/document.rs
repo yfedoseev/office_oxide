@@ -933,7 +933,8 @@ fn read_embedded_word_texts<R: Read + Seek>(
     use crate::core::embedded;
     let mut session = embedded::Session::begin();
     let mut out = Vec::with_capacity(found.len());
-    read_embedded_objects(cfb, found, &session, "ObjectPool/", warnings, &mut out);
+    let mut walk = super::ole_objects::ObjectWalk::new(&found);
+    read_embedded_objects(cfb, found, &session, &mut walk, "ObjectPool/", warnings, &mut out);
     let refused = std::cell::RefCell::new(Vec::new());
     session.report(&|name, why| {
         refused
@@ -951,6 +952,7 @@ fn read_embedded_objects<R: Read + Seek>(
     cfb: &mut CfbReader<R>,
     found: Vec<(super::ole_objects::EmbeddedOleObject, usize)>,
     session: &crate::core::embedded::Session,
+    walk: &mut super::ole_objects::ObjectWalk,
     prefix: &str,
     warnings: &mut Vec<String>,
     out: &mut Vec<super::ole_objects::EmbeddedOleObject>,
@@ -966,9 +968,17 @@ fn read_embedded_objects<R: Read + Seek>(
         out.push(object);
         // The level stays open while the objects inside are read.
         if admission.is_some() {
-            let nested = super::ole_objects::objects_under(cfb.entries(), storage);
+            let nested = walk.under(cfb.entries(), storage);
             if !nested.is_empty() {
-                read_embedded_objects(cfb, nested, session, &format!("{name}/"), warnings, out);
+                read_embedded_objects(
+                    cfb,
+                    nested,
+                    session,
+                    walk,
+                    &format!("{name}/"),
+                    warnings,
+                    out,
+                );
             }
         }
     }
