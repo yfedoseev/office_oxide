@@ -64,24 +64,26 @@ fn test_a_symbol_code_without_a_glyph_is_not_read_as_latin_1() {
     assert_eq!(text_of(&sym("Symbol", "F0FF")), "\u{fffd}");
 }
 
-/// Wingdings, Wingdings 2 and 3 and Webdings are read by their own tables
-/// (the Unicode compatibility mappings), not as Latin-1: a check mark is a
-/// check mark, not `ü`. The values are the characters of Unicode's mapping.
+/// Wingdings, Wingdings 2 and 3 and Webdings are read by their own tables, not
+/// as Latin-1: a check mark is a check mark, not `ü`. The values are the
+/// characters of Unicode's normative source list (UTC L2/12-368, WG2 N4384).
 #[test]
 fn test_the_other_symbol_fonts_use_their_own_tables() {
-    assert_eq!(text_of(&sym("Wingdings", "F0FC")), "\u{2714}"); // heavy check mark, not u-umlaut
+    assert_eq!(text_of(&sym("Wingdings", "F0FC")), "\u{2713}"); // check mark, not u-umlaut
     assert_eq!(text_of(&sym("Wingdings", "F0A7")), "\u{25AA}"); // small square, not a bullet
-    assert_eq!(text_of(&sym("Wingdings", "F06E")), "\u{25A0}"); // black square
+    assert_eq!(text_of(&sym("Wingdings", "F06E")), "\u{25FC}"); // black medium square
     assert_eq!(text_of(&sym("Wingdings", "F0D8")), "\u{2B9A}"); // arrowhead
     assert_eq!(text_of(&sym("Wingdings", "F0B7")), "\u{1F550}"); // clock face, not a bullet
+    assert_eq!(text_of(&sym("Wingdings", "F030")), "\u{1F5C0}"); // folder
+    assert_eq!(text_of(&sym("Wingdings", "F04E")), "\u{1F571}"); // skull and crossbones
     assert_eq!(text_of(&sym("Wingdings 2", "F052")), "\u{2611}"); // ballot box with check
-    assert_eq!(text_of(&sym("Wingdings 2", "F050")), "\u{2713}"); // check mark
+    assert_eq!(text_of(&sym("Wingdings 2", "F050")), "\u{1F5F8}"); // light check mark
     assert_eq!(text_of(&sym("Wingdings 3", "F070")), "\u{25B2}"); // up triangle
     assert_eq!(text_of(&sym("Webdings", "F061")), "\u{2714}"); // check mark
     // The font name is matched without regard to case, spacing or a trailing space.
     assert_eq!(text_of(&sym("WINGDINGS 2", "F052")), "\u{2611}");
     assert_eq!(text_of(&sym("Wingdings2", "F052")), "\u{2611}");
-    assert_eq!(text_of(&sym(" Wingdings ", "F0FC")), "\u{2714}");
+    assert_eq!(text_of(&sym(" Wingdings ", "F0FC")), "\u{2713}");
 }
 
 /// A code the font has no character for (its private-use placeholders) is the
@@ -89,7 +91,7 @@ fn test_the_other_symbol_fonts_use_their_own_tables() {
 #[test]
 fn test_a_symbol_font_code_without_a_character_is_the_replacement_character() {
     assert_eq!(text_of(&sym("Wingdings", "F0FF")), "\u{fffd}");
-    assert_eq!(text_of(&sym("Wingdings 3", "F0A0")), "\u{fffd}");
+    assert_eq!(text_of(&sym("Wingdings 3", "F0F1")), "\u{fffd}");
     assert_eq!(text_of(&sym("Wingdings", "F020")), " ".trim());
     let runs =
         format!("<w:r><w:t>a</w:t></w:r>{}<w:r><w:t>b</w:t></w:r>", sym("Wingdings", "F020"));
@@ -138,7 +140,7 @@ fn test_text_in_a_symbol_font_run_is_read_by_the_font_table() {
         text_run(Some("Wingdings 2"), "\u{F052}"),
     ]
     .concat();
-    assert_eq!(text_of(&runs), "\u{3bc}M and \u{3b1}\u{3b2}\u{2265} \u{2714}\u{2611}");
+    assert_eq!(text_of(&runs), "\u{3bc}M and \u{3b1}\u{3b2}\u{2265} \u{2713}\u{2611}");
 }
 
 /// A run in any other font keeps its characters, and a symbol-font run keeps

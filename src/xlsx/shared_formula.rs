@@ -55,7 +55,7 @@ pub struct SharedFormulas {
     /// Masters refused, counted once each.
     refused_masters: usize,
     /// Every follower in document order. A group's master normally comes
-    /// first, but not always — calamine ships a fixture with the records
+    /// first, but not always — real files exist with the records
     /// deliberately reversed — so a follower is resolved only once the whole
     /// sheet has been read.
     followers: Vec<Follower>,

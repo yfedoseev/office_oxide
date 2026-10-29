@@ -527,7 +527,7 @@ impl DocxDocument {
                         // A header or footer part that cannot be read
                         // (a corrupt zip entry) or does not parse is not
                         // the document: skip and report it rather than
-                        // fail the file, as Tika/POI do.
+                        // fail the file.
                         let data = match opc.read_part(&part_name) {
                             Ok(d) => d,
                             Err(e) => {

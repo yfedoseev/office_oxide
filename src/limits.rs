@@ -14,8 +14,7 @@
 //! slide, notes and master text, and the DOCX and PPTX Markdown and IR
 //! converters for what they copy out of shared storage (hyperlink targets,
 //! shared headers, notes, a paragraph style's name — `classify_style_name`
-//! bounds that one). Apache POI does the same with
-//! `ZipSecureFile.setMaxTextSize`.
+//! bounds that one).
 //!
 //! The text budget is one of several, each for the thing that multiplies:
 //! pictures ([`crate::limits::max_image_bytes`], [`crate::limits::max_total_image_bytes`] and, for the
@@ -802,8 +801,8 @@ pub fn set_max_write_table_cells(cells: usize) {
 /// Every sheet is a part of its own with a relationships part beside it, so
 /// this keeps the package under the 65,535 entries a zip without ZIP64
 /// extensions can hold. Excel itself has no fixed sheet limit (memory
-/// decides) and openpyxl none at all, but a genuine workbook has tens or
-/// hundreds of sheets, not tens of thousands.
+/// decides), but a genuine workbook has tens or hundreds of sheets, not tens
+/// of thousands.
 pub const DEFAULT_MAX_WRITE_SHEETS: usize = 32_767;
 
 static MAX_WRITE_SHEETS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_WRITE_SHEETS);

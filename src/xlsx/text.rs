@@ -407,8 +407,7 @@ impl XlsxDocument {
     /// has handed out is kept, so a caller that uses and drops each
     /// [`SheetIr`](super::SheetIr) before asking for the next holds about
     /// one sheet's IR whatever the workbook's size. This is how a browser
-    /// holds a page, and how openpyxl's read-only mode and Apache POI's
-    /// event model hold a worksheet.
+    /// holds a page, and how a streaming reader holds a worksheet.
     ///
     /// The allowances that bound the IR's memory are therefore a sheet's,
     /// fresh for each: the empty cells that pad its rows

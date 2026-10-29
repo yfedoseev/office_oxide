@@ -72,7 +72,7 @@ fn test_a_run_in_the_symbol_font_is_read_by_the_symbol_table() {
 fn test_a_wingdings_run_is_read_by_its_table_including_non_bmp_characters() {
     let _defaults = default_limits();
     let fonts = ["Arial", "Symbol", "Wingdings"];
-    assert!(text_of(doc_with_first_char_in_font("\u{F0FC} ok", &fonts, 2)).contains("\u{2714} ok"));
+    assert!(text_of(doc_with_first_char_in_font("\u{F0FC} ok", &fonts, 2)).contains("\u{2713} ok"));
     // Wingdings 0xB7 is a clock face outside the Basic Multilingual Plane.
     assert!(text_of(doc_with_first_char_in_font("\u{F0B7} t", &fonts, 2)).contains("\u{1F550} t"));
 }
