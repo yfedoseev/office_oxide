@@ -1255,10 +1255,10 @@ fn parse_alternate_content(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<
 /// symbol-font private-use encoding of a single byte, and what that byte
 /// means is the font's own encoding, so the font decides:
 ///
-/// * `Symbol` has a published encoding (Adobe's `Symbol.afm` with the Adobe
-///   Glyph List), applied by [`crate::core::symbol_font`]. A code the font
-///   has no glyph for is the replacement character, never a Latin letter.
-/// * Any other font has no standard table here, so the byte is mapped to the
+/// * `Symbol`, `Wingdings`, `Wingdings 2`, `Wingdings 3` and `Webdings` have
+///   tables ([`crate::core::symbol_font`]). A code the font has no character
+///   for is the replacement character, never a Latin letter.
+/// * Any other font (or none) has no table, so the byte is mapped to the
 ///   bullet-ish equivalent for the two codes Word's galleries use and passed
 ///   down as before otherwise; everything outside the private-use range
 ///   passes through unchanged.
@@ -1267,15 +1267,16 @@ fn parse_sym_char(e: &quick_xml::events::BytesStart) -> Option<char> {
     let code = u32::from_str_radix(raw.trim(), 16).ok()?;
     let font = xml::optional_attr_str(e, "w:font").ok().flatten();
     if let (Some(font), 0xF000..=0xF0FF) = (font.as_deref(), code) {
-        if font.trim().eq_ignore_ascii_case("Symbol") {
+        if let Some(font) = crate::core::symbol_font::symbol_font(font) {
             return Some(
-                crate::core::symbol_font::symbol_char((code - 0xF000) as u8).unwrap_or('\u{FFFD}'),
+                crate::core::symbol_font::char_for(font, (code - 0xF000) as u8)
+                    .unwrap_or('\u{FFFD}'),
             );
         }
     }
     let mapped = match code {
-        0xF0B7 | 0xF0A7 => 0x2022, // Wingdings bullet
-        0xF0D8 => 0x25BA,          // Wingdings arrowhead
+        0xF0B7 | 0xF0A7 => 0x2022, // a symbol-font bullet
+        0xF0D8 => 0x25BA,          // an arrowhead
         c @ 0xF000..=0xF0FF => c - 0xF000,
         c => c,
     };

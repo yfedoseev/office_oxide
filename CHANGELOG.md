@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `<w:sym>` character in Wingdings, Wingdings 2, Wingdings 3 or Webdings is read by that font's table.** Only Symbol had one, so a check mark (Wingdings `F0FC`) printed as `ü`, a checked box as `R`, and two hard-coded codes gave a bullet and an arrowhead that Wingdings does not draw there. The tables follow the Unicode 7.0 compatibility mappings for these fonts; a code the font has no character for is the replacement character.
+
 - **A `.doc` whose header version is not a Word version says that the language of its 8-bit text is unknown.** The FIB's language ID decides how 8-bit text is read; a fuzzed header can have its version, language, flags and character set overwritten, and the text (Hebrew in one file) was read in Windows-1252 with nothing said. The reader does not guess a script from byte statistics, which would be a plausible-but-wrong result; the warnings now state that the header is damaged, name the version found, and say the text was read as Windows-1252. Every genuine Word version (0x65 to 0x112) is silent.
 
 - **A `.doc` whose piece table has a character position out of order is read, not refused.** [MS-DOC] 2.8.35 requires the positions to ascend, and 2.4.1 finds the text at a position as "the largest i such that aCp[i] <= cp", a rule defined for any array. The pieces are now resolved by that rule (piece `i` covers `[aCp[i], min(aCp[i+1..]))`, which is the old range for a sorted table), a piece left with no range covers nothing, and the warnings say the table was out of order. A fast-saved file with one wrong position was refused whole while catdoc recovered its text.
