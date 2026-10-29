@@ -4,6 +4,7 @@
 Usage: .venv/bin/python bench_python.py ~/projects/office_oxide_tests/
 """
 
+import gc
 import json
 import os
 import resource
@@ -35,6 +36,38 @@ def timeout_handler(signum, frame):
     raise TimeoutError("Timed out")
 
 signal.signal(signal.SIGALRM, timeout_handler)
+
+# A library that allocates without bound on one huge or hostile file must fail
+# that file (a MemoryError, counted as a failure), not be killed by the OS
+# together with the rest of the run. A watcher thread signals the main thread
+# when the process passes this resident size; a cap on the address space
+# would also break the native runtimes some libraries load.
+MAX_RSS_KB = 10 * 1024 * 1024
+# True only while a library call runs, so the signal can never land in the
+# harness itself.
+in_call = False
+
+
+def memory_handler(signum, frame):
+    if in_call:
+        raise MemoryError("resident memory limit")
+
+
+def _watch_memory(main_thread_id: int) -> None:
+    page_kb = os.sysconf("SC_PAGE_SIZE") // 1024
+    while True:
+        time.sleep(0.2)
+        try:
+            with open("/proc/self/statm") as f:
+                rss_kb = int(f.read().split()[1]) * page_kb
+        except OSError:
+            return
+        if rss_kb > MAX_RSS_KB:
+            signal.pthread_kill(main_thread_id, signal.SIGUSR1)
+            time.sleep(2)
+
+
+signal.signal(signal.SIGUSR1, memory_handler)
 
 # ── Library wrappers ──────────────────────────────────────────────────────
 
@@ -142,8 +175,30 @@ def main():
         i = sys.argv.index("--json")
         json_out = sys.argv[i + 1]
 
+    import threading
+
+    threading.Thread(
+        target=_watch_memory, args=(threading.get_ident(),), daemon=True
+    ).start()
+
     files = collect_files(root)
     print(f"Found {len(files)} files", file=sys.stderr)
+    # Optional: BENCH_RANGE=A:B reads only files[A:B] (to bisect a crash), and
+    # BENCH_TRACE=FILE records the file being read, so a run the OS kills
+    # leaves the culprit behind.
+    if os.environ.get("BENCH_RANGE"):
+        a, b = os.environ["BENCH_RANGE"].split(":")
+        files = files[int(a) : int(b)]
+    trace_path = os.environ.get("BENCH_TRACE")
+    # Files that end the whole process when a library reads them (one
+    # `library<TAB>path` per line in BENCH_CRASH_LIST) are counted as that
+    # library's failure (CRASH) without being read.
+    crash_list = set()
+    if os.environ.get("BENCH_CRASH_LIST"):
+        with open(os.environ["BENCH_CRASH_LIST"]) as f:
+            crash_list = {
+                tuple(line.rstrip("\n").split("\t", 1)) for line in f if "\t" in line
+            }
     rss_start_kb = peak_rss_kb()
 
     # stats[lib_name] = {"ok": 0, "fail": 0, "errors": {}, "total_ms": 0}
@@ -154,30 +209,43 @@ def main():
         libs_for_ext = LIBS.get(ext, [])
 
         for lib_name, func in libs_for_ext:
-            if lib_name not in stats:
-                stats[lib_name] = {"ok": 0, "fail": 0, "errors": {}, "total_ms": 0.0, "timeout": 0}
+            # Results are kept per library and extension, as the tables are.
+            key = f"{lib_name} {ext}"
+            if key not in stats:
+                stats[key] = {"ok": 0, "fail": 0, "errors": {}, "total_ms": 0.0, "timeout": 0}
 
+            if (lib_name, path) in crash_list:
+                stats[key]["fail"] += 1
+                stats[key]["errors"]["CRASH"] = stats[key]["errors"].get("CRASH", 0) + 1
+                continue
+            if trace_path:
+                with open(trace_path, "w") as t:
+                    t.write(f"{lib_name}\t{path}\n")
+            global in_call
             signal.alarm(TIMEOUT)
             t0 = time.monotonic()
+            in_call = True
             try:
                 text = func(path)
                 elapsed = (time.monotonic() - t0) * 1000
-                stats[lib_name]["ok"] += 1
-                stats[lib_name]["total_ms"] += elapsed
+                stats[key]["ok"] += 1
+                stats[key]["total_ms"] += elapsed
             except TimeoutError:
-                stats[lib_name]["fail"] += 1
-                stats[lib_name]["timeout"] += 1
+                stats[key]["fail"] += 1
+                stats[key]["timeout"] += 1
                 err_key = "TIMEOUT"
-                stats[lib_name]["errors"][err_key] = stats[lib_name]["errors"].get(err_key, 0) + 1
+                stats[key]["errors"][err_key] = stats[key]["errors"].get(err_key, 0) + 1
             except BaseException as e:
                 elapsed = (time.monotonic() - t0) * 1000
-                stats[lib_name]["fail"] += 1
-                stats[lib_name]["total_ms"] += elapsed
+                stats[key]["fail"] += 1
+                stats[key]["total_ms"] += elapsed
                 err_key = type(e).__name__
-                stats[lib_name]["errors"][err_key] = stats[lib_name]["errors"].get(err_key, 0) + 1
+                stats[key]["errors"][err_key] = stats[key]["errors"].get(err_key, 0) + 1
             finally:
+                in_call = False
                 signal.alarm(0)
 
+        gc.collect()
         if (i + 1) % 500 == 0:
             print(f"  [{i+1}/{len(files)}]", file=sys.stderr)
 
