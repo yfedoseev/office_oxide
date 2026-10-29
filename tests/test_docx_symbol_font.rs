@@ -116,3 +116,57 @@ fn test_a_symbol_between_words_keeps_its_place() {
     );
     assert_eq!(text_of(&runs), "angle \u{2220} = 90");
 }
+
+fn text_run(font: Option<&str>, text: &str) -> String {
+    let props = font
+        .map(|f| format!(r#"<w:rPr><w:rFonts w:ascii="{f}" w:hAnsi="{f}"/></w:rPr>"#))
+        .unwrap_or_default();
+    format!(r#"<w:r>{props}<w:t xml:space="preserve">{text}</w:t></w:r>"#)
+}
+
+/// Text typed in a symbol font is stored as private-use characters
+/// (`U+F000` + the font's byte). In a run whose font is a symbol font they are
+/// the font's characters: `μM` was written as `U+F06D` and `M`.
+#[test]
+fn test_text_in_a_symbol_font_run_is_read_by_the_font_table() {
+    let runs = [
+        text_run(Some("Symbol"), "\u{F06D}"),
+        text_run(None, "M and "),
+        text_run(Some("Symbol"), "\u{F061}\u{F062}\u{F0B3}"),
+        text_run(None, " "),
+        text_run(Some("Wingdings"), "\u{F0FC}"),
+        text_run(Some("Wingdings 2"), "\u{F052}"),
+    ]
+    .concat();
+    assert_eq!(text_of(&runs), "\u{3bc}M and \u{3b1}\u{3b2}\u{2265} \u{2714}\u{2611}");
+}
+
+/// A run in any other font keeps its characters, and a symbol-font run keeps
+/// the characters the font has no mapping for and everything outside `F020..F0FF`.
+#[test]
+fn test_only_symbol_font_runs_and_their_private_use_range_are_mapped() {
+    let kept = format!(
+        "{}{}{}",
+        text_run(Some("Arial"), "\u{F06D}"),
+        text_run(None, "\u{F06D}"),
+        text_run(Some("Symbol"), "plain \u{F0FF}\u{2022}"),
+    );
+    assert_eq!(text_of(&kept), "\u{F06D}\u{F06D}plain \u{F0FF}\u{2022}");
+    // Code 0x20 is a space in a symbol font.
+    assert_eq!(text_of(&text_run(Some("Symbol"), "a\u{F020}b")), "a b");
+}
+
+/// Every rendering reads the run the same way.
+#[test]
+fn test_every_surface_reads_symbol_font_text_alike() {
+    let runs = format!("{}{}", text_run(Some("Symbol"), "\u{F06D}"), text_run(None, "M"));
+    let doc =
+        Document::from_reader(Cursor::new(docx_with_runs(&runs)), DocumentFormat::Docx).unwrap();
+    assert!(doc.plain_text().contains("\u{3bc}M"));
+    assert!(doc.to_markdown().contains("\u{3bc}M"), "{}", doc.to_markdown());
+    // HTML puts the two runs in separate spans; the character is what matters.
+    assert!(doc.to_html().contains('\u{3bc}'));
+    for out in [doc.plain_text(), doc.to_markdown(), doc.to_html()] {
+        assert!(!out.contains('\u{F06D}'), "{out}");
+    }
+}

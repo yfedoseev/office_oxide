@@ -1993,8 +1993,46 @@ fn parse_run(
             _ => {},
         }
     }
+    map_symbol_font_text(&mut run);
     run.content.shrink_to_fit();
     Ok(run)
+}
+
+/// Text typed in a symbol font is stored as private-use characters
+/// (`U+F000` plus the font's byte), so `μ` in the Symbol font is `U+F06D`. In a
+/// run whose own font is Symbol, Wingdings, Wingdings 2 or 3 or Webdings, those
+/// characters are the font's, and are replaced by them; a character the font
+/// has no mapping for stays as it is. Runs in any other font, and runs whose
+/// font comes only from a style, are not touched.
+fn map_symbol_font_text(run: &mut Run) {
+    let Some(props) = &run.properties else {
+        return;
+    };
+    let named = props
+        .font_name
+        .as_deref()
+        .or_else(|| props.script.as_ref().and_then(|s| s.font_h_ansi.as_deref()));
+    let Some(font) = named.and_then(crate::core::symbol_font::symbol_font) else {
+        return;
+    };
+    let in_range = |c: char| ('\u{F020}'..='\u{F0FF}').contains(&c);
+    for content in &mut run.content {
+        if let RunContent::Text(text) = content {
+            if text.chars().any(in_range) {
+                *text = text
+                    .chars()
+                    .map(|c| {
+                        if in_range(c) {
+                            crate::core::symbol_font::char_for(font, (c as u32 - 0xF000) as u8)
+                                .unwrap_or(c)
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+            }
+        }
+    }
 }
 
 /// Push the `RunContent` for a `w:footnoteReference` /

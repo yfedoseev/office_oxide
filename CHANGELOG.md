@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Text typed in a symbol font is read by the font's table in a `.docx` run.** Symbol, Wingdings, Wingdings 2 and 3 and Webdings store their text as private-use characters (`U+F000` plus the byte), so `μM` was written as `U+F06D` and `M`, which render as nothing. In a run whose own font is one of those, the characters are now the font's; a character without a mapping, and every run in another font, is untouched.
+
 - **A `<w:sym>` character in Wingdings, Wingdings 2, Wingdings 3 or Webdings is read by that font's table.** Only Symbol had one, so a check mark (Wingdings `F0FC`) printed as `ü`, a checked box as `R`, and two hard-coded codes gave a bullet and an arrowhead that Wingdings does not draw there. The tables follow the Unicode 7.0 compatibility mappings for these fonts; a code the font has no character for is the replacement character.
 
 - **A `.doc` whose header version is not a Word version says that the language of its 8-bit text is unknown.** The FIB's language ID decides how 8-bit text is read; a fuzzed header can have its version, language, flags and character set overwritten, and the text (Hebrew in one file) was read in Windows-1252 with nothing said. The reader does not guess a script from byte statistics, which would be a plausible-but-wrong result; the warnings now state that the header is damaged, name the version found, and say the text was read as Windows-1252. Every genuine Word version (0x65 to 0x112) is silent.
