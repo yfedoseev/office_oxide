@@ -781,12 +781,35 @@ impl DocxWriter {
                             .saturating_mul(width as u64)
                             .saturating_add(inner)
                     },
+                    DocxElement::RichList(l) => l
+                        .items
+                        .iter()
+                        .map(|item| elements(item))
+                        .fold(0, u64::saturating_add),
                     DocxElement::TextBox(tb) => elements(&tb.content),
                     _ => 0,
                 })
                 .fold(0, u64::saturating_add)
         }
-        elements(&self.elements)
+        // The body, and every other part that holds elements.
+        [
+            elements(&self.elements),
+            self.headers_footers
+                .iter()
+                .map(|h| elements(&h.elements))
+                .fold(0, u64::saturating_add),
+            self.footnotes
+                .iter()
+                .chain(&self.endnotes)
+                .map(|n| elements(&n.elements))
+                .fold(0, u64::saturating_add),
+            self.comments
+                .iter()
+                .map(|c| elements(&c.elements))
+                .fold(0, u64::saturating_add),
+        ]
+        .into_iter()
+        .fold(0, u64::saturating_add)
     }
 
     /// Add a table. The first row is treated as the header row.
@@ -1096,7 +1119,6 @@ impl DocxWriter {
 
     /// Write the document to an arbitrary `Write + Seek` destination.
     pub fn write_to<W: Write + Seek>(&self, writer: W) -> Result<()> {
-        crate::create::check_write_cells(self.table_cells(), crate::format::DocumentFormat::Docx)?;
         let opc = OpcWriter::new(writer)?;
         // Comment anchors are written only for comments this package
         // defines (see `write_run`); the set is scoped to this call.
@@ -1118,6 +1140,8 @@ impl DocxWriter {
     // -----------------------------------------------------------------------
 
     fn write_package<W: Write + Seek>(&self, mut opc: OpcWriter<W>) -> Result<()> {
+        // Both `save` and `write_to` come through here.
+        crate::create::check_write_cells(self.table_cells(), crate::format::DocumentFormat::Docx)?;
         let doc_part = PartName::new("/word/document.xml")?;
         let styles_part = PartName::new("/word/styles.xml")?;
 

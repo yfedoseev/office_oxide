@@ -300,3 +300,38 @@ fn test_a_writer_used_directly_is_held_to_the_write_limit() {
             .into(),
     );
 }
+
+/// `save` is held to the limit as `write_to` is, and tables in a header, a
+/// footnote or a slide's notes are counted with the body's.
+#[test]
+fn test_save_and_the_other_containers_are_held_to_the_write_limit_too() {
+    use office_oxide::docx::write::DocxWriter;
+    use office_oxide::pptx::write::{PptxWriter, Run};
+    let mut limits = LimitScope::new();
+    limits.set(max_write_bytes, set_max_write_bytes, BYTE_LIMIT);
+    let dir = std::env::temp_dir().join(format!("office_oxide_save_limit_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let docx_path = dir.join("big.docx");
+    let pptx_path = dir.join("big.pptx");
+
+    let row: Vec<&str> = vec!["c"; 10];
+    let rows: Vec<Vec<&str>> = vec![row; 10];
+    let mut docx = DocxWriter::new();
+    docx.add_table(&rows);
+    assert!(docx.save(&docx_path).is_err(), "save must refuse what write_to refuses");
+
+    // The same table in the IR, placed in a footnote.
+    let mut with_note = DocxWriter::new();
+    with_note.add_footnote(1, &[Element::Table(table(10, 10))], None);
+    assert!(
+        with_note.write_to(Cursor::new(Vec::new())).is_err(),
+        "a table in a footnote is counted"
+    );
+
+    let cell = || vec![Run::new("c")];
+    let mut pptx = PptxWriter::new();
+    pptx.add_slide()
+        .add_table(vec![(0..10).map(|_| cell()).collect::<Vec<_>>(); 30]);
+    assert!(pptx.save(&pptx_path).is_err(), "save must refuse what write_to refuses");
+    std::fs::remove_dir_all(&dir).ok();
+}

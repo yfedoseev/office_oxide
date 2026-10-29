@@ -655,7 +655,6 @@ impl PptxWriter {
 
     /// Write the presentation to any `Write + Seek` destination.
     pub fn write_to<W: Write + Seek>(&self, writer: W) -> Result<()> {
-        crate::create::check_write_cells(self.table_cells(), crate::format::DocumentFormat::Pptx)?;
         let opc = OpcWriter::new(writer)?;
         self.write_opc(opc)?;
         Ok(())
@@ -666,7 +665,7 @@ impl PptxWriter {
     fn table_cells(&self) -> u64 {
         self.slides
             .iter()
-            .flat_map(|s| &s.body_items)
+            .flat_map(|s| s.body_items.iter().chain(s.notes.iter().flatten()))
             .map(|item| match item {
                 BodyItem::Table(rows) => {
                     let width = rows.iter().map(Vec::len).max().unwrap_or(0);
@@ -678,6 +677,8 @@ impl PptxWriter {
     }
 
     fn write_opc<W: Write + Seek>(&self, mut opc: OpcWriter<W>) -> Result<()> {
+        // Both `save` and `write_to` come through here.
+        crate::create::check_write_cells(self.table_cells(), crate::format::DocumentFormat::Pptx)?;
         let pres_part = PartName::new("/ppt/presentation.xml")?;
         let master_part = PartName::new("/ppt/slideMasters/slideMaster1.xml")?;
         let layout_part = PartName::new("/ppt/slideLayouts/slideLayout1.xml")?;
