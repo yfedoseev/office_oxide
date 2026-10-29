@@ -524,7 +524,7 @@ pub(crate) struct ZipEntryIndex {
     /// Where each entry's local header starts (by index), the same sorted,
     /// and where the central directory starts: built on first use, to bound
     /// what an entry can physically store (see [`Self::stored_span`]).
-    header_starts: std::cell::OnceCell<(Vec<u64>, Vec<u64>, u64)>,
+    header_starts: std::cell::OnceCell<(Vec<Option<u64>>, Vec<u64>, u64)>,
 }
 
 impl Drop for ZipEntryIndex {
@@ -604,18 +604,19 @@ impl ZipEntryIndex {
         index: usize,
     ) -> Option<u64> {
         if self.header_starts.get().is_none() {
-            let mut by_index = Vec::with_capacity(archive.len());
-            for i in 0..archive.len() {
-                by_index.push(archive.by_index_raw(i).ok()?.header_start());
-            }
-            let mut sorted = by_index.clone();
+            // An entry whose header cannot be read is left out, not a reason to
+            // give up on the rest; it has no span of its own (`None`).
+            let by_index: Vec<Option<u64>> = (0..archive.len())
+                .map(|i| archive.by_index_raw(i).ok().map(|f| f.header_start()))
+                .collect();
+            let mut sorted: Vec<u64> = by_index.iter().flatten().copied().collect();
             sorted.sort_unstable();
             let _ = self
                 .header_starts
                 .set((by_index, sorted, archive.central_directory_start()));
         }
         let (by_index, sorted, directory) = self.header_starts.get()?;
-        let mine = *by_index.get(index)?;
+        let mine = (*by_index.get(index)?)?;
         let next = sorted
             .get(sorted.partition_point(|&s| s <= mine))
             .copied()
@@ -939,12 +940,16 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
         .by_index_raw(index)
         .map(|f| f.compressed_size())
         .unwrap_or(0);
-    let compressed = if claimed.saturating_mul(crate::limits::max_inflate_ratio())
-        > crate::limits::INFLATE_RATIO_FLOOR_BYTES
+    let ratio = crate::limits::max_inflate_ratio();
+    let compressed = if ratio != u64::MAX
+        && claimed.saturating_mul(ratio) > crate::limits::INFLATE_RATIO_FLOOR_BYTES
     {
-        entries
+        // A layout that cannot be read is not believed either: the claim is
+        // cut to what would not raise the cap past the floor.
+        let believed = entries
             .stored_span(archive, index)
-            .map_or(claimed, |span| claimed.min(span))
+            .unwrap_or(crate::limits::INFLATE_RATIO_FLOOR_BYTES / ratio.max(1));
+        claimed.min(believed)
     } else {
         claimed
     };
