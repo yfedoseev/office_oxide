@@ -160,3 +160,42 @@ fn test_a_run_font_or_character_style_beats_the_paragraph_style() {
     let character_style = styled_doc(&[1], vec![0x30, 0x4A, 0x03, 0x00]);
     assert!(character_style.starts_with('\u{2713}') && character_style.contains('\u{3bc}'));
 }
+
+/// Runs that differ only in the font table index or the character style they
+/// name show nowhere in a text span: they stay one span.
+#[test]
+fn test_runs_that_differ_only_in_font_or_character_style_stay_one_span() {
+    let _defaults = default_limits();
+    for grpprl in [
+        vec![0x30u8, 0x4A, 0x01, 0x00],
+        vec![0x51u8, 0x4A, 0x01, 0x00],
+    ] {
+        let paras = vec![Para {
+            text: Box::leak("x".repeat(99).into_boxed_str()),
+            terminator: '\r',
+            grpprl: Vec::new(),
+        }];
+        let tweaks = FibTweaks {
+            chpx_runs: 30,
+            chpx_grpprl: grpprl,
+            ..FibTweaks::default()
+        };
+        let (word, table) = build_doc_streams(&paras, &Subdocs::default(), tweaks);
+        let doc = Document::from_reader(
+            Cursor::new(build_doc_from_streams(&word, &table)),
+            DocumentFormat::Doc,
+        )
+        .unwrap();
+        let ir = doc.to_ir();
+        let spans: usize = ir
+            .sections
+            .iter()
+            .flat_map(|s| &s.elements)
+            .map(|e| match e {
+                office_oxide::ir::Element::Paragraph(p) => p.content.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(spans, 1);
+    }
+}

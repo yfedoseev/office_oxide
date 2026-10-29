@@ -969,6 +969,18 @@ impl ChpProps {
         }
     }
 
+    /// These properties as the text spans of a paragraph see them: without
+    /// the two that decide how a symbol-font character reads (`ftc_other`,
+    /// `istd_char`) and show nowhere in a span, so that runs which differ in
+    /// those alone stay one span.
+    pub fn for_spans(&self) -> Self {
+        Self {
+            ftc_other: None,
+            istd_char: None,
+            ..self.clone()
+        }
+    }
+
     /// Text Word does not show in the accepted view: deleted revision
     /// text or hidden (`sprmCFVanish`) text.
     pub fn is_excluded(&self) -> bool {

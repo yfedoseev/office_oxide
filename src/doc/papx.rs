@@ -637,7 +637,7 @@ pub fn build_paragraphs_symbols(
                         continue;
                     }
                     buf.push(ch);
-                    buf_props.push(props.clone());
+                    buf_props.push(props.for_spans());
                     if is_mark {
                         emit_paragraph(
                             &mut buf,
