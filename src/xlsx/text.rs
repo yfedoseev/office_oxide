@@ -277,6 +277,10 @@ impl XlsxDocument {
                 out.write_char('\n')?;
                 out.write_str(COMMENTS_TRUNCATED_NOTICE)?;
             }
+            if let Some(damage) = &ws.damage {
+                out.write_char('\n')?;
+                out.write_str(&damaged_notice(&ws.name, damage))?;
+            }
             if budget.exhausted() {
                 out.write_char('\n')?;
                 out.write_str(&budget.notice())?;
@@ -559,6 +563,10 @@ impl XlsxDocument {
             if ws.comments_truncated {
                 begin(out)?;
                 out.write_str(COMMENTS_TRUNCATED_NOTICE)?;
+            }
+            if let Some(damage) = &ws.damage {
+                begin(out)?;
+                out.write_str(&damaged_notice(&ws.name, damage))?;
             }
             if budget.exhausted() {
                 begin(out)?;
@@ -993,6 +1001,12 @@ fn csv_escape(field: &str) -> String {
     }
 }
 
+/// The line every renderer emits for a sheet whose XML was malformed part-way
+/// and which was read only up to the damage.
+pub(crate) fn damaged_notice(name: &str, damage: &str) -> String {
+    inert(&format!("[sheet {name:?} cut short: {damage}]"))
+}
+
 /// The line every renderer emits for a sheet that could not be read, so
 /// a workbook missing a sheet never passes for a complete one.
 pub(crate) fn unreadable_notice(name: &str, err: &str) -> String {
@@ -1256,6 +1270,7 @@ mod tests {
             merged_cells: Vec::new(),
             hyperlinks: Vec::new(),
             formulas_dropped: 0,
+            damage: None,
             page_setup: None,
             images: std::sync::Arc::from([]),
             cell_images: Vec::new(),
@@ -1341,6 +1356,7 @@ mod tests {
             merged_cells: Vec::new(),
             hyperlinks: Vec::new(),
             formulas_dropped: 0,
+            damage: None,
             page_setup: None,
             images: std::sync::Arc::from([]),
             cell_images: Vec::new(),

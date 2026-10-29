@@ -283,6 +283,7 @@ impl<'d> SheetConverter<'d> {
         self.item_truncated |= self.sheet_padding_cut.is_some()
             || self.image_budget.exhausted()
             || ws.comments_truncated
+            || ws.damage.is_some()
             || ws.formulas_dropped > 0;
         section
     }
@@ -814,6 +815,17 @@ impl<'d> SheetConverter<'d> {
                 )))],
                 ..Default::default()
             }));
+        }
+        if let Some(damage) = &ws.damage {
+            combined.push(Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(
+                    crate::xlsx::text::damaged_notice(&ws.name, damage),
+                ))],
+                ..Default::default()
+            }));
+            warnings.push(format!("sheet {:?} cut short: {damage}", ws.name));
+            // The sheet lost rows: the document's text is truncated.
+            *formulas_truncated = true;
         }
         if ws.formulas_dropped > 0 {
             *formulas_truncated = true;

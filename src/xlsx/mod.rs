@@ -538,8 +538,30 @@ impl XlsxDocument {
                     ws.chart_text = b.chart_text;
                     return Ok(Ok((ws, shared_formula::SharedFormulas::default())));
                 }
-                match Worksheet::parse_unresolved(&b.data, b.name, &b.rels) {
-                    Ok((mut ws, shared)) => {
+                let parsed = match Worksheet::parse_unresolved(&b.data, b.name.clone(), &b.rels) {
+                    Ok(done) => Ok((done, None)),
+                    // Malformed XML part-way through: the rows before the damage
+                    // parsed fine, so they are kept and the loss is said. A sheet
+                    // with no complete row, or whose error is not XML damage,
+                    // stays unreadable.
+                    Err(e) => match worksheet::salvage_prefix(&b.data) {
+                        Some((prefix, rows)) => {
+                            match Worksheet::parse_unresolved(&prefix, b.name.clone(), &b.rels) {
+                                Ok(done) => Ok((
+                                    done,
+                                    Some(format!(
+                                        "its XML is malformed ({e}); the {rows} complete row(s) before \
+                                         the damage were read and everything after them was not"
+                                    )),
+                                )),
+                                Err(_) => Err(e),
+                            }
+                        },
+                        None => Err(e),
+                    },
+                };
+                match parsed {
+                    Ok(((mut ws, shared), damage)) => {
                         ws.kind = b.kind;
                         ws.state = b.state;
                         ws.tables = b.tables;
@@ -548,6 +570,7 @@ impl XlsxDocument {
                         ws.text_shapes = b.text_shapes;
                         ws.comments = b.comments;
                         ws.comments_truncated = b.comments_truncated;
+                        ws.damage = damage;
                         Ok(Ok((ws, shared)))
                     },
                     Err(e) => {

@@ -25,6 +25,9 @@ pub struct Worksheet {
     /// the master would pass the document's text budget
     /// ([`crate::limits::set_max_text_chars`]). The cells keep their values.
     pub formulas_dropped: usize,
+    /// Set when the worksheet's XML is malformed and only the rows before the
+    /// damage were read: what was kept, and where it stops.
+    pub damage: Option<String>,
     /// Per-sheet page geometry parsed from `<pageMargins>` + `<pageSetup>`.
     pub page_setup: Option<PageSetup>,
     /// Pictures anchored on this worksheet via `xl/drawings/drawingN.xml`.
@@ -170,6 +173,54 @@ impl PivotCacheSource {
             (_, None, name) => name.clone(),
         }
     }
+}
+
+/// The part of a malformed worksheet that parsed before the damage: the XML up
+/// to the end of the last complete `<row>`, closed with the end tags of
+/// `<sheetData>` and the root, and how many rows that holds. `None` when the
+/// XML is not damaged (the error lies elsewhere) or no row is complete. A row
+/// the damage reaches is not kept, so no row is ever cut in two.
+pub(crate) fn salvage_prefix(data: &[u8]) -> Option<(Vec<u8>, usize)> {
+    let mut reader = xml::make_fast_reader(data);
+    let mut root: Option<Vec<u8>> = None;
+    let mut sheet_data: Option<Vec<u8>> = None;
+    let mut last_end = None;
+    let mut rows = 0usize;
+    let mut damaged = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => {
+                let name = e.name().as_ref().as_bytes().to_vec();
+                if root.is_none() {
+                    root = Some(name);
+                } else if e.local_name().as_ref() == "sheetData" {
+                    sheet_data = Some(name);
+                }
+            },
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == "row" => {
+                rows += 1;
+                last_end = Some(reader.buffer_position() as usize);
+            },
+            Ok(Event::Eof) => break,
+            Err(_) => {
+                damaged = true;
+                break;
+            },
+            _ => {},
+        }
+    }
+    if !damaged {
+        return None;
+    }
+    let (root, sheet_data, end) = (root?, sheet_data?, last_end?);
+    let mut out = Vec::with_capacity(end + 64);
+    out.extend_from_slice(data.get(..end)?);
+    for name in [&sheet_data, &root] {
+        out.extend_from_slice(b"</");
+        out.extend_from_slice(name);
+        out.push(b'>');
+    }
+    Some((out, rows))
 }
 
 /// Parse the source and records reference of a pivot cache definition.
@@ -921,6 +972,7 @@ impl Worksheet {
             merged_cells: Vec::new(),
             hyperlinks: Vec::new(),
             formulas_dropped: 0,
+            damage: None,
             page_setup: None,
             images: std::sync::Arc::from([]),
             cell_images: Vec::new(),
@@ -1069,6 +1121,7 @@ impl Worksheet {
             merged_cells,
             hyperlinks,
             formulas_dropped: 0,
+            damage: None,
             page_setup,
             images: std::sync::Arc::from([]),
             cell_images: Vec::new(),
