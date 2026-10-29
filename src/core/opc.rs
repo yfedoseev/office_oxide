@@ -911,7 +911,10 @@ fn inflate_despite_declared_size<R: Read + Seek>(
         .min(cap);
     let mut decoder = flate2::read::DeflateDecoder::new(raw);
     let mut out = Vec::with_capacity((declared as usize).min(1 << 20));
-    match (&mut decoder).take(bound + 1).read_to_end(&mut out) {
+    match (&mut decoder)
+        .take(bound.saturating_add(1))
+        .read_to_end(&mut out)
+    {
         Ok(_) if out.len() as u64 <= bound => Ok(out),
         _ => Err(out.len() as u64),
     }

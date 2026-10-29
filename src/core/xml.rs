@@ -374,10 +374,29 @@ pub fn unescape_attr_value(attr: &quick_xml::events::attributes::Attribute<'_>) 
 ///
 /// `None` when the data is not damaged (an end tag that does not match, a
 /// syntax error, or an element still open at the end) or holds no complete
-/// element at that depth: the caller keeps its error. An element the damage
+/// element at that depth: the caller keeps its error.
+///
+/// `container` names the element (by local name) whose children are counted,
+/// when the depth alone would also count children of a sibling at the same
+/// depth (`w:background` beside `w:body`); `skip` names children that are not
+/// content (`p:nvGrpSpPr` and `p:grpSpPr` open every `p:spTree`). An element the damage
 /// reaches is never kept, so none is ever cut in two. The stack of open names
 /// is bounded by the data it came from.
-pub(crate) fn salvage_prefix(data: &[u8], depth: usize) -> Option<(Vec<u8>, usize)> {
+pub(crate) fn salvage_prefix(
+    data: &[u8],
+    depth: usize,
+    container: Option<&str>,
+    skip: &[&str],
+) -> Option<(Vec<u8>, usize)> {
+    let local =
+        |name: &[u8]| -> Vec<u8> { name.rsplit(|&b| b == b':').next().unwrap_or(name).to_vec() };
+    // Whether a child called `child` of the current innermost element is
+    // content to count.
+    let counts = |parent: Option<&Vec<u8>>, child: &[u8]| -> bool {
+        let in_container =
+            container.is_none_or(|c| parent.is_some_and(|p| local(p) == c.as_bytes()));
+        in_container && !skip.iter().any(|s| local(child) == s.as_bytes())
+    };
     let mut reader = quick_xml::Reader::from_reader(data);
     let config = reader.config_mut();
     config.trim_text(true);
@@ -393,13 +412,15 @@ pub(crate) fn salvage_prefix(data: &[u8], depth: usize) -> Option<(Vec<u8>, usiz
                 open.push(e.name().as_ref().as_bytes().to_vec());
             },
             Ok(quick_xml::events::Event::End(_)) => {
-                open.pop();
-                if open.len() == depth {
+                let closed = open.pop();
+                if open.len() == depth && closed.is_some_and(|c| counts(open.last(), &c)) {
                     kept += 1;
                     cut = Some((reader.buffer_position() as usize, open.clone()));
                 }
             },
-            Ok(quick_xml::events::Event::Empty(_)) if open.len() == depth => {
+            Ok(quick_xml::events::Event::Empty(e))
+                if open.len() == depth && counts(open.last(), e.name().as_ref().as_bytes()) =>
+            {
                 kept += 1;
                 cut = Some((reader.buffer_position() as usize, open.clone()));
             },
@@ -1224,10 +1245,29 @@ mod salvage_tests {
     }
 
     #[test]
+    fn test_salvage_counts_only_content_children_of_the_named_container() {
+        // Children of a sibling at the same depth, and the shape tree's own
+        // header elements, are not content.
+        let data = b"<d><bg><v/><v/></bg><b><p>a";
+        assert!(
+            salvage_prefix(data, 2, None, &[]).is_some(),
+            "depth alone counts the bg children"
+        );
+        assert!(salvage_prefix(data, 2, Some("b"), &[]).is_none());
+        let tree = b"<s><t><head/><hp/><sp><x>a</x></sp><sp><x>b";
+        let kept = salvage_prefix(tree, 2, Some("t"), &["head", "hp"]).map(|(_, n)| n);
+        assert_eq!(kept, Some(1));
+        let cut_in_first = b"<s><t><head/><hp/><sp><x>a";
+        assert!(salvage_prefix(cut_in_first, 2, Some("t"), &["head", "hp"]).is_none());
+        // A prefixed name matches by its local name.
+        assert!(salvage_prefix(b"<d><w:b><w:p>a</w:p><w:p>", 2, Some("b"), &[]).is_some());
+    }
+
+    #[test]
     fn test_the_blocks_before_the_damage_are_kept_and_closed() {
         let data = b"<d xmlns:w=\"u\"><w:body><w:p>a</w:p><w:p>b</w:p><w:p>c";
         assert_eq!(
-            text(salvage_prefix(data, 2)),
+            text(salvage_prefix(data, 2, None, &[])),
             Some(("<d xmlns:w=\"u\"><w:body><w:p>a</w:p><w:p>b</w:p></w:body></d>".into(), 2))
         );
     }
@@ -1235,20 +1275,23 @@ mod salvage_tests {
     #[test]
     fn test_a_mismatched_end_tag_is_damage() {
         let data = b"<d><b><p>a</p><p>b</q></b></d>";
-        assert_eq!(text(salvage_prefix(data, 2)), Some(("<d><b><p>a</p></b></d>".into(), 1)));
+        assert_eq!(
+            text(salvage_prefix(data, 2, None, &[])),
+            Some(("<d><b><p>a</p></b></d>".into(), 1))
+        );
     }
 
     #[test]
     fn test_sound_data_and_data_with_no_complete_block_are_not_salvaged() {
-        assert!(salvage_prefix(b"<d><b><p>a</p></b></d>", 2).is_none());
-        assert!(salvage_prefix(b"<d><b><p>a", 2).is_none());
-        assert!(salvage_prefix(b"", 2).is_none());
+        assert!(salvage_prefix(b"<d><b><p>a</p></b></d>", 2, None, &[]).is_none());
+        assert!(salvage_prefix(b"<d><b><p>a", 2, None, &[]).is_none());
+        assert!(salvage_prefix(b"", 2, None, &[]).is_none());
     }
 
     #[test]
     fn test_an_empty_element_at_the_depth_counts_as_a_block() {
         assert_eq!(
-            text(salvage_prefix(b"<d><b><p/><p>", 2)),
+            text(salvage_prefix(b"<d><b><p/><p>", 2, None, &[])),
             Some(("<d><b><p/></b></d>".into(), 1))
         );
     }

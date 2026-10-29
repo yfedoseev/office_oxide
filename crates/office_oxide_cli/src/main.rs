@@ -79,6 +79,15 @@ fn main() {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let cli = Cli::parse();
+    if matches!(cli.command, commands::Command::Replace { .. })
+        && (cli.strict || !cli.limits.is_empty() || cli.include_hidden || cli.include_deleted)
+    {
+        eprintln!(
+            "error: --strict, --limit, --include-hidden and --include-deleted apply to commands \
+             that read a document; `replace` edits the file's XML in place and does not use them"
+        );
+        process::exit(2);
+    }
     match parse_options(&cli) {
         Ok(options) => commands::set_options(options),
         Err(e) => {

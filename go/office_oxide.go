@@ -221,6 +221,7 @@ func (o *ParseOptions) Set(name string, value uint64) error {
 	cname := C.CString(name)
 	defer C.free(unsafe.Pointer(cname))
 	rc := C.office_options_set(o.handle, cname, C.uint64_t(value))
+	runtime.KeepAlive(o)
 	if rc != 0 {
 		return &Error{Code: int(rc), Op: "ParseOptions.Set", Detail: "unknown option '" + name + "'; the options are: " + strings.Join(OptionNames(), ", ")}
 	}
@@ -268,6 +269,7 @@ func OpenWith(path string, options *ParseOptions) (*Document, error) {
 	defer C.free(unsafe.Pointer(cpath))
 	var errCode C.int
 	h := C.office_document_open_with(cpath, options.raw(), &errCode)
+	runtime.KeepAlive(options)
 	if h == nil {
 		return nil, &Error{Code: int(errCode), Op: "OpenWith"}
 	}
@@ -292,6 +294,7 @@ func OpenFromBytesWith(data []byte, format string, options *ParseOptions) (*Docu
 		options.raw(),
 		&errCode,
 	)
+	runtime.KeepAlive(options)
 	if h == nil {
 		return nil, &Error{Code: int(errCode), Op: "OpenFromBytesWith"}
 	}

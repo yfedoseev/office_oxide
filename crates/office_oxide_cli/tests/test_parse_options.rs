@@ -80,3 +80,23 @@ fn test_a_bad_limit_is_a_usage_error_naming_the_choices() {
     let out = run(&["--limit", "no_such_limit=1", "text"], &path);
     assert!(stderr(&out).contains("text_chars"), "{}", stderr(&out));
 }
+
+#[test]
+fn test_replace_refuses_flags_it_would_ignore() {
+    let path = cut_off_docx("replace.docx");
+    for flag in [
+        vec!["--strict"],
+        vec!["--limit", "text_chars=1"],
+        vec!["--include-hidden"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_office-oxide"))
+            .args(&flag)
+            .args(["replace"])
+            .arg(&path)
+            .args(["a", "b"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{flag:?}");
+        assert!(stderr(&out).contains("replace"), "{flag:?}: {}", stderr(&out));
+    }
+}

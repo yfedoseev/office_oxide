@@ -108,6 +108,13 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         // Slide comments are review content that reached no consumer at
         // all. Carry them as endnotes so every renderer sees them.
         for (i, c) in slide.comments.iter().enumerate() {
+            // Each slide's endnotes are copies of the shared comments: charged
+            // to the document's copy budget, so a deck of many slides that name
+            // one large comments part cannot multiply it without bound.
+            let cost = c.text.len() + 2 * c.author.as_ref().map_or(0, String::len);
+            if !crate::limits::charge_copied_text(cost) {
+                break;
+            }
             elements.push(Element::Endnote(Note {
                 id: i as u32,
                 marker: c.author.clone(),

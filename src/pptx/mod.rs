@@ -45,6 +45,9 @@ pub use shape::{
 };
 pub use slide::Slide;
 
+/// The children that open every `p:spTree` and are not shapes.
+const SHAPE_TREE_HEAD: &[&str] = &["nvGrpSpPr", "grpSpPr"];
+
 use std::io::{Read, Seek};
 use std::path::Path;
 
@@ -442,13 +445,17 @@ impl PptxDocument {
                                         Err(e) => {
                                             // Notes malformed part-way keep the
                                             // shapes before the damage.
-                                            let salvaged =
-                                                crate::core::xml::salvage_prefix(&data, 3)
-                                                    .and_then(|(prefix, shapes)| {
-                                                        slide::extract_notes_body(&prefix, &rels)
-                                                            .ok()
-                                                            .map(|body| (body, shapes))
-                                                    });
+                                            let salvaged = crate::core::xml::salvage_prefix(
+                                                &data,
+                                                3,
+                                                Some("spTree"),
+                                                SHAPE_TREE_HEAD,
+                                            )
+                                            .and_then(|(prefix, shapes)| {
+                                                slide::extract_notes_body(&prefix, &rels)
+                                                    .ok()
+                                                    .map(|body| (body, shapes))
+                                            });
                                             match salvaged {
                                                 Some((body, shapes)) => {
                                                     parts.unreadable.record(
@@ -555,13 +562,16 @@ impl PptxDocument {
         // A comments part several slides name is parsed once.
         let mut parsed_comments: std::collections::HashMap<
             String,
-            (Vec<slide::SlideComment>, Option<String>),
+            (std::sync::Arc<[slide::SlideComment]>, Option<String>),
         > = std::collections::HashMap::new();
         for b in &bundles {
             for (comments_part, data) in &b.comments_data {
                 parsed_comments
                     .entry(comments_part.clone())
-                    .or_insert_with(|| slide::parse_comments(data, &comment_authors));
+                    .or_insert_with(|| {
+                        let (comments, error) = slide::parse_comments(data, &comment_authors);
+                        (std::sync::Arc::from(comments), error)
+                    });
             }
         }
         let parsed_comments = &parsed_comments;
@@ -592,13 +602,17 @@ impl PptxDocument {
                     Err(e) => {
                         // A slide malformed part-way keeps the shapes before
                         // the damage, and the loss is reported.
-                        let salvaged = crate::core::xml::salvage_prefix(data, 3).and_then(
-                            |(prefix, shapes)| {
-                                Slide::parse(&prefix, name, &b.slide_rels, &b.media, &b.part_text)
-                                    .ok()
-                                    .map(|slide| (slide, shapes))
-                            },
-                        );
+                        let salvaged = crate::core::xml::salvage_prefix(
+                            data,
+                            3,
+                            Some("spTree"),
+                            SHAPE_TREE_HEAD,
+                        )
+                        .and_then(|(prefix, shapes)| {
+                            Slide::parse(&prefix, name, &b.slide_rels, &b.media, &b.part_text)
+                                .ok()
+                                .map(|slide| (slide, shapes))
+                        });
                         match salvaged {
                             Some((slide, shapes)) => {
                                 problems.push((
@@ -619,15 +633,28 @@ impl PptxDocument {
                 };
                 parsed.layout_index = b.layout_index;
                 parsed.notes = b.notes.clone();
+                // A part is taken once per slide however often it is named. One
+                // part is shared, not copied: a deck of N slides that name one
+                // large comments part holds it once.
+                let mut taken: Vec<&std::sync::Arc<[slide::SlideComment]>> = Vec::new();
+                let mut seen_parts = std::collections::HashSet::new();
                 for (comments_part, _) in &b.comments_data {
+                    if !seen_parts.insert(comments_part) {
+                        continue;
+                    }
                     let Some((comments, error)) = parsed_comments.get(comments_part) else {
                         continue;
                     };
-                    parsed.comments.extend(comments.iter().cloned());
+                    taken.push(comments);
                     if let Some(error) = error {
                         problems.push((comments_part.clone(), error.clone()));
                     }
                 }
+                parsed.comments = match taken.as_slice() {
+                    [] => parsed.comments,
+                    [only] => std::sync::Arc::clone(only),
+                    several => several.iter().flat_map(|c| c.iter().cloned()).collect(),
+                };
                 let chain = b
                     .layout_index
                     .and_then(|i| layout_entries.get(i))
@@ -955,11 +982,12 @@ impl PartCache {
                 // Malformed part-way: the shapes before the damage are kept,
                 // as for a slide, and the loss is reported.
                 let salvaged =
-                    crate::core::xml::salvage_prefix(data, 3).and_then(|(prefix, shapes)| {
-                        Slide::parse(&prefix, String::new(), rels, &media, &part_text)
-                            .ok()
-                            .map(|s| (s, shapes))
-                    });
+                    crate::core::xml::salvage_prefix(data, 3, Some("spTree"), SHAPE_TREE_HEAD)
+                        .and_then(|(prefix, shapes)| {
+                            Slide::parse(&prefix, String::new(), rels, &media, &part_text)
+                                .ok()
+                                .map(|s| (s, shapes))
+                        });
                 match salvaged {
                     Some((s, shapes)) => {
                         self.unreadable.record(
@@ -1449,6 +1477,9 @@ mod part_cache_tests {
             assert_eq!(texts, ["first remark", "second remark"]);
         }
         assert_eq!(slide::COMMENT_PARSES.with(|n| n.get()), 1);
+        // Shared, not copied: every slide holds the one allocation.
+        assert!(std::sync::Arc::ptr_eq(&doc.slides[0].comments, &doc.slides[1].comments));
+        assert!(std::sync::Arc::ptr_eq(&doc.slides[0].comments, &doc.slides[2].comments));
     }
 
     /// Byte-sniffed image formats, used when a relationship target has no

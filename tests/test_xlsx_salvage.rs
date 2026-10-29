@@ -165,3 +165,41 @@ fn test_a_prefixed_worksheet_is_salvaged() {
     let text = open(workbook(&[("P", xml)])).plain_text();
     assert!(text.contains("prefixed"), "{text}");
 }
+
+/// A worksheet cut off between tags (a failed download, a truncated upload) is
+/// not well-formed XML either: the reader gets end-of-file, not an error, so
+/// it must check that the root closed.
+#[test]
+fn test_a_worksheet_cut_off_at_end_of_file_is_reported_not_read_as_complete() {
+    let cut = format!(
+        r#"<worksheet xmlns="{SML}"><sheetData>{}{}<row r="3"><c r="A3" t="inlineStr"><is><t>charl"#,
+        row(1, "alpha", "one"),
+        row(2, "bravo", "two"),
+    );
+    let doc = open(workbook(&[("Cut", cut), ("Fine", sheet(&row(1, "delta", "four")))]));
+    let text = doc.plain_text();
+    assert!(
+        text.contains("alpha") && text.contains("bravo") && text.contains("delta"),
+        "{text}"
+    );
+    assert!(!text.contains("charl"), "the half-read row was kept: {text}");
+    let ir = doc.to_ir();
+    assert!(ir.metadata.text_truncated);
+    assert!(
+        ir.metadata.warnings.iter().any(|w| w.contains("Cut")),
+        "{:?}",
+        ir.metadata.warnings
+    );
+}
+
+#[test]
+fn test_a_number_cut_off_inside_its_value_is_not_read_as_a_shorter_number() {
+    let cut = format!(
+        r#"<worksheet xmlns="{SML}"><sheetData>{}<row r="2"><c r="A2"><v>12"#,
+        row(1, "alpha", "one"),
+    );
+    let doc = open(workbook(&[("Cut", cut)]));
+    let text = doc.plain_text();
+    assert!(!text.contains("12"), "a truncated value was read as complete: {text}");
+    assert!(doc.to_ir().metadata.text_truncated);
+}

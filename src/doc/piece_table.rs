@@ -501,8 +501,8 @@ pub(crate) fn decode_cp_range_symbols(
     if cp_end <= cp_start {
         return out;
     }
-    // The pieces are in CP order (`parse_plc_pcd` rejects a piece whose
-    // range runs backwards, and each starts where the previous ends), so
+    // The pieces are in CP order (`parse_plc_pcd` drops a piece whose range
+    // runs backwards, and each starts where the previous ends), so
     // the first piece that reaches `cp_start` is a binary search away and
     // the walk stops at the first piece past `cp_end` — not a scan of
     // every piece for every range, which `build_paragraphs` calls once per

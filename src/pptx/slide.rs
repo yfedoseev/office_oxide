@@ -78,8 +78,9 @@ pub struct Slide {
     /// content is still extracted, but a consumer can now tell that the
     /// author excluded it, which was impossible before.
     pub hidden: bool,
-    /// Comments attached to this slide, from `ppt/comments/*.xml`.
-    pub comments: Vec<SlideComment>,
+    /// Comments attached to this slide, from `ppt/comments/*.xml`. Shared:
+    /// every slide that names one comments part holds the same allocation.
+    pub comments: std::sync::Arc<[SlideComment]>,
     /// Why this slide's part could not be read, when it could not. The
     /// slide keeps its place in the deck with no content, so every
     /// renderer can show a notice where it was; the part and the reason are
@@ -159,7 +160,7 @@ impl Slide {
             notes: None,
             background_rgb,
             hidden,
-            comments: Vec::new(),
+            comments: Vec::new().into(),
             parse_error: None,
             layout_index: None,
             hide_master_shapes,

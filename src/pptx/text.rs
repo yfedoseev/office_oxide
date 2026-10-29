@@ -142,7 +142,7 @@ impl PptxDocument {
         // Slide comments are review content; `to_ir()` carries them as
         // endnotes, and this direct renderer dropped them — a slide whose
         // only content was its comments came back empty.
-        for c in &slide.comments {
+        for c in slide.comments.iter() {
             result.push_str("\n\n");
             result.push_str(&comment_marker(c.author.as_deref()));
             result.push_str(": ");
@@ -265,7 +265,7 @@ impl PptxDocument {
                 result.push('\n');
             }
         }
-        for c in &slide.comments {
+        for c in slide.comments.iter() {
             result.push_str(&format!(
                 "> **{}:** {}\n\n",
                 comment_marker(c.author.as_deref()),

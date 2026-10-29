@@ -186,10 +186,13 @@ pub(crate) fn salvage_prefix(data: &[u8]) -> Option<(Vec<u8>, usize)> {
     let mut sheet_data: Option<Vec<u8>> = None;
     let mut last_end = None;
     let mut rows = 0usize;
-    let mut damaged = false;
+    let damaged;
+    // Elements still open: end-of-file with some open is a cut-off part.
+    let mut open = 0usize;
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
+                open += 1;
                 let name = e.name().as_ref().as_bytes().to_vec();
                 if root.is_none() {
                     root = Some(name);
@@ -198,10 +201,15 @@ pub(crate) fn salvage_prefix(data: &[u8]) -> Option<(Vec<u8>, usize)> {
                 }
             },
             Ok(Event::End(ref e)) if e.local_name().as_ref() == "row" => {
+                open = open.saturating_sub(1);
                 rows += 1;
                 last_end = Some(reader.buffer_position() as usize);
             },
-            Ok(Event::Eof) => break,
+            Ok(Event::End(_)) => open = open.saturating_sub(1),
+            Ok(Event::Eof) => {
+                damaged = open > 0;
+                break;
+            },
             Err(_) => {
                 damaged = true;
                 break;

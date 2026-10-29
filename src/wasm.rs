@@ -32,31 +32,29 @@ impl WasmParseOptions {
     /// Set an option by name. `value` is a number (`Infinity` for no bound), a
     /// boolean, or for `on_incomplete` the string `"report"` or `"error"`.
     pub fn set(&mut self, name: &str, value: JsValue) -> Result<(), JsValue> {
+        let bad = |why: &str| JsValue::from_str(&format!("{name}: {why}"));
         let number = if let Some(flag) = value.as_bool() {
             u64::from(flag)
         } else if let Some(text) = value.as_string() {
-            match text.as_str() {
-                "report" => 0,
-                "error" | "max" => {
-                    if name == "on_incomplete" {
-                        1
-                    } else {
-                        u64::MAX
-                    }
-                },
-                other => {
-                    return Err(JsValue::from_str(&format!("{name}: unexpected value '{other}'")));
-                },
+            // Words mean one thing for one option each.
+            match (name, text.as_str()) {
+                ("on_incomplete", "report") => 0,
+                ("on_incomplete", "error") => 1,
+                ("on_incomplete", _) => return Err(bad("expected \"report\" or \"error\"")),
+                (_, "max") => u64::MAX,
+                _ => return Err(bad("a string is only accepted as \"max\", or for on_incomplete")),
             }
         } else if let Some(n) = value.as_f64() {
-            if n.is_nan() || n < 0.0 {
-                return Err(JsValue::from_str(&format!("{name}: expected a non-negative number")));
+            if n == f64::INFINITY {
+                u64::MAX
+            } else if n.is_nan() || n < 0.0 || n.fract() != 0.0 || n >= 18_446_744_073_709_551_616.0
+            {
+                return Err(bad("expected a non-negative whole number, or Infinity for no bound"));
+            } else {
+                n as u64
             }
-            n as u64 // saturates: Infinity is u64::MAX
         } else {
-            return Err(JsValue::from_str(&format!(
-                "{name}: expected a number, boolean or string"
-            )));
+            return Err(bad("expected a number, boolean or string"));
         };
         self.inner
             .set_option(name, number)
@@ -89,15 +87,30 @@ pub struct WasmDocument {
 impl WasmDocument {
     /// Create a new document from raw bytes and a format string ("docx", "xlsx", "pptx").
     #[wasm_bindgen(constructor)]
-    pub fn new(
+    pub fn new(data: &[u8], format: &str) -> Result<WasmDocument, JsValue> {
+        Self::open(data, format, None)
+    }
+
+    /// Create a document under `options` (a `WasmParseOptions`, which is only
+    /// borrowed: the same object can open any number of documents).
+    #[wasm_bindgen(js_name = "openWith")]
+    pub fn open_with(
         data: &[u8],
         format: &str,
-        options: Option<WasmParseOptions>,
+        options: &WasmParseOptions,
+    ) -> Result<WasmDocument, JsValue> {
+        Self::open(data, format, Some(options))
+    }
+
+    fn open(
+        data: &[u8],
+        format: &str,
+        options: Option<&WasmParseOptions>,
     ) -> Result<WasmDocument, JsValue> {
         let fmt = DocumentFormat::from_extension(format)
             .ok_or_else(|| JsValue::from_str(&format!("unsupported format: {format}")))?;
         let cursor = Cursor::new(data.to_vec());
-        let inner = match &options {
+        let inner = match options {
             Some(o) => Document::from_reader_with(cursor, fmt, &o.inner),
             None => Document::from_reader(cursor, fmt),
         }
@@ -109,7 +122,12 @@ impl WasmDocument {
     /// (`kind` is `unreadable_part`, `truncated` or `recovered`); empty for a
     /// sound document. Converts the document once.
     pub fn damage(&self) -> Result<JsValue, JsValue> {
-        serde_wasm_bindgen::to_value(&self.inner.damage())
+        use serde::Serialize;
+        // `part` is null, not undefined, when unknown.
+        let serializer = serde_wasm_bindgen::Serializer::new().serialize_missing_as_null(true);
+        self.inner
+            .damage()
+            .serialize(&serializer)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 

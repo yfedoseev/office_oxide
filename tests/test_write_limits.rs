@@ -335,3 +335,44 @@ fn test_save_and_the_other_containers_are_held_to_the_write_limit_too() {
     assert!(pptx.save(&pptx_path).is_err(), "save must refuse what write_to refuses");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A table whose first cell of every row spans `span` columns, so the second
+/// cell is stored `span` columns to the right.
+fn wide_gap_table(rows: usize, span: u32) -> Table {
+    let mut t = table(rows, 2);
+    for row in &mut t.rows {
+        row.cells[0].col_span = span;
+    }
+    t
+}
+
+#[test]
+fn test_a_cell_placed_far_right_is_budgeted_as_the_row_it_makes() {
+    // 200 rows of two cells look like 400 cells, but the writer stores each row
+    // up to its second cell, 1,001 columns in: about 200,000 slots.
+    let mut limits = LimitScope::new();
+    limits.set(max_write_bytes, set_max_write_bytes, 5_000_000);
+    let ir = ir_with(vec![Element::Table(wide_gap_table(200, 1000))], DocumentFormat::Xlsx);
+    let err = write(&ir, DocumentFormat::Xlsx).expect_err("200,000 slots do not fit 5 MB");
+    assert!(matches!(err, OfficeError::Core(CoreError::PackageLimit(_))), "{err:?}");
+    // The same table without the gap is ordinary.
+    let narrow = ir_with(vec![Element::Table(wide_gap_table(200, 1))], DocumentFormat::Xlsx);
+    write(&narrow, DocumentFormat::Xlsx).expect("400 cells fit");
+}
+
+#[test]
+fn test_a_huge_column_span_is_clamped_to_the_sheet_not_walked() {
+    // A few bytes of IR claiming a 4-billion-column, 2-row merge used to insert
+    // one entry per column.
+    let mut t = table(2, 1);
+    t.rows[0].cells[0].col_span = u32::MAX;
+    t.rows[0].cells[0].row_span = 2;
+    let ir = ir_with(vec![Element::Table(t)], DocumentFormat::Xlsx);
+    let started = std::time::Instant::now();
+    let _ = write(&ir, DocumentFormat::Xlsx);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+}

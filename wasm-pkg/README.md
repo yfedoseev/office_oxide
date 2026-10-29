@@ -77,7 +77,8 @@ Two classes: `WasmDocument` reads, `WasmEditableDocument` edits.
 
 | Method | Description |
 | --- | --- |
-| `new WasmDocument(bytes, format, options?)` | Open from `Uint8Array`. `format`: `"docx" \| "xlsx" \| "pptx" \| "doc" \| "xls" \| "ppt"`. `options`: a `WasmParseOptions` (below). |
+| `new WasmDocument(bytes, format)` | Open from `Uint8Array`. `format`: `"docx" \| "xlsx" \| "pptx" \| "doc" \| "xls" \| "ppt"`. |
+| `WasmDocument.openWith(bytes, format, options)` | Open under a `WasmParseOptions` (below). The options are borrowed, so one object can open any number of documents. |
 | `.damage()` | What is wrong with the document: an array of `{kind, part, detail}` (`kind`: `unreadable_part`, `truncated` or `recovered`); empty when sound. |
 | `.formatName()` | Detected format as a string. |
 | `.plainText()` | Extract plain text. |
@@ -99,7 +100,7 @@ name (`WasmParseOptions.names()` lists them): a limit such as `text_chars` or
 ```js
 const opts = new WasmParseOptions(true);
 opts.set("text_chars", 1_000_000);
-const doc = new WasmDocument(bytes, "docx", opts); // throws if incomplete
+const doc = WasmDocument.openWith(bytes, "docx", opts); // throws if incomplete
 ```
 
 ### `WasmEditableDocument`

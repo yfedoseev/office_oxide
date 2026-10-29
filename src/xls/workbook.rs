@@ -257,11 +257,29 @@ impl XlsDocument {
 
         // A workbook Excel encrypted with its default password opens with it.
         #[cfg(feature = "default-password")]
-        let (stream_data, default_password) = {
+        let (stream_data, default_password, decrypt_failure) = {
             let mut stream_data = stream_data;
             let decrypted = crate::core::offcrypto::decrypt_workbook(&mut stream_data);
-            (stream_data, decrypted == Ok(true))
+            (stream_data, decrypted == Ok(true), decrypted.err())
         };
+        #[cfg(feature = "default-password")]
+        let mut doc = match Self::parse_workbook_stream(&stream_data) {
+            // Say why it could not be opened, not only that it is encrypted.
+            Err(XlsError::Encrypted) => {
+                use crate::core::offcrypto::Failure;
+                return Err(match decrypt_failure {
+                    Some(Failure::Unsupported(what)) => {
+                        XlsError::EncryptionNotSupported(what.to_string())
+                    },
+                    Some(Failure::Malformed(what)) => {
+                        XlsError::Corrupted(format!("the encryption header is damaged ({what})"))
+                    },
+                    _ => XlsError::Encrypted,
+                });
+            },
+            other => other?,
+        };
+        #[cfg(not(feature = "default-password"))]
         let mut doc = Self::parse_workbook_stream(&stream_data)?;
         #[cfg(feature = "default-password")]
         if default_password {
@@ -1736,6 +1754,31 @@ mod tests {
             crate::core::offcrypto::tests::cfb_with_streams(&[("Workbook", &stream)]),
         ));
         assert!(matches!(refused, Err(XlsError::Encrypted)));
+    }
+
+    /// A workbook the reader cannot decrypt says why: the scheme it does not
+    /// implement, or a damaged header, not only that the file is encrypted.
+    #[cfg(feature = "default-password")]
+    #[test]
+    fn test_an_undecryptable_xls_says_why() {
+        use crate::core::offcrypto::tests::{cfb_with_streams, record as biff_record};
+        let open = |filepass: &[u8]| {
+            let mut stream = biff_record(0x0809, &[0u8; 16]);
+            stream.extend(biff_record(0x002F, filepass));
+            XlsDocument::from_reader(std::io::Cursor::new(cfb_with_streams(&[(
+                "Workbook", &stream,
+            )])))
+        };
+        // XOR obfuscation: a scheme this reader does not implement.
+        match open(&[0, 0, 0x12, 0x34, 0x56, 0x78]) {
+            Err(XlsError::EncryptionNotSupported(what)) => assert!(what.contains("XOR"), "{what}"),
+            other => panic!("expected a named scheme, got {:?}", other.err()),
+        }
+        // A FILEPASS cut short: a damaged header.
+        match open(&[1, 0]) {
+            Err(XlsError::Corrupted(why)) => assert!(why.contains("damaged"), "{why}"),
+            other => panic!("expected a damaged header, got {:?}", other.err()),
+        }
     }
 
     /// Pictures were found by scanning every byte of the Workbook stream

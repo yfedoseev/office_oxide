@@ -39,6 +39,52 @@ pub fn create_from_markdown_to_writer<W: Write + Seek>(
     create_from_ir_to_writer(&ir, format, writer)
 }
 
+/// The most columns an Excel worksheet has; a table is placed within it.
+const XLSX_MAX_COLS: usize = 16_384;
+
+/// The column each cell of `table` goes to in a worksheet, row by row, and
+/// nothing more: a cell goes to the next column its row has not used, skipping
+/// the columns a row-spanning cell from an earlier row still covers (the
+/// sparse, span-driven model every reader uses), and a span is clamped to the
+/// sheet. A cell that would start past the last column is placed at
+/// `XLSX_MAX_COLS`, where the writer refuses it. The writer and the write
+/// budget both place cells with this, so they cannot disagree about how wide a
+/// row is.
+fn xlsx_placement(table: &Table) -> Vec<Vec<usize>> {
+    // Columns still claimed by a row-spanning cell, and the rows left of it
+    // (including the one being placed).
+    let mut active: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    let mut placed = Vec::with_capacity(table.rows.len());
+    for row in &table.rows {
+        let mut col = 0usize;
+        let mut cols = Vec::with_capacity(row.cells.len());
+        for cell in &row.cells {
+            while col < XLSX_MAX_COLS && active.get(&col).is_some_and(|&left| left > 0) {
+                col += 1;
+            }
+            if col >= XLSX_MAX_COLS {
+                cols.push(XLSX_MAX_COLS);
+                continue;
+            }
+            cols.push(col);
+            let span = (cell.col_span.max(1) as usize).min(XLSX_MAX_COLS - col);
+            let rows_spanned = cell.row_span.max(1) as usize;
+            if rows_spanned > 1 {
+                for c in col..col + span {
+                    active.insert(c, rows_spanned);
+                }
+            }
+            col += span;
+        }
+        for left in active.values_mut() {
+            *left = left.saturating_sub(1);
+        }
+        active.retain(|_, left| *left > 0);
+        placed.push(cols);
+    }
+    placed
+}
+
 /// The cells the writer for `format` builds for `table`: its grid, not the
 /// number of cell entries. The `.pptx` writer pads every row to the widest
 /// row; the `.docx` writer lays the table on a grid as wide as the widest
@@ -46,6 +92,14 @@ pub fn create_from_markdown_to_writer<W: Write + Seek>(
 /// `MAX_TABLE_COLS` as `convert_ir_table` clamps them) and gives every
 /// row that width, filling the cells a row span covers.
 fn written_table_cells(table: &Table, format: DocumentFormat) -> usize {
+    if format == DocumentFormat::Xlsx {
+        // Each row is as wide as its last placed cell: a cell after a wide span
+        // sits far to the right and the row is stored up to it.
+        return xlsx_placement(table)
+            .iter()
+            .map(|cols| cols.last().map_or(0, |&c| c.saturating_add(1)))
+            .fold(0usize, usize::saturating_add);
+    }
     let width = if format == DocumentFormat::Docx {
         let max_cols = crate::docx::write::MAX_TABLE_COLS;
         table
@@ -716,28 +770,14 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                             sheet.set_column_width(ci, w.clamp(3.0, 80.0));
                         }
                     }
-                    // Columns currently claimed by a still-open vertical
-                    // merge anchored in an earlier row, mapped to how many
-                    // more rows (including the one about to be processed)
-                    // it still covers. Without this, `col` advanced purely
-                    // by summing `col_span` across each row's own cells —
-                    // but a row-covering merge means the covered rows have
-                    // that column excluded from their own `cells` entirely
-                    // (the sparse, span-driven model every reader already
-                    // uses), so every cell after the gap silently shifted
-                    // left, misplacing content and hyperlinks onto the
-                    // wrong column instead of skipping over the claimed
-                    // one.
-                    let mut active_spans: std::collections::BTreeMap<usize, usize> =
-                        std::collections::BTreeMap::new();
-                    for row in &t.rows {
-                        let mut col = 0usize;
-                        for cell in &row.cells {
-                            while active_spans
-                                .get(&col)
-                                .is_some_and(|&remaining| remaining > 0)
-                            {
-                                col += 1;
+                    // Where each cell goes (see `xlsx_placement`: the columns a
+                    // row-spanning cell from an earlier row still claims are
+                    // skipped, so a cell after the gap is not shifted left).
+                    let placement = xlsx_placement(t);
+                    for (row, cols) in t.rows.iter().zip(&placement) {
+                        for (cell, &col) in row.cells.iter().zip(cols) {
+                            if col >= XLSX_MAX_COLS {
+                                continue;
                             }
                             let text = cell_text(cell);
                             let data = ir_cell_to_cell_data(cell, &text);
@@ -781,25 +821,12 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                                     sheet.set_cell_hyperlink_tooltip(row_cursor, col, tip);
                                 }
                             }
-                            let cs = cell.col_span.max(1) as usize;
+                            let cs = (cell.col_span.max(1) as usize).min(XLSX_MAX_COLS - col);
                             let rs = cell.row_span.max(1) as usize;
                             if cs > 1 || rs > 1 {
                                 sheet.merge_cells(row_cursor, col, rs, cs);
                             }
-                            if rs > 1 {
-                                for c in col..col + cs {
-                                    active_spans.insert(c, rs);
-                                }
-                            }
-                            col += cs;
                         }
-                        // This row is now consumed: every still-open span
-                        // (including any minted just above) has one fewer
-                        // row left to cover.
-                        for v in active_spans.values_mut() {
-                            *v = v.saturating_sub(1);
-                        }
-                        active_spans.retain(|_, v| *v > 0);
                         row_cursor += 1;
                     }
                 },

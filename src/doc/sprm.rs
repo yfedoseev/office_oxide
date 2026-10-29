@@ -1111,9 +1111,6 @@ chp_sprm_dispatch! {
         }
     }
 
-    /// Signed 2-byte integer (spra 2): an index into the font table
-    /// (`SttbfFfn`) of the font used for a character outside U+0020..U+007F
-    /// ([MS-DOC] §2.6.1). A negative operand cannot be an index and is ignored.
     /// Unsigned 2-byte integer (spra 2): the `istd` of the character style
     /// the run applies ([MS-DOC] §2.6.1).
     "sprmCIstd" @ "2.6.1" => [0x4A30] (props, operand) {
@@ -1122,6 +1119,9 @@ chp_sprm_dispatch! {
         }
     }
 
+    /// Signed 2-byte integer (spra 2): an index into the font table
+    /// (`SttbfFfn`) of the font used for a character outside U+0020..U+007F
+    /// ([MS-DOC] §2.6.1). A negative operand cannot be an index and is ignored.
     "sprmCRgFtc2" @ "2.6.1" => [0x4A51] (props, operand) {
         if operand.len() >= 2 {
             let ftc = i16::from_le_bytes([operand[0], operand[1]]);

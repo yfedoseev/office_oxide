@@ -1026,10 +1026,10 @@ impl XlsxWriter {
     /// naming the limit.
     pub fn add_sheet(&mut self, name: &str) -> SheetData<'_> {
         if self.sheet_limit_reached() {
-            return SheetData(
-                self.refused_sheet
-                    .get_or_insert_with(|| SheetDataInner::new("-")),
-            );
+            // A fresh scratch sheet each time: what a caller wrote into the
+            // last one is dropped, so a loop of refused sheets does not pile
+            // cells up in one (the workbook is an error to write anyway).
+            return SheetData(self.refused_sheet.insert(SheetDataInner::new("-")));
         }
         let name = self.names.claim(name);
         self.sheets.push(SheetDataInner::new(&name));

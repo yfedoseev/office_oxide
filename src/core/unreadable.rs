@@ -109,16 +109,23 @@ impl UnreadableParts {
         self.push_cosmetic(part, reason);
     }
 
-    /// As [`Self::record_cosmetic`], once per `key`, sharing the keys of
-    /// [`Self::record_keyed`].
+    /// As [`Self::record_cosmetic`], once per `key`. Its keys are kept apart
+    /// from those of [`Self::record_keyed`]: a part reached by a theme
+    /// relationship and also by one that carries text is a loss to report in
+    /// the second case whichever was met first.
     pub(crate) fn record_cosmetic_keyed(
         &mut self,
         key: String,
         part: &str,
         reason: &dyn std::fmt::Display,
     ) {
-        if !self.seen.insert(key) {
+        let key = format!("\u{0}cosmetic\u{0}{key}");
+        if self.seen.contains(&key) {
             return;
+        }
+        if self.seen_bytes + key.len() <= MAX_SEEN_BYTES {
+            self.seen_bytes += key.len();
+            self.seen.insert(key);
         }
         self.push_cosmetic(part, reason);
     }
@@ -235,6 +242,17 @@ pub(crate) fn report_ir_lines(warnings: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A part met first through a relationship that holds no text, then through
+    /// one that does, is a loss to report: the first must not hide the second.
+    #[test]
+    fn test_a_cosmetic_record_does_not_hide_a_real_one_for_the_same_part() {
+        let mut sink = UnreadableParts::new("test");
+        sink.record_cosmetic_keyed("#7".into(), "xl/sharedStrings.xml", &"bad");
+        sink.record_keyed("#7".into(), "xl/sharedStrings.xml", &"bad");
+        let (listed, omitted, cosmetic) = sink.finish_with_cosmetic();
+        assert_eq!((listed.len(), omitted, cosmetic.len()), (1, 0, 1));
+    }
 
     #[test]
     fn test_a_part_is_recorded_once_whatever_its_spelling() {

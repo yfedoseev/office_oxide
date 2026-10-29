@@ -129,9 +129,11 @@ fn classify_error(e: &crate::OfficeError) -> i32 {
         },
         E::Xls(crate::xls::XlsError::Io(_)) => OFFICE_ERR_IO,
         E::Xls(crate::xls::XlsError::Cfb(c)) => classify_cfb(c),
-        E::Xls(crate::xls::XlsError::Encrypted | crate::xls::XlsError::UnsupportedVersion(_)) => {
-            OFFICE_ERR_UNSUPPORTED
-        },
+        E::Xls(
+            crate::xls::XlsError::Encrypted
+            | crate::xls::XlsError::EncryptionNotSupported(_)
+            | crate::xls::XlsError::UnsupportedVersion(_),
+        ) => OFFICE_ERR_UNSUPPORTED,
         E::Ppt(crate::ppt::PptError::Io(_)) => OFFICE_ERR_IO,
         E::Ppt(crate::ppt::PptError::Cfb(c)) => classify_cfb(c),
         E::Ppt(crate::ppt::PptError::Encrypted) => OFFICE_ERR_UNSUPPORTED,

@@ -361,7 +361,7 @@ impl DocxDocument {
             Ok(parsed) => parsed,
             // A body that is malformed part-way (or cut off) keeps the blocks
             // before the damage, and the loss is reported.
-            Err(error) => match xml::salvage_prefix(&doc_data, 2) {
+            Err(error) => match xml::salvage_prefix(&doc_data, 2, Some("body"), &[]) {
                 Some((prefix, blocks)) => {
                     let parsed = parse_document(&prefix, &doc_rels, &links).map_err(|_| error)?;
                     skip_unreadable(
@@ -706,6 +706,8 @@ impl DocxDocument {
             let Some(mut notes) = parse_salvaging(
                 &data,
                 part.as_str(),
+                // A note's paragraphs: a damaged note keeps the paragraphs
+                // before the damage (the loss is reported).
                 2,
                 |d| parse_notes_part(d, end),
                 &skip_unreadable,
@@ -1024,7 +1026,7 @@ fn parse_salvaging<T>(
     match parse(data) {
         Ok(parsed) => Some(parsed),
         Err(error) => {
-            if let Some((prefix, blocks)) = xml::salvage_prefix(data, depth) {
+            if let Some((prefix, blocks)) = xml::salvage_prefix(data, depth, None, &[]) {
                 if let Ok(parsed) = parse(&prefix) {
                     skip(
                         part,

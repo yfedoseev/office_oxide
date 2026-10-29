@@ -20,7 +20,7 @@
 //! process-wide defaults: every document read or written afterwards, on every
 //! thread, so set them once at start-up. For limits that belong to one
 //! document (a server with different tenants, a test beside others) use
-//! [`Limits`](crate::limits::Limits) in [`ParseOptions`](crate::options::ParseOptions) with
+//! `Limits` in [`ParseOptions`](crate::options::ParseOptions) with
 //! [`Document::open_with`](crate::Document::open_with): they apply to that
 //! document's reading and conversions and to nothing else. (The tuning
 //! constants behind the scaled text budget and the write-memory estimate are
@@ -51,12 +51,12 @@
 
 //!
 //! OOXML packages are zip archives. A part is bounded by its decompressed size
-//! ([`max_part_bytes`](crate::limits::max_part_bytes), 512 MiB) and, once it is larger than
-//! [`INFLATE_RATIO_FLOOR_BYTES`](crate::limits::INFLATE_RATIO_FLOOR_BYTES), by its ratio to the bytes that store it
-//! ([`max_inflate_ratio`](crate::limits::max_inflate_ratio), 1,000; Apache POI's `ZipSecureFile` does the same
+//! ([`max_part_bytes()`](crate::limits::max_part_bytes), 512 MiB) and, once it is larger than
+//! `INFLATE_RATIO_FLOOR_BYTES`, by its ratio to the bytes that store it
+//! ([`max_inflate_ratio()`](crate::limits::max_inflate_ratio), 1,000; Apache POI's `ZipSecureFile` does the same
 //! with 100). Two package-wide bounds sit on top, as POI's do: the number of
-//! entries an archive may hold ([`max_package_entries`](crate::limits::max_package_entries)) and the total
-//! decompressed bytes read from one package ([`max_package_bytes`](crate::limits::max_package_bytes)). A
+//! entries an archive may hold ([`max_package_entries()`](crate::limits::max_package_entries)) and the total
+//! decompressed bytes read from one package ([`max_package_bytes()`](crate::limits::max_package_bytes)). A
 //! package or part that exceeds any is refused with
 //! [`Error::PackageLimit`](crate::core::Error::PackageLimit) or
 //! [`Error::DecompressionLimit`](crate::core::Error::DecompressionLimit).
@@ -90,7 +90,10 @@ pub fn set_max_package_entries(entries: usize) {
 }
 
 /// The maximum total of decompressed bytes read from one OOXML package.
-/// Each distinct part is charged once, however often it is read.
+/// Each distinct part is charged once, however often it is read; reading a
+/// part again, and reads that fail after inflating, are totalled separately
+/// and each held to this limit too, so the work a package can cause is bounded
+/// by a small multiple of it.
 ///
 /// For a package embedded in a document this is what the document's
 /// [embedded-package allowance](max_embedded_bytes) has left, if that is
@@ -288,7 +291,10 @@ pub(crate) fn stream_len<R: std::io::Seek>(reader: &mut R) -> u64 {
 /// The text budget for an input of `input` bytes (when known) under the
 /// ceiling `limit`.
 fn text_limit_for_input(limit: usize, input: Option<u64>) -> usize {
-    let Some(bytes) = input else { return limit };
+    // No bound is no bound, whatever the size of the input.
+    let Some(bytes) = input.filter(|_| limit != usize::MAX) else {
+        return limit;
+    };
     let scaled = bytes.saturating_mul(TEXT_BUDGET_CHARS_PER_INPUT_BYTE);
     let scaled = usize::try_from(scaled).unwrap_or(usize::MAX);
     limit.min(scaled.max(TEXT_BUDGET_FLOOR_CHARS))
@@ -1262,6 +1268,8 @@ mod tests {
         assert_eq!(text_limit_for_input(1000, Some(1)), 1000);
         // No overflow with an absurd size or limit.
         assert_eq!(text_limit_for_input(usize::MAX, Some(u64::MAX)), usize::MAX);
+        // No bound is no bound, even for a tiny input.
+        assert_eq!(text_limit_for_input(usize::MAX, Some(1)), usize::MAX);
     }
 
     #[test]
@@ -1528,7 +1536,11 @@ pub struct Limits {
     pub write_bytes: u64,
     /// Worksheets a workbook being written may have. See [`max_write_sheets`].
     pub write_sheets: usize,
-    /// List items read from Markdown. See [`max_markdown_list_items`].
+    /// List items read from Markdown. See [`max_markdown_list_items`]. Like the
+    /// other two `markdown_*` limits, this applies to Markdown parsed by
+    /// [`DocumentIR::from_markdown`](crate::ir::DocumentIR::from_markdown) and
+    /// `create_from_markdown` through the process-wide setter only: neither
+    /// takes `ParseOptions`.
     pub markdown_list_items: usize,
     /// Table cells read from Markdown. See [`max_markdown_table_cells`].
     pub markdown_table_cells: usize,
@@ -1701,7 +1713,25 @@ impl Limits {
     /// `value`. For callers that cannot name a Rust field: the command line,
     /// the C interface and the language bindings take limits by name. A value
     /// past what a `usize` holds is the maximum, i.e. no bound.
-    pub fn set(&mut self, name: &str, value: u64) -> Result<(), UnknownLimit> {
+    pub fn set(&mut self, name: &str, value: u64) -> Result<(), LimitError> {
+        // On a target where `usize` is narrower than 64 bits a count too large
+        // for it is an error, not "no bound"; `u64::MAX` alone means no bound.
+        let too_big = usize::try_from(value).is_err() && value != u64::MAX;
+        if too_big
+            && !matches!(
+                name,
+                "package_bytes"
+                    | "part_bytes"
+                    | "inflate_ratio"
+                    | "embedded_bytes"
+                    | "inflated_image_bytes"
+                    | "total_image_bytes"
+                    | "write_bytes"
+            )
+            && Limits::NAMES.contains(&name)
+        {
+            return Err(LimitError::TooLarge(name.to_string(), value));
+        }
         match name {
             "package_entries" => {
                 self.package_entries = usize::try_from(value).unwrap_or(usize::MAX)
@@ -1741,23 +1771,39 @@ impl Limits {
             "markdown_elements" => {
                 self.markdown_elements = usize::try_from(value).unwrap_or(usize::MAX)
             },
-            _ => return Err(UnknownLimit(name.to_string())),
+            _ => return Err(LimitError::Unknown(name.to_string())),
         }
         Ok(())
     }
 }
 
-/// A limit name [`Limits::set`] does not know.
+/// Why [`Limits::set`] refused a limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnknownLimit(pub String);
+#[non_exhaustive]
+pub enum LimitError {
+    /// The name is not a limit.
+    Unknown(String),
+    /// The count does not fit this target's `usize` (only `u64::MAX` means no
+    /// bound).
+    TooLarge(String, u64),
+}
 
-impl std::fmt::Display for UnknownLimit {
+impl std::fmt::Display for LimitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unknown limit '{}'; the limits are: {}", self.0, Limits::NAMES.join(", "))
+        match self {
+            Self::Unknown(name) => {
+                write!(f, "unknown limit '{name}'; the limits are: {}", Limits::NAMES.join(", "))
+            },
+            Self::TooLarge(name, value) => write!(
+                f,
+                "limit '{name}': {value} is more than this target can count; use the maximum \
+                 (u64::MAX) for no bound"
+            ),
+        }
     }
 }
 
-impl std::error::Error for UnknownLimit {}
+impl std::error::Error for LimitError {}
 
 thread_local! {
     /// The limits of the call running on this thread (see [`LimitsScope`]).

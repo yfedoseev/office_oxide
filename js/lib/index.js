@@ -109,14 +109,17 @@ class ParseOptions {
 
   set(name, value) {
     if (!this._h) throw new Error('ParseOptions is closed');
+    const MAX = 2n ** 64n - 1n;
+    const bad = () => new TypeError(`option ${name}: expected a non-negative integer (at most 2**64-1), a boolean, 'max' / Infinity for no bound, or for on_incomplete 'report' or 'error'`);
     let v;
     if (typeof value === 'boolean') v = value ? 1n : 0n;
-    else if (value === 'report') v = 0n;
-    else if (value === 'error' && name === 'on_incomplete') v = 1n;
-    else if (value === Infinity || value === 'max') v = 2n ** 64n - 1n;
-    else if (typeof value === 'bigint' && value >= 0n) v = value;
+    else if (name === 'on_incomplete' && value === 'report') v = 0n;
+    else if (name === 'on_incomplete' && value === 'error') v = 1n;
+    else if (name !== 'on_incomplete' && (value === Infinity || value === 'max')) v = MAX;
+    else if (typeof value === 'bigint' && value >= 0n && value <= MAX) v = value;
     else if (Number.isInteger(value) && value >= 0) v = BigInt(value);
-    else throw new TypeError(`option ${name}: expected a non-negative integer, a boolean, 'max', or for on_incomplete 'report' or 'error'`);
+    else throw bad();
+    if (v > MAX) throw bad();
     const rc = n.optionsSet(this._h, name, v);
     if (rc !== 0) {
       throw new OfficeOxideError(rc, 'ParseOptions.set', `unknown option '${name}'; the options are: ${ParseOptions.names().join(', ')}`);

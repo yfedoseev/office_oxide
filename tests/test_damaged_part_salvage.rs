@@ -309,3 +309,42 @@ fn test_a_pptx_layout_cut_off_mid_shape_keeps_the_shapes_before_it() {
     let warnings = cut.to_ir().metadata.warnings;
     assert!(warnings.iter().any(|w| w.contains("slideLayout1.xml")), "{warnings:?}");
 }
+
+#[test]
+fn test_a_pptx_slide_cut_inside_its_first_shape_is_not_an_empty_slide() {
+    // The shape tree opens with its own header elements; they are not shapes.
+    // Damage in the first real shape leaves nothing to keep, which is an
+    // unreadable slide, never a complete slide with no shapes.
+    let cut = "<p:sp><p:txBody><a:p><a:r><a:t>lost";
+    let doc = open(pptx(&slide(cut)), DocumentFormat::Pptx);
+    if let Ok(doc) = doc {
+        let warnings = doc.to_ir().metadata.warnings;
+        assert!(warnings.iter().any(|w| w.contains("slides/slide1.xml")), "{warnings:?}");
+        assert!(
+            !warnings.iter().any(|w| w.contains("malformed after")),
+            "reported as kept shapes: {warnings:?}"
+        );
+    }
+}
+
+#[test]
+fn test_a_docx_body_damaged_in_its_first_block_is_an_error_whatever_precedes_it() {
+    // `w:background` sits beside `w:body` and has children of its own.
+    let xml = format!(
+        r#"<w:document xmlns:w="{WML}" xmlns:v="urn:schemas-microsoft-com:vml"><w:background w:color="FFFFFF"><v:fill/><v:fill/></w:background><w:body><w:p><w:r><w:t>cut"#
+    );
+    let mut writer = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
+    writer
+        .add_part(
+            &PartName::new("/word/document.xml").unwrap(),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+            xml.as_bytes(),
+        )
+        .unwrap();
+    writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+    let bytes = writer.finish().unwrap().into_inner();
+    assert!(
+        open(bytes, DocumentFormat::Docx).is_err(),
+        "children of w:background were counted as body blocks"
+    );
+}

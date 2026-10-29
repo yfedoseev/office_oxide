@@ -593,7 +593,17 @@ impl XlsxDocument {
                     ws.chart_text = b.chart_text;
                     return Ok(Ok((ws, shared_formula::SharedFormulas::default())));
                 }
-                let parsed = match Worksheet::parse_unresolved(&b.data, b.name.clone(), &b.rels) {
+                // A sheet cut off between tags reaches end-of-file without an
+                // XML error and would read as complete: check the root closed.
+                // (an Excel 4.0 macro sheet's root is `macrosheet`)
+                let root = if b.kind == crate::ir::SheetKind::Macro {
+                    "macrosheet"
+                } else {
+                    "worksheet"
+                };
+                let whole = crate::core::xml::check_root_closed(&b.data, &b.name, root)
+                    .and_then(|()| Worksheet::parse_unresolved(&b.data, b.name.clone(), &b.rels));
+                let parsed = match whole {
                     Ok(done) => Ok((done, None)),
                     // Malformed XML part-way through: the rows before the damage
                     // parsed fine, so they are kept and the loss is said. A sheet
@@ -1417,7 +1427,8 @@ impl SheetPartClaims {
 fn part_key(entries: &opc::ZipEntryIndex, path: &str) -> String {
     match entries.lookup(path) {
         Some(index) => format!("#{index}"),
-        None => path.replace('\\', "/").to_ascii_lowercase(),
+        // Prefixed so that a path can never equal an entry key (`#3`).
+        None => format!("path:{}", path.replace('\\', "/").to_ascii_lowercase()),
     }
 }
 

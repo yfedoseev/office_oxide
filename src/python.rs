@@ -287,7 +287,8 @@ impl PyDocument {
             let kind = match d.kind {
                 crate::options::DamageKind::UnreadablePart => "unreadable_part",
                 crate::options::DamageKind::Truncated => "truncated",
-                _ => "recovered",
+                // No wildcard: a kind added later must be mapped here to compile.
+                crate::options::DamageKind::Recovered => "recovered",
             };
             item.set_item("kind", kind)?;
             item.set_item("part", d.part)?;

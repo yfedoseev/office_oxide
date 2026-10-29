@@ -311,3 +311,27 @@ fn test_a_document_embedded_under_several_names_is_given_once() {
     assert_eq!(text.matches("shared article").count(), 1, "{text}");
     assert_eq!(text.matches("embedded package repeated").count(), 2, "{text}");
 }
+
+/// A copy the text budget refused was never given, so a later copy must not
+/// point to it ("its text is given where it first appears"): whenever a repeat
+/// notice is written, the text it points to is in the output.
+#[test]
+fn test_a_repeat_does_not_point_to_a_copy_the_budget_refused() {
+    for budget in [20, 30, 40, 50, 60, 70, 80, 100] {
+        let mut scope = LimitScope::new();
+        scope.set(max_text_chars, set_max_text_chars, budget);
+        let doc = open(host(vec![
+            word_object("_1", "the shared embedded article"),
+            word_object("_2", "the shared embedded article"),
+            word_object("_3", "the shared embedded article"),
+        ]));
+        let text = doc.plain_text();
+        if text.contains("embedded package repeated") {
+            assert!(
+                text.contains("the shared embedded article"),
+                "budget {budget}: a repeat points to text never given: {text:?}"
+            );
+        }
+        drop(scope);
+    }
+}

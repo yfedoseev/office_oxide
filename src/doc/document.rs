@@ -1069,11 +1069,7 @@ fn embedded_word_text<R: Read + Seek>(
         },
     };
     let read = embedded_word_main_text(cfb, word_idx, table_idxs);
-    let EmbeddedRead {
-        text,
-        fingerprint,
-        notes,
-    } = match read {
+    let EmbeddedRead { text, notes } = match read {
         Ok(read) => read,
         Err(why) => {
             warnings.push(format!("embedded object {name} was not read: {why}"));
@@ -1083,14 +1079,23 @@ fn embedded_word_text<R: Read + Seek>(
     for note in notes {
         warnings.push(format!("embedded object {name}: {note}"));
     }
+    // Two embedded documents are the same when their text is: the
+    // `WordDocument` stream alone does not say (the piece table, fonts and
+    // formatting live in the table stream), so it cannot decide this.
+    let fingerprint = embedded::Fingerprint::of(text.as_bytes());
     let text = if let Some(cached) = embedded::cached::<String>(session, fingerprint) {
         // Found again under another name: its text is where it first appears.
         // A document with no text has nothing to point to.
         let repeat = (!cached.is_empty()).then(|| embedded::REPEATED_NOTICE.to_string());
         repeat.and_then(|notice| charge_embedded_text(session, name, notice))
     } else {
-        embedded::remember(session, fingerprint, text.clone());
-        charge_embedded_text(session, name, text)
+        // Remembered only once it has been given: a copy the budget refused is
+        // not "where it first appears".
+        let charged = charge_embedded_text(session, name, text.clone());
+        if charged.is_some() {
+            embedded::remember(session, fingerprint, text);
+        }
+        charged
     };
     (text, Some(admission))
 }
@@ -1114,8 +1119,7 @@ fn charge_embedded_text(
 
 /// The main story of the Word 97+ document whose `WordDocument` and table
 /// streams are the directory entries given, read as the top-level document's
-/// own is (the deleted and hidden text excluded). The fingerprint is of the
-/// `WordDocument` stream.
+/// own is (the deleted and hidden text excluded).
 fn embedded_word_main_text<R: Read + Seek>(
     cfb: &mut CfbReader<R>,
     word_idx: usize,
@@ -1129,7 +1133,6 @@ fn embedded_word_main_text<R: Read + Seek>(
     {
         // Word 6.0/95 keeps no table stream: its text and pieces are in the
         // main stream.
-        let fingerprint = crate::core::embedded::Fingerprint::of(&word_doc);
         let fib = super::word6::parse_fib(&word_doc).map_err(|e| e.to_string())?;
         let mut pieces = super::word6::pieces(&word_doc, &fib).map_err(|e| e.to_string())?;
         let mut notes = Vec::new();
@@ -1145,11 +1148,9 @@ fn embedded_word_main_text<R: Read + Seek>(
         let (main, _) = super::word6::stories(&word_doc, &fib, &pieces);
         return Ok(EmbeddedRead {
             text: main.trim().to_string(),
-            fingerprint,
             notes,
         });
     }
-    let fingerprint = crate::core::embedded::Fingerprint::of(&word_doc);
     let mut fib = Fib::parse(&word_doc).map_err(|e| e.to_string())?;
     let table_idx = if fib.use_table1 { t1.or(t0) } else { t0.or(t1) }
         .ok_or_else(|| "neither 0Table nor 1Table stream is present".to_string())?;
@@ -1202,7 +1203,6 @@ fn embedded_word_main_text<R: Read + Seek>(
     );
     Ok(EmbeddedRead {
         text: sanitize_text(&raw).trim().to_string(),
-        fingerprint,
         notes,
     })
 }
@@ -1211,7 +1211,6 @@ fn embedded_word_main_text<R: Read + Seek>(
 struct EmbeddedRead {
     text: String,
     /// Fingerprint of its `WordDocument` stream.
-    fingerprint: crate::core::embedded::Fingerprint,
     /// What to tell the reader about this document's text: the text-budget
     /// notice when the budget cut the story short, and the piece-table notice
     /// when its positions were out of order.

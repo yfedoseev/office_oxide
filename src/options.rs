@@ -78,7 +78,7 @@ impl ParseOptions {
     /// `name` is a limit (see [`Limits::NAMES`]) with a number as its value, or
     /// one of `include_hidden_text` and `include_deleted_text` (0 or 1), or
     /// `on_incomplete` (0 reports, 1 is an error).
-    pub fn set_option(&mut self, name: &str, value: u64) -> Result<(), UnknownOption> {
+    pub fn set_option(&mut self, name: &str, value: u64) -> Result<(), OptionError> {
         match name {
             "include_hidden_text" => self.include_hidden_text = value != 0,
             "include_deleted_text" => self.include_deleted_text = value != 0,
@@ -89,10 +89,10 @@ impl ParseOptions {
                     OnIncomplete::Error
                 }
             },
-            limit => self
-                .limits
-                .set(limit, value)
-                .map_err(|_| UnknownOption(name.to_string()))?,
+            limit => self.limits.set(limit, value).map_err(|e| match e {
+                crate::limits::LimitError::Unknown(_) => OptionError::Unknown(name.to_string()),
+                other => OptionError::Limit(other),
+            })?,
         }
         Ok(())
     }
@@ -102,23 +102,31 @@ impl ParseOptions {
     }
 }
 
-/// An option name [`ParseOptions::set_option`] does not know.
+/// Why [`ParseOptions::set_option`] refused an option.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnknownOption(pub String);
+#[non_exhaustive]
+pub enum OptionError {
+    /// The name is not an option.
+    Unknown(String),
+    /// The name is a limit and the value is not acceptable for it.
+    Limit(crate::limits::LimitError),
+}
 
-impl std::fmt::Display for UnknownOption {
+impl std::fmt::Display for OptionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "unknown option '{}'; the options are: include_hidden_text, include_deleted_text, \
-             on_incomplete, {}",
-            self.0,
-            Limits::NAMES.join(", ")
-        )
+        match self {
+            Self::Unknown(name) => write!(
+                f,
+                "unknown option '{name}'; the options are: include_hidden_text, \
+                 include_deleted_text, on_incomplete, {}",
+                Limits::NAMES.join(", ")
+            ),
+            Self::Limit(e) => e.fmt(f),
+        }
     }
 }
 
-impl std::error::Error for UnknownOption {}
+impl std::error::Error for OptionError {}
 
 /// How a document came to be incomplete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
