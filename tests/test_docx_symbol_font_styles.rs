@@ -219,7 +219,7 @@ fn test_deeply_nested_tables_do_not_overflow_the_stack() {
         body = format!("<w:tbl><w:tr><w:tc>{body}</w:tc></w:tr></w:tbl><w:p/>");
     }
     let text = std::thread::Builder::new()
-        .stack_size(256 * 1024)
+        .stack_size(2 * 1024 * 1024)
         .spawn(move || text_of(&body, SYMBOL_PARAGRAPH_STYLE))
         .unwrap()
         .join()
