@@ -16,11 +16,15 @@
 //! shared headers, notes, a paragraph style's name — `classify_style_name`
 //! bounds that one).
 //!
-//! **These are process-wide settings.** Each setter changes the limit for every
-//! document read or written afterwards, on every thread, so set them once at
-//! start-up, before any document is opened; they are not a per-request or
-//! per-tenant control. (The tuning constants behind the scaled text budget and
-//! the write-memory estimate are `doc(hidden)`: they may change.)
+//! **Two ways to set them.** The `set_max_*` functions change the
+//! process-wide defaults: every document read or written afterwards, on every
+//! thread, so set them once at start-up. For limits that belong to one
+//! document (a server with different tenants, a test beside others) use
+//! [`Limits`] in [`ParseOptions`](crate::options::ParseOptions) with
+//! [`Document::open_with`](crate::Document::open_with): they apply to that
+//! document's reading and conversions and to nothing else. (The tuning
+//! constants behind the scaled text budget and the write-memory estimate are
+//! `doc(hidden)`: they may change.)
 //!
 //! The text budget is one of several, each for the thing that multiplies:
 //! pictures ([`crate::limits::max_image_bytes`], [`crate::limits::max_total_image_bytes`] and, for the
@@ -46,16 +50,16 @@
 //! it once at startup with [the text-budget setter](crate::limits::set_max_text_chars).
 
 //!
-//! OOXML packages are zip archives, and the per-part decompression cap
-//! ([`MAX_PART_SIZE`](crate::core::opc::MAX_PART_SIZE)) bounds one part
-//! only. Two package-wide bounds sit on top of it, mirroring Apache POI's
-//! `ZipSecureFile` limits: the number of entries an archive may hold
-//! (set with [the entry-count setter](crate::limits::set_max_package_entries))
-//! and the total decompressed bytes that may be read from one package (set
-//! with [the byte-budget setter](crate::limits::set_max_package_bytes)). A
-//! package that
-//! exceeds either is refused with
-//! [`Error::PackageLimit`](crate::core::Error::PackageLimit).
+//! OOXML packages are zip archives. A part is bounded by its decompressed size
+//! ([`max_part_bytes`], 512 MiB) and, once it is larger than
+//! [`INFLATE_RATIO_FLOOR_BYTES`], by its ratio to the bytes that store it
+//! ([`max_inflate_ratio`], 1,000; Apache POI's `ZipSecureFile` does the same
+//! with 100). Two package-wide bounds sit on top, as POI's do: the number of
+//! entries an archive may hold ([`max_package_entries`]) and the total
+//! decompressed bytes read from one package ([`max_package_bytes`]). A
+//! package or part that exceeds any is refused with
+//! [`Error::PackageLimit`](crate::core::Error::PackageLimit) or
+//! [`Error::DecompressionLimit`](crate::core::Error::DecompressionLimit).
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -76,7 +80,7 @@ static MAX_PACKAGE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_PACKAGE_BYTES);
 
 /// The maximum number of entries an OOXML package may hold.
 pub fn max_package_entries() -> usize {
-    MAX_PACKAGE_ENTRIES.load(Ordering::Relaxed)
+    scoped(|l| l.package_entries).unwrap_or_else(|| MAX_PACKAGE_ENTRIES.load(Ordering::Relaxed))
 }
 
 /// Set the maximum number of entries for every package opened afterwards.
@@ -92,7 +96,8 @@ pub fn set_max_package_entries(entries: usize) {
 /// [embedded-package allowance](max_embedded_bytes) has left, if that is
 /// less.
 pub fn max_package_bytes() -> u64 {
-    let configured = MAX_PACKAGE_BYTES.load(Ordering::Relaxed);
+    let configured =
+        scoped(|l| l.package_bytes).unwrap_or_else(|| MAX_PACKAGE_BYTES.load(Ordering::Relaxed));
     crate::core::embedded::package_bytes_cap().map_or(configured, |cap| configured.min(cap))
 }
 
@@ -100,6 +105,62 @@ pub fn max_package_bytes() -> u64 {
 /// afterwards. `u64::MAX` disables the bound.
 pub fn set_max_package_bytes(bytes: u64) {
     MAX_PACKAGE_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// The default largest decompressed size of one part of a package: 512 MiB.
+///
+/// Real documents do not have half-gigabyte parts; a part that claims to is
+/// corrupt or a decompression bomb. Raise it for a collection known to hold
+/// very large worksheets; lower it to bound the memory one part can take.
+pub const DEFAULT_MAX_PART_BYTES: u64 = 512 << 20;
+
+/// The default largest ratio of a part's decompressed to its compressed size,
+/// once the part is larger than [`INFLATE_RATIO_FLOOR_BYTES`]: 1,000.
+///
+/// Ordinary XML deflates 5-20 times; a sparse worksheet reaches a few
+/// hundred. A part 1,000 times larger than the bytes that encode it, and
+/// large besides, is a bomb. Apache POI refuses a ratio above 100 for any
+/// size (and added a size floor after reporting small, legitimate parts).
+pub const DEFAULT_MAX_INFLATE_RATIO: u64 = 1000;
+
+/// A part no larger than this (decompressed) is never refused for its ratio:
+/// 64 MiB. A ratio only says something about a part big enough to hurt.
+pub const INFLATE_RATIO_FLOOR_BYTES: u64 = 64 << 20;
+
+static MAX_PART_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_PART_BYTES);
+static MAX_INFLATE_RATIO: AtomicU64 = AtomicU64::new(DEFAULT_MAX_INFLATE_RATIO);
+
+/// The largest decompressed size accepted for one part of a package.
+pub fn max_part_bytes() -> u64 {
+    scoped(|l| l.part_bytes).unwrap_or_else(|| MAX_PART_BYTES.load(Ordering::Relaxed))
+}
+
+/// Set the per-part decompressed-size limit for every package opened
+/// afterwards. `u64::MAX` disables the bound.
+pub fn set_max_part_bytes(bytes: u64) {
+    MAX_PART_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// The largest decompressed-to-compressed ratio accepted for a part larger
+/// than [`INFLATE_RATIO_FLOOR_BYTES`].
+pub fn max_inflate_ratio() -> u64 {
+    scoped(|l| l.inflate_ratio).unwrap_or_else(|| MAX_INFLATE_RATIO.load(Ordering::Relaxed))
+}
+
+/// Set the inflate-ratio limit for every package opened afterwards.
+/// `u64::MAX` disables the check.
+pub fn set_max_inflate_ratio(ratio: u64) {
+    MAX_INFLATE_RATIO.store(ratio, Ordering::Relaxed);
+}
+
+/// The most a part with `compressed` stored bytes may inflate to: the
+/// per-part size limit, and (past the floor) the ratio limit.
+pub(crate) fn part_inflate_cap(compressed: u64) -> u64 {
+    let size = max_part_bytes();
+    let by_ratio = compressed
+        .saturating_mul(max_inflate_ratio())
+        .max(INFLATE_RATIO_FLOOR_BYTES);
+    size.min(by_ratio)
 }
 
 /// The default depth to which embedded packages are opened: 3.
@@ -131,7 +192,7 @@ static MAX_EMBEDDED_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_EMBEDDED_BYTES
 /// How many levels deep an embedded package is opened (the document itself is
 /// level 0, a package it embeds level 1).
 pub fn max_embedded_depth() -> usize {
-    MAX_EMBEDDED_DEPTH.load(Ordering::Relaxed)
+    scoped(|l| l.embedded_depth).unwrap_or_else(|| MAX_EMBEDDED_DEPTH.load(Ordering::Relaxed))
 }
 
 /// Set the embedding depth limit for every document read afterwards. `0`
@@ -142,7 +203,7 @@ pub fn set_max_embedded_depth(depth: usize) {
 
 /// The most distinct embedded packages opened for one document.
 pub fn max_embedded_packages() -> usize {
-    MAX_EMBEDDED_PACKAGES.load(Ordering::Relaxed)
+    scoped(|l| l.embedded_packages).unwrap_or_else(|| MAX_EMBEDDED_PACKAGES.load(Ordering::Relaxed))
 }
 
 /// Set the limit on embedded packages opened per document, for every
@@ -154,7 +215,7 @@ pub fn set_max_embedded_packages(packages: usize) {
 /// The total bytes the embedded packages of one document may take, counting
 /// their sizes and what reading them inflates.
 pub fn max_embedded_bytes() -> u64 {
-    MAX_EMBEDDED_BYTES.load(Ordering::Relaxed)
+    scoped(|l| l.embedded_bytes).unwrap_or_else(|| MAX_EMBEDDED_BYTES.load(Ordering::Relaxed))
 }
 
 /// Set the embedded-package byte allowance for every document read
@@ -248,7 +309,7 @@ pub fn max_text_chars() -> usize {
 /// The text budget as configured, whatever has been spent of it by the
 /// packages embedded in the document being read.
 pub(crate) fn configured_max_text_chars() -> usize {
-    MAX_TEXT_CHARS.load(Ordering::Relaxed)
+    scoped(|l| l.text_chars).unwrap_or_else(|| MAX_TEXT_CHARS.load(Ordering::Relaxed))
 }
 
 /// Set the per-document text budget for every document read afterwards.
@@ -284,7 +345,8 @@ static MAX_GRID_PADDING_CELLS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_GRID_P
 
 /// The per-document allowance of empty slots padding spreadsheet rows.
 pub fn max_grid_padding_cells() -> usize {
-    MAX_GRID_PADDING_CELLS.load(Ordering::Relaxed)
+    scoped(|l| l.grid_padding_cells)
+        .unwrap_or_else(|| MAX_GRID_PADDING_CELLS.load(Ordering::Relaxed))
 }
 
 /// Set the per-document empty-slot allowance for every document read
@@ -308,7 +370,8 @@ static MAX_SHEET_GRID_PADDING_CELLS: AtomicUsize =
 
 /// The per-sheet allowance of empty slots padding spreadsheet rows.
 pub fn max_sheet_grid_padding_cells() -> usize {
-    MAX_SHEET_GRID_PADDING_CELLS.load(Ordering::Relaxed)
+    scoped(|l| l.sheet_grid_padding_cells)
+        .unwrap_or_else(|| MAX_SHEET_GRID_PADDING_CELLS.load(Ordering::Relaxed))
 }
 
 /// Set the per-sheet empty-slot allowance for every document read
@@ -333,7 +396,8 @@ static MAX_INFLATED_IMAGE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_INFLATED
 /// The per-document allowance of bytes a legacy file's compressed metafile
 /// pictures may inflate to.
 pub fn max_inflated_image_bytes() -> u64 {
-    MAX_INFLATED_IMAGE_BYTES.load(Ordering::Relaxed)
+    scoped(|l| l.inflated_image_bytes)
+        .unwrap_or_else(|| MAX_INFLATED_IMAGE_BYTES.load(Ordering::Relaxed))
 }
 
 /// Set the per-document inflated-image allowance for every document read
@@ -591,7 +655,7 @@ static MAX_IR_PADDING_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_IR_PADDI
 /// The per-document allowance of bytes for the empty cells padding the rows
 /// of a spreadsheet's IR.
 pub fn max_ir_padding_bytes() -> usize {
-    MAX_IR_PADDING_BYTES.load(Ordering::Relaxed)
+    scoped(|l| l.ir_padding_bytes).unwrap_or_else(|| MAX_IR_PADDING_BYTES.load(Ordering::Relaxed))
 }
 
 /// Set the empty-cell padding allowance for every document converted
@@ -619,7 +683,8 @@ static MAX_SHEET_IR_PADDING_BYTES: AtomicUsize =
 /// The per-sheet allowance of bytes for the empty cells padding the rows of
 /// a spreadsheet sheet in the IR, when sheets are converted one at a time.
 pub fn max_sheet_ir_padding_bytes() -> usize {
-    MAX_SHEET_IR_PADDING_BYTES.load(Ordering::Relaxed)
+    scoped(|l| l.sheet_ir_padding_bytes)
+        .unwrap_or_else(|| MAX_SHEET_IR_PADDING_BYTES.load(Ordering::Relaxed))
 }
 
 /// Set the per-sheet empty-cell padding allowance for every sheet converted
@@ -721,7 +786,7 @@ static MAX_IMAGE_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_IMAGE_BYTES);
 /// once for every anchor that draws it: the workbook stores a media part once,
 /// and the IR gives each image its own copy.
 pub fn max_image_bytes() -> usize {
-    MAX_IMAGE_BYTES.load(Ordering::Relaxed)
+    scoped(|l| l.image_bytes).unwrap_or_else(|| MAX_IMAGE_BYTES.load(Ordering::Relaxed))
 }
 
 /// Set the picture-byte budget for every document converted afterwards.
@@ -743,7 +808,7 @@ static MAX_TOTAL_IMAGE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_TOTAL_IMAGE
 /// The most picture bytes all the sheets of one workbook may copy into the IR
 /// in a sheet-by-sheet conversion.
 pub fn max_total_image_bytes() -> u64 {
-    MAX_TOTAL_IMAGE_BYTES.load(Ordering::Relaxed)
+    scoped(|l| l.total_image_bytes).unwrap_or_else(|| MAX_TOTAL_IMAGE_BYTES.load(Ordering::Relaxed))
 }
 
 /// Set the total picture-byte limit for every sheet-by-sheet conversion
@@ -920,7 +985,7 @@ static MAX_WRITE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_WRITE_BYTES);
 /// padded to its widest row) of an IR written to `.docx`, `.pptx` or `.xlsx`
 /// may be estimated to need before the write is refused.
 pub fn max_write_bytes() -> u64 {
-    MAX_WRITE_BYTES.load(Ordering::Relaxed)
+    scoped(|l| l.write_bytes).unwrap_or_else(|| MAX_WRITE_BYTES.load(Ordering::Relaxed))
 }
 
 /// Set the write-memory limit for every write afterwards. `u64::MAX` disables
@@ -943,7 +1008,7 @@ static MAX_WRITE_SHEETS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_WRITE_SHEETS
 /// The most sections (worksheets) an IR written to `.xlsx` may hold before
 /// the write is refused.
 pub fn max_write_sheets() -> usize {
-    MAX_WRITE_SHEETS.load(Ordering::Relaxed)
+    scoped(|l| l.write_sheets).unwrap_or_else(|| MAX_WRITE_SHEETS.load(Ordering::Relaxed))
 }
 
 /// Set the worksheet limit for every write afterwards. `usize::MAX`
@@ -961,7 +1026,8 @@ static MAX_MARKDOWN_LIST_ITEMS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_MARKD
 /// The most list items (nested ones included) `DocumentIR::from_markdown`
 /// keeps; the rest are dropped with a notice.
 pub fn max_markdown_list_items() -> usize {
-    MAX_MARKDOWN_LIST_ITEMS.load(Ordering::Relaxed)
+    scoped(|l| l.markdown_list_items)
+        .unwrap_or_else(|| MAX_MARKDOWN_LIST_ITEMS.load(Ordering::Relaxed))
 }
 
 /// Set the Markdown list-item limit for every parse afterwards.
@@ -994,7 +1060,8 @@ static MAX_MARKDOWN_TABLE_CELLS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_MARK
 /// The most table cells `DocumentIR::from_markdown` keeps, over all of a
 /// document's tables.
 pub fn max_markdown_table_cells() -> usize {
-    MAX_MARKDOWN_TABLE_CELLS.load(Ordering::Relaxed)
+    scoped(|l| l.markdown_table_cells)
+        .unwrap_or_else(|| MAX_MARKDOWN_TABLE_CELLS.load(Ordering::Relaxed))
 }
 
 /// Set the Markdown table-cell limit for every parse afterwards.
@@ -1009,7 +1076,7 @@ static MAX_MARKDOWN_ELEMENTS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_MARKDOW
 /// lists and tables) `DocumentIR::from_markdown`
 /// keeps; the rest of the document is dropped with a notice.
 pub fn max_markdown_elements() -> usize {
-    MAX_MARKDOWN_ELEMENTS.load(Ordering::Relaxed)
+    scoped(|l| l.markdown_elements).unwrap_or_else(|| MAX_MARKDOWN_ELEMENTS.load(Ordering::Relaxed))
 }
 
 /// Set the Markdown block limit for every parse afterwards. `usize::MAX`
@@ -1383,6 +1450,21 @@ mod tests {
         assert!(charge_copied_text(5));
     }
 
+    #[test]
+    fn test_part_cap_is_the_size_limit_and_past_the_floor_the_ratio_limit() {
+        let mut limits = test_support::LimitScope::new();
+        // Stored bytes few: the floor governs, so a modest part is allowed.
+        assert_eq!(part_inflate_cap(10), INFLATE_RATIO_FLOOR_BYTES);
+        // Many stored bytes: the ratio allows more than the floor, up to the size limit.
+        let stored = 100 << 10;
+        assert_eq!(part_inflate_cap(stored), stored * DEFAULT_MAX_INFLATE_RATIO);
+        assert_eq!(part_inflate_cap(u64::MAX), DEFAULT_MAX_PART_BYTES);
+        limits.set(max_inflate_ratio, set_max_inflate_ratio, u64::MAX);
+        assert_eq!(part_inflate_cap(10), DEFAULT_MAX_PART_BYTES);
+        limits.set(max_part_bytes, set_max_part_bytes, 1000);
+        assert_eq!(part_inflate_cap(10), 1000);
+    }
+
     /// Outside any conversion there is no running total, but a charge is not
     /// unlimited either: it is held to the configured limit on its own.
     #[test]
@@ -1393,6 +1475,241 @@ mod tests {
         assert!(!charge_copied_text(usize::MAX));
         assert!(copied_text_notice().is_none());
         assert!(image_budget_warning().is_none());
+    }
+}
+
+/// Every limit in this module as one value, for use per call.
+///
+/// The `set_max_*` functions change the process-wide defaults, which suits a
+/// program that configures the library once. A server reading documents for
+/// different tenants, or a test running beside others, wants the limits to
+/// belong to the *call*: build a `Limits`, put it in
+/// [`ParseOptions`](crate::options::ParseOptions) and read with
+/// [`Document::open_with`](crate::Document::open_with). Nothing global
+/// changes; other threads are unaffected.
+///
+/// [`Limits::default`] holds the documented defaults, [`Limits::current`] the
+/// process-wide values now in force, [`Limits::strict`] a tighter set for
+/// untrusted input, and [`Limits::unlimited`] switches every bound off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Limits {
+    /// Entries one OOXML package may hold. See [`max_package_entries`].
+    pub package_entries: usize,
+    /// Decompressed bytes read from one OOXML package. See [`max_package_bytes`].
+    pub package_bytes: u64,
+    /// Decompressed size of one part. See [`max_part_bytes`].
+    pub part_bytes: u64,
+    /// Decompressed-to-stored ratio of a part larger than [`INFLATE_RATIO_FLOOR_BYTES`]. See [`max_inflate_ratio`].
+    pub inflate_ratio: u64,
+    /// Depth to which embedded packages are opened. See [`max_embedded_depth`].
+    pub embedded_depth: usize,
+    /// Embedded packages opened for one document. See [`max_embedded_packages`].
+    pub embedded_packages: usize,
+    /// Bytes of embedded packages opened for one document. See [`max_embedded_bytes`].
+    pub embedded_bytes: u64,
+    /// Characters of text one document may produce. See [`max_text_chars`].
+    pub text_chars: usize,
+    /// Empty cells that pad a spreadsheet grid. See [`max_grid_padding_cells`].
+    pub grid_padding_cells: usize,
+    /// Empty cells that pad one sheet's grid. See [`max_sheet_grid_padding_cells`].
+    pub sheet_grid_padding_cells: usize,
+    /// Bytes a compressed metafile may inflate to. See [`max_inflated_image_bytes`].
+    pub inflated_image_bytes: u64,
+    /// Bytes of padding in a document's IR. See [`max_ir_padding_bytes`].
+    pub ir_padding_bytes: usize,
+    /// Bytes of padding in one sheet's IR. See [`max_sheet_ir_padding_bytes`].
+    pub sheet_ir_padding_bytes: usize,
+    /// Bytes of one picture copied into the IR. See [`max_image_bytes`].
+    pub image_bytes: usize,
+    /// Bytes of all pictures copied into the IR. See [`max_total_image_bytes`].
+    pub total_image_bytes: u64,
+    /// Estimated bytes a document being written may take. See [`max_write_bytes`].
+    pub write_bytes: u64,
+    /// Worksheets a workbook being written may have. See [`max_write_sheets`].
+    pub write_sheets: usize,
+    /// List items read from Markdown. See [`max_markdown_list_items`].
+    pub markdown_list_items: usize,
+    /// Table cells read from Markdown. See [`max_markdown_table_cells`].
+    pub markdown_table_cells: usize,
+    /// Elements read from Markdown. See [`max_markdown_elements`].
+    pub markdown_elements: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            package_entries: DEFAULT_MAX_PACKAGE_ENTRIES,
+            package_bytes: DEFAULT_MAX_PACKAGE_BYTES,
+            part_bytes: DEFAULT_MAX_PART_BYTES,
+            inflate_ratio: DEFAULT_MAX_INFLATE_RATIO,
+            embedded_depth: DEFAULT_MAX_EMBEDDED_DEPTH,
+            embedded_packages: DEFAULT_MAX_EMBEDDED_PACKAGES,
+            embedded_bytes: DEFAULT_MAX_EMBEDDED_BYTES,
+            text_chars: DEFAULT_MAX_TEXT_CHARS,
+            grid_padding_cells: DEFAULT_MAX_GRID_PADDING_CELLS,
+            sheet_grid_padding_cells: DEFAULT_MAX_SHEET_GRID_PADDING_CELLS,
+            inflated_image_bytes: DEFAULT_MAX_INFLATED_IMAGE_BYTES,
+            ir_padding_bytes: DEFAULT_MAX_IR_PADDING_BYTES,
+            sheet_ir_padding_bytes: DEFAULT_MAX_SHEET_IR_PADDING_BYTES,
+            image_bytes: DEFAULT_MAX_IMAGE_BYTES,
+            total_image_bytes: DEFAULT_MAX_TOTAL_IMAGE_BYTES,
+            write_bytes: DEFAULT_MAX_WRITE_BYTES,
+            write_sheets: DEFAULT_MAX_WRITE_SHEETS,
+            markdown_list_items: DEFAULT_MAX_MARKDOWN_LIST_ITEMS,
+            markdown_table_cells: DEFAULT_MAX_MARKDOWN_TABLE_CELLS,
+            markdown_elements: DEFAULT_MAX_MARKDOWN_ELEMENTS,
+        }
+    }
+}
+
+impl Limits {
+    /// The process-wide limits now in force (the defaults, or what the
+    /// `set_max_*` functions changed them to).
+    pub fn current() -> Self {
+        Self {
+            package_entries: MAX_PACKAGE_ENTRIES.load(Ordering::Relaxed),
+            package_bytes: MAX_PACKAGE_BYTES.load(Ordering::Relaxed),
+            part_bytes: MAX_PART_BYTES.load(Ordering::Relaxed),
+            inflate_ratio: MAX_INFLATE_RATIO.load(Ordering::Relaxed),
+            embedded_depth: MAX_EMBEDDED_DEPTH.load(Ordering::Relaxed),
+            embedded_packages: MAX_EMBEDDED_PACKAGES.load(Ordering::Relaxed),
+            embedded_bytes: MAX_EMBEDDED_BYTES.load(Ordering::Relaxed),
+            text_chars: MAX_TEXT_CHARS.load(Ordering::Relaxed),
+            grid_padding_cells: MAX_GRID_PADDING_CELLS.load(Ordering::Relaxed),
+            sheet_grid_padding_cells: MAX_SHEET_GRID_PADDING_CELLS.load(Ordering::Relaxed),
+            inflated_image_bytes: MAX_INFLATED_IMAGE_BYTES.load(Ordering::Relaxed),
+            ir_padding_bytes: MAX_IR_PADDING_BYTES.load(Ordering::Relaxed),
+            sheet_ir_padding_bytes: MAX_SHEET_IR_PADDING_BYTES.load(Ordering::Relaxed),
+            image_bytes: MAX_IMAGE_BYTES.load(Ordering::Relaxed),
+            total_image_bytes: MAX_TOTAL_IMAGE_BYTES.load(Ordering::Relaxed),
+            write_bytes: MAX_WRITE_BYTES.load(Ordering::Relaxed),
+            write_sheets: MAX_WRITE_SHEETS.load(Ordering::Relaxed),
+            markdown_list_items: MAX_MARKDOWN_LIST_ITEMS.load(Ordering::Relaxed),
+            markdown_table_cells: MAX_MARKDOWN_TABLE_CELLS.load(Ordering::Relaxed),
+            markdown_elements: MAX_MARKDOWN_ELEMENTS.load(Ordering::Relaxed),
+        }
+    }
+
+    /// A tighter set for input from a source nobody vouches for: an eighth of
+    /// each size default, at most one level of embedded packages, and a
+    /// part may not inflate more than 100 times its stored size. Documents
+    /// of ordinary size read as usual.
+    pub fn strict() -> Self {
+        let d = Self::default();
+        Self {
+            package_entries: d.package_entries / 8,
+            package_bytes: d.package_bytes / 8,
+            part_bytes: d.part_bytes / 8,
+            inflate_ratio: 100,
+            embedded_depth: 1,
+            embedded_packages: d.embedded_packages / 8,
+            embedded_bytes: d.embedded_bytes / 8,
+            text_chars: d.text_chars / 8,
+            grid_padding_cells: d.grid_padding_cells / 8,
+            sheet_grid_padding_cells: d.sheet_grid_padding_cells / 8,
+            inflated_image_bytes: d.inflated_image_bytes / 8,
+            ir_padding_bytes: d.ir_padding_bytes / 8,
+            sheet_ir_padding_bytes: d.sheet_ir_padding_bytes / 8,
+            image_bytes: d.image_bytes / 8,
+            total_image_bytes: d.total_image_bytes / 8,
+            write_bytes: d.write_bytes / 8,
+            write_sheets: d.write_sheets,
+            markdown_list_items: d.markdown_list_items / 8,
+            markdown_table_cells: d.markdown_table_cells / 8,
+            markdown_elements: d.markdown_elements / 8,
+        }
+    }
+
+    /// No bound at all. Only for input you produced yourself.
+    pub fn unlimited() -> Self {
+        Self {
+            package_entries: usize::MAX,
+            package_bytes: u64::MAX,
+            part_bytes: u64::MAX,
+            inflate_ratio: u64::MAX,
+            embedded_depth: usize::MAX,
+            embedded_packages: usize::MAX,
+            embedded_bytes: u64::MAX,
+            text_chars: usize::MAX,
+            grid_padding_cells: usize::MAX,
+            sheet_grid_padding_cells: usize::MAX,
+            inflated_image_bytes: u64::MAX,
+            ir_padding_bytes: usize::MAX,
+            sheet_ir_padding_bytes: usize::MAX,
+            image_bytes: usize::MAX,
+            total_image_bytes: u64::MAX,
+            write_bytes: u64::MAX,
+            write_sheets: usize::MAX,
+            markdown_list_items: usize::MAX,
+            markdown_table_cells: usize::MAX,
+            markdown_elements: usize::MAX,
+        }
+    }
+
+    /// Make these the process-wide limits, as the `set_max_*` functions do.
+    pub fn apply(&self) {
+        MAX_PACKAGE_ENTRIES.store(self.package_entries, Ordering::Relaxed);
+        MAX_PACKAGE_BYTES.store(self.package_bytes, Ordering::Relaxed);
+        MAX_PART_BYTES.store(self.part_bytes, Ordering::Relaxed);
+        MAX_INFLATE_RATIO.store(self.inflate_ratio, Ordering::Relaxed);
+        MAX_EMBEDDED_DEPTH.store(self.embedded_depth, Ordering::Relaxed);
+        MAX_EMBEDDED_PACKAGES.store(self.embedded_packages, Ordering::Relaxed);
+        MAX_EMBEDDED_BYTES.store(self.embedded_bytes, Ordering::Relaxed);
+        MAX_TEXT_CHARS.store(self.text_chars, Ordering::Relaxed);
+        MAX_GRID_PADDING_CELLS.store(self.grid_padding_cells, Ordering::Relaxed);
+        MAX_SHEET_GRID_PADDING_CELLS.store(self.sheet_grid_padding_cells, Ordering::Relaxed);
+        MAX_INFLATED_IMAGE_BYTES.store(self.inflated_image_bytes, Ordering::Relaxed);
+        MAX_IR_PADDING_BYTES.store(self.ir_padding_bytes, Ordering::Relaxed);
+        MAX_SHEET_IR_PADDING_BYTES.store(self.sheet_ir_padding_bytes, Ordering::Relaxed);
+        MAX_IMAGE_BYTES.store(self.image_bytes, Ordering::Relaxed);
+        MAX_TOTAL_IMAGE_BYTES.store(self.total_image_bytes, Ordering::Relaxed);
+        MAX_WRITE_BYTES.store(self.write_bytes, Ordering::Relaxed);
+        MAX_WRITE_SHEETS.store(self.write_sheets, Ordering::Relaxed);
+        MAX_MARKDOWN_LIST_ITEMS.store(self.markdown_list_items, Ordering::Relaxed);
+        MAX_MARKDOWN_TABLE_CELLS.store(self.markdown_table_cells, Ordering::Relaxed);
+        MAX_MARKDOWN_ELEMENTS.store(self.markdown_elements, Ordering::Relaxed);
+    }
+}
+
+thread_local! {
+    /// The limits of the call running on this thread (see [`LimitsScope`]).
+    static SCOPED: std::cell::RefCell<Option<std::rc::Rc<Limits>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Read one field of the limits set for this call, if one is set.
+fn scoped<T>(field: impl FnOnce(&Limits) -> T) -> Option<T> {
+    SCOPED
+        .try_with(|c| c.borrow().as_ref().map(|l| field(l)))
+        .ok()
+        .flatten()
+}
+
+/// The limits set for the call running on this thread, if it has its own, for
+/// work that continues on another thread to carry them over.
+pub(crate) fn scope_snapshot() -> Option<Limits> {
+    scoped(Limits::clone)
+}
+
+/// While alive, the limits getters on this thread return `limits`' values
+/// instead of the process-wide ones. Restores what it replaced when dropped.
+#[must_use = "the limits apply only while the scope is alive; bind it for the length of the call"]
+pub(crate) struct LimitsScope(Option<std::rc::Rc<Limits>>);
+
+impl LimitsScope {
+    pub(crate) fn new(limits: Option<&Limits>) -> Self {
+        let Some(limits) = limits else {
+            return Self(SCOPED.with(|c| c.borrow().clone()));
+        };
+        let before = SCOPED.with(|c| c.borrow_mut().replace(std::rc::Rc::new(limits.clone())));
+        Self(before)
+    }
+}
+
+impl Drop for LimitsScope {
+    fn drop(&mut self) {
+        let _ = SCOPED.try_with(|c| *c.borrow_mut() = self.0.take());
     }
 }
 

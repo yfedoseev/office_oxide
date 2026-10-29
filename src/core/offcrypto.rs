@@ -20,10 +20,10 @@
 //!
 //! **Not for protecting anything, and not FIPS-validated.** The password tried
 //! is public, so nothing here keeps a secret: the code only reads files whose
-//! "protection" is a formality. Its MD5, SHA-1, SHA-2, AES and RC4 are written
-//! for this one purpose (see `core::crypto`), are not constant-time and are not
-//! a validated cryptographic module; MD5 and RC4 cannot be part of a FIPS 140
-//! build, so a build that must be FIPS-compliant leaves the feature off.
+//! "protection" is a formality. The primitives are the RustCrypto crates (see
+//! `core::crypto`); the code around them is not a validated cryptographic
+//! module. MD5 and RC4 cannot be part of a FIPS 140 build, so a build that
+//! must be FIPS-compliant leaves the feature off.
 
 use super::crypto::{Aes, Hash, Rc4, md5, sha1};
 

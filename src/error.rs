@@ -1,5 +1,6 @@
 /// Unified error type for office_oxide.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OfficeError {
     /// Error from the core OPC/XML layer.
     #[error(transparent)]
@@ -35,6 +36,14 @@ pub enum OfficeError {
     /// which could not tell a caught panic from a clean rejection.
     #[error("internal error: parsing panicked: {0}")]
     Panic(String),
+
+    /// The document was read, but the result is known to be incomplete and
+    /// the caller asked for an error in that case
+    /// ([`OnIncomplete::Error`](crate::options::OnIncomplete::Error)). The
+    /// message names the first losses; [`Document::damage`](crate::Document::damage)
+    /// lists them all for a document opened without that option.
+    #[error("the document is incomplete: {0}")]
+    Incomplete(String),
 
     /// The file extension or format is not supported.
     #[error("unsupported format: {0}")]

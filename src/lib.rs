@@ -76,6 +76,8 @@ pub mod ir_render;
 /// the package-wide entry-count and decompressed-size bounds).
 pub mod limits;
 
+pub mod options;
+
 /// Which text readers return: hidden text and tracked deletions.
 pub mod read_options;
 mod stream;
@@ -241,6 +243,10 @@ where
     }
     let account = std::sync::Arc::new(std::sync::Mutex::new(core::embedded::take_state()));
     let child_account = account.clone();
+    // The embedding call's own limits and read settings, if it has them, so
+    // the embedded package is read under the same ones.
+    let own_limits = limits::scope_snapshot();
+    let own_read = read_options::scope_snapshot();
     let spawned = std::thread::Builder::new()
         .stack_size(PARSE_STACK_SIZE)
         .spawn(move || {
@@ -249,6 +255,8 @@ where
                 .unwrap_or_else(|e| e.into_inner())
                 .take();
             core::embedded::install_state(state);
+            let _limits = limits::LimitsScope::new(own_limits.as_ref());
+            let _read = read_options::ReadScope::new(own_read);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
             *child_account.lock().unwrap_or_else(|e| e.into_inner()) = core::embedded::take_state();
             result
@@ -332,6 +340,17 @@ pub struct Document {
     /// when it is not): small inputs get a text budget scaled to them (see
     /// [`limits::DEFAULT_MAX_TEXT_CHARS`]).
     input_bytes: u64,
+    /// The options this document was opened with, if it was opened with
+    /// [`Document::open_with`]; every conversion runs under them.
+    options: Option<std::sync::Arc<options::ParseOptions>>,
+}
+
+/// The per-call state a conversion runs under (see [`Document::call_scope`]).
+#[must_use = "the scope ends as soon as it is dropped; bind it for the length of the call"]
+struct CallScope {
+    _limits: limits::LimitsScope,
+    _read: read_options::ReadScope,
+    _input: limits::InputSizeScope,
 }
 
 enum DocumentInner {
@@ -348,6 +367,18 @@ impl Document {
         Self {
             inner,
             input_bytes: 0,
+            options: None,
+        }
+    }
+
+    /// The state a conversion of this document runs under: its own limits
+    /// and read settings when it was opened with options, the input size
+    /// either way.
+    fn call_scope(&self) -> CallScope {
+        CallScope {
+            _limits: limits::LimitsScope::new(self.options.as_deref().map(|o| &o.limits)),
+            _read: read_options::ReadScope::new(self.options.as_deref().map(|o| o.read_settings())),
+            _input: limits::InputSizeScope::new(self.input_bytes),
         }
     }
 
@@ -485,6 +516,129 @@ impl Document {
             },
             _ => Self::new(DocumentInner::Ppt(Box::new(ppt::PptDocument::open(path)?))),
         })
+    }
+
+    /// Open a document under `options` instead of the process-wide limits
+    /// and read settings.
+    ///
+    /// The options stay with the document: its conversions
+    /// ([`Self::plain_text`], [`Self::to_markdown`], [`Self::to_ir`] and the
+    /// rest) run under them too, on any thread. With
+    /// [`OnIncomplete::Error`](options::OnIncomplete::Error) the document is
+    /// converted once at open and refused if the result is known to be
+    /// incomplete (see [`Self::damage`]).
+    #[must_use = "opening a document allocates — use the returned handle or drop it"]
+    pub fn open_with(path: impl AsRef<Path>, options: &options::ParseOptions) -> Result<Self> {
+        let path = path.as_ref().to_owned();
+        let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+        let options = std::sync::Arc::new(options.clone());
+        let own = options.clone();
+        let doc = with_parse_stack(move || {
+            let _limits = limits::LimitsScope::new(Some(&own.limits));
+            let _read = read_options::ReadScope::new(Some(own.read_settings()));
+            let _scale = limits::InputSizeScope::new(bytes);
+            Self::open_inner(&path).map(|doc| doc.from_input(bytes))
+        })?;
+        doc.with_options(options)
+    }
+
+    /// Open a document from any `Read + Seek` source under `options` (see
+    /// [`Self::open_with`]).
+    #[must_use = "opening a document allocates — use the returned handle or drop it"]
+    pub fn from_reader_with<R: Read + Seek + Send + 'static>(
+        reader: R,
+        format: DocumentFormat,
+        options: &options::ParseOptions,
+    ) -> Result<Self> {
+        let options = std::sync::Arc::new(options.clone());
+        let own = options.clone();
+        let doc = with_parse_stack(move || {
+            let _limits = limits::LimitsScope::new(Some(&own.limits));
+            let _read = read_options::ReadScope::new(Some(own.read_settings()));
+            let mut reader = reader;
+            let bytes = limits::stream_len(&mut reader);
+            let _scale = limits::InputSizeScope::new(bytes);
+            Self::from_reader_inner(reader, format).map(|doc| doc.from_input(bytes))
+        })?;
+        doc.with_options(options)
+    }
+
+    /// Keep `options` with this document and, if they ask for an error on an
+    /// incomplete result, check for one now.
+    fn with_options(mut self, options: std::sync::Arc<options::ParseOptions>) -> Result<Self> {
+        let strict = options.on_incomplete == options::OnIncomplete::Error;
+        self.options = Some(options);
+        if strict {
+            let losses: Vec<String> = self
+                .damage()
+                .iter()
+                .filter(|d| d.is_loss())
+                .take(5)
+                .map(ToString::to_string)
+                .collect();
+            if !losses.is_empty() {
+                return Err(OfficeError::Incomplete(losses.join("; ")));
+            }
+        }
+        Ok(self)
+    }
+
+    /// Everything known to be wrong with this document, found by reading it:
+    /// parts that could not be read, output a limit cut or the file's own
+    /// structure shows is missing, and repairs that left the content intact.
+    /// Empty for a sound document.
+    ///
+    /// This converts the document once. [`Damage::is_loss`](options::Damage::is_loss)
+    /// tells a loss from an informational repair.
+    pub fn damage(&self) -> Vec<options::Damage> {
+        use options::{Damage, DamageKind};
+        let mut found: Vec<Damage> = self
+            .unreadable_part_pairs()
+            .into_iter()
+            .map(|(part, detail)| Damage {
+                kind: DamageKind::UnreadablePart,
+                part: Some(part),
+                detail,
+            })
+            .collect();
+        let ir = self.to_ir();
+        let reported_as_part = |warning: &str| {
+            found
+                .iter()
+                .any(|d| d.part.as_deref().is_some_and(|p| warning.contains(p)))
+        };
+        let mut warnings: Vec<Damage> = ir
+            .metadata
+            .warnings
+            .iter()
+            .filter(|w| !reported_as_part(w))
+            .map(|w| Damage {
+                kind: DamageKind::Recovered,
+                part: None,
+                detail: w.clone(),
+            })
+            .collect();
+        if ir.metadata.text_truncated {
+            // The reader's own account of the cut, when it gave one.
+            let detail = ir
+                .metadata
+                .warnings
+                .iter()
+                .find(|w| {
+                    let w = w.to_ascii_lowercase();
+                    w.contains("truncat") || w.contains("limit") || w.contains("cut")
+                })
+                .cloned()
+                .unwrap_or_else(|| "the text is incomplete".to_string());
+            warnings.retain(|d| d.detail != detail);
+            found.push(Damage {
+                kind: DamageKind::Truncated,
+                part: None,
+                detail,
+            });
+        }
+        found.extend(warnings);
+        found
     }
 
     /// Open a document from a file path using memory-mapped I/O.
@@ -627,13 +781,13 @@ impl Document {
 
     /// Extract plain text using the format-specific implementation.
     pub fn plain_text(&self) -> String {
-        let _scale = limits::InputSizeScope::new(self.input_bytes);
+        let _scale = self.call_scope();
         dispatch_inner!(self, plain_text)
     }
 
     /// Convert to markdown using the format-specific implementation.
     pub fn to_markdown(&self) -> String {
-        let _scale = limits::InputSizeScope::new(self.input_bytes);
+        let _scale = self.call_scope();
         dispatch_inner!(self, to_markdown)
     }
 
@@ -665,7 +819,7 @@ impl Document {
     /// `SheetIr::text_truncated` are only available from
     /// [`xlsx::XlsxDocument::sheets_ir`].
     pub fn to_markdown_with(&self, options: ir_render::MarkdownOptions) -> String {
-        let _scale = limits::InputSizeScope::new(self.input_bytes);
+        let _scale = self.call_scope();
         match &self.inner {
             DocumentInner::Xlsx(doc) => {
                 ir_render::markdown_from_sections(doc.sheets_ir().map(|s| s.section), options)
@@ -679,7 +833,7 @@ impl Document {
     /// A spreadsheet is converted and rendered one sheet at a time (see
     /// [`Self::to_html_with`]).
     pub fn to_html(&self) -> String {
-        let _scale = limits::InputSizeScope::new(self.input_bytes);
+        let _scale = self.call_scope();
         self.to_html_with(ir_render::HtmlOptions::default())
     }
 
@@ -711,7 +865,7 @@ impl Document {
     /// `SheetIr::text_truncated` are only available from
     /// [`xlsx::XlsxDocument::sheets_ir`].
     pub fn to_html_with(&self, options: ir_render::HtmlOptions) -> String {
-        let _scale = limits::InputSizeScope::new(self.input_bytes);
+        let _scale = self.call_scope();
         match &self.inner {
             DocumentInner::Xlsx(doc) => {
                 ir_render::html_from_sections(doc.sheets_ir().map(|s| s.section), options)
@@ -724,7 +878,7 @@ impl Document {
     /// produced, so the text is never held in memory; the other formats
     /// build it first.
     pub fn write_plain_text<W: std::io::Write + ?Sized>(&self, out: &mut W) -> std::io::Result<()> {
-        let _scale = limits::InputSizeScope::new(self.input_bytes);
+        let _scale = self.call_scope();
         match &self.inner {
             DocumentInner::Xlsx(doc) => doc.write_plain_text(out),
             _ => out.write_all(self.plain_text().as_bytes()),
@@ -735,7 +889,7 @@ impl Document {
     /// produced, so the Markdown is never held in memory; the other formats
     /// build it first.
     pub fn write_markdown<W: std::io::Write + ?Sized>(&self, out: &mut W) -> std::io::Result<()> {
-        let _scale = limits::InputSizeScope::new(self.input_bytes);
+        let _scale = self.call_scope();
         match &self.inner {
             DocumentInner::Xlsx(doc) => doc.write_markdown(out),
             _ => out.write_all(self.to_markdown().as_bytes()),
@@ -767,7 +921,7 @@ impl Document {
         options: ir_render::MarkdownOptions,
         out: &mut W,
     ) -> std::io::Result<()> {
-        let _scale = limits::InputSizeScope::new(self.input_bytes);
+        let _scale = self.call_scope();
         match &self.inner {
             DocumentInner::Xlsx(doc) => stream::render_to_io(out, |sink| {
                 ir_render::write_markdown_sections(
@@ -783,7 +937,7 @@ impl Document {
     /// Write [`Self::to_html`] to `out`. A spreadsheet is converted and
     /// written a sheet at a time; the other formats build it first.
     pub fn write_html<W: std::io::Write + ?Sized>(&self, out: &mut W) -> std::io::Result<()> {
-        let _scale = limits::InputSizeScope::new(self.input_bytes);
+        let _scale = self.call_scope();
         self.write_html_with(ir_render::HtmlOptions::default(), out)
     }
 
@@ -812,7 +966,7 @@ impl Document {
         options: ir_render::HtmlOptions,
         out: &mut W,
     ) -> std::io::Result<()> {
-        let _scale = limits::InputSizeScope::new(self.input_bytes);
+        let _scale = self.call_scope();
         match &self.inner {
             DocumentInner::Xlsx(doc) => stream::render_to_io(out, |sink| {
                 ir_render::write_html_sections(doc.sheets_ir().map(|s| s.section), options, sink)
@@ -832,7 +986,7 @@ impl Document {
     /// padding and picture allowances instead. Here every cut is in the
     /// content and in `Metadata::warnings` and `Metadata::text_truncated`.
     pub fn to_ir(&self) -> DocumentIR {
-        let _scale = limits::InputSizeScope::new(self.input_bytes);
+        let _scale = self.call_scope();
         match &self.inner {
             DocumentInner::Docx(doc) => convert_docx::docx_to_ir(doc),
             DocumentInner::Xlsx(doc) => convert_xlsx::xlsx_to_ir(doc),

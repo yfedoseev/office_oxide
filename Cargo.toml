@@ -100,6 +100,11 @@ pyo3 = { version = "0.30", features = [
 # WASM bindings
 wasm-bindgen = { version = "0.2", optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
+md-5 = { version = "0.10", optional = true }
+sha1 = { version = "0.10", optional = true }
+sha2 = { version = "0.10", optional = true }
+aes = { version = "0.8", optional = true }
+rc4 = { version = "0.1", optional = true }
 
 [features]
 default = []
@@ -109,9 +114,10 @@ mmap = ["dep:memmap2"]
 parallel = ["dep:rayon"]
 # Open the documents Office protects with its fixed default password
 # (`VelvetSweatshop`, or an empty one): RC4 workbooks and OOXML encryption.
-# Off by default; adds no dependency. Not for protecting anything and not
-# FIPS-validated: MD5 and RC4 cannot be part of a FIPS 140 build.
-default-password = []
+# Off by default; pulls in the RustCrypto md-5, sha1, sha2, aes and rc4 crates
+# only when enabled. Not for protecting anything and not FIPS-validated: MD5
+# and RC4 cannot be part of a FIPS 140 build.
+default-password = ["dep:md-5", "dep:sha1", "dep:sha2", "dep:aes", "dep:rc4"]
 
 [package.metadata.docs.rs]
 features = ["python", "parallel"]

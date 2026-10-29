@@ -344,3 +344,22 @@ fn test_many_names_for_one_package_do_not_multiply_its_text() {
         text.len()
     );
 }
+
+#[test]
+fn test_the_depth_of_embedding_can_be_set_for_one_document() {
+    let _limits = common::default_limits();
+    let chain = aliased_tree(6, 1);
+    let mut options = office_oxide::options::ParseOptions::default();
+    options.limits.embedded_depth = 1;
+    let bytes = chain.clone();
+    let doc =
+        Document::from_reader_with(Cursor::new(bytes), DocumentFormat::Docx, &options).unwrap();
+    let text = doc.plain_text();
+    // The nested open runs on its own thread; it reads under the call's
+    // limits, not the process-wide depth of 3.
+    assert!(text.contains("L1"), "{text}");
+    assert!(!text.contains("L2"), "{text}");
+    // The process-wide default is untouched, and another document reads to it.
+    assert_eq!(limits::max_embedded_depth(), limits::DEFAULT_MAX_EMBEDDED_DEPTH);
+    assert!(open(chain).plain_text().contains("L3"));
+}

@@ -846,7 +846,7 @@ fn open_zip_checked<R: Read + Seek>(mut reader: R, max_entries: usize) -> Result
 /// the difference between a failed parse and an out-of-memory kill of the
 /// host process — and every binding (Python, Go, C#, WASM) inherits that
 /// difference.
-pub const MAX_PART_SIZE: u64 = 512 * 1024 * 1024;
+pub const MAX_PART_SIZE: u64 = crate::limits::DEFAULT_MAX_PART_BYTES;
 
 /// Decode a deflated entry whose stream is complete but whose length is not
 /// the one its header declares. `Err` carries the bytes inflated by an
@@ -869,7 +869,7 @@ fn inflate_despite_declared_size<R: Read + Seek>(
     let bound = declared
         .saturating_add(declared / 4)
         .saturating_add(64 * 1024)
-        .min(MAX_PART_SIZE);
+        .min(crate::limits::max_part_bytes());
     let mut decoder = flate2::read::DeflateDecoder::new(raw);
     let mut out = Vec::with_capacity((declared as usize).min(1 << 20));
     match (&mut decoder).take(bound + 1).read_to_end(&mut out) {
@@ -907,10 +907,13 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
     // CVE-2014-3574). The declared size is attacker-controlled, so it is
     // used only to refuse early — the read below is separately capped so a
     // lying header cannot get past it either.
-    if file.size() > MAX_PART_SIZE {
+    // The size limit, and past the floor the ratio limit, of this part
+    // (`limits::part_inflate_cap`).
+    let cap = crate::limits::part_inflate_cap(file.compressed_size());
+    if file.size() > cap {
         return Err(Error::DecompressionLimit {
             part: name.to_string(),
-            limit: MAX_PART_SIZE,
+            limit: cap,
         });
     }
     // The package-wide account, checked against the declared size before
@@ -918,7 +921,7 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
     entries.charge(index, file.size(), name, 0)?;
     let declared = file.size();
     let mut buf = Vec::with_capacity((declared as usize).min(1 << 20));
-    let mut capped = (&mut file).take(MAX_PART_SIZE + 1);
+    let mut capped = (&mut file).take(cap.saturating_add(1));
     let read = capped.read_to_end(&mut buf);
     drop(file);
     match read {
@@ -967,11 +970,11 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
         log::warn!("opc: part '{name}' is shorter than its declared size");
         entries.record_crc_mismatch(name);
     }
-    if buf.len() as u64 > MAX_PART_SIZE {
+    if buf.len() as u64 > cap {
         entries.note_failed_read(index, buf.len() as u64);
         return Err(Error::DecompressionLimit {
             part: name.to_string(),
-            limit: MAX_PART_SIZE,
+            limit: cap,
         });
     }
     // A lying declared size is caught here, before the bytes are kept.
@@ -1422,7 +1425,7 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(err, Error::DecompressionLimit { ref part, limit }
-                if part == "word/a.xml" && limit == MAX_PART_SIZE),
+                if part == "word/a.xml" && limit == crate::limits::part_inflate_cap(4)),
             "{err:?}"
         );
     }
