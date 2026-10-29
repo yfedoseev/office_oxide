@@ -3,6 +3,7 @@ use crate::ir::*;
 
 pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
     let _image_scope = crate::limits::begin_image_budget();
+    let _scale = crate::limits::InputSizeScope::new(doc.input_bytes);
     let _text_scope = crate::limits::begin_copied_text_budget();
     // Slide size sits at presentation level — every slide in the
     // deck shares it.

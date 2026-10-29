@@ -247,6 +247,7 @@ pub enum SubDocumentKind {
 impl DocDocument {
     /// Open a DOC file from a reader.
     pub fn from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
+        let _scale = crate::limits::InputSizeScope::new(crate::limits::stream_len(&mut reader));
         // Word for Windows 1.x/2.0 wrote flat files, the FIB first; they
         // have no compound container to open.
         let mut magic = [0u8; 2];
@@ -1083,7 +1084,10 @@ fn embedded_word_text<R: Read + Seek>(
         warnings.push(format!("embedded object {name}: {note}"));
     }
     let text = if let Some(cached) = embedded::cached::<String>(session, fingerprint) {
-        charge_embedded_text(session, name, cached)
+        // Found again under another name: its text is where it first appears.
+        // A document with no text has nothing to point to.
+        let repeat = (!cached.is_empty()).then(|| embedded::REPEATED_NOTICE.to_string());
+        repeat.and_then(|notice| charge_embedded_text(session, name, notice))
     } else {
         embedded::remember(session, fingerprint, text.clone());
         charge_embedded_text(session, name, text)

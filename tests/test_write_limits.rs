@@ -237,3 +237,66 @@ fn test_the_default_write_limit_leaves_ordinary_documents_alone() {
         write(&ir, format).unwrap_or_else(|e| panic!("{format:?}: 20,000 cells: {e}"));
     }
 }
+
+/// The writers used directly are held to the same limit as the IR path: the
+/// cells they were handed are counted when the document is written.
+#[test]
+fn test_a_writer_used_directly_is_held_to_the_write_limit() {
+    use office_oxide::docx::write::DocxWriter;
+    use office_oxide::pptx::write::{PptxWriter, Run};
+    use office_oxide::xlsx::write::{CellData, XlsxWriter};
+    let mut limits = LimitScope::new();
+    limits.set(max_write_bytes, set_max_write_bytes, BYTE_LIMIT);
+    let refused = |err: office_oxide::OfficeError| {
+        assert!(err.to_string().contains("set_max_write_bytes"), "{err}");
+    };
+
+    // 10 x 10 = 100 cells: past 50 `.docx` cells.
+    let row: Vec<&str> = vec!["c"; 10];
+    let rows: Vec<Vec<&str>> = vec![row; 10];
+    let mut docx = DocxWriter::new();
+    docx.add_table(&rows);
+    refused(
+        docx.write_to(Cursor::new(Vec::new()))
+            .expect_err("100 docx cells")
+            .into(),
+    );
+    let mut small = DocxWriter::new();
+    small.add_table(&[vec!["a", "b"], vec!["c", "d"]]);
+    small
+        .write_to(Cursor::new(Vec::new()))
+        .expect("4 cells are within the limit");
+
+    // A `.pptx` cell costs a third as much: 300 are past the limit, 100 are not.
+    let cell = || vec![Run::new("c")];
+    let pptx_rows = |n: usize| vec![(0..10).map(|_| cell()).collect::<Vec<_>>(); n];
+    let mut big = PptxWriter::new();
+    big.add_slide().add_table(pptx_rows(30));
+    refused(
+        big.write_to(Cursor::new(Vec::new()))
+            .expect_err("300 pptx cells")
+            .into(),
+    );
+    let mut ok = PptxWriter::new();
+    ok.add_slide().add_table(pptx_rows(10));
+    ok.write_to(Cursor::new(Vec::new()))
+        .expect("100 pptx cells fit");
+
+    // A worksheet cell costs a tenth: 600 cells are past the limit.
+    let mut book = XlsxWriter::new();
+    {
+        let mut sheet = book.add_sheet("S");
+        for r in 0..30 {
+            sheet.add_row(
+                (0..20)
+                    .map(|c| CellData::String(format!("{r}{c}")))
+                    .collect(),
+            );
+        }
+    }
+    refused(
+        book.write_to(Cursor::new(Vec::new()))
+            .expect_err("600 cells")
+            .into(),
+    );
+}

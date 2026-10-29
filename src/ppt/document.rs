@@ -44,7 +44,8 @@ pub struct PptDocument {
 
 impl PptDocument {
     /// Open a PPT file from a reader.
-    pub fn from_reader<R: Read + Seek>(reader: R) -> Result<Self> {
+    pub fn from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
+        let _scale = crate::limits::InputSizeScope::new(crate::limits::stream_len(&mut reader));
         let mut cfb = CfbReader::new(reader)?;
         let summary_properties = crate::cfb::read_document_properties(&mut cfb);
 

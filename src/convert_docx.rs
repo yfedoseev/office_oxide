@@ -197,6 +197,7 @@ struct SharedStory {
 
 pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
     let _image_scope = crate::limits::begin_image_budget();
+    let _scale = crate::limits::InputSizeScope::new(doc.input_bytes);
     let _text_scope = crate::limits::begin_copied_text_budget();
     let folds = StyleFolds::default();
     let cx = Cx {

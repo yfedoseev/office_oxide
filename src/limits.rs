@@ -207,6 +207,15 @@ impl Drop for InputSizeScope {
     }
 }
 
+/// The length of `reader`'s data (0 when it cannot be told), leaving the
+/// position where it was.
+pub(crate) fn stream_len<R: std::io::Seek>(reader: &mut R) -> u64 {
+    let here = reader.stream_position().unwrap_or(0);
+    let end = reader.seek(std::io::SeekFrom::End(0)).unwrap_or(0);
+    let _ = reader.seek(std::io::SeekFrom::Start(here));
+    end
+}
+
 /// The text budget for an input of `input` bytes (when known) under the
 /// ceiling `limit`.
 fn text_limit_for_input(limit: usize, input: Option<u64>) -> usize {

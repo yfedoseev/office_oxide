@@ -224,6 +224,7 @@ impl XlsxDocument {
         // One text budget for the whole document: a shared string
         // referenced from every cell is rendered once per cell, and
         // nothing else bounds that product (see `crate::limits`).
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
         let mut budget = TextBudget::new();
         // The parts of the text are separated by a blank line; the
         // separator goes in front of each part but the first.
@@ -346,6 +347,7 @@ impl XlsxDocument {
 
     /// Extract a single sheet as plain text.
     pub fn sheet_plain_text(&self, sheet_index: usize) -> Option<String> {
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
         let mut budget = TextBudget::new();
         let mut text = String::new();
         // Writing to a `String` cannot fail.
@@ -448,6 +450,7 @@ impl XlsxDocument {
         let ws = self.worksheets.get(sheet_index)?;
         let col_count = compute_column_count(&ws.rows);
         let mut lines = Vec::new();
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
         let mut budget = TextBudget::new();
         let fmt = CellFormatter::new(self);
 
@@ -505,6 +508,7 @@ impl XlsxDocument {
     }
 
     pub(crate) fn render_markdown<W: Write + ?Sized>(&self, out: &mut W) -> fmt::Result {
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
         let mut budget = TextBudget::new();
         // The parts of the Markdown are separated by a blank line; the
         // separator goes in front of each part but the first.
@@ -653,6 +657,7 @@ impl XlsxDocument {
 
     /// Convert specific sheet to markdown.
     pub fn sheet_to_markdown(&self, sheet_index: usize) -> Option<String> {
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
         let mut budget = TextBudget::new();
         let mut md = String::new();
         // Writing to a `String` cannot fail.
@@ -1227,6 +1232,7 @@ mod tests {
 </styleSheet>"#;
         let ss = super::super::styles::StyleSheet::parse(styles).expect("styles parse");
         let doc = XlsxDocument {
+            input_bytes: 0,
             workbook: super::super::WorkbookInfo {
                 sheets: Vec::new(),
                 defined_names: Vec::new(),
@@ -1299,6 +1305,7 @@ mod tests {
             chart_text: Vec::new(),
         };
         let doc = XlsxDocument {
+            input_bytes: 0,
             workbook: super::super::WorkbookInfo {
                 sheets: Vec::new(),
                 defined_names: Vec::new(),
@@ -1373,6 +1380,7 @@ mod tests {
             chart_text: Vec::new(),
         };
         let doc = XlsxDocument {
+            input_bytes: 0,
             workbook: super::super::WorkbookInfo {
                 sheets: Vec::new(),
                 defined_names: Vec::new(),
@@ -1411,6 +1419,7 @@ mod tests {
     #[test]
     fn test_plain_text_includes_chart_text() {
         let doc = XlsxDocument {
+            input_bytes: 0,
             workbook: super::super::WorkbookInfo {
                 sheets: Vec::new(),
                 defined_names: Vec::new(),

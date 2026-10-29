@@ -758,6 +758,37 @@ impl DocxWriter {
         self
     }
 
+    /// The table cells the document holds (rows times the widest row, tables
+    /// inside cells included), which the write limit is counted in.
+    fn table_cells(&self) -> u64 {
+        fn elements(items: &[DocxElement]) -> u64 {
+            items
+                .iter()
+                .map(|e| match e {
+                    DocxElement::Table(t) => {
+                        let width = t.rows.iter().map(Vec::len).max().unwrap_or(0);
+                        (t.rows.len() as u64).saturating_mul(width as u64)
+                    },
+                    DocxElement::RichTable(t) => {
+                        let width = t.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0);
+                        let inner: u64 = t
+                            .rows
+                            .iter()
+                            .flat_map(|r| &r.cells)
+                            .map(|c| elements(&c.content))
+                            .fold(0, u64::saturating_add);
+                        (t.rows.len() as u64)
+                            .saturating_mul(width as u64)
+                            .saturating_add(inner)
+                    },
+                    DocxElement::TextBox(tb) => elements(&tb.content),
+                    _ => 0,
+                })
+                .fold(0, u64::saturating_add)
+        }
+        elements(&self.elements)
+    }
+
     /// Add a table. The first row is treated as the header row.
     pub fn add_table(&mut self, rows: &[Vec<&str>]) -> &mut Self {
         let owned: Vec<Vec<String>> = rows
@@ -1065,6 +1096,7 @@ impl DocxWriter {
 
     /// Write the document to an arbitrary `Write + Seek` destination.
     pub fn write_to<W: Write + Seek>(&self, writer: W) -> Result<()> {
+        crate::create::check_write_cells(self.table_cells(), crate::format::DocumentFormat::Docx)?;
         let opc = OpcWriter::new(writer)?;
         // Comment anchors are written only for comments this package
         // defines (see `write_run`); the set is scoped to this call.

@@ -297,15 +297,17 @@ fn test_the_byte_allowance_stops_reading_embedded_documents() {
     drop(scope);
 }
 
-/// One document embedded under several names is read from its content each
-/// time it is copied, and each copy is in the text, as it is in the file.
+/// One document embedded under several names has its text given once, where it
+/// first appears; each further name is one line saying so (as for a `.docx`).
 #[test]
-fn test_a_document_embedded_under_several_names_appears_once_per_copy() {
+fn test_a_document_embedded_under_several_names_is_given_once() {
     let _defaults = default_limits();
     let doc = open(host(vec![
         word_object("_1", "shared article"),
         word_object("_2", "shared article"),
         word_object("_3", "shared article"),
     ]));
-    assert_eq!(doc.plain_text().matches("shared article").count(), 3);
+    let text = doc.plain_text();
+    assert_eq!(text.matches("shared article").count(), 1, "{text}");
+    assert_eq!(text.matches("embedded package repeated").count(), 2, "{text}");
 }

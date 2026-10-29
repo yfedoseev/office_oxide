@@ -98,6 +98,9 @@ fn make_content_reader(xml_data: &[u8]) -> quick_xml::Reader<&[u8]> {
 /// A parsed DOCX document.
 #[derive(Debug, Clone)]
 pub struct DocxDocument {
+    /// The size of the file this document was read from (0 when unknown): small
+    /// inputs get a text budget scaled to them (see [`crate::limits`]).
+    pub(crate) input_bytes: u64,
     /// The document body.
     pub body: Body,
     /// Parsed stylesheet from `word/styles.xml`.
@@ -181,6 +184,14 @@ pub struct NoteBody {
 impl DocxDocument {
     /// Open a DOCX file from a file path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let bytes = std::fs::metadata(path.as_ref()).map_or(0, |m| m.len());
+        let _scale = crate::limits::InputSizeScope::new(bytes);
+        let mut doc = Self::open_unscaled(path)?;
+        doc.input_bytes = bytes;
+        Ok(doc)
+    }
+
+    fn open_unscaled(path: impl AsRef<Path>) -> Result<Self> {
         let reader = OpcReader::open(path)?;
         Self::from_opc(reader)
     }
@@ -188,12 +199,29 @@ impl DocxDocument {
     /// Open a DOCX file using memory-mapped I/O for better performance on large files.
     #[cfg(feature = "mmap")]
     pub fn open_mmap(path: impl AsRef<Path>) -> Result<Self> {
+        let bytes = std::fs::metadata(path.as_ref()).map_or(0, |m| m.len());
+        let _scale = crate::limits::InputSizeScope::new(bytes);
+        let mut doc = Self::open_mmap_unscaled(path)?;
+        doc.input_bytes = bytes;
+        Ok(doc)
+    }
+
+    #[cfg(feature = "mmap")]
+    fn open_mmap_unscaled(path: impl AsRef<Path>) -> Result<Self> {
         let reader = OpcReader::open_mmap(path)?;
         Self::from_opc(reader)
     }
 
     /// Open a DOCX document from any `Read + Seek` source.
     pub fn from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
+        let bytes = crate::limits::stream_len(&mut reader);
+        let _scale = crate::limits::InputSizeScope::new(bytes);
+        let mut doc = Self::from_reader_unscaled(reader)?;
+        doc.input_bytes = bytes;
+        Ok(doc)
+    }
+
+    fn from_reader_unscaled<R: Read + Seek>(mut reader: R) -> Result<Self> {
         // A password-protected DOCX is a CFB container, not a zip at all.
         // Without this check, opening one here (rather than through the
         // unified `Document::from_reader`, which already has it) failed
@@ -813,6 +841,7 @@ impl DocxDocument {
         let (unreadable_parts, unreadable_parts_omitted, cosmetic_parts) =
             unreadable_parts.into_inner().finish_with_cosmetic();
         Ok(DocxDocument {
+            input_bytes: 0,
             body,
             styles,
             numbering,
@@ -2737,7 +2766,7 @@ fn repeated_package_notice(
     session: &crate::core::embedded::Session,
     part: &str,
 ) -> Option<Vec<BlockElement>> {
-    const NOTICE: &str = "[embedded package repeated: its text is given where it first appears]";
+    const NOTICE: &str = crate::core::embedded::REPEATED_NOTICE;
     if let Err(refusal) = crate::core::embedded::charge_text(session, NOTICE.chars().count()) {
         crate::core::embedded::refuse(session, part, refusal);
         return None;

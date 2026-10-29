@@ -1,8 +1,8 @@
 # office_oxide for Go — The Fastest Office Document Library for Go
 
 Fast Office document processing (DOCX, XLSX, PPTX, DOC, XLS, PPT) for Go, powered by a Rust core.
-Up to 100× faster than python-docx, openpyxl, and python-pptx on equivalent tasks.
-100% pass rate on valid Office files — zero failures on legitimate Word/Excel/PowerPoint documents. MIT / Apache-2.0 licensed.
+5–10× faster than python-docx, openpyxl, and python-pptx on equivalent tasks.
+Opens 97.3% of a 10,386-file test collection; the rest are encrypted, truncated or corrupt files. MIT / Apache-2.0 licensed.
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/yfedoseev/office_oxide/go.svg)](https://pkg.go.dev/github.com/yfedoseev/office_oxide/go)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](https://opensource.org/licenses)
@@ -76,24 +76,24 @@ func mustStr(s string, err error) string {
 
 ## Why office_oxide?
 
-- **Fast** — 0.8ms mean DOCX, 5.0ms mean XLSX, 0.7ms mean PPTX; up to 100× faster than python-docx / openpyxl / python-pptx
-- **Reliable** — 100% pass rate on valid Office files (6,062-file corpus); zero failures on legitimate documents
+- **Fast** — 1.7ms mean DOCX, 6.2ms mean XLSX, 2.6ms mean PPTX; 5–10× faster than python-docx / openpyxl / python-pptx
+- **Reliable** — opens 97.3% of a 10,386-file test collection; the rest are encrypted, truncated or corrupt files
 - **Complete** — 6 formats: DOCX, XLSX, PPTX + legacy DOC, XLS, PPT
 - **Permissive** — MIT / Apache-2.0, no AGPL or GPL restrictions
 - **Idiomatic Go** — Sentinel errors, `defer doc.Close()`, clean return signatures
 
 ## Performance
 
-Benchmarked on 6,062 files from 11 independent public test suites. Single-thread, release build, warm disk cache.
+Benchmarked on 10,386 files (the project's test collection). Single-thread, release build, warm disk cache.
 
 | Library | Format | Mean | Pass Rate | License |
 |---------|--------|------|-----------|---------|
-| **office_oxide** | **DOCX** | **0.8ms** | **98.9%** | **MIT** |
-| python-docx | DOCX | 11.8ms | 95.1% | MIT |
-| **office_oxide** | **XLSX** | **5.0ms** | **97.8%** | **MIT** |
-| openpyxl | XLSX | 94.5ms | 96.2% | MIT |
-| **office_oxide** | **PPTX** | **0.7ms** | **98.4%** | **MIT** |
-| python-pptx | PPTX | 32.5ms | 86.7% | MIT |
+| **office_oxide** | **DOCX** | **1.7ms** | **98.7%** | **MIT** |
+| python-docx | DOCX | 9.5ms | 95.7% | MIT |
+| **office_oxide** | **XLSX** | **6.2ms** | **98.6%** | **MIT** |
+| openpyxl | XLSX | 60.7ms | 96.0% | MIT |
+| **office_oxide** | **PPTX** | **2.6ms** | **98.1%** | **MIT** |
+| python-pptx | PPTX | 13.4ms | 90.0% | MIT |
 
 Full methodology and corpus breakdown in [BENCHMARKS.md](../BENCHMARKS.md).
 
@@ -171,4 +171,4 @@ Dual-licensed under [MIT](../LICENSE-MIT) or [Apache-2.0](../LICENSE-APACHE) at 
 
 ---
 
-**Go** + **Rust core** | MIT / Apache-2.0 | 100% pass rate on valid Office files (6,062-file corpus) | Up to 100× faster than alternatives | 6 formats
+**Go** + **Rust core** | MIT / Apache-2.0 | Opens 97.3% of a 10,386-file test collection | 5–10× faster than the common Python libraries | 6 formats

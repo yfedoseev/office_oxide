@@ -316,3 +316,28 @@ fn test_a_larger_input_is_bounded_by_the_limit() {
     assert_eq!(text.matches('x').count(), 96_000_000);
     assert!(!text.contains("set_max_text_chars"));
 }
+
+/// The format's own reader knows the size of its file too: the same small
+/// workbook read through `XlsxDocument` directly is bounded by the floor, and
+/// the larger file by the limit, as through `Document`.
+#[test]
+fn test_a_format_reader_used_directly_scales_the_budget_too() {
+    use office_oxide::xlsx::XlsxDocument;
+    let _defaults = common::default_limits();
+    let small = XlsxDocument::from_reader(Cursor::new(xlsx_big_string(32_000, 3_000, 0))).unwrap();
+    let chars = small.plain_text().matches('x').count();
+    assert!(
+        (60_000_000..=office_oxide::limits::TEXT_BUDGET_FLOOR_CHARS).contains(&chars),
+        "{chars}"
+    );
+    let large =
+        XlsxDocument::from_reader(Cursor::new(xlsx_big_string(32_000, 3_000, 80 * 1024))).unwrap();
+    assert_eq!(large.plain_text().matches('x').count(), 96_000_000);
+    // And by path.
+    let path = std::env::temp_dir().join(format!("office_oxide_scale_{}.xlsx", std::process::id()));
+    std::fs::write(&path, xlsx_big_string(32_000, 3_000, 0)).unwrap();
+    let by_path = XlsxDocument::open(&path).unwrap();
+    std::fs::remove_file(&path).ok();
+    let chars = by_path.plain_text().matches('x').count();
+    assert!(chars <= office_oxide::limits::TEXT_BUDGET_FLOOR_CHARS, "{chars}");
+}

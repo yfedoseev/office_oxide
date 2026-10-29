@@ -312,15 +312,6 @@ fn cfb_stream_format<R: Read + Seek>(reader: &mut R) -> Option<DocumentFormat> {
 }
 
 /// Dispatch a method call to the inner document type across all variants.
-/// The length of `reader`'s data (0 when it cannot be told), leaving the
-/// position where it was.
-fn stream_len<R: Seek>(reader: &mut R) -> u64 {
-    let here = reader.stream_position().unwrap_or(0);
-    let end = reader.seek(std::io::SeekFrom::End(0)).unwrap_or(0);
-    let _ = reader.seek(std::io::SeekFrom::Start(here));
-    end
-}
-
 macro_rules! dispatch_inner {
     ($self:expr, $method:ident) => {
         match &$self.inner {
@@ -532,7 +523,7 @@ impl Document {
     ) -> Result<Self> {
         with_parse_stack(move || {
             let mut reader = reader;
-            let bytes = stream_len(&mut reader);
+            let bytes = limits::stream_len(&mut reader);
             let _scale = limits::InputSizeScope::new(bytes);
             Self::from_reader_inner(reader, format).map(|doc| doc.from_input(bytes))
         })
@@ -546,7 +537,7 @@ impl Document {
     ) -> Result<Self> {
         with_nested_parse_stack(move || {
             let mut reader = reader;
-            let bytes = stream_len(&mut reader);
+            let bytes = limits::stream_len(&mut reader);
             let _scale = limits::InputSizeScope::new(bytes);
             Self::from_reader_inner(reader, format).map(|doc| doc.from_input(bytes))
         })

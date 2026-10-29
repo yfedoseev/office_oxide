@@ -655,9 +655,26 @@ impl PptxWriter {
 
     /// Write the presentation to any `Write + Seek` destination.
     pub fn write_to<W: Write + Seek>(&self, writer: W) -> Result<()> {
+        crate::create::check_write_cells(self.table_cells(), crate::format::DocumentFormat::Pptx)?;
         let opc = OpcWriter::new(writer)?;
         self.write_opc(opc)?;
         Ok(())
+    }
+
+    /// The table cells the presentation holds (every row padded to the widest),
+    /// which the write limit is counted in.
+    fn table_cells(&self) -> u64 {
+        self.slides
+            .iter()
+            .flat_map(|s| &s.body_items)
+            .map(|item| match item {
+                BodyItem::Table(rows) => {
+                    let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+                    (rows.len() as u64).saturating_mul(width as u64)
+                },
+                _ => 0,
+            })
+            .fold(0, u64::saturating_add)
     }
 
     fn write_opc<W: Write + Seek>(&self, mut opc: OpcWriter<W>) -> Result<()> {

@@ -1173,6 +1173,15 @@ impl XlsxWriter {
             ))
             .into());
         }
+        let cells: u64 = self
+            .sheets
+            .iter()
+            .map(|sheet| {
+                let width = sheet.rows.iter().map(Vec::len).max().unwrap_or(0);
+                (sheet.rows.len() as u64).saturating_mul(width as u64)
+            })
+            .fold(0, u64::saturating_add);
+        crate::create::check_write_cells(cells, crate::format::DocumentFormat::Xlsx)?;
         // CT_Sheets requires at least one sheet. Writing <sheets/> produced a
         // workbook no reader accepts, and save() still returned Ok, so add a
         // blank sheet rather than emitting an invalid file.

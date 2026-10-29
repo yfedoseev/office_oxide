@@ -99,6 +99,7 @@ impl<'d> SheetConverter<'d> {
     pub(crate) fn new(doc: &'d crate::xlsx::XlsxDocument, scope: IrScope) -> Self {
         // Date styles found once and custom number formats compiled once, not
         // re-scanned and re-parsed per cell.
+        let _scale = crate::limits::InputSizeScope::new(doc.input_bytes);
         let formatter = crate::xlsx::text::CellFormatter::new(doc);
         let total_image =
             usize::try_from(crate::limits::max_total_image_bytes()).unwrap_or(usize::MAX);

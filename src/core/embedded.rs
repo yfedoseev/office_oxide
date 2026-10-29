@@ -300,6 +300,12 @@ pub(crate) fn remember<T: Send + Sync + 'static>(_session: &Session, fp: Fingerp
     });
 }
 
+/// What stands for an embedded document or package whose text was already
+/// given, when it is found again under another name: one line, in place of a
+/// second copy of the text.
+pub(crate) const REPEATED_NOTICE: &str =
+    "[embedded package repeated: its text is given where it first appears]";
+
 #[cfg(test)]
 mod tests {
     use super::*;

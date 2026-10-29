@@ -2279,6 +2279,7 @@ mod tests {
             None,
         );
         let doc = crate::pptx::PptxDocument {
+            input_bytes: 0,
             presentation: crate::pptx::PresentationInfo {
                 slides: Vec::new(),
                 slide_size: None,
@@ -2328,6 +2329,7 @@ mod tests {
             None,
         );
         let doc = crate::pptx::PptxDocument {
+            input_bytes: 0,
             presentation: crate::pptx::PresentationInfo {
                 slides: Vec::new(),
                 slide_size: None,

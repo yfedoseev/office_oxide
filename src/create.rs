@@ -76,6 +76,25 @@ fn bytes_per_cell(format: DocumentFormat) -> u64 {
     }
 }
 
+/// Refuse a write that would need more than [`crate::limits::max_write_bytes`]
+/// for `cells` cells of `format`, for the IR path and for the writers used
+/// directly alike.
+pub(crate) fn check_write_cells(
+    cells: u64,
+    format: DocumentFormat,
+) -> std::result::Result<(), crate::core::Error> {
+    let per_cell = bytes_per_cell(format);
+    let limit = crate::limits::max_write_bytes();
+    if cells.saturating_mul(per_cell) > limit {
+        return Err(crate::core::Error::PackageLimit(format!(
+            "the document holds more than {} table cells, about {limit} bytes to write as \
+             {format:?}; the limit is office_oxide::limits::set_max_write_bytes",
+            limit / per_cell
+        )));
+    }
+    Ok(())
+}
+
 /// Refuse an IR that exceeds the write limits: more sections than
 /// [`crate::limits::max_write_sheets`] for `.xlsx`, or tables whose cells the
 /// writer would need more than [`crate::limits::max_write_bytes`] to build: the
@@ -100,8 +119,6 @@ fn check_write_budget(ir: &DocumentIR, format: DocumentFormat) -> Result<()> {
     if !matches!(format, DocumentFormat::Docx | DocumentFormat::Pptx | DocumentFormat::Xlsx) {
         return Ok(());
     }
-    let limit = crate::limits::max_write_bytes();
-    let per_cell = bytes_per_cell(format);
     let mut cells = 0u64;
     let mut stack: Vec<&[Element]> = Vec::new();
     for s in &ir.sections {
@@ -136,15 +153,7 @@ fn check_write_budget(ir: &DocumentIR, format: DocumentFormat) -> Result<()> {
                     for cell in t.rows.iter().flat_map(|r| &r.cells) {
                         stack.push(&cell.content);
                     }
-                    if cells.saturating_mul(per_cell) > limit {
-                        return Err(crate::core::Error::PackageLimit(format!(
-                            "the document holds more than {} table cells, about {limit} bytes \
-                             to write as {format:?}; the limit is \
-                             office_oxide::limits::set_max_write_bytes",
-                            limit / per_cell
-                        ))
-                        .into());
-                    }
+                    check_write_cells(cells, format)?;
                 },
                 Element::List(l) => lists.push(l),
                 Element::TextBox(t) => stack.push(&t.content),

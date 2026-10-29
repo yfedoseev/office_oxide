@@ -64,7 +64,7 @@ doc.free();
 ## Why office-oxide-wasm?
 
 - **Portable** — runs anywhere JavaScript runs: browsers, Node.js, Deno, Bun, Cloudflare Workers
-- **Reliable** — 100% pass rate on valid Office files (6,062-file corpus); zero failures on legitimate documents
+- **Reliable** — opens 97.3% of a 10,386-file test collection; the rest are encrypted, truncated or corrupt files
 - **Complete** — 6 formats: DOCX, XLSX, PPTX + legacy DOC, XLS, PPT
 - **Permissive** — MIT / Apache-2.0, no AGPL or GPL restrictions
 - **No native build** — pure WASM bundle, works without node-gyp or a C compiler
@@ -143,4 +143,4 @@ MIT OR Apache-2.0
 
 ---
 
-**WASM** + **Rust core** | MIT / Apache-2.0 | 100% pass rate on valid Office files (6,062-file corpus) | Browser + Node.js + edge runtimes | 6 formats
+**WASM** + **Rust core** | MIT / Apache-2.0 | Opens 97.3% of a 10,386-file test collection | Browser + Node.js + edge runtimes | 6 formats

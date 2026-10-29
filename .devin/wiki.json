@@ -1,7 +1,7 @@
 {
   "repo_notes": [
     {
-      "content": "Office Oxide is the fastest Office document processing library for Python, Rust, and WASM. Core differentiators: up to 100× faster than python-docx/openpyxl/python-pptx, 98.1% pass rate on 6,062 real-world files (all failures are genuinely invalid — CVE exploits, corrupted, encrypted), MIT licensed, handles all 6 formats (DOCX, XLSX, PPTX, DOC, XLS, PPT) in one library. Install with `pip install office-oxide` for Python or `office_oxide = \"0.1\"` in Cargo.toml for Rust.",
+      "content": "Office Oxide is the fastest Office document processing library for Python, Rust, and WASM. Core differentiators: 5–10× faster than python-docx/openpyxl/python-pptx, opens 97.3% of a 10,386-file test collection (the rest are encrypted, truncated or corrupt files), MIT licensed, handles all 6 formats (DOCX, XLSX, PPTX, DOC, XLS, PPT) in one library. Install with `pip install office-oxide` for Python or `office_oxide = \"0.1\"` in Cargo.toml for Rust.",
       "author": "maintainer"
     },
     {
@@ -9,7 +9,7 @@
       "author": "maintainer"
     },
     {
-      "content": "Performance benchmarked on 6,062 files from 11 independent test suites: Apache POI, LibreOffice Core, Apache Tika, calamine, python-docx, python-pptx, mammoth, Open XML SDK, ClosedXML, Pandoc. DOCX 7ms mean (vs mammoth 353ms, markitdown 773ms), XLSX 6ms mean (matches calamine, 40× faster than openpyxl 245ms), PPTX 3ms mean (8× faster than python-pptx 24ms).",
+      "content": "Performance benchmarked on 10,386 files of the project's test collection (October 2026): DOCX 1.7ms mean (python-docx 9.5ms), XLSX 6.2ms mean (python-calamine 8.7ms, openpyxl 60.7ms), PPTX 2.6ms mean (python-pptx 13.4ms).",
       "author": "maintainer"
     },
     {
@@ -36,7 +36,7 @@
     },
     {
       "title": "Performance and Benchmarks",
-      "purpose": "Document benchmark methodology, 6,062-file corpus from 11 sources, results vs python-docx/openpyxl/python-pptx/calamine/xlrd/mammoth/markitdown"
+      "purpose": "Document benchmark methodology, the 10,386-file test collection, results vs python-docx/openpyxl/python-pptx/calamine/xlrd/markitdown/catdoc"
     },
     {
       "title": "MCP Server and AI Integration",

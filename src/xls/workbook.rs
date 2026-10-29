@@ -211,6 +211,7 @@ fn bof_dt(data: &[u8]) -> Option<u16> {
 impl XlsDocument {
     /// Open an XLS file from a reader (any `Read + Seek`).
     pub fn from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
+        let _scale = crate::limits::InputSizeScope::new(crate::limits::stream_len(&mut reader));
         // A pre-OLE2 Excel file (BIFF2/3/4 — Excel 2.x through 4.x) has no
         // compound-file container at all: it is a raw record stream that
         // starts with its own `BOF`, holding one worksheet. It used to be

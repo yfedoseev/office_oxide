@@ -26,7 +26,7 @@ All six Office formats are production-ready:
 | XLS  | ✓ | — | — | ✓ | ✓ | ✓ | ✓ |
 | PPT  | ✓ | — | — | ✓ | ✓ | ✓ | ✓ |
 
-**98.4% pass rate on a 6,062-file public corpus. Zero failures on legitimate Office files.**
+**Opens 97.3% of a 10,386-file test collection; the rest are encrypted, truncated or corrupt files.**
 
 Language bindings: Rust, Python (PyPI), Go, C# / .NET (NuGet), Node.js native (npm), WASM (npm), C FFI.
 

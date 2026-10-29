@@ -69,6 +69,9 @@ use crate::core::xml;
 /// A parsed XLSX document.
 #[derive(Debug, Clone)]
 pub struct XlsxDocument {
+    /// The size of the file this document was read from (0 when unknown): small
+    /// inputs get a text budget scaled to them (see [`crate::limits`]).
+    pub(crate) input_bytes: u64,
     /// Workbook-level metadata (name, sheets list, date system).
     pub workbook: WorkbookInfo,
     /// Parsed worksheets in sheet-order.
@@ -184,6 +187,14 @@ impl XlsxDocument {
 impl XlsxDocument {
     /// Open an XLSX file from a file path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let bytes = std::fs::metadata(path.as_ref()).map_or(0, |m| m.len());
+        let _scale = crate::limits::InputSizeScope::new(bytes);
+        let mut doc = Self::open_unscaled(path)?;
+        doc.input_bytes = bytes;
+        Ok(doc)
+    }
+
+    fn open_unscaled(path: impl AsRef<Path>) -> Result<Self> {
         let file = File::open(path).map_err(crate::core::Error::from)?;
         let archive = opc::open_zip_rejecting_duplicates(file)?;
         Self::from_zip(archive)
@@ -192,6 +203,15 @@ impl XlsxDocument {
     /// Open an XLSX file using memory-mapped I/O for better performance on large files.
     #[cfg(feature = "mmap")]
     pub fn open_mmap(path: impl AsRef<Path>) -> Result<Self> {
+        let bytes = std::fs::metadata(path.as_ref()).map_or(0, |m| m.len());
+        let _scale = crate::limits::InputSizeScope::new(bytes);
+        let mut doc = Self::open_mmap_unscaled(path)?;
+        doc.input_bytes = bytes;
+        Ok(doc)
+    }
+
+    #[cfg(feature = "mmap")]
+    fn open_mmap_unscaled(path: impl AsRef<Path>) -> Result<Self> {
         let file = File::open(path).map_err(crate::core::Error::from)?;
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(crate::core::Error::from)? };
         debug!("XLSX fast path: mmap opened ({} bytes)", mmap.len());
@@ -201,6 +221,14 @@ impl XlsxDocument {
 
     /// Open an XLSX document from any `Read + Seek` source.
     pub fn from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
+        let bytes = crate::limits::stream_len(&mut reader);
+        let _scale = crate::limits::InputSizeScope::new(bytes);
+        let mut doc = Self::from_reader_unscaled(reader)?;
+        doc.input_bytes = bytes;
+        Ok(doc)
+    }
+
+    fn from_reader_unscaled<R: Read + Seek>(mut reader: R) -> Result<Self> {
         // A password-protected XLSX is a CFB container, not a zip at all.
         // See the identical check in docx::DocxDocument::from_reader.
         if crate::cfb::is_cfb_container(&mut reader).map_err(crate::core::Error::from)? {
@@ -736,6 +764,7 @@ impl XlsxDocument {
         let (unreadable_parts, unreadable_parts_omitted, cosmetic_parts) =
             shared.unreadable.finish();
         Ok(XlsxDocument {
+            input_bytes: 0,
             workbook,
             worksheets,
             shared_strings,

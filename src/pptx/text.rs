@@ -51,10 +51,12 @@ impl PptxDocument {
     /// [`super::layout::MASTER_TEXT_SECTION_TITLE`]; see the
     /// [`super::layout`] module.
     pub fn plain_text(&self) -> String {
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
         let _text_scope = crate::limits::begin_copied_text_budget();
         let mut parts = Vec::new();
         // Notes shared by many slides are printed with each (see
         // `crate::limits`), so the slides' text is charged to the budget.
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
         let mut budget = crate::limits::TextBudget::new();
         for (i, _) in self.slides.iter().enumerate() {
             if let Some(text) = self.slide_plain(i) {
@@ -100,6 +102,7 @@ impl PptxDocument {
 
     /// Extract plain text from a single slide by index.
     pub fn slide_plain_text(&self, index: usize) -> Option<String> {
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
         let _text_scope = crate::limits::begin_copied_text_budget();
         let mut text = self.slide_plain(index)?;
         if let Some(notice) = crate::limits::copied_text_notice() {
@@ -154,8 +157,10 @@ impl PptxDocument {
     /// Layout and master static text follows the slides once, as for
     /// [`Self::plain_text`].
     pub fn to_markdown(&self) -> String {
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
         let _text_scope = crate::limits::begin_copied_text_budget();
         let mut parts = Vec::new();
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
         let mut budget = crate::limits::TextBudget::new();
         for (i, _) in self.slides.iter().enumerate() {
             if let Some(md) = self.slide_markdown(i) {
@@ -202,6 +207,7 @@ impl PptxDocument {
 
     /// Convert a single slide to markdown by index.
     pub fn slide_to_markdown(&self, index: usize) -> Option<String> {
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
         let _text_scope = crate::limits::begin_copied_text_budget();
         let mut md = self.slide_markdown(index)?;
         if let Some(notice) = crate::limits::copied_text_notice() {
@@ -646,6 +652,7 @@ mod tests {
 
     fn make_doc(slides: Vec<Slide>) -> PptxDocument {
         PptxDocument {
+            input_bytes: 0,
             core_properties: None,
             app_properties: None,
             package_properties: Default::default(),
