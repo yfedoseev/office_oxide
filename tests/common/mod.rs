@@ -1078,6 +1078,13 @@ fn build_fkp_page(fc0: u32, fc1: u32, grpprl: &[u8], istd: u16) -> [u8; 512] {
 }
 
 /// Assemble the CFB container around the `WordDocument` and `0Table` streams.
+/// The container of [`build_doc_full`] around `WordDocument` and `0Table`
+/// streams a test has rewritten.
+#[allow(dead_code)]
+pub fn build_doc_from_streams(word_doc: &[u8], table: &[u8]) -> Vec<u8> {
+    build_cfb(word_doc, table)
+}
+
 fn build_cfb(word_doc: &[u8], table: &[u8]) -> Vec<u8> {
     let wd_sectors = word_doc.len() / 512;
     let zero_table_sectors = table.len().div_ceil(512);

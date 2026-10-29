@@ -14,7 +14,8 @@ use super::papx::{
     DocParagraph, build_paragraphs, parse_papx_paragraphs, resolve_huge_papx, runs_work_too_large,
 };
 use super::piece_table::{
-    covers_declared_length, extract_text_range_excluding, parse_clx, sanitize_text,
+    ParsedPieces, covers_declared_length, extract_text_range_excluding, parse_clx_diagnosed,
+    sanitize_text,
 };
 use super::styles::parse_style_sheet;
 use crate::cfb::blip::BlipDiagnostics;
@@ -303,11 +304,17 @@ impl DocDocument {
 
         let clx_end = clx_end.min(table_stream.len());
         let clx_data = &table_stream[clx_start..clx_end];
-        let mut pieces = parse_clx(clx_data)?;
+        let ParsedPieces {
+            mut pieces,
+            irregular: cps_out_of_order,
+        } = parse_clx_diagnosed(clx_data)?;
         // Refuse pieces that read far more than the stream holds, and cut the
         // table where the text budget runs out, before any text is decoded.
         let mut text_budget = crate::limits::TextBudget::new();
         let mut work_warnings: Vec<String> = Vec::new();
+        if cps_out_of_order {
+            work_warnings.push(PIECE_TABLE_OUT_OF_ORDER.into());
+        }
         if super::piece_table::bound_piece_reads(&mut pieces, word_doc.len(), &mut text_budget)? {
             work_warnings.push(text_budget.notice());
         }
@@ -881,6 +888,12 @@ impl DocDocument {
 /// Whether the file carries a VBA project: Word keeps it in a root
 /// `Macros` storage holding the `VBA` storage ([MS-OVBA] §2.2.1 project
 /// storage; Excel's equivalent root storage is `_VBA_PROJECT_CUR`).
+/// The warning for a piece table whose character positions are not ascending.
+const PIECE_TABLE_OUT_OF_ORDER: &str = "the piece table's character positions are not in ascending \
+     order ([MS-DOC] PlcPcd); its pieces were resolved by the lookup rule of the text retrieval \
+     algorithm (the largest index whose position is not past the character), and some text may be \
+     misplaced";
+
 /// Read the main text of each embedded Word document, within the document's
 /// embedded-package account: the object is admitted by the size of its
 /// streams (a count, a byte allowance, depth one), its text is charged to the
@@ -953,7 +966,7 @@ fn embedded_word_text<R: Read + Seek>(
     let EmbeddedRead {
         text,
         fingerprint,
-        cut,
+        notes,
     } = match read {
         Ok(read) => read,
         Err(why) => {
@@ -961,8 +974,8 @@ fn embedded_word_text<R: Read + Seek>(
             return None;
         },
     };
-    if let Some(notice) = cut {
-        warnings.push(format!("embedded object {name}: {notice}"));
+    for note in notes {
+        warnings.push(format!("embedded object {name}: {note}"));
     }
     if let Some(cached) = embedded::cached::<String>(session, fingerprint) {
         return charge_embedded_text(session, name, cached);
@@ -1019,11 +1032,20 @@ fn embedded_word_main_text<R: Read + Seek>(
         return Err("the piece table lies outside the table stream".into());
     }
     let clx_end = (clx_start + fib.clx_size as usize).min(table_stream.len());
-    let mut pieces = parse_clx(&table_stream[clx_start..clx_end]).map_err(|e| e.to_string())?;
+    let ParsedPieces {
+        mut pieces,
+        irregular,
+    } = parse_clx_diagnosed(&table_stream[clx_start..clx_end]).map_err(|e| e.to_string())?;
     let mut budget = crate::limits::TextBudget::new();
-    let cut = super::piece_table::bound_piece_reads(&mut pieces, word_doc.len(), &mut budget)
+    let mut notes = Vec::new();
+    if irregular {
+        notes.push(PIECE_TABLE_OUT_OF_ORDER.to_string());
+    }
+    if super::piece_table::bound_piece_reads(&mut pieces, word_doc.len(), &mut budget)
         .map_err(|e| e.to_string())?
-        .then(|| budget.notice());
+    {
+        notes.push(budget.notice());
+    }
     let mut chpx_runs = if fib.fc_plcf_bte_chpx != 0 && fib.lcb_plcf_bte_chpx != 0 {
         parse_chpx_runs(&word_doc, &table_stream, fib.fc_plcf_bte_chpx, fib.lcb_plcf_bte_chpx)
     } else {
@@ -1037,7 +1059,7 @@ fn embedded_word_main_text<R: Read + Seek>(
     Ok(EmbeddedRead {
         text: sanitize_text(&raw).trim().to_string(),
         fingerprint,
-        cut,
+        notes,
     })
 }
 
@@ -1046,8 +1068,10 @@ struct EmbeddedRead {
     text: String,
     /// Fingerprint of its `WordDocument` stream.
     fingerprint: crate::core::embedded::Fingerprint,
-    /// The text-budget notice, when the budget cut the story short.
-    cut: Option<String>,
+    /// What to tell the reader about this document's text: the text-budget
+    /// notice when the budget cut the story short, and the piece-table notice
+    /// when its positions were out of order.
+    notes: Vec<String>,
 }
 
 fn has_vba_project<R: Read + Seek>(cfb: &CfbReader<R>) -> bool {

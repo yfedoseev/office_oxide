@@ -73,6 +73,22 @@ fn resolve_prm(prm: u16, prcs: &[Vec<u8>]) -> Vec<u8> {
 /// - Optional Grpprl entries (type 0x01): skip them.
 /// - Pcdt entry (type 0x02): the piece table.
 pub fn parse_clx(data: &[u8]) -> Result<Vec<Piece>> {
+    Ok(parse_clx_diagnosed(data)?.pieces)
+}
+
+/// The pieces of a `PlcPcd`, and whether its character positions were out of
+/// order (see [`parse_clx_diagnosed`]).
+pub struct ParsedPieces {
+    pub pieces: Vec<Piece>,
+    /// `true` when some character position was smaller than the one before it,
+    /// which [MS-DOC] §2.8.35 forbids; the pieces were then resolved by the
+    /// lookup rule of §2.4.1 and the text may be misplaced.
+    pub irregular: bool,
+}
+
+/// As [`parse_clx`], also saying whether the table's character positions were
+/// out of order.
+pub fn parse_clx_diagnosed(data: &[u8]) -> Result<ParsedPieces> {
     let mut pos = 0;
 
     // The `RgPrc` array: property-modifier grpprls a piece's `Prm1`
@@ -120,7 +136,7 @@ pub fn parse_clx(data: &[u8]) -> Result<Vec<Piece>> {
 /// - n PCD entries (8 bytes each)
 ///
 /// Where n = (size - 4) / 12 (solve for: (n+1)*4 + n*8 = size)
-fn parse_plc_pcd(data: &[u8], prcs: &[Vec<u8>]) -> Result<Vec<Piece>> {
+fn parse_plc_pcd(data: &[u8], prcs: &[Vec<u8>]) -> Result<ParsedPieces> {
     if data.len() < 8 {
         return Err(DocError::InvalidPieceTable("PlcPcd too small".into()));
     }
@@ -128,7 +144,10 @@ fn parse_plc_pcd(data: &[u8], prcs: &[Vec<u8>]) -> Result<Vec<Piece>> {
     // n pieces: (n+1)*4 + n*8 = data.len() → n = (data.len() - 4) / 12
     let n = (data.len() - 4) / 12;
     if n == 0 {
-        return Ok(Vec::new());
+        return Ok(ParsedPieces {
+            pieces: Vec::new(),
+            irregular: false,
+        });
     }
 
     let cp_array_size = (n + 1) * 4;
@@ -136,21 +155,34 @@ fn parse_plc_pcd(data: &[u8], prcs: &[Vec<u8>]) -> Result<Vec<Piece>> {
         return Err(DocError::InvalidPieceTable("PlcPcd size mismatch".into()));
     }
 
-    let mut pieces = Vec::with_capacity(n);
-
-    for i in 0..n {
-        let cp_start = u32::from_le_bytes([
+    let cp = |i: usize| {
+        u32::from_le_bytes([
             data[i * 4],
             data[i * 4 + 1],
             data[i * 4 + 2],
             data[i * 4 + 3],
-        ]);
-        let cp_end = u32::from_le_bytes([
-            data[(i + 1) * 4],
-            data[(i + 1) * 4 + 1],
-            data[(i + 1) * 4 + 2],
-            data[(i + 1) * 4 + 3],
-        ]);
+        ])
+    };
+    // [MS-DOC] §2.8.35: the CPs MUST ascend without duplicates, and §2.4.1
+    // step 3 finds the text at `cp` as the piece with "the largest i such that
+    // aCp[i] <= cp". That rule is defined for any array, and it makes piece `i`
+    // the one for `cp` exactly when `aCp[i] <= cp` and every later CP is greater
+    // than `cp`: its range is `[aCp[i], min(aCp[i + 1..]))`. For a sorted array
+    // that is `[aCp[i], aCp[i + 1])`, as always; for a table with a wrong
+    // position (a fast-saved file) the ranges stay ascending and disjoint, a
+    // piece left with no range covers nothing, and no subtraction can underflow.
+    let mut later_min = vec![u32::MAX; n + 1];
+    later_min[n] = cp(n);
+    for i in (0..n).rev() {
+        later_min[i] = later_min[i + 1].min(cp(i));
+    }
+    let irregular = (0..n).any(|i| cp(i + 1) < cp(i));
+
+    let mut pieces = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let cp_start = cp(i);
+        let cp_end = later_min[i + 1];
 
         // PCD at offset cp_array_size + i * 8.
         let pcd_offset = cp_array_size + i * 8;
@@ -166,11 +198,9 @@ fn parse_plc_pcd(data: &[u8], prcs: &[Vec<u8>]) -> Result<Vec<Piece>> {
         let is_compressed = (fc & 0x40000000) != 0;
         let prm = u16::from_le_bytes([data[pcd_offset + 6], data[pcd_offset + 7]]);
 
-        // A non-monotonic CP range would underflow later subtractions
-        // (extract_text / decode_cp_range / fc_to_cp). Reject it here so the
-        // malformed piece table surfaces as `Err`, not a panic (AGENTS.md #6).
+        // A piece with no range covers no position (see above).
         if cp_end < cp_start {
-            return Err(DocError::InvalidPieceTable("non-monotonic piece CP range".into()));
+            continue;
         }
 
         pieces.push(Piece {
@@ -182,7 +212,7 @@ fn parse_plc_pcd(data: &[u8], prcs: &[Vec<u8>]) -> Result<Vec<Piece>> {
         });
     }
 
-    Ok(pieces)
+    Ok(ParsedPieces { pieces, irregular })
 }
 
 /// How many times over the `WordDocument` stream's own size the pieces may
@@ -1167,28 +1197,99 @@ mod tests {
     // synthetic piece table, no third-party document.
     // --------------------------------------------------------------------
 
-    /// A non-monotonic CP array (`CP[1] < CP[0]`) must surface as `Err`, not
-    /// trigger a subtraction-with-overflow panic when the range is later
-    /// walked. `parse_plc_pcd` validates CP ordering (piece_table.rs:119) and
-    /// returns `Err` on a reversed range, so the later subtraction is always
-    /// on a well-ordered piece.
-    #[test]
-    fn test_parse_clx_rejects_nonmonotonic_cps() {
-        // CLX: Pcdt marker, PlcPcd size 16, CP[0]=10, CP[1]=5 (reversed), one PCD.
-        let mut clx = Vec::new();
-        clx.push(0x02); // Pcdt marker
-        clx.extend_from_slice(&16u32.to_le_bytes()); // PlcPcd size = (n+1)*4 + n*8, n=1
-        clx.extend_from_slice(&10u32.to_le_bytes()); // CP[0]
-        clx.extend_from_slice(&5u32.to_le_bytes()); // CP[1]  (CP[1] < CP[0]!)
-        clx.extend_from_slice(&0u16.to_le_bytes()); // PCD: unused u16
-        clx.extend_from_slice(&0u32.to_le_bytes()); // PCD: fc
-        clx.extend_from_slice(&0u16.to_le_bytes()); // PCD: prm
+    /// A CLX holding a `PlcPcd` over `cps` (one more entry than there are
+    /// pieces); piece `i` is a UTF-16 piece whose `fc` is `2 * (i + 1)`, so the
+    /// piece a character resolves to can be read off its `fc`.
+    fn clx_over(cps: &[u32]) -> Vec<u8> {
+        let n = cps.len() - 1;
+        let mut clx = vec![0x02];
+        clx.extend_from_slice(&((cps.len() * 4 + n * 8) as u32).to_le_bytes());
+        for cp in cps {
+            clx.extend_from_slice(&cp.to_le_bytes());
+        }
+        for i in 0..n {
+            clx.extend_from_slice(&0u16.to_le_bytes()); // PCD: unused u16
+            clx.extend_from_slice(&(2 * (i as u32 + 1)).to_le_bytes()); // PCD: fc
+            clx.extend_from_slice(&0u16.to_le_bytes()); // PCD: prm
+        }
+        clx
+    }
 
-        let pieces = parse_clx(&clx);
-        assert!(
-            pieces.is_err(),
-            "non-monotonic CP array must surface as Err, not panic on subtraction"
-        );
+    /// [MS-DOC] 2.8.35 requires the CP array to ascend, but 2.4.1 step 3 finds
+    /// the text at a position as "the largest i such that aCp[i] <= cp", which is
+    /// defined for any array. A reversed range used to be refused (and, before
+    /// that check, could underflow); it now covers no text and is flagged.
+    #[test]
+    fn test_a_reversed_piece_covers_no_text_and_is_flagged() {
+        let parsed = parse_clx_diagnosed(&clx_over(&[10, 5])).expect("no panic, no error");
+        assert!(parsed.pieces.is_empty(), "{:?}", parsed.pieces);
+        assert!(parsed.irregular);
+    }
+
+    /// One wrong position in a long, otherwise ascending table (a fast-saved
+    /// file): piece 1 ends where the next smaller position begins, and the
+    /// piece whose range is reversed covers nothing.
+    #[test]
+    fn test_one_misplaced_position_is_resolved_by_the_largest_index_rule() {
+        let parsed = parse_clx_diagnosed(&clx_over(&[0, 130, 195, 133, 135])).unwrap();
+        let ranges: Vec<_> = parsed
+            .pieces
+            .iter()
+            .map(|p| (p.cp_start, p.cp_end, p.fc))
+            .collect();
+        // fc is 2 * (index + 1) with the compression bit clear.
+        assert_eq!(ranges, vec![(0, 130, 2), (130, 133, 4), (133, 135, 8)]);
+        assert!(parsed.irregular);
+    }
+
+    #[test]
+    fn test_an_ascending_table_is_unchanged_and_not_flagged() {
+        let parsed = parse_clx_diagnosed(&clx_over(&[0, 10, 10, 25, 40])).unwrap();
+        let ranges: Vec<_> = parsed
+            .pieces
+            .iter()
+            .map(|p| (p.cp_start, p.cp_end))
+            .collect();
+        assert_eq!(ranges, vec![(0, 10), (10, 10), (10, 25), (25, 40)]);
+        assert!(!parsed.irregular);
+        assert_eq!(parse_clx(&clx_over(&[0, 10, 10, 25, 40])).unwrap().len(), 4);
+    }
+
+    /// For arrays of every shape, the pieces resolve each position to the piece
+    /// the specification's rule (the largest `i` with `aCp[i] <= cp`) names, the
+    /// kept ranges ascend without overlapping, and nothing panics.
+    #[test]
+    fn test_pieces_resolve_every_position_as_the_specification_says() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        for round in 0..4000 {
+            let n = 1 + next(24) as usize;
+            let spread = if round % 3 == 0 { 8 } else { 400 };
+            let cps: Vec<u32> = (0..=n).map(|_| next(spread) as u32).collect();
+            let parsed = parse_clx_diagnosed(&clx_over(&cps)).expect("any array parses");
+            let mut previous_end = 0u32;
+            for p in &parsed.pieces {
+                assert!(p.cp_start <= p.cp_end, "{cps:?}");
+                assert!(p.cp_start >= previous_end || p.cp_start == p.cp_end, "{cps:?}");
+                previous_end = p.cp_end;
+            }
+            for cp in 0..=spread as u32 {
+                let named = cps.iter().rposition(|&c| c <= cp).filter(|&i| i < n);
+                let found = parsed
+                    .pieces
+                    .iter()
+                    .find(|p| p.cp_start <= cp && cp < p.cp_end)
+                    .map(|p| (p.fc / 2 - 1) as usize);
+                assert_eq!(found, named, "cp {cp} in {cps:?}");
+            }
+            let sorted = cps.windows(2).all(|w| w[0] <= w[1]);
+            assert_eq!(parsed.irregular, !sorted, "{cps:?}");
+        }
     }
 
     /// The backing clamp must bound the *work* (the CP range actually walked),
