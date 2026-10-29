@@ -9,6 +9,7 @@
 //! characters ([`crate::core::symbol_font`]).
 
 use super::sprm::ChpProps;
+use super::styles::{StyleDef, style_ftc_other};
 use crate::core::symbol_font::{SymbolFont, char_for, symbol_font};
 
 /// `cData` MUST NOT exceed this ([MS-DOC] §2.9.286).
@@ -61,51 +62,88 @@ pub(crate) fn parse_symbol_fonts(table: &[u8], fc: u32, lcb: u32) -> Vec<Option<
 }
 
 /// The character positions whose run is in a symbol font.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct SymbolRuns {
-    /// `(start, end, font)`, sorted by `start`.
-    ranges: Vec<(u32, u32, SymbolFont)>,
+    /// Runs that state their font (directly or through a character style):
+    /// `(start, end, font)`, sorted by `start`. `None` is a run set in some
+    /// other font, which must not fall through to its paragraph's.
+    runs: Vec<(u32, u32, Option<SymbolFont>)>,
+    /// Paragraphs whose style gives them a symbol font, sorted by `start`.
+    paragraphs: Vec<(u32, u32, SymbolFont)>,
+    /// No range puts any character in a symbol font.
+    empty: bool,
 }
 
 impl SymbolRuns {
     /// No run is in a symbol font.
     pub(crate) fn none() -> Self {
-        Self::default()
+        Self {
+            runs: Vec::new(),
+            paragraphs: Vec::new(),
+            empty: true,
+        }
     }
 
     /// The symbol-font ranges among `cp_runs` (every character run of the
     /// document with its properties, as character positions), given the
     /// document's `fonts` ([`parse_symbol_fonts`]).
+    ///
+    /// A run's font is its own `sprmCRgFtc2`, else the one its character
+    /// style gives; a run with neither is in its paragraph's style font, from
+    /// `paragraphs` (`(start, end, istd)`), so a symbol-font paragraph style
+    /// reaches the runs that carry no font of their own ([MS-DOC] §2.4.6.1
+    /// applies the paragraph style, then the character style, then the run).
     pub(crate) fn from_runs(
         cp_runs: &[(u32, u32, ChpProps)],
         fonts: &[Option<SymbolFont>],
+        styles: &[StyleDef],
+        paragraphs: &[(u32, u32, u16)],
     ) -> Self {
         if fonts.iter().all(Option::is_none) {
             return Self::none();
         }
-        let mut ranges: Vec<_> = cp_runs
+        let font_of = |index: u16| fonts.get(usize::from(index)).copied().flatten();
+        let mut runs: Vec<_> = cp_runs
             .iter()
             .filter(|(start, end, _)| end > start)
             .filter_map(|(start, end, props)| {
-                let font = fonts
-                    .get(usize::from(props.ftc_other?))
-                    .copied()
-                    .flatten()?;
-                Some((*start, *end, font))
+                let index = props
+                    .ftc_other
+                    .or_else(|| style_ftc_other(styles, props.istd_char?))?;
+                Some((*start, *end, font_of(index)))
             })
             .collect();
-        ranges.sort_by_key(|&(start, ..)| start);
-        Self { ranges }
+        runs.sort_by_key(|&(start, ..)| start);
+        let mut paragraphs: Vec<_> = paragraphs
+            .iter()
+            .filter(|(start, end, _)| end > start)
+            .filter_map(|&(start, end, istd)| {
+                Some((start, end, font_of(style_ftc_other(styles, istd)?)?))
+            })
+            .collect();
+        paragraphs.sort_by_key(|&(start, ..)| start);
+        let empty = paragraphs.is_empty() && runs.iter().all(|r| r.2.is_none());
+        Self {
+            runs,
+            paragraphs,
+            empty,
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.ranges.is_empty()
+        self.empty
     }
 
     /// The symbol font of the run that covers `cp`, if any.
     fn font_at(&self, cp: u32) -> Option<SymbolFont> {
-        let after = self.ranges.partition_point(|&(start, ..)| start <= cp);
-        let &(_, end, font) = self.ranges.get(after.checked_sub(1)?)?;
+        let after = self.runs.partition_point(|&(start, ..)| start <= cp);
+        if let Some(&(_, end, font)) = after.checked_sub(1).and_then(|i| self.runs.get(i)) {
+            if cp < end {
+                return font;
+            }
+        }
+        let after = self.paragraphs.partition_point(|&(start, ..)| start <= cp);
+        let &(_, end, font) = self.paragraphs.get(after.checked_sub(1)?)?;
         (cp < end).then_some(font)
     }
 
@@ -237,7 +275,7 @@ mod tests {
             (12, 20, props(None)),
             (20, 25, props(Some(7))), // past the font table
         ];
-        let symbols = SymbolRuns::from_runs(&runs, &fonts);
+        let symbols = SymbolRuns::from_runs(&runs, &fonts, &[], &[]);
         assert_eq!(symbols.font_at(0), Some(Symbol));
         assert_eq!(symbols.font_at(4), Some(Symbol));
         assert_eq!(symbols.font_at(5), None);
@@ -245,12 +283,12 @@ mod tests {
         assert_eq!(symbols.font_at(11), Some(Wingdings));
         assert_eq!(symbols.font_at(12), None);
         assert_eq!(symbols.font_at(22), None);
-        assert!(SymbolRuns::from_runs(&runs, &[None, None]).is_empty());
+        assert!(SymbolRuns::from_runs(&runs, &[None, None], &[], &[]).is_empty());
     }
 
     #[test]
     fn test_only_private_use_units_in_a_symbol_run_are_mapped() {
-        let symbols = SymbolRuns::from_runs(&[(0, 4, props(Some(0)))], &[Some(Symbol)]);
+        let symbols = SymbolRuns::from_runs(&[(0, 4, props(Some(0)))], &[Some(Symbol)], &[], &[]);
         assert_eq!(symbols.map_unit(1, 0xF06D), Some('\u{3bc}'));
         assert_eq!(symbols.map_unit(1, 0x006D), None); // not private-use
         assert_eq!(symbols.map_unit(1, 0xF0FF), None); // no character for it
@@ -259,7 +297,8 @@ mod tests {
 
     #[test]
     fn test_utf16_text_is_rewritten_around_the_mapped_units() {
-        let symbols = SymbolRuns::from_runs(&[(10, 12, props(Some(0)))], &[Some(Wingdings)]);
+        let symbols =
+            SymbolRuns::from_runs(&[(10, 12, props(Some(0)))], &[Some(Wingdings)], &[], &[]);
         let mut out = String::new();
         // "a", Wingdings clock (non-BMP), "b" -- the clock is at cp 11.
         push_utf16(&mut out, &[0x61, 0x61, 0xF0B7, 0x62], 9, &symbols);
@@ -267,5 +306,64 @@ mod tests {
         let mut plain = String::new();
         push_utf16(&mut plain, &[0xD83D, 0xDE00, 0xF0B7], 0, &SymbolRuns::none());
         assert_eq!(plain, "\u{1F600}\u{F0B7}"); // a surrogate pair and an untouched unit
+    }
+
+    fn style(base: Option<u16>, ftc: Option<u16>) -> StyleDef {
+        StyleDef {
+            base,
+            own_ftc_other: ftc,
+            ..StyleDef::default()
+        }
+    }
+
+    #[test]
+    fn test_a_paragraph_style_font_reaches_runs_that_state_none() {
+        let fonts = [None, Some(Symbol)];
+        // istd 1 sets font 1 (Symbol); istd 2 is based on it; istd 0 sets none.
+        let styles = [
+            style(None, None),
+            style(None, Some(1)),
+            style(Some(1), None),
+        ];
+        let paragraphs = [(0, 10, 2), (10, 20, 0)];
+        let runs = [
+            (0, 4, props(None)),
+            (4, 6, props(Some(0))), // a run of its own, in no symbol font
+        ];
+        let symbols = SymbolRuns::from_runs(&runs, &fonts, &styles, &paragraphs);
+        assert_eq!(symbols.font_at(2), Some(Symbol), "inherited through the base");
+        assert_eq!(symbols.font_at(5), None, "the run's own font wins");
+        assert_eq!(symbols.font_at(8), Some(Symbol));
+        assert_eq!(symbols.font_at(12), None, "a paragraph whose style names no font");
+        assert!(!symbols.is_empty());
+    }
+
+    #[test]
+    fn test_a_character_style_font_wins_over_the_paragraph_style() {
+        let fonts = [None, Some(Symbol), Some(Wingdings)];
+        let styles = [
+            style(None, None),
+            style(None, Some(1)),
+            style(None, Some(2)),
+        ];
+        let runs = [(
+            0,
+            4,
+            ChpProps {
+                istd_char: Some(2),
+                ..ChpProps::default()
+            },
+        )];
+        let symbols = SymbolRuns::from_runs(&runs, &fonts, &styles, &[(0, 10, 1)]);
+        assert_eq!(symbols.font_at(1), Some(Wingdings));
+        assert_eq!(symbols.font_at(6), Some(Symbol));
+    }
+
+    #[test]
+    fn test_a_cyclic_style_chain_gives_no_font() {
+        let fonts = [Some(Symbol)];
+        let styles = [style(Some(1), None), style(Some(0), None)];
+        let symbols = SymbolRuns::from_runs(&[], &fonts, &styles, &[(0, 10, 0)]);
+        assert!(symbols.is_empty());
     }
 }

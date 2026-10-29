@@ -930,6 +930,9 @@ pub struct ChpProps {
     /// outside U+0020..U+007F, which is where the private-use characters of a
     /// symbol font are. `None` when the run does not set it.
     pub ftc_other: Option<u16>,
+    /// `sprmCIstd` (0x4A30): the `istd` of the character style applied to
+    /// the run. `None` when the run applies none.
+    pub istd_char: Option<u16>,
     /// `sprmCFStrike` (0x0837) / `sprmCFDStrike` (0x2A53): single or
     /// double strikethrough.
     pub strike: bool,
@@ -1099,6 +1102,14 @@ chp_sprm_dispatch! {
     /// Signed 2-byte integer (spra 2): an index into the font table
     /// (`SttbfFfn`) of the font used for a character outside U+0020..U+007F
     /// ([MS-DOC] §2.6.1). A negative operand cannot be an index and is ignored.
+    /// Unsigned 2-byte integer (spra 2): the `istd` of the character style
+    /// the run applies ([MS-DOC] §2.6.1).
+    "sprmCIstd" @ "2.6.1" => [0x4A30] (props, operand) {
+        if operand.len() >= 2 {
+            props.istd_char = Some(u16::from_le_bytes([operand[0], operand[1]]));
+        }
+    }
+
     "sprmCRgFtc2" @ "2.6.1" => [0x4A51] (props, operand) {
         if operand.len() >= 2 {
             let ftc = i16::from_le_bytes([operand[0], operand[1]]);
@@ -2020,6 +2031,7 @@ mod tests {
         (0x6870, "sprmCCv"),
         (0x4A43, "sprmCHps"),
         (0x4A51, "sprmCRgFtc2"),
+        (0x4A30, "sprmCIstd"),
         (0x0837, "sprmCFStrike"),
         (0x2A53, "sprmCFDStrike"),
         (0x083C, "sprmCFVanish"),

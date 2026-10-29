@@ -49,6 +49,27 @@ struct PapxData {
     istd: u16,
 }
 
+/// Each paragraph of `fkp` as a character-position range with its style
+/// (`istd`): the PAPX header's, replaced by `sprmPIstd` when the `grpprl`
+/// carries one.
+pub(crate) fn paragraph_style_ranges(
+    fkp: &[FkpParagraph],
+    pieces: &[Piece],
+) -> Vec<(u32, u32, u16)> {
+    let index = PieceFcIndex::new(pieces);
+    fkp.iter()
+        .flat_map(|p| {
+            let istd = super::sprm::extract_pap_props(&p.grpprl)
+                .style_istd
+                .unwrap_or(p.istd);
+            index
+                .cp_ranges(p.fc_start, p.fc_end)
+                .into_iter()
+                .map(move |(a, b)| (a, b, istd))
+        })
+        .collect()
+}
+
 /// A fully-resolved main-text paragraph: its raw text, the terminating
 /// character, and the distilled PAP properties.
 #[derive(Debug, Clone)]

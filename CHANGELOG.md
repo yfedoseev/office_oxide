@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `.doc` run whose symbol font comes from a style is read by the font's table too.** The reader looked only at the run's own `sprmCRgFtc2`. The style sheet's character properties (`UpxChpx`, [MS-DOC] §2.9.258) are now read: a run takes its own font, else the font of the character style it applies (`sprmCIstd`), else its paragraph style's, following `istdBase` (bounded, cycles end the walk). The paragraph styles are read only when a style names a symbol font.
+
 - **A worksheet whose XML is malformed part-way through keeps the rows before the damage.** The whole sheet was reported unreadable although everything before the damage parsed. The sheet is now read up to the end of the last complete row (a row the damage reaches is dropped whole, so no row is cut in two), a notice in every rendering and a warning say the sheet was cut short, and `text_truncated` is set. A sheet with no complete row stays unreadable. Parts of a `.docx` or `.pptx` are not salvaged yet.
 
 - **A `.docx` run whose symbol font comes from a style is read by the font's table too.** The mapping looked only at the run's own `w:rFonts`; Word writes a font on a run only when it differs from the style's, so a Symbol or Wingdings paragraph or character style, a style based on one, or a document default left the private-use characters as they were. The effective font (document defaults, paragraph style chain, character style chain, then the run) is now resolved once over the parsed document (body, tables, hyperlinks, headers, footers, notes and comments), without copying a face name per run.

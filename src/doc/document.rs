@@ -14,8 +14,8 @@ use super::fonts::{SymbolRuns, parse_symbol_fonts};
 use super::images::{DocImage, extract_images_diagnosed};
 use super::list_format::ListFormatting;
 use super::papx::{
-    DocParagraph, build_paragraphs_symbols, parse_papx_paragraphs, resolve_huge_papx,
-    runs_work_too_large,
+    DocParagraph, build_paragraphs_symbols, paragraph_style_ranges, parse_papx_paragraphs,
+    resolve_huge_papx, runs_work_too_large,
 };
 use super::piece_table::{
     ParsedPieces, Piece, covers_declared_length, extract_text_range_excluding_symbols,
@@ -357,7 +357,7 @@ impl DocDocument {
         // applies the same exclusion to the structured paragraphs.
         let deleted_ranges =
             resolve_excluded_cp_ranges_from_runs(&chpx_runs, &pieces, fib.text_len);
-        let symbols = symbol_runs(&table_stream, &fib, &chpx_runs, &pieces);
+        let symbols = symbol_runs(&word_doc, &table_stream, &fib, &chpx_runs, &pieces);
         let raw_text = extract_text_range_excluding_symbols(
             &word_doc,
             &pieces,
@@ -904,12 +904,37 @@ impl DocDocument {
 /// storage; Excel's equivalent root storage is `_VBA_PROJECT_CUR`).
 /// The runs of the document set in a symbol font (see [`super::fonts`]):
 /// nothing is computed for a document whose font table names none.
-fn symbol_runs(table: &[u8], fib: &Fib, chpx_runs: &[FkpRun], pieces: &[Piece]) -> SymbolRuns {
+fn symbol_runs(
+    word_doc: &[u8],
+    table: &[u8],
+    fib: &Fib,
+    chpx_runs: &[FkpRun],
+    pieces: &[Piece],
+) -> SymbolRuns {
     let fonts = parse_symbol_fonts(table, fib.fc_sttbf_ffn, fib.lcb_sttbf_ffn);
     if fonts.iter().all(Option::is_none) {
         return SymbolRuns::none();
     }
-    SymbolRuns::from_runs(&resolve_chp_cp_runs(chpx_runs, pieces), &fonts)
+    let styles = parse_style_sheet(table, fib).styles;
+    // A paragraph style can put its paragraphs in a symbol font; only then
+    // are the paragraphs' styles needed.
+    let style_names_symbol_font = styles.iter().any(|s| {
+        s.own_ftc_other
+            .is_some_and(|i| fonts.get(usize::from(i)).copied().flatten().is_some())
+    });
+    let paragraphs =
+        if style_names_symbol_font && fib.fc_plcf_bte_papx != 0 && fib.lcb_plcf_bte_papx != 0 {
+            let fkp =
+                parse_papx_paragraphs(word_doc, table, fib.fc_plcf_bte_papx, fib.lcb_plcf_bte_papx);
+            if runs_work_too_large(pieces, fkp.iter().map(|r| (r.fc_start, r.fc_end))) {
+                Vec::new()
+            } else {
+                paragraph_style_ranges(&fkp, pieces)
+            }
+        } else {
+            Vec::new()
+        };
+    SymbolRuns::from_runs(&resolve_chp_cp_runs(chpx_runs, pieces), &fonts, &styles, &paragraphs)
 }
 
 /// The warning for a piece table whose character positions are not ascending.
@@ -1143,7 +1168,7 @@ fn embedded_word_main_text<R: Read + Seek>(
         chpx_runs.clear();
     }
     let excluded = resolve_excluded_cp_ranges_from_runs(&chpx_runs, &pieces, fib.text_len);
-    let symbols = symbol_runs(&table_stream, &fib, &chpx_runs, &pieces);
+    let symbols = symbol_runs(&word_doc, &table_stream, &fib, &chpx_runs, &pieces);
     let raw = extract_text_range_excluding_symbols(
         &word_doc,
         &pieces,

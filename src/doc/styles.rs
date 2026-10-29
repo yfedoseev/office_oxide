@@ -14,7 +14,11 @@
 //! rule 6). Either way [`StyleSheet::warning`] says why, so the loss reaches
 //! `Metadata::warnings` instead of passing unnoticed.
 
-use super::{MAX_OUTLINE_LEVEL, OutlineLevel, fib::Fib, sprm::extract_pap_props};
+use super::{
+    MAX_OUTLINE_LEVEL, OutlineLevel,
+    fib::Fib,
+    sprm::{extract_chp_props, extract_pap_props},
+};
 
 /// One style definition, indexed by `istd`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -34,6 +38,10 @@ pub struct StyleDef {
     /// Style kind (`StdfBase.stk`, [MS-DOC] §2.9.253): 1 paragraph, 2
     /// character, 3 table, 4 numbering. 0 for an empty slot.
     pub stk: u16,
+    /// The font-table index this style's own character properties give to
+    /// characters outside U+0020..U+007F (`sprmCRgFtc2`, [MS-DOC] §2.6.1), from
+    /// its `UpxChpx`. `None` when it states none (it may inherit one).
+    pub own_ftc_other: Option<u16>,
     /// The name exposed on `Paragraph::style`, worked out once when the style
     /// sheet is parsed (see [`assign_display_names`]) so that a lookup per
     /// paragraph does not re-examine a name that can be tens of kilobytes.
@@ -321,6 +329,7 @@ fn parse_stsh(data: &[u8]) -> StyleSheet {
             base,
             own_outline,
             stk,
+            own_ftc_other: style_own_ftc_other(std, cb_std_base),
             display_name: None,
         });
         pos += cb_std;
@@ -412,6 +421,64 @@ fn style_inheritance(std: &[u8], cb_std_base: usize) -> (Option<u16>, Option<u8>
         None => None,
     };
     (base, own_outline)
+}
+
+/// `STK_CHARACTER`: `StdfBase.stk` of a character style ([MS-DOC] §2.9.253).
+const STK_CHARACTER: u16 = 2;
+
+/// The font a style's own `UpxChpx` gives characters outside U+0020..U+007F.
+///
+/// After the name come `cupx` `LPUpx` entries (`cbUpx(u16)`, then `cbUpx`
+/// bytes, each starting on an even offset within the `STD`, [MS-DOC] §2.9.258).
+/// A paragraph style holds a `UpxPapx` then a `UpxChpx`; a character style
+/// holds a `UpxChpx` only. The `UpxChpx` is a bare character `grpprl`
+/// ([MS-DOC] §2.9.328). Any bound that does not hold yields `None`.
+fn style_own_ftc_other(std: &[u8], cb_std_base: usize) -> Option<u16> {
+    if std.len() < 6 {
+        return None;
+    }
+    let stk = u16::from_le_bytes([std[2], std[3]]) & 0x000F;
+    let cupx = usize::from(u16::from_le_bytes([std[4], std[5]]) & 0x000F);
+    let chpx_index = match stk {
+        STK_PARAGRAPH => 1,
+        STK_CHARACTER => 0,
+        _ => return None,
+    };
+    if cupx <= chpx_index {
+        return None;
+    }
+    let cch = usize::from(u16::from_le_bytes(
+        std.get(cb_std_base..cb_std_base.checked_add(2)?)?
+            .try_into()
+            .ok()?,
+    ));
+    let mut at = cb_std_base.checked_add(2 + 2 * cch + 2)?;
+    for index in 0..=chpx_index {
+        at += at % 2;
+        let cb_upx =
+            usize::from(u16::from_le_bytes(std.get(at..at.checked_add(2)?)?.try_into().ok()?));
+        let data = std.get(at + 2..(at + 2).checked_add(cb_upx)?)?;
+        if index == chpx_index {
+            return extract_chp_props(data).ftc_other;
+        }
+        at += 2 + cb_upx;
+    }
+    None
+}
+
+/// The font-table index that `istd`'s character properties give characters
+/// outside U+0020..U+007F, following `istdBase` for at most
+/// [`MAX_STYLE_CHAIN`] steps (a cycle resolves to `None`).
+pub fn style_ftc_other(styles: &[StyleDef], istd: u16) -> Option<u16> {
+    let mut current = istd;
+    for _ in 0..MAX_STYLE_CHAIN {
+        let style = styles.get(usize::from(current))?;
+        if style.own_ftc_other.is_some() {
+            return style.own_ftc_other;
+        }
+        current = style.base?;
+    }
+    None
 }
 
 /// Parse an `Xstz` (§2.9.354) — a style name: an `Xst` (a `cch: u16` followed
@@ -1328,5 +1395,34 @@ mod tests {
         assert_eq!(n(3), None, "table style");
         assert_eq!(n(4), None, "numbering style");
         assert_eq!(n(5), None, "a character style is not Caption whatever its sti");
+    }
+
+    /// A character style (`stk` 2) with one `UpxChpx` holding `sprmCRgFtc2` = 5.
+    fn char_style_std() -> Vec<u8> {
+        let mut std = vec![0u8; 10];
+        std[2..4].copy_from_slice(&(2u16 | (0x0FFFu16 << 4)).to_le_bytes());
+        std[4..6].copy_from_slice(&1u16.to_le_bytes()); // cupx
+        std.extend_from_slice(&1u16.to_le_bytes()); // cch
+        std.extend_from_slice(&u16::from(b'X').to_le_bytes());
+        std.extend_from_slice(&0u16.to_le_bytes()); // chTerm
+        std.extend_from_slice(&4u16.to_le_bytes()); // cbUpx
+        std.extend_from_slice(&[0x51, 0x4A, 5, 0]); // sprmCRgFtc2
+        std
+    }
+
+    #[test]
+    fn test_a_character_style_font_is_read_and_a_cut_style_never_panics() {
+        let std = char_style_std();
+        assert_eq!(style_own_ftc_other(&std, 10), Some(5));
+        for cut in 0..std.len() {
+            assert_eq!(style_own_ftc_other(&std[..cut], 10), None, "cut at {cut}");
+        }
+        // A `cbUpx` that runs past the style, and a name length that does.
+        let mut long = std.clone();
+        long[16..18].copy_from_slice(&0xFFF0u16.to_le_bytes());
+        assert_eq!(style_own_ftc_other(&long, 10), None);
+        let mut wide = std;
+        wide[10..12].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        assert_eq!(style_own_ftc_other(&wide, 10), None);
     }
 }

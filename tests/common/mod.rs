@@ -527,6 +527,9 @@ pub struct Style<'a> {
     /// `StdfBase.stk` ([MS-DOC] §2.9.253): 1 paragraph, 2 character, 3 table,
     /// 4 numbering.
     pub kind: u16,
+    /// The `sprmCRgFtc2` operand in the style's own `UpxChpx`: the font-table
+    /// index of the font the style gives characters outside U+0020..U+007F.
+    pub ftc: Option<u16>,
 }
 
 #[allow(dead_code)]
@@ -539,6 +542,7 @@ impl<'a> Style<'a> {
             base: None,
             outline: None,
             kind: 1,
+            ftc: None,
         }
     }
     /// A user-defined style based on `base`.
@@ -549,7 +553,14 @@ impl<'a> Style<'a> {
             base: Some(base),
             outline: None,
             kind: 1,
+            ftc: None,
         }
+    }
+    /// The same style, giving characters outside U+0020..U+007F the font at
+    /// index `ftc` of the font table.
+    pub fn font(mut self, ftc: u16) -> Self {
+        self.ftc = Some(ftc);
+        self
     }
     /// The same style with a different style kind (`stk`).
     pub fn kind(mut self, stk: u16) -> Self {
@@ -574,20 +585,38 @@ fn lpstd(style: &Style) -> Vec<u8> {
     std[0..2].copy_from_slice(&style.sti.to_le_bytes());
     let istd_base = style.base.unwrap_or(0x0FFF);
     std[2..4].copy_from_slice(&(style.kind | (istd_base << 4)).to_le_bytes());
-    std[4..6].copy_from_slice(&u16::from(style.outline.is_some()).to_le_bytes());
+    // A paragraph style holds a `UpxPapx` and then a `UpxChpx`; a character
+    // style holds a `UpxChpx` only. Each is present when it has something to say
+    // (a paragraph style's `UpxPapx` is then empty but for its `istd`).
+    let has_papx = style.kind == 1 && (style.outline.is_some() || style.ftc.is_some());
+    let has_chpx = matches!(style.kind, 1 | 2) && style.ftc.is_some();
+    let cupx = u16::from(has_papx) + u16::from(has_chpx);
+    std[4..6].copy_from_slice(&cupx.to_le_bytes());
     let units: Vec<u16> = style.name.encode_utf16().collect();
     std.extend_from_slice(&(units.len() as u16).to_le_bytes());
     for u in &units {
         std.extend_from_slice(&u.to_le_bytes());
     }
     std.extend_from_slice(&0u16.to_le_bytes());
-    if let Some(operand) = style.outline {
+    if has_papx {
         if std.len() % 2 == 1 {
             std.push(0);
         }
-        std.extend_from_slice(&5u16.to_le_bytes()); // cbUpx: istd(2) + grpprl(3)
+        let grpprl: Vec<u8> = style
+            .outline
+            .map(|operand| vec![0x40, 0x26, operand]) // sprmPOutLvl
+            .unwrap_or_default();
+        std.extend_from_slice(&((2 + grpprl.len()) as u16).to_le_bytes()); // cbUpx
         std.extend_from_slice(&0u16.to_le_bytes()); // UpxPapx.istd
-        std.extend_from_slice(&[0x40, 0x26, operand]); // sprmPOutLvl
+        std.extend_from_slice(&grpprl);
+    }
+    if let (true, Some(ftc)) = (has_chpx, style.ftc) {
+        if std.len() % 2 == 1 {
+            std.push(0);
+        }
+        let ftc = ftc.to_le_bytes();
+        std.extend_from_slice(&4u16.to_le_bytes()); // cbUpx
+        std.extend_from_slice(&[0x51, 0x4A, ftc[0], ftc[1]]); // sprmCRgFtc2
     }
     let mut out = (std.len() as u16).to_le_bytes().to_vec();
     out.extend_from_slice(&std);
@@ -595,6 +624,20 @@ fn lpstd(style: &Style) -> Vec<u8> {
         out.push(0);
     }
     out
+}
+
+/// The `WordDocument` and `1Table` streams of a document of `paras`, paragraph
+/// `i` in the style `istds[i]`, whose Table stream ends with `stsh`; for a test
+/// that adds to the streams before building the file ([`build_doc_with_styles`]
+/// builds it straight away).
+#[allow(dead_code)]
+pub fn build_streams_with_styles(
+    paras: &[Para],
+    istds: &[u16],
+    stsh: &[u8],
+    tweaks: FibTweaks,
+) -> (Vec<u8>, Vec<u8>) {
+    build_streams(paras, &Subdocs::default(), tweaks, istds, stsh)
 }
 
 /// A spec-conformant STSH ([MS-DOC] §2.7.1 / §2.9.274) holding `styles` in
@@ -625,6 +668,7 @@ pub fn heading_style_sheet() -> Vec<u8> {
             base: Some(0),
             outline: None,
             kind: 1,
+            ftc: None,
         });
     }
     let mut d = style_sheet(&styles);
