@@ -305,3 +305,22 @@ fn test_what_an_embedded_package_could_not_read_is_reported_by_the_document_that
     let sound = open(docx_embedding("outer", &[(&leaf("fine"), 1)]));
     assert!(sound.as_docx().unwrap().unreadable_parts.is_empty());
 }
+
+/// A package reached through several entry names is charged to the byte
+/// allowance and to the package count once, not once per name: five names for
+/// one blob fit an allowance of two and a half packages (five charges would
+/// need five), and all five places in the document carry its text.
+#[test]
+fn test_one_blob_under_several_names_is_charged_once() {
+    let mut scope = LimitScope::new();
+    let blob = leaf("shared child");
+    scope.set(
+        limits::max_embedded_bytes,
+        limits::set_max_embedded_bytes,
+        blob.len() as u64 * 5 / 2,
+    );
+    scope.set(limits::max_embedded_packages, limits::set_max_embedded_packages, 1);
+    let doc = open(docx_embedding("top", &[(&blob, 5)]));
+    assert!(skipped(&doc).is_empty(), "{:?}", skipped(&doc));
+    assert_eq!(doc.plain_text().matches("shared child").count(), 5);
+}

@@ -66,6 +66,19 @@ fn written_table_cells(table: &Table, format: DocumentFormat) -> usize {
     table.rows.len().saturating_mul(width)
 }
 
+/// The cost of a table cell to the writer for `format`, in percent of a
+/// `.docx` cell: the limit [`crate::limits::max_write_table_cells`] is in
+/// `.docx` cells, and a `.pptx` writer holds about a third of the memory for a
+/// cell (measured at 100,000 cells: 1,832 bytes a cell for `.docx`, 632 for
+/// `.pptx`, 161 for `.xlsx`). A `.xlsx` cell is counted whole against its own
+/// limit.
+fn cell_cost_percent(format: DocumentFormat) -> usize {
+    match format {
+        DocumentFormat::Pptx => 35,
+        _ => 100,
+    }
+}
+
 /// Refuse an IR that exceeds the write limits: more sections than
 /// [`crate::limits::max_write_sheets`] for `.xlsx`, or tables holding more cells than
 /// [`crate::limits::max_write_table_cells`] (`.docx`, `.pptx`) or
@@ -96,6 +109,7 @@ fn check_write_budget(ir: &DocumentIR, format: DocumentFormat) -> Result<()> {
         },
         _ => return Ok(()),
     };
+    let cost = cell_cost_percent(format);
     let mut cells = 0usize;
     let mut stack: Vec<&[Element]> = Vec::new();
     for s in &ir.sections {
@@ -126,7 +140,11 @@ fn check_write_budget(ir: &DocumentIR, format: DocumentFormat) -> Result<()> {
         for e in elements {
             match e {
                 Element::Table(t) => {
-                    cells = cells.saturating_add(written_table_cells(t, format));
+                    cells = cells.saturating_add(
+                        written_table_cells(t, format)
+                            .saturating_mul(cost)
+                            .div_ceil(100),
+                    );
                     for cell in t.rows.iter().flat_map(|r| &r.cells) {
                         stack.push(&cell.content);
                     }

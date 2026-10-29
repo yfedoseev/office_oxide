@@ -872,7 +872,9 @@ pub(crate) fn image_budget_notice() -> Option<String> {
 }
 
 /// The default most table cells one IR may hold when it is written to
-/// `.docx` or `.pptx`: 250,000.
+/// `.docx` or `.pptx`: 250,000, counted in `.docx` cells; a `.pptx` cell weighs
+/// about a third as much to the writer (632 bytes against 1,832, measured at
+/// 100,000 cells), so a `.pptx` may hold about three times as many.
 ///
 /// The writers build every cell in memory; a million-cell table took
 /// 2.2 GB to write, about 2 KB a cell, so 250,000 cells is about half a

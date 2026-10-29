@@ -61,8 +61,15 @@ fn test_a_table_with_too_many_cells_is_refused_when_writing() {
     let mut limits = LimitScope::new();
     limits.set(max_write_table_cells, set_max_write_table_cells, CELL_LIMIT);
     for format in [DocumentFormat::Docx, DocumentFormat::Pptx] {
-        let big = ir_with(vec![Element::Table(table(10, 10))], format);
-        let err = write(&big, format).expect_err("100 cells exceed a limit of 50");
+        // A `.pptx` cell weighs about a third of a `.docx` cell to the writer,
+        // so the same limit holds three times as many of them.
+        let rows = if format == DocumentFormat::Docx {
+            10
+        } else {
+            30
+        };
+        let big = ir_with(vec![Element::Table(table(rows, 10))], format);
+        let err = write(&big, format).expect_err("past a limit of 50 cells");
         assert!(
             matches!(err, OfficeError::Core(CoreError::PackageLimit(_))),
             "{format:?}: {err:?}"
@@ -73,6 +80,23 @@ fn test_a_table_with_too_many_cells_is_refused_when_writing() {
         let small = ir_with(vec![Element::Table(table(5, 5))], format);
         write(&small, format).unwrap_or_else(|e| panic!("{format:?}: {e}"));
     }
+}
+
+/// A `.pptx` writer holds about 632 bytes a cell against 1,832 for a `.docx`
+/// one, so the table-cell limit lets a `.pptx` hold about three times as many
+/// cells: 100 cells are past a limit of 50 in a `.docx` and within it in a
+/// `.pptx`, which counts them as 35; and many tiny tables are not free.
+#[test]
+fn test_a_pptx_cell_costs_the_writer_less_than_a_docx_cell() {
+    let mut limits = LimitScope::new();
+    limits.set(max_write_table_cells, set_max_write_table_cells, CELL_LIMIT);
+    let hundred = |format| ir_with(vec![Element::Table(table(10, 10))], format);
+    assert!(write(&hundred(DocumentFormat::Docx), DocumentFormat::Docx).is_err());
+    write(&hundred(DocumentFormat::Pptx), DocumentFormat::Pptx).expect("35 cell-equivalents fit");
+    // One-cell tables round up, so a crowd of them is charged.
+    let crowd =
+        ir_with((0..200).map(|_| Element::Table(table(1, 1))).collect(), DocumentFormat::Pptx);
+    assert!(write(&crowd, DocumentFormat::Pptx).is_err());
 }
 
 /// Rows padded to the widest row: 20 one-cell rows and one 20-cell row are
