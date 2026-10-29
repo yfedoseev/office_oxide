@@ -275,7 +275,7 @@ impl DocDocument {
         // Propagate FIB errors. Swallowing them into an empty document with
         // `Ok` is what made an encrypted file look like a document that
         // simply had no text.
-        let fib = Fib::parse(&word_doc)?;
+        let mut fib = Fib::parse(&word_doc)?;
 
         // Open the appropriate table stream; try preferred first, then fallback.
         let table_stream = if fib.use_table1 {
@@ -291,6 +291,10 @@ impl DocDocument {
         let table_stream = table_stream.map_err(|_| {
             DocError::MissingStream("neither 0Table nor 1Table stream is present".into())
         })?;
+
+        // A header with a destroyed version has lost its language; the font
+        // table still declares the character sets of the fonts used.
+        let language_from_fonts = take_language_from_fonts(&mut fib, &table_stream);
 
         // Extract CLX from the table stream.
         let clx_start = fib.clx_offset as usize;
@@ -320,7 +324,7 @@ impl DocDocument {
             work_warnings.push(PIECE_TABLE_OUT_OF_ORDER.into());
         }
         if !super::fib::is_word_version(fib.n_fib) {
-            work_warnings.push(super::fib::damaged_version_warning(fib.n_fib));
+            work_warnings.push(super::fib::damaged_version_warning(fib.n_fib, language_from_fonts));
         }
         if super::piece_table::bound_piece_reads(&mut pieces, word_doc.len(), &mut text_budget)? {
             work_warnings.push(text_budget.notice());
@@ -646,7 +650,7 @@ impl DocDocument {
         let mut warnings = container_warnings(cfb);
         warnings.extend(papx.warnings);
         if !super::fib::is_word_version(fib.n_fib) {
-            warnings.push(super::fib::damaged_version_warning(fib.n_fib));
+            warnings.push(super::fib::damaged_version_warning(fib.n_fib, None));
         }
         if budget_cut {
             warnings.push(text_budget.notice());
@@ -937,6 +941,19 @@ fn symbol_runs(
     SymbolRuns::from_runs(&resolve_chp_cp_runs(chpx_runs, pieces), &fonts, &styles, &paragraphs)
 }
 
+/// When the header's version is not a Word version its language is lost: take
+/// the language of the 8-bit text from the character sets the font table
+/// declares, set it as the document's, and return the character set used.
+fn take_language_from_fonts(fib: &mut Fib, table: &[u8]) -> Option<u8> {
+    if super::fib::is_word_version(fib.n_fib) {
+        return None;
+    }
+    let (chs, lid) =
+        super::fonts::language_from_font_charsets(table, fib.fc_sttbf_ffn, fib.lcb_sttbf_ffn)?;
+    fib.lid = lid;
+    Some(chs)
+}
+
 /// The warning for a piece table whose character positions are not ascending.
 const PIECE_TABLE_OUT_OF_ORDER: &str = "the piece table's character positions are not in ascending \
      order ([MS-DOC] PlcPcd); its pieces were resolved by the lookup rule of the text retrieval \
@@ -1113,7 +1130,7 @@ fn embedded_word_main_text<R: Read + Seek>(
         let mut pieces = super::word6::pieces(&word_doc, &fib).map_err(|e| e.to_string())?;
         let mut notes = Vec::new();
         if !super::fib::is_word_version(fib.n_fib) {
-            notes.push(super::fib::damaged_version_warning(fib.n_fib));
+            notes.push(super::fib::damaged_version_warning(fib.n_fib, None));
         }
         let mut budget = crate::limits::TextBudget::new();
         if super::piece_table::bound_piece_reads(&mut pieces, word_doc.len(), &mut budget)
@@ -1129,12 +1146,13 @@ fn embedded_word_main_text<R: Read + Seek>(
         });
     }
     let fingerprint = crate::core::embedded::Fingerprint::of(&word_doc);
-    let fib = Fib::parse(&word_doc).map_err(|e| e.to_string())?;
+    let mut fib = Fib::parse(&word_doc).map_err(|e| e.to_string())?;
     let table_idx = if fib.use_table1 { t1.or(t0) } else { t0.or(t1) }
         .ok_or_else(|| "neither 0Table nor 1Table stream is present".to_string())?;
     let table_stream = cfb
         .read_stream_by_index(table_idx)
         .map_err(|e| e.to_string())?;
+    let language_from_fonts = take_language_from_fonts(&mut fib, &table_stream);
     let clx_start = fib.clx_offset as usize;
     if clx_start >= table_stream.len()
         || clx_size_zero_or_oob(fib.clx_size, clx_start, table_stream.len())
@@ -1149,7 +1167,7 @@ fn embedded_word_main_text<R: Read + Seek>(
     let mut budget = crate::limits::TextBudget::new();
     let mut notes = Vec::new();
     if !super::fib::is_word_version(fib.n_fib) {
-        notes.push(super::fib::damaged_version_warning(fib.n_fib));
+        notes.push(super::fib::damaged_version_warning(fib.n_fib, language_from_fonts));
     }
     if irregular {
         notes.push(PIECE_TABLE_OUT_OF_ORDER.to_string());

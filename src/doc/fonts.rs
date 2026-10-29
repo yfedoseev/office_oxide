@@ -22,20 +22,46 @@ const FFN_FIXED_LEN: usize = 39;
 /// symbol font it names, if any. Bounded by the structure and the stream: a
 /// damaged table gives a short list, never an error.
 pub(crate) fn parse_symbol_fonts(table: &[u8], fc: u32, lcb: u32) -> Vec<Option<SymbolFont>> {
+    let mut fonts = Vec::new();
+    for_each_font(table, fc, lcb, |ffn| {
+        fonts.push(symbol_font(&ffn_name(ffn)));
+    });
+    fonts
+}
+
+/// The name of the font an `FFN` describes.
+fn ffn_name(ffn: &[u8]) -> String {
+    char::decode_utf16(
+        ffn.get(FFN_FIXED_LEN..)
+            .unwrap_or_default()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .take_while(|&u| u != 0)
+            .take(64),
+    )
+    .map(|r| r.unwrap_or('\u{FFFD}'))
+    .collect()
+}
+
+/// Call `f` with each `FFN` of the `SttbfFfn` at `fc`/`lcb` in the table
+/// stream, in order. Bounded by the structure and the stream: a damaged
+/// table gives fewer fonts, never an error.
+fn for_each_font(table: &[u8], fc: u32, lcb: u32, mut f: impl FnMut(&[u8])) {
     let start = fc as usize;
     if lcb < 4 || start >= table.len() {
-        return Vec::new();
+        return;
     }
     let end = start.saturating_add(lcb as usize).min(table.len());
     let sttb = &table[start..end];
     // The size is clamped to the stream, so fewer than the four header bytes
     // can remain.
     let [c0, c1, e0, e1, ..] = *sttb else {
-        return Vec::new();
+        return;
     };
     let c_data = usize::from(u16::from_le_bytes([c0, c1])).min(MAX_FONTS);
     let cb_extra = usize::from(u16::from_le_bytes([e0, e1]));
-    let mut fonts = Vec::with_capacity(c_data.min(256));
     let mut pos = 4usize;
     for _ in 0..c_data {
         let Some(&cch) = sttb.get(pos) else { break };
@@ -43,22 +69,34 @@ pub(crate) fn parse_symbol_fonts(table: &[u8], fc: u32, lcb: u32) -> Vec<Option<
         let Some(ffn) = sttb.get(pos + 1..pos + 1 + cch) else {
             break;
         };
-        let name: String = char::decode_utf16(
-            ffn.get(FFN_FIXED_LEN..)
-                .unwrap_or_default()
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|c| u16::from_le_bytes(*c))
-                .take_while(|&u| u != 0)
-                .take(64),
-        )
-        .map(|r| r.unwrap_or('\u{FFFD}'))
-        .collect();
-        fonts.push(symbol_font(&name));
+        f(ffn);
         pos += 1 + cch + cb_extra;
     }
-    fonts
+}
+
+/// The language a damaged header leaves open, taken from what the font table
+/// declares: each `FFN` states the character set (`chs`, [MS-DOC] §2.9.102)
+/// its font was chosen for, and the 8-bit text of a Cyrillic, Greek, Hebrew,
+/// Arabic, Baltic, Central European, Turkish, Vietnamese, Thai or East Asian
+/// document is in the code page of those fonts. The character set most of the
+/// fonts that state a non-Western one name decides, the first named winning a
+/// tie; `None` when no font states one. Returns that character set and a
+/// language ID with its code page.
+pub(crate) fn language_from_font_charsets(table: &[u8], fc: u32, lcb: u32) -> Option<(u8, u16)> {
+    let mut counts: Vec<(u8, usize)> = Vec::new();
+    for_each_font(table, fc, lcb, |ffn| {
+        let Some(&chs) = ffn.get(3) else { return };
+        if super::codepage::lid_for_charset(chs).is_none() {
+            return;
+        }
+        match counts.iter_mut().find(|(c, _)| *c == chs) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((chs, 1)),
+        }
+    });
+    let best = counts.iter().map(|&(_, n)| n).max()?;
+    let (chs, _) = *counts.iter().find(|&&(_, n)| n == best)?;
+    Some((chs, super::codepage::lid_for_charset(chs)?))
 }
 
 /// The character positions whose run is in a symbol font.
@@ -365,5 +403,43 @@ mod tests {
         let styles = [style(Some(1), None), style(Some(0), None)];
         let symbols = SymbolRuns::from_runs(&[], &fonts, &styles, &[(0, 10, 0)]);
         assert!(symbols.is_empty());
+    }
+
+    /// A font table of fonts with the given character sets.
+    fn table_with_charsets(sets: &[u8]) -> Vec<u8> {
+        let mut out = (sets.len() as u16).to_le_bytes().to_vec();
+        out.extend_from_slice(&0u16.to_le_bytes());
+        for &chs in sets {
+            let mut ffn = vec![0u8; FFN_FIXED_LEN];
+            ffn[3] = chs;
+            ffn.extend_from_slice(&[b'A', 0, 0, 0]);
+            out.push(ffn.len() as u8);
+            out.extend_from_slice(&ffn);
+        }
+        out
+    }
+
+    #[test]
+    fn test_the_language_follows_the_character_set_most_fonts_declare() {
+        let lang = |sets: &[u8]| {
+            let t = table_with_charsets(sets);
+            language_from_font_charsets(&t, 0, t.len() as u32)
+        };
+        assert_eq!(lang(&[0xCC, 0xCC, 0x00]), Some((0xCC, 0x0419)));
+        // Western, symbol, OEM and default sets name no other language.
+        assert_eq!(lang(&[0x00, 0x01, 0x02, 0xFF]), None);
+        // The most named wins; the first named wins a tie.
+        assert_eq!(lang(&[0xA1, 0xB1, 0xB1]), Some((0xB1, 0x040D)));
+        assert_eq!(lang(&[0xA1, 0xB1]), Some((0xA1, 0x0408)));
+        assert_eq!(lang(&[]), None);
+    }
+
+    #[test]
+    fn test_a_damaged_font_table_gives_no_language_and_no_panic() {
+        let t = table_with_charsets(&[0xCC, 0xCC]);
+        for cut in 0..t.len() {
+            let _ = language_from_font_charsets(&t[..cut], 0, cut as u32);
+        }
+        assert_eq!(language_from_font_charsets(&t, u32::MAX, u32::MAX), None);
     }
 }

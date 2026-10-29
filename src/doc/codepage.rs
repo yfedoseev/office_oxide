@@ -39,6 +39,28 @@ pub(crate) fn codepage_for_lid(lid: u16) -> u16 {
     }
 }
 
+/// A language ID whose code page is the one a font character set (`chs`,
+/// [MS-DOC] §2.9.102 `FFN`, the Windows `LOGFONT` charset) names; `None` for
+/// the Western, symbol, OEM and default sets, which are Windows-1252 already.
+pub(crate) fn lid_for_charset(chs: u8) -> Option<u16> {
+    Some(match chs {
+        0x80 => 0x0411, // SHIFTJIS_CHARSET, 932
+        0x81 => 0x0412, // HANGUL_CHARSET, 949
+        0x86 => 0x0804, // GB2312_CHARSET, 936
+        0x88 => 0x0404, // CHINESEBIG5_CHARSET, 950
+        0xA1 => 0x0408, // GREEK_CHARSET, 1253
+        0xA2 => 0x041F, // TURKISH_CHARSET, 1254
+        0xA3 => 0x042A, // VIETNAMESE_CHARSET, 1258
+        0xB1 => 0x040D, // HEBREW_CHARSET, 1255
+        0xB2 => 0x0401, // ARABIC_CHARSET, 1256
+        0xBA => 0x0425, // BALTIC_CHARSET, 1257
+        0xCC => 0x0419, // RUSSIAN_CHARSET, 1251
+        0xDE => 0x041E, // THAI_CHARSET, 874
+        0xEE => 0x0415, // EASTEUROPE_CHARSET, 1250
+        _ => return None,
+    })
+}
+
 /// Decode one compressed-text byte using the codepage its FIB `lid`
 /// implies. Byte-for-byte identical to the pre-existing `cp1252_to_char`
 /// for the default/English case (no behavior change for the vast

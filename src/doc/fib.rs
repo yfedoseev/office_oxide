@@ -14,12 +14,21 @@ pub(crate) fn is_word_version(n_fib: u16) -> bool {
 }
 
 /// What to tell the reader about a header whose version is not a Word version.
-pub(crate) fn damaged_version_warning(n_fib: u16) -> String {
-    format!(
-        "the file header's version number (nFib 0x{n_fib:04X}) is not a Word version, so the \
-         header is damaged and the language of the document's 8-bit text is unknown; that text \
-         was read as Windows-1252"
-    )
+/// `from_fonts` is the character set of the font table that gave the 8-bit
+/// text its language instead (see `fonts::language_from_font_charsets`).
+pub(crate) fn damaged_version_warning(n_fib: u16, from_fonts: Option<u8>) -> String {
+    match from_fonts {
+        Some(chs) => format!(
+            "the file header's version number (nFib 0x{n_fib:04X}) is not a Word version, so the \
+             header is damaged and its language is lost; the language of the document's 8-bit \
+             text was taken from the character set (0x{chs:02X}) its fonts declare"
+        ),
+        None => format!(
+            "the file header's version number (nFib 0x{n_fib:04X}) is not a Word version, so the \
+             header is damaged and the language of the document's 8-bit text is unknown; that \
+             text was read as Windows-1252"
+        ),
+    }
 }
 
 /// Parsed FIB fields needed for text extraction.

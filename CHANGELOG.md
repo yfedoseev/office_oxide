@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `.doc` whose header is destroyed takes the language of its 8-bit text from the font table.** A header whose version is not a Word version lost its language, so the text was read as Windows-1252 and said so. Each font in the font table declares the character set it was chosen for ([MS-DOC] §2.9.102), so the text of a Cyrillic, Greek, Hebrew, Arabic, Baltic, Central European, Turkish, Vietnamese, Thai or East Asian document is now read in the code page of the character set most of its fonts declare, and the warning says where the language came from. A document whose fonts declare none, and every document with an intact header, are read as before.
+
 - **The per-sheet and the document-wide padding allowances are one mechanism.** The empty-slot allowance of a `.xls` and the empty-cell allowance of an `.xlsx` IR kept their own copies of the same charge-and-spend logic; both are now two instances of one `Allowance`. No limit, default or message changed. The text-budget default is documented as deliberately flat.
 
 - **A damaged properties part, package-relationships part or chart is reported instead of passing as absent.** A `docProps/core.xml`, `app.xml`, custom-properties or thumbnail part that exists but cannot be read or parsed, and a workbook's `_rels/.rels` that cannot be read (so the properties could not be located), now each give a warning; the document reads as before. A chart or SmartArt diagram part whose XML is cut off or malformed in a `.docx`, `.pptx` or `.xlsx` keeps the text before the damage and is reported as an unreadable part. What an embedded package could not read is now listed by the document that embeds it, named by both parts.
