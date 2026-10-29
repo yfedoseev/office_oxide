@@ -212,3 +212,35 @@ fn test_docx_ir_stops_copying_a_shared_header_at_the_budget() {
         ir.metadata.warnings
     );
 }
+
+/// The default is one flat number: a tiny workbook and a larger one are cut at
+/// the same place, whatever the size of the file. A bound that moved with the
+/// input would cut genuine small files and still let a large crafted one
+/// through (see `DEFAULT_MAX_TEXT_CHARS`).
+#[test]
+fn test_the_budget_does_not_depend_on_the_size_of_the_input() {
+    let mut limits = LimitScope::new();
+    limits.set(max_text_chars, set_max_text_chars, BUDGET);
+    let small = xlsx_fan_out(3);
+    let large = xlsx_fan_out(20);
+    assert!(large.len() > small.len());
+    let cut = |bytes: Vec<u8>| {
+        let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx).unwrap();
+        cells_in(&doc.plain_text(), 'x')
+    };
+    // Both stop after the two cells that fit in the budget.
+    assert_eq!((cut(small), cut(large)), (2, 2));
+}
+
+/// The truncation notice says where to raise the budget.
+#[test]
+fn test_the_truncation_notice_names_the_setter() {
+    let mut limits = LimitScope::new();
+    limits.set(max_text_chars, set_max_text_chars, BUDGET);
+    let text = open_xlsx(8).plain_text();
+    assert!(
+        text.contains("set_max_text_chars"),
+        "{}",
+        &text[text.len().saturating_sub(300)..]
+    );
+}

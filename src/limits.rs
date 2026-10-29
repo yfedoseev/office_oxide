@@ -828,7 +828,11 @@ pub(crate) fn image_budget_notice() -> Option<String> {
 /// `.docx` or `.pptx`: 250,000.
 ///
 /// The writers build every cell in memory; a million-cell table took
-/// 2.2 GB to write. Genuine tables in these formats stay far below this.
+/// 2.2 GB to write, about 2 KB a cell, so 250,000 cells is about half a
+/// gigabyte. Genuine tables in these formats stay far below this. A worksheet
+/// is not counted: the `.xlsx` writer costs well under 0.3 KB a cell on top
+/// of the IR it is handed (measured at 250,000, 1,000,000 and 2,000,000
+/// cells), so a worksheet is bounded by [`max_write_sheets`] alone.
 pub const DEFAULT_MAX_WRITE_TABLE_CELLS: usize = 250_000;
 
 static MAX_WRITE_TABLE_CELLS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_WRITE_TABLE_CELLS);

@@ -171,3 +171,17 @@ fn test_a_direct_writer_caller_past_the_sheet_limit_gets_an_error() {
         .expect_err("two sheets were refused");
     assert!(err.to_string().contains("set_max_write_sheets"), "{err}");
 }
+
+/// The `.docx` and `.pptx` writers cost a couple of kilobytes a table cell,
+/// which is why they are counted; the `.xlsx` writer's cost is a small
+/// multiple of the IR it is handed, so a worksheet is bounded by the sheet
+/// limit alone and the table-cell limit does not apply to it.
+#[test]
+fn test_the_table_cell_limit_does_not_apply_to_a_worksheet() {
+    let mut limits = LimitScope::new();
+    limits.set(max_write_table_cells, set_max_write_table_cells, CELL_LIMIT);
+    let sheet = ir_with(vec![Element::Table(table(10, 10))], DocumentFormat::Xlsx);
+    write(&sheet, DocumentFormat::Xlsx).expect("100 cells in a worksheet are written");
+    let doc = ir_with(vec![Element::Table(table(10, 10))], DocumentFormat::Docx);
+    assert!(write(&doc, DocumentFormat::Docx).is_err());
+}
