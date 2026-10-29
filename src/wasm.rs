@@ -6,6 +6,77 @@ use wasm_bindgen::prelude::*;
 use crate::Document;
 use crate::format::DocumentFormat;
 
+/// Options for one document: limits, which text is kept, and whether an
+/// incomplete result is an error. `new WasmParseOptions(true)` starts from
+/// tighter limits and makes an incomplete result throw; `set(name, value)`
+/// sets any option by name (see `WasmParseOptions.names()`).
+#[wasm_bindgen]
+pub struct WasmParseOptions {
+    inner: crate::options::ParseOptions,
+}
+
+#[wasm_bindgen]
+impl WasmParseOptions {
+    /// Options holding the defaults, or the strict ones when `strict` is true.
+    #[wasm_bindgen(constructor)]
+    pub fn new(strict: Option<bool>) -> WasmParseOptions {
+        WasmParseOptions {
+            inner: if strict.unwrap_or(false) {
+                crate::options::ParseOptions::strict()
+            } else {
+                crate::options::ParseOptions::default()
+            },
+        }
+    }
+
+    /// Set an option by name. `value` is a number (`Infinity` for no bound), a
+    /// boolean, or for `on_incomplete` the string `"report"` or `"error"`.
+    pub fn set(&mut self, name: &str, value: JsValue) -> Result<(), JsValue> {
+        let bad = |why: &str| JsValue::from_str(&format!("{name}: {why}"));
+        let number = if let Some(flag) = value.as_bool() {
+            u64::from(flag)
+        } else if let Some(text) = value.as_string() {
+            // Words mean one thing for one option each.
+            match (name, text.as_str()) {
+                ("on_incomplete", "report") => 0,
+                ("on_incomplete", "error") => 1,
+                ("on_incomplete", _) => return Err(bad("expected \"report\" or \"error\"")),
+                (_, "max") => u64::MAX,
+                _ => return Err(bad("a string is only accepted as \"max\", or for on_incomplete")),
+            }
+        } else if let Some(n) = value.as_f64() {
+            if n == f64::INFINITY {
+                u64::MAX
+            } else if n.is_nan() || n < 0.0 || n.fract() != 0.0 || n >= 18_446_744_073_709_551_616.0
+            {
+                return Err(bad("expected a non-negative whole number, or Infinity for no bound"));
+            } else {
+                n as u64
+            }
+        } else {
+            return Err(bad("expected a number, boolean or string"));
+        };
+        self.inner
+            .set_option(name, number)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// The names of every option.
+    pub fn names() -> Vec<String> {
+        let mut names = vec![
+            "include_hidden_text".to_string(),
+            "include_deleted_text".to_string(),
+            "on_incomplete".to_string(),
+        ];
+        names.extend(
+            crate::limits::Limits::NAMES
+                .iter()
+                .map(|n| (*n).to_string()),
+        );
+        names
+    }
+}
+
 /// A parsed Office document for use in JavaScript/WASM.
 #[wasm_bindgen]
 pub struct WasmDocument {
@@ -17,12 +88,47 @@ impl WasmDocument {
     /// Create a new document from raw bytes and a format string ("docx", "xlsx", "pptx").
     #[wasm_bindgen(constructor)]
     pub fn new(data: &[u8], format: &str) -> Result<WasmDocument, JsValue> {
+        Self::open(data, format, None)
+    }
+
+    /// Create a document under `options` (a `WasmParseOptions`, which is only
+    /// borrowed: the same object can open any number of documents).
+    #[wasm_bindgen(js_name = "openWith")]
+    pub fn open_with(
+        data: &[u8],
+        format: &str,
+        options: &WasmParseOptions,
+    ) -> Result<WasmDocument, JsValue> {
+        Self::open(data, format, Some(options))
+    }
+
+    fn open(
+        data: &[u8],
+        format: &str,
+        options: Option<&WasmParseOptions>,
+    ) -> Result<WasmDocument, JsValue> {
         let fmt = DocumentFormat::from_extension(format)
             .ok_or_else(|| JsValue::from_str(&format!("unsupported format: {format}")))?;
         let cursor = Cursor::new(data.to_vec());
-        let inner =
-            Document::from_reader(cursor, fmt).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let inner = match options {
+            Some(o) => Document::from_reader_with(cursor, fmt, &o.inner),
+            None => Document::from_reader(cursor, fmt),
+        }
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(WasmDocument { inner })
+    }
+
+    /// What is wrong with the document: an array of `{kind, part, detail}`
+    /// (`kind` is `unreadable_part`, `truncated` or `recovered`); empty for a
+    /// sound document. Converts the document once.
+    pub fn damage(&self) -> Result<JsValue, JsValue> {
+        use serde::Serialize;
+        // `part` is null, not undefined, when unknown.
+        let serializer = serde_wasm_bindgen::Serializer::new().serialize_missing_as_null(true);
+        self.inner
+            .damage()
+            .serialize(&serializer)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Return the format name: "docx", "xlsx", or "pptx".

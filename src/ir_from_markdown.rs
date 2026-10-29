@@ -29,17 +29,88 @@ impl DocumentIR {
     /// let ir = DocumentIR::from_markdown(md, DocumentFormat::Docx);
     /// assert!(!ir.sections.is_empty());
     /// ```
+    ///
+    /// At most `max_markdown_list_items` list items are
+    /// kept (each is about 250 bytes of IR, from as little as four bytes of
+    /// Markdown); the rest are dropped, a notice paragraph ends the last
+    /// section, and `Metadata::text_truncated` and a warning say so.
+    /// The document as a whole is bounded the same way by
+    /// `max_markdown_elements`: past it the rest of the
+    /// Markdown is not read. Table cells have an allowance of their own,
+    /// `max_markdown_table_cells`: the rows of a table past
+    /// it are dropped, with a notice, and the rest of the document is read.
     pub fn from_markdown(markdown: &str, format: DocumentFormat) -> Self {
-        let mut parser = MarkdownParser::new(markdown);
-        let sections = parser.parse_sections();
-        DocumentIR {
-            metadata: Metadata {
-                format,
-                title: None,
-                ..Default::default()
-            },
-            sections,
+        Self::from_markdown_with_limits(
+            markdown,
+            format,
+            crate::limits::max_markdown_list_items(),
+            crate::limits::max_markdown_elements(),
+            crate::limits::max_markdown_table_cells(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_markdown_with_list_limit(
+        markdown: &str,
+        format: DocumentFormat,
+        max_list_items: usize,
+    ) -> Self {
+        Self::from_markdown_with_limits(
+            markdown,
+            format,
+            max_list_items,
+            crate::limits::max_markdown_elements(),
+            crate::limits::max_markdown_table_cells(),
+        )
+    }
+
+    pub(crate) fn from_markdown_with_limits(
+        markdown: &str,
+        format: DocumentFormat,
+        max_list_items: usize,
+        max_elements: usize,
+        max_table_cells: usize,
+    ) -> Self {
+        let mut parser =
+            MarkdownParser::new(markdown, max_list_items, max_elements, max_table_cells);
+        let mut sections = parser.parse_sections();
+        let mut metadata = Metadata {
+            format,
+            title: None,
+            ..Default::default()
+        };
+        let mut notices: Vec<String> = Vec::new();
+        if parser.dropped_list_items > 0 {
+            notices.push(format!(
+                "[{} list item(s) dropped: the document exceeds the {} list item limit]",
+                parser.dropped_list_items, max_list_items
+            ));
         }
+        if parser.dropped_table_rows > 0 {
+            notices.push(format!(
+                "[{} table row(s) dropped: the document's tables exceed the {} cell limit]",
+                parser.dropped_table_rows, max_table_cells
+            ));
+        }
+        if parser.elements_exhausted {
+            notices.push(format!(
+                "[the rest of the document was dropped: it exceeds the {max_elements} block limit]"
+            ));
+        }
+        for notice in notices {
+            metadata.text_truncated = true;
+            metadata.warnings.push(notice.clone());
+            if sections.is_empty() {
+                sections.push(Section::default());
+            }
+            if let Some(last) = sections.last_mut() {
+                last.elements.push(Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(notice))],
+                    ..Default::default()
+                }));
+            }
+        }
+        DocumentIR { metadata, sections }
     }
 }
 
@@ -50,14 +121,58 @@ impl DocumentIR {
 struct MarkdownParser<'a> {
     lines: Vec<&'a str>,
     pos: usize,
+    /// List items still allowed, over the whole document.
+    list_items_left: usize,
+    /// List items read and dropped for want of allowance.
+    dropped_list_items: usize,
+    /// Block allowance still left, over the whole document.
+    elements_left: usize,
+    /// A block did not fit; the rest of the document is not read.
+    elements_exhausted: bool,
+    /// Table cells still allowed, over the whole document.
+    table_cells_left: usize,
+    /// The table-cell allowance ran out.
+    table_cells_exhausted: bool,
+    /// Table rows read and dropped for want of allowance.
+    dropped_table_rows: usize,
+    /// The table just read left nothing to keep (every row was dropped).
+    table_left_out: bool,
 }
 
 impl<'a> MarkdownParser<'a> {
-    fn new(src: &'a str) -> Self {
+    fn new(
+        src: &'a str,
+        max_list_items: usize,
+        max_elements: usize,
+        max_table_cells: usize,
+    ) -> Self {
         Self {
+            elements_left: max_elements,
+            elements_exhausted: false,
+            table_cells_left: max_table_cells,
+            table_cells_exhausted: false,
+            dropped_table_rows: 0,
+            table_left_out: false,
             lines: src.lines().collect(),
             pos: 0,
+            list_items_left: max_list_items,
+            dropped_list_items: 0,
         }
+    }
+
+    /// Spend `cost` blocks of the allowance before a block is built. When
+    /// they do not fit, the allowance is closed for good: the document is
+    /// cut here rather than continued with later, smaller blocks.
+    fn charge(&mut self, cost: usize) -> bool {
+        if self.elements_exhausted {
+            return false;
+        }
+        if cost > self.elements_left {
+            self.elements_exhausted = true;
+            return false;
+        }
+        self.elements_left -= cost;
+        true
     }
 
     fn peek(&self) -> Option<&'a str> {
@@ -81,6 +196,9 @@ impl<'a> MarkdownParser<'a> {
         };
 
         while self.pos < self.lines.len() {
+            if self.elements_exhausted {
+                break;
+            }
             let line = match self.peek() {
                 Some(l) => l,
                 None => break,
@@ -96,6 +214,9 @@ impl<'a> MarkdownParser<'a> {
             // into the text as an ordinary paragraph ("rust let x = 1;") and
             // no Element::CodeBlock was ever produced from markdown.
             if let Some(lang) = fence_language(line) {
+                if !self.charge(1) {
+                    break;
+                }
                 self.advance();
                 let mut body: Vec<String> = Vec::new();
                 while let Some(l) = self.peek() {
@@ -120,9 +241,15 @@ impl<'a> MarkdownParser<'a> {
             // silently swallowed) and, matching this parser's existing page-
             // boundary convention, starts a new section.
             if is_thematic_break(line) {
+                if !self.charge(1) {
+                    break;
+                }
                 self.advance();
                 current.elements.push(Element::ThematicBreak);
                 if !current.elements.is_empty() || current.title.is_some() {
+                    if !self.charge(1) {
+                        break;
+                    }
                     sections.push(current);
                     current = Section {
                         title: None,
@@ -135,10 +262,16 @@ impl<'a> MarkdownParser<'a> {
 
             // ATX heading
             if let Some((level, text)) = parse_atx_heading(line) {
+                if !self.charge(1) {
+                    break;
+                }
                 self.advance();
                 // H1 headings start a new section
                 if level == 1 {
                     if !current.elements.is_empty() || current.title.is_some() {
+                        if !self.charge(1) {
+                            break;
+                        }
                         sections.push(current);
                     }
                     current = Section {
@@ -162,10 +295,21 @@ impl<'a> MarkdownParser<'a> {
                     current.elements.push(Element::Table(table));
                     continue;
                 }
+                if self.elements_exhausted {
+                    break;
+                }
+                if self.table_left_out {
+                    // Its lines are read and reported; what follows is not
+                    // part of it.
+                    continue;
+                }
             }
 
             // Unordered list
             if is_unordered_list_marker(line) {
+                if !self.charge(1) {
+                    break;
+                }
                 let list = self.parse_list(false);
                 current.elements.push(Element::List(list));
                 continue;
@@ -173,12 +317,18 @@ impl<'a> MarkdownParser<'a> {
 
             // Ordered list
             if is_ordered_list_marker(line) {
+                if !self.charge(1) {
+                    break;
+                }
                 let list = self.parse_list(true);
                 current.elements.push(Element::List(list));
                 continue;
             }
 
             // Regular paragraph (accumulate until blank line or block element)
+            if !self.charge(1) {
+                break;
+            }
             let para = self.parse_paragraph();
             if !para.content.is_empty() {
                 current.elements.push(Element::Paragraph(para));
@@ -233,6 +383,7 @@ impl<'a> MarkdownParser<'a> {
     }
 
     fn parse_table(&mut self) -> Option<Table> {
+        self.table_left_out = false;
         // Collect all consecutive pipe lines
         let mut raw: Vec<&'a str> = Vec::new();
         while let Some(line) = self.peek() {
@@ -259,10 +410,24 @@ impl<'a> MarkdownParser<'a> {
             return None;
         }
 
+        // The table is charged as a block, and each row's cells against the
+        // cell allowance, before they are built. A row that does not fit ends
+        // the table there: the rows after it are dropped and counted, and
+        // what follows the table is read as usual.
+        if !self.charge(1) {
+            return None;
+        }
         let mut rows: Vec<TableRow> = Vec::new();
         for (i, row_line) in data_rows.iter().enumerate() {
             let is_header = i == 0;
-            let cells = split_pipe_row(row_line)
+            let cell_texts = split_pipe_row(row_line);
+            if self.table_cells_exhausted || cell_texts.len() > self.table_cells_left {
+                self.table_cells_exhausted = true;
+                self.dropped_table_rows += data_rows.len() - i;
+                break;
+            }
+            self.table_cells_left -= cell_texts.len();
+            let cells = cell_texts
                 .into_iter()
                 .map(|cell_text| {
                     // The header is marked by its rule and `repeat_as_header`,
@@ -294,6 +459,11 @@ impl<'a> MarkdownParser<'a> {
                 repeat_as_header: is_header,
                 ..Default::default()
             });
+        }
+
+        if rows.is_empty() {
+            self.table_left_out = true;
+            return None;
         }
 
         // A Markdown table has no styling of its own; without borders and a
@@ -351,6 +521,11 @@ impl<'a> MarkdownParser<'a> {
                 break;
             }
             self.advance();
+            if self.list_items_left == 0 {
+                self.dropped_list_items += 1;
+                continue;
+            }
+            self.list_items_left -= 1;
             // CommonMark §5.2: an ordered list starts at its first item's
             // number.
             if ordered && items.is_empty() {
@@ -399,11 +574,70 @@ fn border_line(size_eighths_pt: u32) -> BorderLine {
     }
 }
 
+/// Finds the next occurrence of one marker, remembering the last answer.
+///
+/// The inline parser looks for a closing marker from every opener, so an
+/// input of many openers and no closer rescanned the rest of the line each
+/// time. The first occurrence at or after `from` is `hit` (or there is none),
+/// which is also the first occurrence at or after any later start up to
+/// `hit`, so a search that starts inside the remembered range is answered
+/// without scanning. Starts only move forward, so the scans of one marker
+/// cover disjoint stretches of the text and the whole parse is linear.
+struct NextMarker {
+    needle: &'static str,
+    from: usize,
+    hit: Option<usize>,
+    primed: bool,
+}
+
+impl NextMarker {
+    const fn new(needle: &'static str) -> Self {
+        Self {
+            needle,
+            from: 0,
+            hit: None,
+            primed: false,
+        }
+    }
+
+    /// The byte offset in `text` of the first `needle` at or after `start`.
+    fn find(&mut self, text: &str, start: usize) -> Option<usize> {
+        if self.primed && start >= self.from && self.hit.is_none_or(|h| h >= start) {
+            return self.hit;
+        }
+        self.primed = true;
+        self.from = start;
+        self.hit = text[start..].find(self.needle).map(|p| start + p);
+        #[cfg(test)]
+        count_scanned(self.hit.map_or(text.len(), |h| h + self.needle.len()) - start);
+        self.hit
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes the inline marker searches of this thread have scanned.
+    static SCANNED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_scanned(bytes: usize) {
+    SCANNED_BYTES.with(|c| c.set(c.get() + bytes));
+}
+
 fn parse_inline(text: &str) -> Vec<InlineContent> {
     let mut out: Vec<InlineContent> = Vec::new();
     let bytes = text.as_bytes();
     let len = text.len();
     let mut plain_start = 0usize;
+    let mut star2 = NextMarker::new("**");
+    let mut under2 = NextMarker::new("__");
+    let mut star1 = NextMarker::new("*");
+    let mut under1 = NextMarker::new("_");
+    let mut tilde2 = NextMarker::new("~~");
+    let mut tick = NextMarker::new("`");
+    let mut close_bracket = NextMarker::new("]");
+    let mut close_paren = NextMarker::new(")");
 
     macro_rules! flush_plain {
         ($end:expr) => {
@@ -423,8 +657,13 @@ fn parse_inline(text: &str) -> Vec<InlineContent> {
             && ((bytes[i] == b'*' && bytes[i + 1] == b'*')
                 || (bytes[i] == b'_' && bytes[i + 1] == b'_'))
         {
-            let marker = &text[i..i + 2];
-            if let Some(end) = text[i + 2..].find(marker) {
+            let found = if bytes[i] == b'*' {
+                star2.find(text, i + 2)
+            } else {
+                under2.find(text, i + 2)
+            };
+            if let Some(close) = found {
+                let end = close - (i + 2);
                 flush_plain!(i);
                 let inner = &text[i + 2..i + 2 + end];
                 out.push(InlineContent::Text(TextSpan {
@@ -440,8 +679,13 @@ fn parse_inline(text: &str) -> Vec<InlineContent> {
 
         // Italic: *text* or _text_
         if (bytes[i] == b'*' || bytes[i] == b'_') && i + 1 < len && bytes[i + 1] != bytes[i] {
-            let marker = &text[i..i + 1];
-            if let Some(end) = text[i + 1..].find(marker) {
+            let found = if bytes[i] == b'*' {
+                star1.find(text, i + 1)
+            } else {
+                under1.find(text, i + 1)
+            };
+            if let Some(close) = found {
+                let end = close - (i + 1);
                 flush_plain!(i);
                 let inner = &text[i + 1..i + 1 + end];
                 out.push(InlineContent::Text(TextSpan {
@@ -457,7 +701,8 @@ fn parse_inline(text: &str) -> Vec<InlineContent> {
 
         // Strikethrough: ~~text~~
         if i + 1 < len && bytes[i] == b'~' && bytes[i + 1] == b'~' {
-            if let Some(end) = text[i + 2..].find("~~") {
+            if let Some(close) = tilde2.find(text, i + 2) {
+                let end = close - (i + 2);
                 flush_plain!(i);
                 let inner = &text[i + 2..i + 2 + end];
                 out.push(InlineContent::Text(TextSpan {
@@ -473,7 +718,8 @@ fn parse_inline(text: &str) -> Vec<InlineContent> {
 
         // Inline code: `code` — strip backticks, treat as plain
         if bytes[i] == b'`' {
-            if let Some(end) = text[i + 1..].find('`') {
+            if let Some(close) = tick.find(text, i + 1) {
+                let end = close - (i + 1);
                 flush_plain!(i);
                 let inner = &text[i + 1..i + 1 + end];
                 out.push(InlineContent::Text(TextSpan::plain(inner)));
@@ -485,10 +731,12 @@ fn parse_inline(text: &str) -> Vec<InlineContent> {
 
         // Markdown link: [text](url)
         if bytes[i] == b'[' {
-            if let Some(bracket_end) = text[i + 1..].find(']') {
+            if let Some(close) = close_bracket.find(text, i + 1) {
+                let bracket_end = close - (i + 1);
                 let after_bracket = i + 1 + bracket_end + 1;
                 if after_bracket < len && bytes[after_bracket] == b'(' {
-                    if let Some(paren_end) = text[after_bracket + 1..].find(')') {
+                    if let Some(close) = close_paren.find(text, after_bracket + 1) {
+                        let paren_end = close - (after_bracket + 1);
                         flush_plain!(i);
                         let link_text = &text[i + 1..i + 1 + bracket_end];
                         let url = &text[after_bracket + 1..after_bracket + 1 + paren_end];
@@ -626,6 +874,187 @@ fn strip_list_marker(line: &str) -> &str {
 mod tests {
     use super::*;
     use crate::format::DocumentFormat;
+
+    /// The quadratic parser `parse_inline` replaced, kept as the reference
+    /// its output must equal.
+    fn parse_inline_reference(text: &str) -> Vec<InlineContent> {
+        let mut out: Vec<InlineContent> = Vec::new();
+        let bytes = text.as_bytes();
+        let len = text.len();
+        let mut plain_start = 0usize;
+
+        macro_rules! flush_plain {
+            ($end:expr) => {
+                if plain_start < $end {
+                    let t = &text[plain_start..$end];
+                    if !t.is_empty() {
+                        out.push(InlineContent::Text(TextSpan::plain(t)));
+                    }
+                }
+            };
+        }
+
+        let mut i = 0usize;
+        while i < len {
+            // Bold: **text** or __text__
+            if i + 1 < len
+                && ((bytes[i] == b'*' && bytes[i + 1] == b'*')
+                    || (bytes[i] == b'_' && bytes[i + 1] == b'_'))
+            {
+                let marker = &text[i..i + 2];
+                if let Some(end) = text[i + 2..].find(marker) {
+                    flush_plain!(i);
+                    let inner = &text[i + 2..i + 2 + end];
+                    out.push(InlineContent::Text(TextSpan {
+                        text: inner.to_string(),
+                        bold: true,
+                        ..Default::default()
+                    }));
+                    i += 2 + end + 2;
+                    plain_start = i;
+                    continue;
+                }
+            }
+
+            // Italic: *text* or _text_
+            if (bytes[i] == b'*' || bytes[i] == b'_') && i + 1 < len && bytes[i + 1] != bytes[i] {
+                let marker = &text[i..i + 1];
+                if let Some(end) = text[i + 1..].find(marker) {
+                    flush_plain!(i);
+                    let inner = &text[i + 1..i + 1 + end];
+                    out.push(InlineContent::Text(TextSpan {
+                        text: inner.to_string(),
+                        italic: true,
+                        ..Default::default()
+                    }));
+                    i += 1 + end + 1;
+                    plain_start = i;
+                    continue;
+                }
+            }
+
+            // Strikethrough: ~~text~~
+            if i + 1 < len && bytes[i] == b'~' && bytes[i + 1] == b'~' {
+                if let Some(end) = text[i + 2..].find("~~") {
+                    flush_plain!(i);
+                    let inner = &text[i + 2..i + 2 + end];
+                    out.push(InlineContent::Text(TextSpan {
+                        text: inner.to_string(),
+                        strikethrough: true,
+                        ..Default::default()
+                    }));
+                    i += 2 + end + 2;
+                    plain_start = i;
+                    continue;
+                }
+            }
+
+            // Inline code: `code` — strip backticks, treat as plain
+            if bytes[i] == b'`' {
+                if let Some(end) = text[i + 1..].find('`') {
+                    flush_plain!(i);
+                    let inner = &text[i + 1..i + 1 + end];
+                    out.push(InlineContent::Text(TextSpan::plain(inner)));
+                    i += 1 + end + 1;
+                    plain_start = i;
+                    continue;
+                }
+            }
+
+            // Markdown link: [text](url)
+            if bytes[i] == b'[' {
+                if let Some(bracket_end) = text[i + 1..].find(']') {
+                    let after_bracket = i + 1 + bracket_end + 1;
+                    if after_bracket < len && bytes[after_bracket] == b'(' {
+                        if let Some(paren_end) = text[after_bracket + 1..].find(')') {
+                            flush_plain!(i);
+                            let link_text = &text[i + 1..i + 1 + bracket_end];
+                            let url = &text[after_bracket + 1..after_bracket + 1 + paren_end];
+                            out.push(InlineContent::Text(TextSpan {
+                                text: link_text.to_string(),
+                                hyperlink: Some(url.to_string()),
+                                ..Default::default()
+                            }));
+                            i = after_bracket + 1 + paren_end + 1;
+                            plain_start = i;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            i += text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        }
+
+        flush_plain!(len);
+
+        out
+    }
+
+    /// Every string over the characters the inline parser reacts to, up to
+    /// length 8, parses exactly as it did when each opener rescanned the line.
+    #[test]
+    fn test_inline_parse_equals_the_reference_on_all_short_strings() {
+        let alphabet = ['*', '_', '~', '`', '[', ']', '(', ')', 'a', 'é'];
+        let mut buf: Vec<usize> = Vec::new();
+        fn walk(alphabet: &[char], buf: &mut Vec<usize>, max: usize, check: &mut dyn FnMut(&str)) {
+            let s: String = buf.iter().map(|&k| alphabet[k]).collect();
+            check(&s);
+            if buf.len() == max {
+                return;
+            }
+            for k in 0..alphabet.len() {
+                buf.push(k);
+                walk(alphabet, buf, max, check);
+                buf.pop();
+            }
+        }
+        let mut checked = 0usize;
+        walk(&alphabet, &mut buf, 5, &mut |s| {
+            assert_eq!(parse_inline(s), parse_inline_reference(s), "input {s:?}");
+            checked += 1;
+        });
+        // Longer strings from a small alphabet that exercises every marker.
+        let small = ['*', '_', '~', '`', '[', ']', '(', ')'];
+        let mut state = 7u32;
+        for _ in 0..20_000 {
+            let mut s = String::new();
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            for _ in 0..(state >> 28) as usize + 4 {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                s.push(small[(state >> 16) as usize % small.len()]);
+                if state & 0x100 != 0 {
+                    s.push('x');
+                }
+            }
+            assert_eq!(parse_inline(&s), parse_inline_reference(&s), "input {s:?}");
+        }
+        assert!(checked > 100_000);
+    }
+
+    /// An opener with no closer, repeated, used to rescan the rest of the
+    /// line for each one. Counted in bytes the marker searches scan rather
+    /// than in wall-clock time, so it holds on a loaded machine: the work
+    /// stays a small multiple of the input and does not grow faster than it.
+    #[test]
+    fn test_inline_parse_of_unclosed_openers_scans_a_linear_number_of_bytes() {
+        let scanned = |text: &str| {
+            SCANNED_BYTES.with(|c| c.set(0));
+            let out = parse_inline(text);
+            assert!(!out.is_empty());
+            SCANNED_BYTES.with(|c| c.get())
+        };
+        for unit in ["[", "[](", "**", "__", "~~", "`", "*a", "_a", "[a]", "[a]("] {
+            let small = unit.repeat(2_000 / unit.len());
+            let large = unit.repeat(4_000 / unit.len());
+            let (n, n2) = (scanned(&small), scanned(&large));
+            assert!(n <= 4 * small.len(), "{unit:?}: scanned {n} bytes of {}", small.len());
+            assert!(
+                n2 <= 4 * large.len() && n2 <= 3 * n.max(large.len()),
+                "{unit:?}: doubling the input took the scan from {n} to {n2} bytes"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_heading_paragraph() {
@@ -798,5 +1227,219 @@ mod tests {
         let ir = DocumentIR::from_markdown("", DocumentFormat::Docx);
         assert_eq!(ir.sections.len(), 1);
         assert!(ir.sections[0].elements.is_empty());
+    }
+
+    fn item_count(l: &List) -> usize {
+        l.items
+            .iter()
+            .map(|i| 1 + i.nested.as_ref().map_or(0, item_count))
+            .sum()
+    }
+
+    #[test]
+    fn test_list_items_past_the_limit_are_dropped_with_a_notice() {
+        let md = "- x\n".repeat(100) + "\nafter\n";
+        let ir = DocumentIR::from_markdown_with_list_limit(&md, DocumentFormat::Docx, 10);
+        let kept: usize = ir.sections[0]
+            .elements
+            .iter()
+            .map(|e| {
+                if let Element::List(l) = e {
+                    item_count(l)
+                } else {
+                    0
+                }
+            })
+            .sum();
+        assert_eq!(kept, 10);
+        assert!(ir.metadata.text_truncated);
+        assert!(ir.metadata.warnings[0].contains("90 list item(s) dropped"));
+        let text = ir.plain_text();
+        assert!(text.contains("after"), "text after the list is still read");
+        assert!(text.contains("list item limit"), "the notice reaches every renderer");
+    }
+
+    #[test]
+    fn test_nested_and_ordered_items_count_toward_the_limit() {
+        let md = "1. a\n   - b\n   - c\n2. d\n";
+        let ir = DocumentIR::from_markdown_with_list_limit(md, DocumentFormat::Docx, 3);
+        let kept: usize = ir.sections[0]
+            .elements
+            .iter()
+            .map(|e| {
+                if let Element::List(l) = e {
+                    item_count(l)
+                } else {
+                    0
+                }
+            })
+            .sum();
+        assert_eq!(kept, 3);
+        assert!(ir.metadata.text_truncated);
+    }
+
+    #[test]
+    fn test_a_list_within_the_limit_is_untouched() {
+        let ir = DocumentIR::from_markdown_with_list_limit("- a\n- b\n", DocumentFormat::Docx, 2);
+        assert!(!ir.metadata.text_truncated);
+        assert!(ir.metadata.warnings.is_empty());
+    }
+
+    fn block_count(ir: &DocumentIR) -> usize {
+        ir.sections.iter().map(|s| s.elements.len()).sum()
+    }
+
+    fn with_blocks(md: &str, max: usize) -> DocumentIR {
+        DocumentIR::from_markdown_with_limits(md, DocumentFormat::Docx, usize::MAX, max, usize::MAX)
+    }
+
+    #[test]
+    fn test_paragraphs_past_the_block_limit_are_dropped_with_a_notice() {
+        let md = "para\n\n".repeat(100) + "# late\n";
+        let ir = with_blocks(&md, 10);
+        // Ten paragraphs, then the notice.
+        assert_eq!(block_count(&ir), 11);
+        assert!(ir.metadata.text_truncated);
+        assert!(ir.metadata.warnings[0].contains("limit"));
+        assert!(ir.plain_text().contains("block limit"), "the notice reaches every renderer");
+        assert!(!ir.plain_text().contains("late"), "nothing after the cut is read");
+    }
+
+    /// A table of the size a spreadsheet exports to CSV and Markdown is not a
+    /// reason to drop what follows it.
+    #[test]
+    fn test_a_realistic_table_keeps_what_follows_it() {
+        for (rows, cols) in [(1_000usize, 25usize), (4_200, 6)] {
+            let mut md = String::new();
+            md.push_str(&format!(
+                "|{}\n",
+                (0..cols).map(|c| format!(" h{c} |")).collect::<String>()
+            ));
+            md.push_str(&format!("|{}\n", " --- |".repeat(cols)));
+            for r in 0..rows {
+                md.push_str(&format!(
+                    "|{}\n",
+                    (0..cols).map(|c| format!(" {r}x{c} |")).collect::<String>()
+                ));
+            }
+            md.push_str("\nafter the table\n");
+            let ir = DocumentIR::from_markdown(&md, DocumentFormat::Docx);
+            let cells: usize = ir
+                .sections
+                .iter()
+                .flat_map(|s| &s.elements)
+                .filter_map(|e| {
+                    if let Element::Table(t) = e {
+                        Some(t)
+                    } else {
+                        None
+                    }
+                })
+                .map(|t| t.rows.iter().map(|r| r.cells.len()).sum::<usize>())
+                .sum();
+            assert_eq!(cells, (rows + 1) * cols, "{rows} x {cols}: every cell kept");
+            assert!(ir.plain_text().contains("after the table"), "{rows} x {cols}");
+            assert!(!ir.metadata.text_truncated, "{:?}", ir.metadata.warnings);
+        }
+    }
+
+    /// Past the cell limit only the rows that do not fit are cut: the text
+    /// after the table is read, and the cut is reported.
+    #[test]
+    fn test_a_table_past_the_cell_limit_loses_only_its_late_rows() {
+        let mut md = String::from("| a | b |\n| - | - |\n");
+        for r in 0..50 {
+            md.push_str(&format!("| r{r} | x |\n"));
+        }
+        md.push_str("\nafter the table\n");
+        let ir =
+            DocumentIR::from_markdown_with_limits(&md, DocumentFormat::Docx, usize::MAX, 1_000, 20);
+        let table = ir
+            .sections
+            .iter()
+            .flat_map(|s| &s.elements)
+            .find_map(|e| {
+                if let Element::Table(t) = e {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .expect("the table");
+        assert_eq!(table.rows.len(), 10, "20 cells of 2 columns");
+        let text = ir.plain_text();
+        assert!(text.contains("after the table"), "the rest of the document is kept");
+        assert!(text.contains("41 table row(s)"), "{text}");
+        assert!(ir.metadata.text_truncated);
+        assert!(ir.metadata.warnings[0].contains("limit"));
+    }
+
+    /// A first row that alone is over the cell limit leaves no table, and the
+    /// lines after it are still read.
+    #[test]
+    fn test_a_first_row_over_the_cell_limit_leaves_no_table_and_the_rest_is_read() {
+        let md = "| a | b | c | d |\n| - | - | - | - |\n| 1 | 2 | 3 | 4 |\n\nafter\n";
+        let ir =
+            DocumentIR::from_markdown_with_limits(md, DocumentFormat::Docx, usize::MAX, 1_000, 3);
+        assert!(
+            !ir.sections
+                .iter()
+                .flat_map(|s| &s.elements)
+                .any(|e| matches!(e, Element::Table(_)))
+        );
+        assert!(ir.plain_text().contains("after"));
+        assert!(ir.metadata.text_truncated);
+    }
+
+    #[test]
+    fn test_sections_past_the_block_limit_are_dropped() {
+        let md = "---\n".repeat(100);
+        let ir = with_blocks(&md, 10);
+        // Each break is a block and a section: five of each fit.
+        assert!(ir.sections.len() <= 7, "{} sections", ir.sections.len());
+        assert!(ir.metadata.text_truncated);
+    }
+
+    #[test]
+    fn test_table_cells_are_charged_before_the_row_is_built() {
+        let wide = format!("|{}\n", "a|".repeat(2_000));
+        let ir = DocumentIR::from_markdown_with_limits(
+            &wide,
+            DocumentFormat::Docx,
+            usize::MAX,
+            usize::MAX,
+            100,
+        );
+        let cells: usize = ir
+            .sections
+            .iter()
+            .flat_map(|s| &s.elements)
+            .map(|e| match e {
+                Element::Table(t) => t.rows.iter().map(|r| r.cells.len()).sum(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(cells, 0, "a header row of 2,000 cells does not fit 100 cells");
+        assert!(ir.metadata.text_truncated);
+        // A small table fits: two rows of 2 cells.
+        let ir = DocumentIR::from_markdown_with_limits(
+            "|a|b|\n|-|-|\n|c|d|\n",
+            DocumentFormat::Docx,
+            usize::MAX,
+            usize::MAX,
+            4,
+        );
+        assert!(!ir.metadata.text_truncated);
+    }
+
+    #[test]
+    fn test_a_document_within_the_block_limit_is_unchanged() {
+        let md = "# T\n\ntext **b** [l](u)\n\n- a\n- b\n\n|x|y|\n|-|-|\n|1|2|\n\n```\ncode\n```\n\n---\n\nmore\n";
+        let unlimited = with_blocks(md, usize::MAX);
+        // Counted blocks: 2 sections, heading-less paragraphs, list, table,
+        // code, break.
+        assert_eq!(with_blocks(md, 30), unlimited);
+        assert!(!unlimited.metadata.text_truncated);
+        assert!(with_blocks(md, 3).metadata.text_truncated);
     }
 }

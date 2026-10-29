@@ -28,6 +28,7 @@
 //! | `wasm` | wasm-bindgen WASM bindings |
 //! | `mmap` | Memory-mapped file I/O |
 //! | `parallel` | Rayon-based parallel processing |
+//! | `default-password` | Open files Office encrypts with its fixed default password (`VelvetSweatshop`); uses MD5 and RC4, which are not FIPS 140 approved, so it is off by default |
 
 // Sub-modules (previously separate crates)
 /// Library version (matches the Cargo package version).
@@ -74,6 +75,12 @@ pub mod ir_render;
 /// Resource limits for untrusted input (the per-document text budget and
 /// the package-wide entry-count and decompressed-size bounds).
 pub mod limits;
+
+pub mod options;
+
+/// Which text readers return: hidden text and tracked deletions.
+pub mod read_options;
+mod stream;
 
 #[cfg(not(target_family = "wasm"))]
 pub mod ffi;
@@ -215,6 +222,64 @@ where
     }
 }
 
+/// Run the parse of a package embedded in a document, on a thread of its own
+/// that does not wait for a parse slot.
+///
+/// The embedding document's parse holds a slot (or is itself nested inside
+/// one that does) while it waits for this one, so a nested parse that also
+/// waited for a slot would wait for itself: a chain of embedded packages as
+/// long as the pool, or as many documents embedding one package as the pool
+/// has slots, would never finish. The depth of embedding is bounded
+/// ([`limits::max_embedded_depth`]), so the threads are too. The thread
+/// carries the embedding document's account of its embedded packages and
+/// hands it back.
+fn with_nested_parse_stack<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    if !needs_stack_thread() {
+        return f();
+    }
+    let account = std::sync::Arc::new(std::sync::Mutex::new(core::embedded::take_state()));
+    let child_account = account.clone();
+    // The embedding call's own limits and read settings, if it has them, so
+    // the embedded package is read under the same ones.
+    let own_limits = limits::scope_snapshot();
+    let own_read = read_options::scope_snapshot();
+    let spawned = std::thread::Builder::new()
+        .stack_size(PARSE_STACK_SIZE)
+        .spawn(move || {
+            let state = child_account
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            core::embedded::install_state(state);
+            let _limits = limits::LimitsScope::new(own_limits.as_ref());
+            let _read = read_options::ReadScope::new(own_read);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            *child_account.lock().unwrap_or_else(|e| e.into_inner()) = core::embedded::take_state();
+            result
+        });
+    let joined = spawned
+        .map_err(|e| OfficeError::UnsupportedFormat(format!("thread spawn failed: {e}")))
+        .map(|handle| handle.join());
+    // However the nested parse ended, the embedding document's account is
+    // back on this thread.
+    core::embedded::install_state(account.lock().unwrap_or_else(|e| e.into_inner()).take());
+    match joined? {
+        Ok(Ok(result)) => result,
+        Ok(Err(payload)) | Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic payload".to_string());
+            Err(OfficeError::Panic(msg))
+        },
+    }
+}
+
 /// Whether a reader's first bytes are the CFB (compound file) signature.
 ///
 /// Leaves the reader rewound to the start. Thin wrapper around
@@ -271,6 +336,21 @@ macro_rules! dispatch_inner {
 /// A unified document handle supporting DOCX, XLSX, PPTX, DOC, XLS, and PPT formats.
 pub struct Document {
     inner: DocumentInner,
+    /// The size of the file the document was read from, when it is known (0
+    /// when it is not): small inputs get a text budget scaled to them (see
+    /// [`limits::DEFAULT_MAX_TEXT_CHARS`]).
+    input_bytes: u64,
+    /// The options this document was opened with, if it was opened with
+    /// [`Document::open_with`]; every conversion runs under them.
+    options: Option<std::sync::Arc<options::ParseOptions>>,
+}
+
+/// The per-call state a conversion runs under (see [`Document::call_scope`]).
+#[must_use = "the scope ends as soon as it is dropped; bind it for the length of the call"]
+struct CallScope {
+    _limits: limits::LimitsScope,
+    _read: read_options::ReadScope,
+    _input: limits::InputSizeScope,
 }
 
 enum DocumentInner {
@@ -283,11 +363,65 @@ enum DocumentInner {
 }
 
 impl Document {
+    fn new(inner: DocumentInner) -> Self {
+        Self {
+            inner,
+            input_bytes: 0,
+            options: None,
+        }
+    }
+
+    /// The state a conversion of this document runs under: its own limits
+    /// and read settings when it was opened with options, the input size
+    /// either way.
+    fn call_scope(&self) -> CallScope {
+        CallScope {
+            _limits: limits::LimitsScope::new(self.options.as_deref().map(|o| &o.limits)),
+            _read: read_options::ReadScope::new(self.options.as_deref().map(|o| o.read_settings())),
+            _input: limits::InputSizeScope::new(self.input_bytes),
+        }
+    }
+
+    /// This document read from `bytes` bytes of input.
+    fn from_input(mut self, bytes: u64) -> Self {
+        self.input_bytes = bytes;
+        self
+    }
+
+    /// The parts of this OOXML document that could not be read, as `(part,
+    /// reason)`, for the document that embeds it to report: its text carries
+    /// the in-band notices already, but its warnings do not. Bounded as the
+    /// reports are; empty for the legacy formats.
+    pub(crate) fn unreadable_part_pairs(&self) -> Vec<(String, String)> {
+        match &self.inner {
+            DocumentInner::Docx(d) => d
+                .unreadable_parts
+                .iter()
+                .map(|line| match line.split_once(": ") {
+                    Some((part, why)) => (part.to_string(), why.to_string()),
+                    None => (line.clone(), String::new()),
+                })
+                .collect(),
+            DocumentInner::Pptx(d) => d.unreadable_parts.clone(),
+            DocumentInner::Xlsx(d) => d
+                .unreadable_parts
+                .iter()
+                .chain(&d.unreadable_sheets)
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Open a document from a file path. Format is detected from the extension.
     #[must_use = "opening a document allocates — use the returned handle or drop it"]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_owned();
-        with_parse_stack(move || Self::open_inner(&path))
+        let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+        with_parse_stack(move || {
+            let _scale = limits::InputSizeScope::new(bytes);
+            Self::open_inner(&path).map(|doc| doc.from_input(bytes))
+        })
     }
 
     fn open_inner(path: &Path) -> Result<Self> {
@@ -320,6 +454,14 @@ impl Document {
             )
             && is_encrypted_ooxml_cfb(path)
         {
+            #[cfg(feature = "default-password")]
+            match decrypt_default_password(std::fs::File::open(path).ok()) {
+                Ok(Some(package)) => {
+                    return Self::from_reader_inner(std::io::Cursor::new(package), ext_format);
+                },
+                Err(why) => return Err(OfficeError::UnsupportedFormat(why)),
+                Ok(None) => {},
+            }
             return Err(OfficeError::UnsupportedFormat(
                 "the file is a password-protected (encrypted) OOXML package; \
                  decryption is not supported"
@@ -330,21 +472,15 @@ impl Document {
         match format {
             DocumentFormat::Docx => {
                 let doc = docx::DocxDocument::open(path)?;
-                Ok(Self {
-                    inner: DocumentInner::Docx(Box::new(doc)),
-                })
+                Ok(Self::new(DocumentInner::Docx(Box::new(doc))))
             },
             DocumentFormat::Xlsx => {
                 let doc = xlsx::XlsxDocument::open(path)?;
-                Ok(Self {
-                    inner: DocumentInner::Xlsx(Box::new(doc)),
-                })
+                Ok(Self::new(DocumentInner::Xlsx(Box::new(doc))))
             },
             DocumentFormat::Pptx => {
                 let doc = pptx::PptxDocument::open(path)?;
-                Ok(Self {
-                    inner: DocumentInner::Pptx(Box::new(doc)),
-                })
+                Ok(Self::new(DocumentInner::Pptx(Box::new(doc))))
             },
             DocumentFormat::Doc | DocumentFormat::Xls | DocumentFormat::Ppt => {
                 match Self::open_legacy(path, format) {
@@ -372,22 +508,145 @@ impl Document {
 
     fn open_legacy(path: &Path, format: DocumentFormat) -> Result<Self> {
         Ok(match format {
-            DocumentFormat::Doc => Self {
-                inner: DocumentInner::Doc(Box::new(doc::DocDocument::open(path)?)),
+            DocumentFormat::Doc => {
+                Self::new(DocumentInner::Doc(Box::new(doc::DocDocument::open(path)?)))
             },
-            DocumentFormat::Xls => Self {
-                inner: DocumentInner::Xls(Box::new(xls::XlsDocument::open(path)?)),
+            DocumentFormat::Xls => {
+                Self::new(DocumentInner::Xls(Box::new(xls::XlsDocument::open(path)?)))
             },
-            _ => Self {
-                inner: DocumentInner::Ppt(Box::new(ppt::PptDocument::open(path)?)),
-            },
+            _ => Self::new(DocumentInner::Ppt(Box::new(ppt::PptDocument::open(path)?))),
         })
+    }
+
+    /// Open a document under `options` instead of the process-wide limits
+    /// and read settings.
+    ///
+    /// The options stay with the document: its conversions
+    /// ([`Self::plain_text`], [`Self::to_markdown`], [`Self::to_ir`] and the
+    /// rest) run under them too, on any thread. With
+    /// [`OnIncomplete::Error`](options::OnIncomplete::Error) the document is
+    /// converted once at open and refused if the result is known to be
+    /// incomplete (see [`Self::damage`]).
+    #[must_use = "opening a document allocates — use the returned handle or drop it"]
+    pub fn open_with(path: impl AsRef<Path>, options: &options::ParseOptions) -> Result<Self> {
+        let path = path.as_ref().to_owned();
+        let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+        let options = std::sync::Arc::new(options.clone());
+        let own = options.clone();
+        let doc = with_parse_stack(move || {
+            let _limits = limits::LimitsScope::new(Some(&own.limits));
+            let _read = read_options::ReadScope::new(Some(own.read_settings()));
+            let _scale = limits::InputSizeScope::new(bytes);
+            Self::open_inner(&path).map(|doc| doc.from_input(bytes))
+        })?;
+        doc.with_options(options)
+    }
+
+    /// Open a document from any `Read + Seek` source under `options` (see
+    /// [`Self::open_with`]).
+    #[must_use = "opening a document allocates — use the returned handle or drop it"]
+    pub fn from_reader_with<R: Read + Seek + Send + 'static>(
+        reader: R,
+        format: DocumentFormat,
+        options: &options::ParseOptions,
+    ) -> Result<Self> {
+        let options = std::sync::Arc::new(options.clone());
+        let own = options.clone();
+        let doc = with_parse_stack(move || {
+            let _limits = limits::LimitsScope::new(Some(&own.limits));
+            let _read = read_options::ReadScope::new(Some(own.read_settings()));
+            let mut reader = reader;
+            let bytes = limits::stream_len(&mut reader);
+            let _scale = limits::InputSizeScope::new(bytes);
+            Self::from_reader_inner(reader, format).map(|doc| doc.from_input(bytes))
+        })?;
+        doc.with_options(options)
+    }
+
+    /// Keep `options` with this document and, if they ask for an error on an
+    /// incomplete result, check for one now.
+    fn with_options(mut self, options: std::sync::Arc<options::ParseOptions>) -> Result<Self> {
+        let strict = options.on_incomplete == options::OnIncomplete::Error;
+        self.options = Some(options);
+        if strict {
+            let losses: Vec<String> = self
+                .damage()
+                .iter()
+                .filter(|d| d.is_loss())
+                .take(5)
+                .map(ToString::to_string)
+                .collect();
+            if !losses.is_empty() {
+                return Err(OfficeError::Incomplete(losses.join("; ")));
+            }
+        }
+        Ok(self)
+    }
+
+    /// Everything known to be wrong with this document, found by reading it:
+    /// parts that could not be read, output a limit cut or the file's own
+    /// structure shows is missing, and repairs that left the content intact.
+    /// Empty for a sound document.
+    ///
+    /// This converts the document once. [`Damage::is_loss`](options::Damage::is_loss)
+    /// tells a loss from an informational repair.
+    pub fn damage(&self) -> Vec<options::Damage> {
+        use options::{Damage, DamageKind};
+        let mut found: Vec<Damage> = self
+            .unreadable_part_pairs()
+            .into_iter()
+            .map(|(part, detail)| Damage {
+                kind: DamageKind::UnreadablePart,
+                part: Some(part),
+                detail,
+            })
+            .collect();
+        let ir = self.to_ir();
+        let reported_as_part = |warning: &str| {
+            found
+                .iter()
+                .any(|d| d.part.as_deref().is_some_and(|p| warning.contains(p)))
+        };
+        let mut warnings: Vec<Damage> = ir
+            .metadata
+            .warnings
+            .iter()
+            .filter(|w| !reported_as_part(w))
+            .map(|w| Damage {
+                kind: DamageKind::Recovered,
+                part: None,
+                detail: w.clone(),
+            })
+            .collect();
+        if ir.metadata.text_truncated {
+            // The reader's own account of the cut, when it gave one.
+            let detail = ir
+                .metadata
+                .warnings
+                .iter()
+                .find(|w| {
+                    let w = w.to_ascii_lowercase();
+                    w.contains("truncat") || w.contains("limit") || w.contains("cut")
+                })
+                .cloned()
+                .unwrap_or_else(|| "the text is incomplete".to_string());
+            warnings.retain(|d| d.detail != detail);
+            found.push(Damage {
+                kind: DamageKind::Truncated,
+                part: None,
+                detail,
+            });
+        }
+        found.extend(warnings);
+        found
     }
 
     /// Open a document from a file path using memory-mapped I/O.
     #[cfg(feature = "mmap")]
     pub fn open_mmap(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        let bytes = std::fs::metadata(path).map_or(0, |m| m.len());
+        let _scale = limits::InputSizeScope::new(bytes);
         let format = DocumentFormat::from_path(path).ok_or_else(|| {
             OfficeError::UnsupportedFormat(
                 path.extension()
@@ -400,21 +659,15 @@ impl Document {
         match format {
             DocumentFormat::Docx => {
                 let doc = docx::DocxDocument::open_mmap(path)?;
-                Ok(Self {
-                    inner: DocumentInner::Docx(Box::new(doc)),
-                })
+                Ok(Self::new(DocumentInner::Docx(Box::new(doc))).from_input(bytes))
             },
             DocumentFormat::Xlsx => {
                 let doc = xlsx::XlsxDocument::open_mmap(path)?;
-                Ok(Self {
-                    inner: DocumentInner::Xlsx(Box::new(doc)),
-                })
+                Ok(Self::new(DocumentInner::Xlsx(Box::new(doc))).from_input(bytes))
             },
             DocumentFormat::Pptx => {
                 let doc = pptx::PptxDocument::open_mmap(path)?;
-                Ok(Self {
-                    inner: DocumentInner::Pptx(Box::new(doc)),
-                })
+                Ok(Self::new(DocumentInner::Pptx(Box::new(doc))).from_input(bytes))
             },
             _ => Err(OfficeError::UnsupportedFormat(format!("{format:?}"))),
         }
@@ -426,7 +679,26 @@ impl Document {
         reader: R,
         format: DocumentFormat,
     ) -> Result<Self> {
-        with_parse_stack(move || Self::from_reader_inner(reader, format))
+        with_parse_stack(move || {
+            let mut reader = reader;
+            let bytes = limits::stream_len(&mut reader);
+            let _scale = limits::InputSizeScope::new(bytes);
+            Self::from_reader_inner(reader, format).map(|doc| doc.from_input(bytes))
+        })
+    }
+
+    /// Open a package embedded in a document, charging it to that document's
+    /// account (see [`core::embedded`]); never waits for a parse slot.
+    pub(crate) fn from_reader_nested<R: Read + Seek + Send + 'static>(
+        reader: R,
+        format: DocumentFormat,
+    ) -> Result<Self> {
+        with_nested_parse_stack(move || {
+            let mut reader = reader;
+            let bytes = limits::stream_len(&mut reader);
+            let _scale = limits::InputSizeScope::new(bytes);
+            Self::from_reader_inner(reader, format).map(|doc| doc.from_input(bytes))
+        })
     }
 
     fn from_reader_inner<R: Read + Seek>(mut reader: R, format: DocumentFormat) -> Result<Self> {
@@ -437,6 +709,14 @@ impl Document {
         if matches!(format, DocumentFormat::Docx | DocumentFormat::Xlsx | DocumentFormat::Pptx)
             && is_cfb_container(&mut reader)?
         {
+            #[cfg(feature = "default-password")]
+            match decrypt_default_password(Some(&mut reader)) {
+                Ok(Some(package)) => {
+                    return Self::from_reader_inner(std::io::Cursor::new(package), format);
+                },
+                Err(why) => return Err(OfficeError::UnsupportedFormat(why)),
+                Ok(None) => {},
+            }
             return Err(OfficeError::UnsupportedFormat(
                 "the file is a password-protected (encrypted) OOXML package; \
                  decryption is not supported"
@@ -446,21 +726,15 @@ impl Document {
         match format {
             DocumentFormat::Docx => {
                 let doc = docx::DocxDocument::from_reader(reader)?;
-                Ok(Self {
-                    inner: DocumentInner::Docx(Box::new(doc)),
-                })
+                Ok(Self::new(DocumentInner::Docx(Box::new(doc))))
             },
             DocumentFormat::Xlsx => {
                 let doc = xlsx::XlsxDocument::from_reader(reader)?;
-                Ok(Self {
-                    inner: DocumentInner::Xlsx(Box::new(doc)),
-                })
+                Ok(Self::new(DocumentInner::Xlsx(Box::new(doc))))
             },
             DocumentFormat::Pptx => {
                 let doc = pptx::PptxDocument::from_reader(reader)?;
-                Ok(Self {
-                    inner: DocumentInner::Pptx(Box::new(doc)),
-                })
+                Ok(Self::new(DocumentInner::Pptx(Box::new(doc))))
             },
             DocumentFormat::Doc | DocumentFormat::Xls | DocumentFormat::Ppt => {
                 match Self::legacy_from_reader(&mut reader, format) {
@@ -483,15 +757,13 @@ impl Document {
             .seek(std::io::SeekFrom::Start(0))
             .map_err(core::Error::from)?;
         Ok(match format {
-            DocumentFormat::Doc => Self {
-                inner: DocumentInner::Doc(Box::new(doc::DocDocument::from_reader(reader)?)),
+            DocumentFormat::Doc => {
+                Self::new(DocumentInner::Doc(Box::new(doc::DocDocument::from_reader(reader)?)))
             },
-            DocumentFormat::Xls => Self {
-                inner: DocumentInner::Xls(Box::new(xls::XlsDocument::from_reader(reader)?)),
+            DocumentFormat::Xls => {
+                Self::new(DocumentInner::Xls(Box::new(xls::XlsDocument::from_reader(reader)?)))
             },
-            _ => Self {
-                inner: DocumentInner::Ppt(Box::new(ppt::PptDocument::from_reader(reader)?)),
-            },
+            _ => Self::new(DocumentInner::Ppt(Box::new(ppt::PptDocument::from_reader(reader)?))),
         })
     }
 
@@ -509,11 +781,13 @@ impl Document {
 
     /// Extract plain text using the format-specific implementation.
     pub fn plain_text(&self) -> String {
+        let _scale = self.call_scope();
         dispatch_inner!(self, plain_text)
     }
 
     /// Convert to markdown using the format-specific implementation.
     pub fn to_markdown(&self) -> String {
+        let _scale = self.call_scope();
         dispatch_inner!(self, to_markdown)
     }
 
@@ -522,13 +796,45 @@ impl Document {
     /// Unlike [`Self::to_markdown`], which uses the format-specific
     /// renderer, this goes through the IR so that options such as
     /// [`ir_render::ImageEmbed::Base64`] apply uniformly to every format.
+    ///
+    /// A spreadsheet is converted and rendered one sheet at a time, so only
+    /// one sheet's IR exists at once (see
+    /// [`xlsx::XlsxDocument::sheets_ir`]).
+    ///
+    /// # Allowances for a spreadsheet
+    ///
+    /// This path converts one sheet at a time, so the allowances that bound
+    /// the IR's memory are a sheet's own, fresh for each sheet:
+    /// `max_sheet_ir_padding_bytes` for the empty cells that pad
+    /// its rows and `max_image_bytes` for the picture bytes it
+    /// copies. The text budget ([`limits::max_text_chars`]) and the total of
+    /// picture bytes copied (`max_total_image_bytes`) are
+    /// document-wide. [`Self::to_ir`] holds every sheet at once and keeps
+    /// document-wide allowances for the padding and the pictures
+    /// (`max_ir_padding_bytes`, `max_image_bytes` for the
+    /// whole document), so a workbook that fits sheet by sheet but not as a
+    /// whole is rendered whole here and cut there. What is cut is said in the
+    /// content in both (a notice where the cut is); this path has no metadata
+    /// to return, so the cut sheets' `SheetIr::warnings` and
+    /// `SheetIr::text_truncated` are only available from
+    /// [`xlsx::XlsxDocument::sheets_ir`].
     pub fn to_markdown_with(&self, options: ir_render::MarkdownOptions) -> String {
-        self.to_ir().to_markdown_with(options)
+        let _scale = self.call_scope();
+        match &self.inner {
+            DocumentInner::Xlsx(doc) => {
+                ir_render::markdown_from_sections(doc.sheets_ir().map(|s| s.section), options)
+            },
+            _ => self.to_ir().to_markdown_with(options),
+        }
     }
 
     /// Convert to an HTML fragment.
+    ///
+    /// A spreadsheet is converted and rendered one sheet at a time (see
+    /// [`Self::to_html_with`]).
     pub fn to_html(&self) -> String {
-        self.to_ir().to_html()
+        let _scale = self.call_scope();
+        self.to_html_with(ir_render::HtmlOptions::default())
     }
 
     /// Convert to an HTML fragment with explicit rendering options.
@@ -536,12 +842,151 @@ impl Document {
     /// With [`ir_render::ImageEmbed::Base64`] the fragment carries its
     /// images inline as `data:` URIs, so it renders standalone — the
     /// counterpart of [`Self::to_markdown_with`].
+    ///
+    /// A spreadsheet is converted and rendered one sheet at a time, so only
+    /// one sheet's IR exists at once (see
+    /// [`xlsx::XlsxDocument::sheets_ir`]).
+    ///
+    /// # Allowances for a spreadsheet
+    ///
+    /// This path converts one sheet at a time, so the allowances that bound
+    /// the IR's memory are a sheet's own, fresh for each sheet:
+    /// `max_sheet_ir_padding_bytes` for the empty cells that pad
+    /// its rows and `max_image_bytes` for the picture bytes it
+    /// copies. The text budget ([`limits::max_text_chars`]) and the total of
+    /// picture bytes copied (`max_total_image_bytes`) are
+    /// document-wide. [`Self::to_ir`] holds every sheet at once and keeps
+    /// document-wide allowances for the padding and the pictures
+    /// (`max_ir_padding_bytes`, `max_image_bytes` for the
+    /// whole document), so a workbook that fits sheet by sheet but not as a
+    /// whole is rendered whole here and cut there. What is cut is said in the
+    /// content in both (a notice where the cut is); this path has no metadata
+    /// to return, so the cut sheets' `SheetIr::warnings` and
+    /// `SheetIr::text_truncated` are only available from
+    /// [`xlsx::XlsxDocument::sheets_ir`].
     pub fn to_html_with(&self, options: ir_render::HtmlOptions) -> String {
-        self.to_ir().to_html_with(options)
+        let _scale = self.call_scope();
+        match &self.inner {
+            DocumentInner::Xlsx(doc) => {
+                ir_render::html_from_sections(doc.sheets_ir().map(|s| s.section), options)
+            },
+            _ => self.to_ir().to_html_with(options),
+        }
+    }
+
+    /// Write [`Self::plain_text`] to `out`. A spreadsheet is written as it is
+    /// produced, so the text is never held in memory; the other formats
+    /// build it first.
+    pub fn write_plain_text<W: std::io::Write + ?Sized>(&self, out: &mut W) -> std::io::Result<()> {
+        let _scale = self.call_scope();
+        match &self.inner {
+            DocumentInner::Xlsx(doc) => doc.write_plain_text(out),
+            _ => out.write_all(self.plain_text().as_bytes()),
+        }
+    }
+
+    /// Write [`Self::to_markdown`] to `out`. A spreadsheet is written as it is
+    /// produced, so the Markdown is never held in memory; the other formats
+    /// build it first.
+    pub fn write_markdown<W: std::io::Write + ?Sized>(&self, out: &mut W) -> std::io::Result<()> {
+        let _scale = self.call_scope();
+        match &self.inner {
+            DocumentInner::Xlsx(doc) => doc.write_markdown(out),
+            _ => out.write_all(self.to_markdown().as_bytes()),
+        }
+    }
+
+    /// Write [`Self::to_markdown_with`] to `out`. A spreadsheet is converted
+    /// and written a sheet at a time; the other formats build it first.
+    ///
+    /// # Allowances for a spreadsheet
+    ///
+    /// This path converts one sheet at a time, so the allowances that bound
+    /// the IR's memory are a sheet's own, fresh for each sheet:
+    /// `max_sheet_ir_padding_bytes` for the empty cells that pad
+    /// its rows and `max_image_bytes` for the picture bytes it
+    /// copies. The text budget ([`limits::max_text_chars`]) and the total of
+    /// picture bytes copied (`max_total_image_bytes`) are
+    /// document-wide. [`Self::to_ir`] holds every sheet at once and keeps
+    /// document-wide allowances for the padding and the pictures
+    /// (`max_ir_padding_bytes`, `max_image_bytes` for the
+    /// whole document), so a workbook that fits sheet by sheet but not as a
+    /// whole is rendered whole here and cut there. What is cut is said in the
+    /// content in both (a notice where the cut is); this path has no metadata
+    /// to return, so the cut sheets' `SheetIr::warnings` and
+    /// `SheetIr::text_truncated` are only available from
+    /// [`xlsx::XlsxDocument::sheets_ir`].
+    pub fn write_markdown_with<W: std::io::Write + ?Sized>(
+        &self,
+        options: ir_render::MarkdownOptions,
+        out: &mut W,
+    ) -> std::io::Result<()> {
+        let _scale = self.call_scope();
+        match &self.inner {
+            DocumentInner::Xlsx(doc) => stream::render_to_io(out, |sink| {
+                ir_render::write_markdown_sections(
+                    doc.sheets_ir().map(|s| s.section),
+                    options,
+                    sink,
+                )
+            }),
+            _ => out.write_all(self.to_ir().to_markdown_with(options).as_bytes()),
+        }
+    }
+
+    /// Write [`Self::to_html`] to `out`. A spreadsheet is converted and
+    /// written a sheet at a time; the other formats build it first.
+    pub fn write_html<W: std::io::Write + ?Sized>(&self, out: &mut W) -> std::io::Result<()> {
+        let _scale = self.call_scope();
+        self.write_html_with(ir_render::HtmlOptions::default(), out)
+    }
+
+    /// Write [`Self::to_html_with`] to `out`. A spreadsheet is converted and
+    /// written a sheet at a time; the other formats build it first.
+    ///
+    /// # Allowances for a spreadsheet
+    ///
+    /// This path converts one sheet at a time, so the allowances that bound
+    /// the IR's memory are a sheet's own, fresh for each sheet:
+    /// `max_sheet_ir_padding_bytes` for the empty cells that pad
+    /// its rows and `max_image_bytes` for the picture bytes it
+    /// copies. The text budget ([`limits::max_text_chars`]) and the total of
+    /// picture bytes copied (`max_total_image_bytes`) are
+    /// document-wide. [`Self::to_ir`] holds every sheet at once and keeps
+    /// document-wide allowances for the padding and the pictures
+    /// (`max_ir_padding_bytes`, `max_image_bytes` for the
+    /// whole document), so a workbook that fits sheet by sheet but not as a
+    /// whole is rendered whole here and cut there. What is cut is said in the
+    /// content in both (a notice where the cut is); this path has no metadata
+    /// to return, so the cut sheets' `SheetIr::warnings` and
+    /// `SheetIr::text_truncated` are only available from
+    /// [`xlsx::XlsxDocument::sheets_ir`].
+    pub fn write_html_with<W: std::io::Write + ?Sized>(
+        &self,
+        options: ir_render::HtmlOptions,
+        out: &mut W,
+    ) -> std::io::Result<()> {
+        let _scale = self.call_scope();
+        match &self.inner {
+            DocumentInner::Xlsx(doc) => stream::render_to_io(out, |sink| {
+                ir_render::write_html_sections(doc.sheets_ir().map(|s| s.section), options, sink)
+            }),
+            _ => out.write_all(self.to_ir().to_html_with(options).as_bytes()),
+        }
     }
 
     /// Convert to the format-agnostic Document IR.
+    ///
+    /// A spreadsheet is converted whole, so its allowances are
+    /// document-wide: `max_ir_padding_bytes` for the padding cells,
+    /// `max_image_bytes` for all of the document's pictures and
+    /// [`limits::max_text_chars`] for its text. The streaming methods
+    /// ([`Self::to_markdown_with`], [`Self::to_html_with`] and the
+    /// `write_*_with` methods) convert a sheet at a time with a sheet's own
+    /// padding and picture allowances instead. Here every cut is in the
+    /// content and in `Metadata::warnings` and `Metadata::text_truncated`.
     pub fn to_ir(&self) -> DocumentIR {
+        let _scale = self.call_scope();
         match &self.inner {
             DocumentInner::Docx(doc) => convert_docx::docx_to_ir(doc),
             DocumentInner::Xlsx(doc) => convert_xlsx::xlsx_to_ir(doc),
@@ -614,6 +1059,8 @@ impl Document {
                     .to_string(),
             )
         })?;
+        // The write runs under this document's limits as well as the read.
+        let _scale = self.call_scope();
         let ir = self.to_ir();
         create::create_from_ir(&ir, target_format, path)?;
         Ok(())
@@ -643,6 +1090,55 @@ fn is_encrypted_ooxml_cfb(path: &Path) -> bool {
         return false;
     };
     reader.has_stream("EncryptionInfo") && reader.has_stream("EncryptedPackage")
+}
+
+/// The zip inside an encrypted OOXML compound file when one of Office's
+/// default passwords opens it; `None` when the file needs a real password,
+/// is not encrypted, or uses a scheme this reader does not implement (the
+/// caller then refuses it as before).
+#[cfg(feature = "default-password")]
+fn decrypt_default_password<R: Read + Seek>(
+    source: Option<R>,
+) -> std::result::Result<Option<Vec<u8>>, String> {
+    use core::offcrypto::Failure;
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let Ok(mut reader) = crate::cfb::CfbReader::new(source) else {
+        return Ok(None);
+    };
+    if !(reader.has_stream("EncryptionInfo") && reader.has_stream("EncryptedPackage")) {
+        return Ok(None);
+    }
+    let (Ok(info), Ok(package)) =
+        (reader.open_stream("EncryptionInfo"), reader.open_stream("EncryptedPackage"))
+    else {
+        return Err(
+            "the file is an encrypted OOXML package whose encryption streams cannot be read".into(),
+        );
+    };
+    match core::offcrypto::decrypt_package(&info, &package) {
+        // The payload must be the zip itself. Reopening it goes through the
+        // same entry point, so a payload that is another encrypted container
+        // would be decrypted again, to a depth the file chooses.
+        Ok(zip) if zip.starts_with(b"PK") => Ok(Some(zip)),
+        Ok(_) => Err(
+            "the file is an encrypted OOXML package whose decrypted payload is not a zip package"
+                .into(),
+        ),
+        Err(Failure::NeedsPassword) => Err(
+            "the file is a password-protected (encrypted) OOXML package; its password is not \
+             Office's default one, so it cannot be opened"
+                .into(),
+        ),
+        Err(Failure::Unsupported(what)) => Err(format!(
+            "the file is an encrypted OOXML package that uses encryption this reader does not \
+             support ({what})"
+        )),
+        Err(Failure::Malformed(what)) => Err(format!(
+            "the file is an encrypted OOXML package whose encryption header is damaged ({what})"
+        )),
+    }
 }
 
 fn sniff_format(path: &Path, ext_format: DocumentFormat) -> DocumentFormat {
@@ -797,9 +1293,12 @@ mod tests {
         std::fs::remove_file(&path).ok();
         let err = result.err().expect("expected an Err");
         let msg = err.to_string();
+        // The fixture's encryption streams are empty: without the
+        // `default-password` feature the file is "password-protected"; with
+        // it, the reader looks at the streams and says they are damaged.
         assert!(
-            msg.contains("password-protected"),
-            "expected a friendly password-protected message, got: {msg}"
+            msg.contains("password-protected") || msg.contains("encrypted OOXML package"),
+            "expected a friendly encrypted-package message, got: {msg}"
         );
     }
 
@@ -822,9 +1321,12 @@ mod tests {
             .err()
             .expect("expected an Err, not a silently empty presentation");
         let msg = err.to_string();
+        // The fixture's encryption streams are empty: without the
+        // `default-password` feature the file is "password-protected"; with
+        // it, the reader looks at the streams and says they are damaged.
         assert!(
-            msg.contains("password-protected"),
-            "expected a friendly password-protected message, got: {msg}"
+            msg.contains("password-protected") || msg.contains("encrypted OOXML package"),
+            "expected a friendly encrypted-package message, got: {msg}"
         );
     }
 

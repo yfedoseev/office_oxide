@@ -65,7 +65,10 @@ pub struct Slide {
     /// structured `TextBody` (same model ordinary slide body text uses)
     /// rather than flattened text, so bold/italic/bullets/numbering in
     /// notes survive through to the IR.
-    pub notes: Option<TextBody>,
+    ///
+    /// Shared (`Arc`): several slides can relate to one notes part, which
+    /// is then parsed and held once.
+    pub notes: Option<std::sync::Arc<TextBody>>,
     /// Solid background colour (RGB) extracted from the slide's
     /// `<p:cSld><p:bg><p:bgPr><a:solidFill>` element. Only the solid
     /// case is parsed; gradient / image / theme-reference fills are
@@ -75,8 +78,11 @@ pub struct Slide {
     /// content is still extracted, but a consumer can now tell that the
     /// author excluded it, which was impossible before.
     pub hidden: bool,
-    /// Comments attached to this slide, from `ppt/comments/*.xml`.
-    pub comments: Vec<SlideComment>,
+    /// The comments parts this slide names, from `ppt/comments/*.xml`, each
+    /// shared: every slide that names a part holds the same allocation, and a
+    /// slide that names several holds each, never a concatenation of them. Read
+    /// them through [`Slide::comments`].
+    pub comment_parts: Vec<std::sync::Arc<[SlideComment]>>,
     /// Why this slide's part could not be read, when it could not. The
     /// slide keeps its place in the deck with no content, so every
     /// renderer can show a notice where it was; the part and the reason are
@@ -108,6 +114,12 @@ fn make_content_reader(xml_data: &[u8]) -> quick_xml::Reader<&[u8]> {
 }
 
 impl Slide {
+    /// Every comment on this slide, part by part in the order the slide names
+    /// them.
+    pub fn comments(&self) -> impl Iterator<Item = &SlideComment> {
+        self.comment_parts.iter().flat_map(|part| part.iter())
+    }
+
     /// Parse a slide from its XML data.
     ///
     /// `media` maps an image relationship id to its bytes and format;
@@ -118,8 +130,8 @@ impl Slide {
         xml_data: &[u8],
         name: String,
         rels: &Relationships,
-        media: &std::collections::HashMap<String, (Vec<u8>, String)>,
-        part_text: &std::collections::HashMap<String, Vec<String>>,
+        media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
+        part_text: &PartText,
     ) -> CoreResult<Self> {
         let mut reader = make_content_reader(xml_data);
         let mut shapes = Vec::new();
@@ -156,7 +168,7 @@ impl Slide {
             notes: None,
             background_rgb,
             hidden,
-            comments: Vec::new(),
+            comment_parts: Vec::new(),
             parse_error: None,
             layout_index: None,
             hide_master_shapes,
@@ -235,8 +247,8 @@ fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
 fn parse_shape_tree(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-    media: &std::collections::HashMap<String, (Vec<u8>, String)>,
-    part_text: &std::collections::HashMap<String, Vec<String>>,
+    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
+    part_text: &PartText,
 ) -> CoreResult<Vec<Shape>> {
     parse_shape_tree_until(reader, rels, media, part_text, "spTree")
 }
@@ -247,8 +259,8 @@ fn parse_shape_tree(
 fn parse_shape_tree_until(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-    media: &std::collections::HashMap<String, (Vec<u8>, String)>,
-    part_text: &std::collections::HashMap<String, Vec<String>>,
+    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
+    part_text: &PartText,
     end_local: &str,
 ) -> CoreResult<Vec<Shape>> {
     let mut shapes = Vec::new();
@@ -290,8 +302,8 @@ fn parse_shape_tree_until(
 fn parse_alternate_content(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-    media: &std::collections::HashMap<String, (Vec<u8>, String)>,
-    part_text: &std::collections::HashMap<String, Vec<String>>,
+    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
+    part_text: &PartText,
 ) -> CoreResult<Vec<Shape>> {
     let mut shapes: Vec<Shape> = Vec::new();
     let mut have_choice = false;
@@ -390,7 +402,7 @@ fn parse_auto_shape(
 fn parse_picture(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-    media: &std::collections::HashMap<String, (Vec<u8>, String)>,
+    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
 ) -> CoreResult<Shape> {
     let mut props = NvPicProps::default();
     let mut position = None;
@@ -430,7 +442,7 @@ fn parse_picture(
         .link
         .as_deref()
         .and_then(|rid| rels.get_by_id(rid))
-        .map(|rel| rel.target.clone());
+        .map(|rel| std::sync::Arc::clone(&rel.target));
 
     Ok(Shape::Picture(PictureShape {
         id: props.id,
@@ -527,8 +539,8 @@ fn read_rel_attr(e: &quick_xml::events::BytesStart, local: &str) -> CoreResult<O
 fn parse_group_shape(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-    media: &std::collections::HashMap<String, (Vec<u8>, String)>,
-    part_text: &std::collections::HashMap<String, Vec<String>>,
+    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
+    part_text: &PartText,
 ) -> CoreResult<Shape> {
     // Groups nest, so this is the recursion an adversarial deck drives.
     // Past the limit the subtree is skipped: a stack overflow aborts the
@@ -630,14 +642,24 @@ fn collect_a_t_text(
     Ok(out)
 }
 
+/// Relationship id → the text lines of the chart or SmartArt data part it
+/// names. A part is read once and its lines are shared by every reference,
+/// so a part named by thousands of frames or slides costs one copy.
+pub(crate) type PartText = std::collections::HashMap<String, std::sync::Arc<[String]>>;
+
 /// The text of a SmartArt data part (`ppt/diagrams/dataN.xml`,
 /// `<dgm:dataModel>`, ECMA-376 Part 1 §21.4.3): one line per non-empty
 /// paragraph of each point's `<dgm:t>` body, in point-list order. The runs
 /// of one paragraph are joined without a separator — a word split across
 /// runs stays one word.
-pub(crate) fn diagram_data_text_lines(xml_data: &[u8]) -> Vec<String> {
+///
+/// Also says why the part could not be read to its end (`None` when it
+/// could): the lines are then what came before the damage.
+pub(crate) fn diagram_data_text_lines(xml_data: &[u8]) -> (Vec<String>, Option<String>) {
     let mut reader = make_content_reader(xml_data);
     let mut lines = Vec::new();
+    let mut depth = 0usize;
+    let damage;
     let mut in_point_text = 0u32;
     let mut current = String::new();
     loop {
@@ -645,16 +667,24 @@ pub(crate) fn diagram_data_text_lines(xml_data: &[u8]) -> Vec<String> {
             Ok(Event::Start(ref e)) => match e.local_name().as_ref() {
                 // `t` is both the point's text body (`dgm:t`) and a run's
                 // text (`a:t`); the outer one is told apart by nesting.
-                "t" if in_point_text == 0 => in_point_text = 1,
+                "t" if in_point_text == 0 => {
+                    in_point_text = 1;
+                    depth += 1;
+                },
                 "t" => {
                     if let Ok(t) = xml::read_text_content_fast(&mut reader) {
                         current.push_str(&t);
                     }
                 },
-                _ if in_point_text > 0 => in_point_text += 1,
-                _ => {},
+                _ if in_point_text > 0 => {
+                    in_point_text += 1;
+                    depth += 1;
+                },
+                _ => depth += 1,
             },
+            Ok(Event::End(_)) if in_point_text == 0 => depth = depth.saturating_sub(1),
             Ok(Event::End(ref e)) if in_point_text > 0 => {
+                depth = depth.saturating_sub(1);
                 in_point_text -= 1;
                 if matches!(e.local_name().as_ref(), "p" | "t") {
                     let line = current.trim();
@@ -664,11 +694,19 @@ pub(crate) fn diagram_data_text_lines(xml_data: &[u8]) -> Vec<String> {
                     current.clear();
                 }
             },
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => {
+                damage = (depth > 0 || in_point_text > 0)
+                    .then(|| "the XML ends inside an open element".to_string());
+                break;
+            },
+            Err(e) => {
+                damage = Some(format!("the XML is malformed: {e}"));
+                break;
+            },
             _ => {},
         }
     }
-    lines
+    (lines, damage)
 }
 
 /// Find a part reference inside a `<a:graphicData>` subtree — the first
@@ -724,7 +762,7 @@ fn find_part_rid(
 /// resolved against the slide's pre-read images.
 fn parse_ole_graphic_data(
     reader: &mut quick_xml::Reader<&[u8]>,
-    media: &std::collections::HashMap<String, (Vec<u8>, String)>,
+    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
 ) -> CoreResult<GraphicContent> {
     let mut ole = OleObject {
         prog_id: None,
@@ -751,7 +789,7 @@ fn parse_ole_graphic_data(
                         if let Some((bytes, ext)) =
                             read_blip_embed_attr(e)?.and_then(|rid| media.get(&rid))
                         {
-                            ole.preview_data = Some(bytes.clone());
+                            ole.preview_data = Some(std::sync::Arc::clone(bytes));
                             ole.preview_format = Some(ext.clone());
                         }
                     },
@@ -781,8 +819,8 @@ fn parse_ole_graphic_data(
 fn parse_graphic_frame(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-    media: &std::collections::HashMap<String, (Vec<u8>, String)>,
-    part_text: &std::collections::HashMap<String, Vec<String>>,
+    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
+    part_text: &PartText,
 ) -> CoreResult<Shape> {
     let mut id = 0u32;
     let mut name = String::new();
@@ -851,7 +889,7 @@ fn parse_graphic_frame(
                             content = if texts.is_empty() {
                                 GraphicContent::Unknown
                             } else {
-                                GraphicContent::Text(texts)
+                                GraphicContent::Text(texts.into())
                             };
                         }
                     },
@@ -1151,7 +1189,7 @@ fn parse_nv_pic_props(
         let external = rel.target_mode == TargetMode::External;
         props.media = Some(MediaReference {
             kind,
-            target: rel.target.clone(),
+            target: std::sync::Arc::clone(&rel.target),
             external,
         });
     }
@@ -1682,13 +1720,13 @@ fn parse_hlink_click(
     let resolved = r_id.as_deref().and_then(|id| rels.get_by_id(id));
     let target = if let Some(rel) = resolved {
         if rel.target_mode == TargetMode::External {
-            HyperlinkTarget::External(rel.target.clone())
+            HyperlinkTarget::External(std::sync::Arc::clone(&rel.target))
         } else {
-            HyperlinkTarget::Internal(rel.target.clone())
+            HyperlinkTarget::Internal(std::sync::Arc::clone(&rel.target))
         }
     } else if let Some(ref action) = action {
         // Internal action like ppaction://hlinksldjump
-        HyperlinkTarget::Internal(action.to_string())
+        HyperlinkTarget::Internal(action.as_ref().into())
     } else {
         return Ok(None);
     };
@@ -1868,6 +1906,12 @@ fn parse_table_cell(
 // Notes text extraction (used by lib.rs)
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+thread_local! {
+    /// How many comments parts this thread has parsed (tests only).
+    pub(crate) static COMMENT_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Parse a slide comments part.
 ///
 /// Handles both shapes PowerPoint writes: the legacy
@@ -1877,10 +1921,15 @@ fn parse_table_cell(
 /// a comment of their own, after the comment they answer. `authors` maps an
 /// author id to its display name — read from the presentation's
 /// comment-authors / authors part, see [`parse_comment_authors`].
+///
+/// A part that is not well-formed gives the comments read before the damage
+/// and, second, why reading stopped.
 pub(crate) fn parse_comments(
     xml_data: &[u8],
     authors: &std::collections::HashMap<String, String>,
-) -> Vec<SlideComment> {
+) -> (Vec<SlideComment>, Option<String>) {
+    #[cfg(test)]
+    COMMENT_PARSES.with(|n| n.set(n.get() + 1));
     /// One open `cm` or `reply` element.
     struct Frame {
         author_id: Option<String>,
@@ -1902,6 +1951,7 @@ pub(crate) fn parse_comments(
     let mut reader = make_content_reader(xml_data);
     let mut out = Vec::new();
     let mut frames: Vec<Frame> = Vec::new();
+    let mut error = None;
 
     loop {
         match reader.read_event() {
@@ -1965,20 +2015,30 @@ pub(crate) fn parse_comments(
                 },
                 _ => {},
             },
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                error = Some(e.to_string());
+                break;
+            },
             _ => {},
         }
     }
-    out
+    (out, error)
 }
 
 /// Parse a comment-authors part into `id → name`: the legacy
 /// `<p:cmAuthorLst><p:cmAuthor id="0" name="…"/>` (ECMA-376 Part 1
 /// §19.4.2) or the modern `<p188:authorLst><p188:author id="{guid}"
 /// name="…"/>` ([MS-PPTX] authors part).
-pub(crate) fn parse_comment_authors(xml_data: &[u8]) -> std::collections::HashMap<String, String> {
+///
+/// A part that is not well-formed gives the authors read before the damage
+/// and, second, why reading stopped.
+pub(crate) fn parse_comment_authors(
+    xml_data: &[u8],
+) -> (std::collections::HashMap<String, String>, Option<String>) {
     let mut reader = make_content_reader(xml_data);
     let mut authors = std::collections::HashMap::new();
+    let mut error = None;
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e))
@@ -1990,11 +2050,15 @@ pub(crate) fn parse_comment_authors(xml_data: &[u8]) -> std::collections::HashMa
                     authors.insert(id.into_owned(), name.into_owned());
                 }
             },
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                error = Some(e.to_string());
+                break;
+            },
             _ => {},
         }
     }
-    authors
+    (authors, error)
 }
 
 /// Extract the speaker notes body from a notes slide XML. Finds the
@@ -2070,6 +2134,26 @@ pub(crate) fn extract_plain_text_from_body(body: &TextBody) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    const DIAGRAM_HEAD: &str = r#"<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><dgm:ptLst><dgm:pt><dgm:t><a:p><a:r><a:t>first point</a:t></a:r></a:p></dgm:t></dgm:pt>"#;
+
+    #[test]
+    fn test_a_sound_diagram_part_reports_no_damage() {
+        let xml = format!("{DIAGRAM_HEAD}</dgm:ptLst></dgm:dataModel>");
+        let (lines, damage) = diagram_data_text_lines(xml.as_bytes());
+        assert_eq!(lines, vec!["first point".to_string()]);
+        assert_eq!(damage, None);
+    }
+
+    #[test]
+    fn test_a_damaged_diagram_part_keeps_what_came_first_and_says_it_was_cut() {
+        for tail in ["<dgm:pt><dgm:t><a:p><a:r", "<dgm:pt><<", "<dgm:pt>"] {
+            let xml = format!("{DIAGRAM_HEAD}{tail}");
+            let (lines, damage) = diagram_data_text_lines(xml.as_bytes());
+            assert_eq!(lines, vec!["first point".to_string()], "{tail}");
+            assert!(damage.is_some(), "{tail}");
+        }
+    }
     use super::*;
 
     fn make_slide_xml(body: &str) -> Vec<u8> {
@@ -2204,6 +2288,7 @@ mod tests {
             None,
         );
         let doc = crate::pptx::PptxDocument {
+            input_bytes: 0,
             presentation: crate::pptx::PresentationInfo {
                 slides: Vec::new(),
                 slide_size: None,
@@ -2215,6 +2300,8 @@ mod tests {
             app_properties: None,
             has_macros: false,
             unreadable_parts: Vec::new(),
+            unreadable_parts_omitted: 0,
+            cosmetic_parts: Vec::new(),
             layouts: Vec::new(),
             masters: Vec::new(),
             package_properties: Default::default(),
@@ -2251,6 +2338,7 @@ mod tests {
             None,
         );
         let doc = crate::pptx::PptxDocument {
+            input_bytes: 0,
             presentation: crate::pptx::PresentationInfo {
                 slides: Vec::new(),
                 slide_size: None,
@@ -2262,6 +2350,8 @@ mod tests {
             app_properties: None,
             has_macros: false,
             unreadable_parts: Vec::new(),
+            unreadable_parts_omitted: 0,
+            cosmetic_parts: Vec::new(),
             layouts: Vec::new(),
             masters: Vec::new(),
             package_properties: Default::default(),
@@ -2424,7 +2514,7 @@ mod tests {
         assert_eq!(auto.alt_text.as_deref(), Some("SRS_Globe_lr2"));
         let hl = auto.hyperlink.as_ref().expect("hyperlink must be captured");
         match &hl.target {
-            HyperlinkTarget::Internal(target) => assert_eq!(target, "slide2.xml"),
+            HyperlinkTarget::Internal(target) => assert_eq!(&**target, "slide2.xml"),
             other => panic!("expected an Internal target, got {other:?}"),
         }
     }
@@ -2518,7 +2608,7 @@ mod tests {
             .as_ref()
             .expect("an empty r:id must fall back to the action attribute");
         match &hl.target {
-            HyperlinkTarget::Internal(action) => assert_eq!(action, "ppaction://noaction"),
+            HyperlinkTarget::Internal(action) => assert_eq!(&**action, "ppaction://noaction"),
             other => panic!("expected an Internal action target, got {other:?}"),
         }
     }
@@ -2539,7 +2629,7 @@ mod tests {
         };
         match auto.hyperlink.as_ref().map(|h| &h.target) {
             Some(HyperlinkTarget::Internal(a)) => {
-                assert_eq!(a, "ppaction://hlinkshowjump?jump=nextslide")
+                assert_eq!(&**a, "ppaction://hlinkshowjump?jump=nextslide")
             },
             other => panic!("expected the action fallback, got {other:?}"),
         }
@@ -2585,10 +2675,10 @@ mod tests {
         let mut charts = std::collections::HashMap::new();
         charts.insert(
             "rId2".to_string(),
-            vec![
+            std::sync::Arc::from(vec![
                 "Title: Dollars per Group".to_string(),
                 "Categories: Group 1, Group 2".to_string(),
-            ],
+            ]),
         );
 
         let slide = Slide::parse(
@@ -3312,7 +3402,10 @@ mod tests {
         );
 
         let mut media = std::collections::HashMap::new();
-        media.insert("rId7".to_string(), (vec![0xDEu8, 0xADu8, 0xBEu8, 0xEFu8], "png".to_string()));
+        media.insert(
+            "rId7".to_string(),
+            (vec![0xDEu8, 0xADu8, 0xBEu8, 0xEFu8].into(), "png".to_string()),
+        );
 
         let slide = Slide::parse(
             &xml,

@@ -1,0 +1,308 @@
+//! A bounded record of the parts of a package that could not be read.
+//!
+//! A reader that skips a part it cannot use reports the loss; what it
+//! reports is shaped by the file, so the report is bounded the same way for
+//! every format: each part once (however many references name it), at most
+//! [`MAX_UNREADABLE_PARTS`] kept, a part name or reason cut at
+//! [`MAX_REPORT_CHARS`] characters (both can echo values the file controls),
+//! and the number of the rest counted.
+//!
+//! "Each part once" is decided on the exact normalised name, never on a
+//! hash of it: a hash of a fixed width can be made to collide with another
+//! part's, and the collision would hide that part's failure.
+
+use std::collections::HashSet;
+
+/// Most parts recorded as unreadable; the rest are counted.
+pub(crate) const MAX_UNREADABLE_PARTS: usize = 100;
+/// Longest part name or reason kept in a record, in characters.
+pub(crate) const MAX_REPORT_CHARS: usize = 256;
+/// Most bytes of normalised names remembered to tell a part already recorded
+/// from a new one. Past it a name is not remembered, so it is treated as new
+/// each time it is met: it can then be counted more than once among the rest,
+/// but a part is never taken for one already recorded when it is not.
+const MAX_SEEN_BYTES: usize = 1 << 20;
+
+/// The parts that could not be read: each once, at most
+/// [`MAX_UNREADABLE_PARTS`] kept, and the number of the rest.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UnreadableParts {
+    /// Prefix of the log line, naming the reader.
+    label: &'static str,
+    listed: Vec<(String, String)>,
+    omitted: usize,
+    /// The normalised name of each part recorded so far (up to
+    /// [`MAX_SEEN_BYTES`] of them).
+    seen: HashSet<String>,
+    seen_bytes: usize,
+    /// Parts the reader reached through a relationship it knows holds no text
+    /// (a theme) and could not read: kept apart from `listed`, because the
+    /// document reads as it did without them.
+    cosmetic: Vec<(String, String)>,
+}
+
+impl UnreadableParts {
+    /// An empty record for the reader called `label` (`"docx"`, `"pptx"`).
+    pub(crate) fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            ..Self::default()
+        }
+    }
+
+    /// Record that `part` could not be read, for `reason`. A part already
+    /// recorded (compared without regard to case or `\` against `/`, as a
+    /// zip lookup is) is not recorded again; it is logged once, when it is
+    /// first met.
+    pub(crate) fn record(&mut self, part: &str, reason: &dyn std::fmt::Display) {
+        let key: String = part
+            .chars()
+            .map(|c| {
+                if c == '\\' {
+                    '/'
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            })
+            .collect();
+        self.record_keyed(key, part, reason);
+    }
+
+    /// As [`Self::record`], with the identity of the part given by the caller
+    /// as `key` (a reader whose package has its own notion of "the same
+    /// part"), recorded once per key.
+    pub(crate) fn record_keyed(&mut self, key: String, part: &str, reason: &dyn std::fmt::Display) {
+        if self.seen.contains(&key) {
+            return;
+        }
+        if self.seen_bytes + key.len() <= MAX_SEEN_BYTES {
+            self.seen_bytes += key.len();
+            self.seen.insert(key);
+        }
+        self.push(part, reason);
+    }
+
+    /// Record that the item `name` (a sheet, say, which is not a part and
+    /// may share its name with another) could not be read. Every call is one
+    /// item.
+    pub(crate) fn record_item(&mut self, name: &str, reason: &dyn std::fmt::Display) {
+        self.push(name, reason);
+    }
+
+    fn push(&mut self, name: &str, reason: &dyn std::fmt::Display) {
+        if self.listed.len() >= MAX_UNREADABLE_PARTS {
+            self.omitted += 1;
+            return;
+        }
+        let cut = |s: &str| s.chars().take(MAX_REPORT_CHARS).collect::<String>();
+        let (name, reason) = (cut(name), cut(&reason.to_string()));
+        log::warn!("{}: skipping unreadable part {name}: {reason}", self.label);
+        self.listed.push((name, reason));
+    }
+
+    /// Record a part reached through a relationship that holds no text (a
+    /// theme), which could not be read. It is a warning only: the text is
+    /// what it was, and no notice is written into it. What decides this is
+    /// how the reader reached the part, never the part's name, which the file
+    /// chooses.
+    pub(crate) fn record_cosmetic(&mut self, part: &str, reason: &dyn std::fmt::Display) {
+        self.push_cosmetic(part, reason);
+    }
+
+    /// As [`Self::record_cosmetic`], once per `key`. Its keys are kept apart
+    /// from those of [`Self::record_keyed`]: a part reached by a theme
+    /// relationship and also by one that carries text is a loss to report in
+    /// the second case whichever was met first.
+    pub(crate) fn record_cosmetic_keyed(
+        &mut self,
+        key: String,
+        part: &str,
+        reason: &dyn std::fmt::Display,
+    ) {
+        let key = format!("\u{0}cosmetic\u{0}{key}");
+        if self.seen.contains(&key) {
+            return;
+        }
+        if self.seen_bytes + key.len() <= MAX_SEEN_BYTES {
+            self.seen_bytes += key.len();
+            self.seen.insert(key);
+        }
+        self.push_cosmetic(part, reason);
+    }
+
+    fn push_cosmetic(&mut self, part: &str, reason: &dyn std::fmt::Display) {
+        if self.cosmetic.len() >= MAX_UNREADABLE_PARTS {
+            return;
+        }
+        let cut = |s: &str| s.chars().take(MAX_REPORT_CHARS).collect::<String>();
+        let (part, reason) = (cut(part), cut(&reason.to_string()));
+        log::warn!("{}: skipping unreadable part {part}: {reason}", self.label);
+        self.cosmetic.push((part, reason));
+    }
+
+    /// The first part or item recorded, if any.
+    pub(crate) fn first(&self) -> Option<&(String, String)> {
+        self.listed.first()
+    }
+
+    /// The parts kept and the number left out (the unit tests' view; the
+    /// readers use [`Self::finish_with_cosmetic`]).
+    #[cfg(test)]
+    pub(crate) fn finish(self) -> (Vec<(String, String)>, usize) {
+        (self.listed, self.omitted)
+    }
+
+    /// The parts kept, the number left out, and the parts that held no text.
+    pub(crate) fn finish_with_cosmetic(
+        self,
+    ) -> (Vec<(String, String)>, usize, Vec<(String, String)>) {
+        (self.listed, self.omitted, self.cosmetic)
+    }
+}
+
+/// The warning for `omitted` parts left out of a list.
+pub(crate) fn omitted_warning(omitted: usize) -> String {
+    format!("and {omitted} more unreadable parts not listed")
+}
+
+/// How the lines of a report are written: the file chooses the part names and
+/// reasons in them, so each target keeps them inert.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReportTarget {
+    /// Plain text, and the text of an IR (its renderers escape what they
+    /// write, for Markdown and HTML alike).
+    Plain,
+    /// Markdown written directly: every Markdown metacharacter is escaped.
+    Markdown,
+}
+
+/// A warning on one line: a control character, a line break (also U+2028
+/// and U+2029) or a bidirectional override is replaced by a space, so a
+/// name that holds one cannot start a new block or reorder the line.
+pub(crate) fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control()
+                || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+            {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// The in-band lines that report unreadable parts in the text of a document
+/// (plain text, Markdown, and the last section of the IR), one for each
+/// warning of `warnings` and each bracketed as a spreadsheet's notice is.
+///
+/// The warnings are the bounded record's (at most [`MAX_UNREADABLE_PARTS`]
+/// entries and the count of the rest, each part and reason cut at
+/// [`MAX_REPORT_CHARS`]); `warnings` themselves stay as the file gave them,
+/// for `Metadata::warnings`, and the lines are made inert for `target`. They
+/// are charged to the copied-text budget the running conversion holds before
+/// any is written. When the budget cannot pay for them none is written, and
+/// the budget's own notice (which the caller appends after this) says so. A
+/// document that lost no part has no warnings, hence no lines.
+pub(crate) fn report_lines(warnings: &[String], target: ReportTarget) -> Vec<String> {
+    if warnings.is_empty() {
+        return Vec::new();
+    }
+    let lines: Vec<String> = warnings
+        .iter()
+        .map(|w| {
+            let line = format!("[{}]", one_line(w));
+            match target {
+                ReportTarget::Plain => line,
+                ReportTarget::Markdown => crate::core::markdown::escape_text(&line),
+            }
+        })
+        .collect();
+    let chars = lines
+        .iter()
+        .fold(0usize, |n, l| n.saturating_add(l.len()).saturating_add(2));
+    if !crate::limits::charge_copied_text(chars) {
+        return Vec::new();
+    }
+    lines
+}
+
+/// [`report_lines`] for the content of an IR, which has no budget notice
+/// after it: where the budget cannot pay for the report, the budget's own
+/// notice stands in its place. The IR's renderers escape the text.
+pub(crate) fn report_ir_lines(warnings: &[String]) -> Vec<String> {
+    let lines = report_lines(warnings, ReportTarget::Plain);
+    if lines.is_empty() && !warnings.is_empty() {
+        return crate::limits::copied_text_notice().into_iter().collect();
+    }
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A part met first through a relationship that holds no text, then through
+    /// one that does, is a loss to report: the first must not hide the second.
+    #[test]
+    fn test_a_cosmetic_record_does_not_hide_a_real_one_for_the_same_part() {
+        let mut sink = UnreadableParts::new("test");
+        sink.record_cosmetic_keyed("#7".into(), "xl/sharedStrings.xml", &"bad");
+        sink.record_keyed("#7".into(), "xl/sharedStrings.xml", &"bad");
+        let (listed, omitted, cosmetic) = sink.finish_with_cosmetic();
+        assert_eq!((listed.len(), omitted, cosmetic.len()), (1, 0, 1));
+    }
+
+    #[test]
+    fn test_a_part_is_recorded_once_whatever_its_spelling() {
+        let mut sink = UnreadableParts::new("test");
+        sink.record("/word/header1.xml", &"bad");
+        sink.record("/WORD/Header1.xml", &"bad");
+        sink.record("\\word\\header1.xml", &"worse");
+        assert_eq!(sink.finish(), (vec![("/word/header1.xml".into(), "bad".into())], 0));
+    }
+
+    /// The record keeps the names themselves, so two parts can never be
+    /// taken for one; past the memory bound a part is counted again, never
+    /// dropped.
+    #[test]
+    fn test_parts_are_told_apart_by_their_names_not_by_a_hash() {
+        let mut sink = UnreadableParts::new("test");
+        sink.record("/Word\\A.xml", &"bad");
+        assert!(sink.seen.contains("/word/a.xml"));
+        let long = |i: usize| format!("{i:08}{}", "n".repeat(MAX_SEEN_BYTES / 4));
+        for i in 0..6 {
+            sink.record(&long(i), &"bad");
+            sink.record(&long(i), &"bad");
+        }
+        let (listed, _) = sink.finish();
+        // Every distinct part is listed; the ones past the bound may be
+        // listed again, none is lost.
+        for i in 0..6 {
+            let prefix = &long(i)[..8];
+            assert!(listed.iter().any(|(p, _)| p.starts_with(prefix)), "{i}");
+        }
+        assert!(listed.iter().any(|(p, _)| p == "/Word\\A.xml"));
+    }
+
+    #[test]
+    fn test_the_list_is_capped_and_the_rest_counted() {
+        let mut sink = UnreadableParts::new("test");
+        for i in 0..MAX_UNREADABLE_PARTS + 7 {
+            sink.record(&format!("/p{i}.xml"), &"bad");
+            sink.record(&format!("/p{i}.xml"), &"bad");
+        }
+        let (listed, omitted) = sink.finish();
+        assert_eq!((listed.len(), omitted), (MAX_UNREADABLE_PARTS, 7));
+    }
+
+    #[test]
+    fn test_names_and_reasons_are_cut() {
+        let mut sink = UnreadableParts::new("test");
+        sink.record(&"n".repeat(1000), &"r".repeat(1000));
+        let (listed, _) = sink.finish();
+        assert_eq!(listed[0].0.chars().count(), MAX_REPORT_CHARS);
+        assert_eq!(listed[0].1.chars().count(), MAX_REPORT_CHARS);
+    }
+}

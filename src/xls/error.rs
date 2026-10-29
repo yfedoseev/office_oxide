@@ -15,6 +15,12 @@ pub enum XlsError {
     #[error("file is encrypted or password-protected")]
     Encrypted,
 
+    /// The file is encrypted with a scheme or parameter this reader does not
+    /// implement (the `default-password` feature opens the ones Office's
+    /// default password protects); the text says which.
+    #[error("file is encrypted with a scheme this reader does not support: {0}")]
+    EncryptionNotSupported(String),
+
     /// The file uses a BIFF version that is not supported.
     ///
     /// Carries a description of the detected format rather than a bare

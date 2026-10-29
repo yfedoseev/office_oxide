@@ -396,8 +396,7 @@ fn test_comment_authors_resolve_for_legacy_and_modern_comments() {
     let doc = pkg.open();
     let authored = |i: usize| -> Vec<(Option<String>, String)> {
         doc.slides[i]
-            .comments
-            .iter()
+            .comments()
             .map(|c| (c.author.clone(), c.text.clone()))
             .collect()
     };
@@ -570,7 +569,7 @@ fn test_a_video_shape_surfaces_its_clip() {
     };
     let media = pic.media.as_ref().expect("the clip reference");
     assert_eq!(media.kind, office_oxide::pptx::MediaKind::Video);
-    assert_eq!(media.target, "../media/media1.mp4");
+    assert_eq!(&*media.target, "../media/media1.mp4");
     assert!(!media.external);
     assert_eq!(pic.data.as_deref(), Some(PNG), "the poster frame is still the picture");
 }
@@ -1092,4 +1091,113 @@ fn test_pptx_layout_hiding_master_shapes_keeps_only_layout_static_text() {
         assert_eq!(text.matches("SHARED LINE").count(), 1, "{name}: {text}");
         assert!(!text.contains("MASTER STATIC"), "{name}: {text}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// A relationships part that cannot be read is on record
+// ---------------------------------------------------------------------------
+
+/// A hyperlink target longer than the relationship parser accepts, which
+/// makes the whole relationships part unreadable.
+fn oversized_target() -> String {
+    format!("http://example.com/{}", "a".repeat(80 * 1024))
+}
+
+fn assert_reported(pkg: &Pkg, rels_part: &str) {
+    let doc = pkg.open();
+    let found = doc
+        .unreadable_parts
+        .iter()
+        .find(|(p, _)| p.ends_with(rels_part))
+        .unwrap_or_else(|| panic!("{rels_part} not recorded: {:?}", doc.unreadable_parts));
+    assert!(found.1.contains("Target"), "the reason is named: {}", found.1);
+    // The slide text is still extracted.
+    assert!(doc.plain_text().contains("SLIDE ONE"));
+    let ir = pkg.document().to_ir();
+    assert!(ir.metadata.text_truncated, "the loss must be on record");
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains(rels_part) && w.contains("Target")),
+        "the metadata names the part and the reason: {:?}",
+        ir.metadata.warnings
+    );
+}
+
+#[test]
+fn test_an_unreadable_notes_relationships_part_is_recorded() {
+    let mut pkg = deck(&[&text_sp("SLIDE ONE")]);
+    add_notes(&mut pkg, 1, "<a:p><a:r><a:t>NOTE</a:t></a:r></a:p>");
+    pkg.ext_rel(
+        "ppt/notesSlides/notesSlide1.xml",
+        "rId7",
+        rel_types::HYPERLINK,
+        &oversized_target(),
+    );
+    assert_reported(&pkg, "notesSlide1.xml.rels");
+}
+
+#[test]
+fn test_an_unreadable_layout_relationships_part_is_recorded() {
+    let mut pkg = deck(&[&text_sp("SLIDE ONE")]);
+    pkg.part(
+        "ppt/slideLayouts/slideLayout1.xml",
+        &format!("{CT_PML}slideLayout+xml"),
+        slide_xml("").replace("p:sld", "p:sldLayout"),
+    );
+    pkg.rel(
+        "ppt/slides/slide1.xml",
+        "rIdL",
+        rel_types::SLIDE_LAYOUT,
+        "../slideLayouts/slideLayout1.xml",
+    );
+    pkg.ext_rel(
+        "ppt/slideLayouts/slideLayout1.xml",
+        "rId7",
+        rel_types::HYPERLINK,
+        &oversized_target(),
+    );
+    assert_reported(&pkg, "slideLayout1.xml.rels");
+}
+
+#[test]
+fn test_an_unreadable_master_relationships_part_is_recorded() {
+    let mut pkg = deck(&[&text_sp("SLIDE ONE")]);
+    for (name, tag) in [
+        ("slideLayouts/slideLayout1", "sldLayout"),
+        ("slideMasters/slideMaster1", "sldMaster"),
+    ] {
+        pkg.part(
+            &format!("ppt/{name}.xml"),
+            &format!(
+                "{CT_PML}{}+xml",
+                if tag == "sldLayout" {
+                    "slideLayout"
+                } else {
+                    "slideMaster"
+                }
+            ),
+            slide_xml("").replace("p:sld", &format!("p:{tag}")),
+        );
+    }
+    pkg.rel(
+        "ppt/slides/slide1.xml",
+        "rIdL",
+        rel_types::SLIDE_LAYOUT,
+        "../slideLayouts/slideLayout1.xml",
+    );
+    pkg.rel(
+        "ppt/slideLayouts/slideLayout1.xml",
+        "rIdM",
+        rel_types::SLIDE_MASTER,
+        "../slideMasters/slideMaster1.xml",
+    );
+    pkg.ext_rel(
+        "ppt/slideMasters/slideMaster1.xml",
+        "rId7",
+        rel_types::HYPERLINK,
+        &oversized_target(),
+    );
+    assert_reported(&pkg, "slideMaster1.xml.rels");
 }

@@ -169,14 +169,20 @@ pub(super) fn parse(data: &[u8], biff: u8) -> Result<XlsDocument> {
             _ => {},
         }
     }
-    let (rows, xf) = build_grid(&mut cells);
-    Ok(XlsDocument::from_one_sheet(Sheet {
-        name: "Sheet1".to_string(),
-        rows,
-        xf,
-        formats: Arc::new(NumberFormats::default()),
-        ..Default::default()
-    }))
+    let mut grid_budget = crate::limits::GridBudget::new();
+    grid_budget.begin_sheet("Sheet1");
+    let (rows, xf) = build_grid(&mut cells, &mut grid_budget);
+    let notices = grid_budget.notices();
+    Ok(XlsDocument::from_one_sheet(
+        Sheet {
+            name: "Sheet1".to_string(),
+            rows,
+            xf,
+            formats: Arc::new(NumberFormats::default()),
+            ..Default::default()
+        },
+        notices,
+    ))
 }
 
 fn f64_at(d: &[u8], o: usize) -> f64 {

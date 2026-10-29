@@ -25,6 +25,12 @@ fn require_written(ok: bool, what: &str) -> PyResult<()> {
 }
 
 pyo3::create_exception!(office_oxide, OfficeOxideError, pyo3::exceptions::PyException);
+pyo3::create_exception!(
+    office_oxide,
+    IncompleteDocumentError,
+    OfficeOxideError,
+    "The document was read but the result is known to be incomplete, and the options asked for an error."
+);
 
 /// The largest magnitude up to which every integer is exactly an `f64`.
 const MAX_EXACT_INT: i64 = 1 << 53;
@@ -94,7 +100,92 @@ fn writer_cell_data(value: &Bound<'_, PyAny>) -> PyResult<crate::xlsx::write::Ce
 
 impl From<OfficeError> for PyErr {
     fn from(e: OfficeError) -> PyErr {
-        OfficeOxideError::new_err(e.to_string())
+        match e {
+            OfficeError::Incomplete(_) => IncompleteDocumentError::new_err(e.to_string()),
+            _ => OfficeOxideError::new_err(e.to_string()),
+        }
+    }
+}
+
+/// Options for one document: limits, which text is kept, and whether an
+/// incomplete result is an error.
+///
+/// ```text
+/// opts = ParseOptions(strict=True, text_chars=1_000_000)
+/// doc = Document.open("report.docx", options=opts)
+/// ```
+///
+/// `strict=True` starts from tighter limits and makes an incomplete result an
+/// error (`IncompleteDocumentError`); keyword arguments then set any option by
+/// name (see `ParseOptions.names()`): a limit such as `text_chars` or
+/// `part_bytes` with an integer, `include_hidden_text` and
+/// `include_deleted_text` with a bool, `on_incomplete` with `"report"` or
+/// `"error"`.
+#[pyclass(name = "ParseOptions", module = "office_oxide")]
+struct PyParseOptions {
+    inner: crate::options::ParseOptions,
+}
+
+fn option_value(name: &str, value: &Bound<'_, PyAny>) -> PyResult<u64> {
+    if name == "on_incomplete" {
+        if let Ok(text) = value.extract::<String>() {
+            return match text.as_str() {
+                "report" => Ok(0),
+                "error" => Ok(1),
+                other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "on_incomplete must be \"report\" or \"error\", not \"{other}\""
+                ))),
+            };
+        }
+    }
+    if let Ok(flag) = value.cast::<pyo3::types::PyBool>() {
+        return Ok(u64::from(flag.is_true()));
+    }
+    value.extract::<u64>().map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "option {name}: expected a non-negative integer or a bool"
+        ))
+    })
+}
+
+#[pymethods]
+impl PyParseOptions {
+    #[new]
+    #[pyo3(signature = (*, strict=false, **options))]
+    fn new(strict: bool, options: Option<&Bound<'_, pyo3::types::PyDict>>) -> PyResult<Self> {
+        let mut inner = if strict {
+            crate::options::ParseOptions::strict()
+        } else {
+            crate::options::ParseOptions::default()
+        };
+        if let Some(options) = options {
+            for (name, value) in options.iter() {
+                let name: String = name.extract()?;
+                inner
+                    .set_option(&name, option_value(&name, &value)?)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            }
+        }
+        Ok(Self { inner })
+    }
+
+    /// Set one option by name.
+    fn set(&mut self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.inner
+            .set_option(name, option_value(name, value)?)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    /// The names of every option.
+    #[staticmethod]
+    fn names() -> Vec<&'static str> {
+        let mut names = vec![
+            "include_hidden_text",
+            "include_deleted_text",
+            "on_incomplete",
+        ];
+        names.extend_from_slice(crate::limits::Limits::NAMES);
+        names
     }
 }
 
@@ -131,10 +222,13 @@ impl PyDocument {
     /// Format is detected from the extension; magic-byte sniffing corrects
     /// mismatched extensions. Raises OfficeOxideError on parse failure.
     #[staticmethod]
-    #[pyo3(signature = (path, /))]
-    fn open(path: PathBuf) -> PyResult<Self> {
+    #[pyo3(signature = (path, /, *, options=None))]
+    fn open(path: PathBuf, options: Option<PyRef<'_, PyParseOptions>>) -> PyResult<Self> {
         let source = path.display().to_string();
-        let inner = Document::open(&path)?;
+        let inner = match &options {
+            Some(o) => Document::open_with(&path, &o.inner)?,
+            None => Document::open(&path)?,
+        };
         Ok(PyDocument {
             inner: Some(inner),
             source: Some(source),
@@ -145,12 +239,19 @@ impl PyDocument {
     ///
     /// `format` is one of: "docx", "xlsx", "pptx", "doc", "xls", "ppt".
     #[staticmethod]
-    #[pyo3(signature = (data, format, /))]
-    fn from_bytes(data: &[u8], format: &str) -> PyResult<Self> {
+    #[pyo3(signature = (data, format, /, *, options=None))]
+    fn from_bytes(
+        data: &[u8],
+        format: &str,
+        options: Option<PyRef<'_, PyParseOptions>>,
+    ) -> PyResult<Self> {
         let fmt = DocumentFormat::from_extension(format)
             .ok_or_else(|| OfficeOxideError::new_err(format!("unsupported format: {format}")))?;
         let cursor = Cursor::new(data.to_vec());
-        let inner = Document::from_reader(cursor, fmt)?;
+        let inner = match &options {
+            Some(o) => Document::from_reader_with(cursor, fmt, &o.inner)?,
+            None => Document::from_reader(cursor, fmt)?,
+        };
         Ok(PyDocument {
             inner: Some(inner),
             source: None,
@@ -173,6 +274,28 @@ impl PyDocument {
     /// Back-compat alias for `format`.
     fn format_name(&self) -> PyResult<&'static str> {
         self.format()
+    }
+
+    /// What is wrong with the document: a list of dicts with `kind`
+    /// (`"unreadable_part"`, `"truncated"` or `"recovered"`), `part` (or
+    /// `None`) and `detail`. Empty for a sound document. Converts the
+    /// document once.
+    fn damage<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, pyo3::types::PyDict>>> {
+        let mut out = Vec::new();
+        for d in self.get()?.damage() {
+            let item = pyo3::types::PyDict::new(py);
+            let kind = match d.kind {
+                crate::options::DamageKind::UnreadablePart => "unreadable_part",
+                crate::options::DamageKind::Truncated => "truncated",
+                // No wildcard: a kind added later must be mapped here to compile.
+                crate::options::DamageKind::Recovered => "recovered",
+            };
+            item.set_item("kind", kind)?;
+            item.set_item("part", d.part)?;
+            item.set_item("detail", d.detail)?;
+            out.push(item);
+        }
+        Ok(out)
     }
 
     /// Extract plain text from the document.
@@ -206,7 +329,8 @@ impl PyDocument {
     /// (nested dicts/lists).
     fn to_ir<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
         let doc_ir = self.get()?.to_ir();
-        let json_str = serde_json::to_string(&doc_ir)
+        let json_str = doc_ir
+            .to_json_string()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         let json_module = py.import("json")?;
         let result = json_module.call_method1("loads", (json_str,))?;
@@ -216,7 +340,8 @@ impl PyDocument {
     /// Convert the document to a format-agnostic intermediate representation as a JSON string.
     fn to_ir_json(&self) -> PyResult<String> {
         let doc_ir = self.get()?.to_ir();
-        serde_json::to_string(&doc_ir)
+        doc_ir
+            .to_json_string()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -610,11 +735,13 @@ impl PyPptxWriter {
 /// Python module entry point.
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyParseOptions>()?;
     m.add_class::<PyDocument>()?;
     m.add_class::<PyEditable>()?;
     m.add_class::<PyXlsxWriter>()?;
     m.add_class::<PyPptxWriter>()?;
     m.add("OfficeOxideError", m.py().get_type::<OfficeOxideError>())?;
+    m.add("IncompleteDocumentError", m.py().get_type::<IncompleteDocumentError>())?;
     m.add("__version__", crate::VERSION)?;
     m.add_function(wrap_pyfunction!(extract_text, m)?)?;
     m.add_function(wrap_pyfunction!(to_markdown, m)?)?;

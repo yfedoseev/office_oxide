@@ -20,7 +20,20 @@ pub struct StyleSheet {
     /// Paragraph styles whose name cannot be exposed (over-long, or holding a
     /// control character); reported once in `Metadata::warnings`.
     pub(crate) unusable_style_names: usize,
+    /// Styles past [`MAX_STYLES`], left out of the sheet; reported once in
+    /// `Metadata::warnings`.
+    pub(crate) styles_left_out: usize,
 }
+
+/// The most styles one style sheet keeps: 20,000, about five times the number
+/// Word itself allows (a little over 4,000).
+///
+/// A style is about a kilobyte in memory for a hundred bytes of XML, so a sheet
+/// of millions of them is a memory multiplier on its own; and a `w:basedOn`
+/// chain is only ever followed 20 links deep, so styles past the cap that
+/// extend a long chain add nothing a reader could resolve. Styles beyond the
+/// cap are left out and counted.
+pub(crate) const MAX_STYLES: usize = 20_000;
 
 /// Document-wide default properties.
 #[derive(Debug, Clone, Default)]
@@ -106,7 +119,13 @@ impl StyleSheet {
                     },
                     "style" => {
                         if let Some(style) = parse_style(&mut reader, e)? {
-                            sheet.styles.insert(style.style_id.clone(), style);
+                            if sheet.styles.len() < MAX_STYLES
+                                || sheet.styles.contains_key(&style.style_id)
+                            {
+                                sheet.styles.insert(style.style_id.clone(), style);
+                            } else {
+                                sheet.styles_left_out += 1;
+                            }
                         }
                     },
                     _ => {},
@@ -210,6 +229,29 @@ impl StyleSheet {
         out
     }
 
+    /// [`Self::effective_run_properties_in`] without the face names, colour
+    /// names and style id: the flags, sizes and spacing only, for a consumer
+    /// that folds the chain for every run and reads nothing else. A style
+    /// stores a face name once and the full fold copies it for every level
+    /// of the chain and every run; this one never does.
+    pub(crate) fn effective_run_flags_in(
+        &self,
+        table: Option<&RunProperties>,
+        paragraph_style_id: Option<&str>,
+        direct: Option<&RunProperties>,
+    ) -> RunProperties {
+        let mut out = self.run_style_base_with(
+            true,
+            table,
+            paragraph_style_id,
+            direct.and_then(|d| d.style_id.as_deref()),
+        );
+        if let Some(d) = direct {
+            out.overlay(&d.clone_light());
+        }
+        out
+    }
+
     /// Everything a run inherits before its own `w:rPr`: document
     /// defaults, the table layer, the paragraph style chain, then the
     /// character style chain. Depends only on its three inputs, so a
@@ -220,18 +262,38 @@ impl StyleSheet {
         paragraph_style_id: Option<&str>,
         character_style_id: Option<&str>,
     ) -> RunProperties {
+        self.run_style_base_with(false, table, paragraph_style_id, character_style_id)
+    }
+
+    /// [`Self::run_style_base`], with `light` leaving out the text of every
+    /// layer (see [`RunProperties::clone_light`]).
+    fn run_style_base_with(
+        &self,
+        light: bool,
+        table: Option<&RunProperties>,
+        paragraph_style_id: Option<&str>,
+        character_style_id: Option<&str>,
+    ) -> RunProperties {
+        let layer = |out: &mut RunProperties, rp: &RunProperties| {
+            if light {
+                out.overlay(&rp.clone_light());
+            } else {
+                out.overlay(rp);
+            }
+        };
         let mut out = self
             .doc_defaults
             .as_ref()
-            .and_then(|d| d.run_properties.clone())
+            .and_then(|d| d.run_properties.as_ref())
+            .map(|rp| if light { rp.clone_light() } else { rp.clone() })
             .unwrap_or_default();
         if let Some(t) = table {
-            out.overlay(t);
+            layer(&mut out, t);
         }
         if let Some(pid) = paragraph_style_id {
             for style in self.chain(pid) {
                 if let Some(rp) = style.run_properties.as_ref() {
-                    out.overlay(rp);
+                    layer(&mut out, rp);
                 }
             }
         }
@@ -240,7 +302,7 @@ impl StyleSheet {
         if let Some(cid) = character_style_id {
             for style in self.chain(cid) {
                 if let Some(rp) = style.run_properties.as_ref() {
-                    out.overlay(rp);
+                    layer(&mut out, rp);
                 }
             }
         }
@@ -296,6 +358,46 @@ impl StyleSheet {
         hidden.unwrap_or(false)
     }
 
+    /// The font a run uses for characters outside ASCII (`w:hAnsi`, else
+    /// `w:ascii`), from the document defaults, the paragraph style chain, the
+    /// character style chain and the run's own properties, the later
+    /// overriding the earlier. It borrows: nothing is copied for a run.
+    pub(crate) fn effective_font_name<'a>(
+        &'a self,
+        paragraph_style_id: Option<&str>,
+        direct: Option<&'a RunProperties>,
+    ) -> Option<&'a str> {
+        fn layer(rp: &RunProperties) -> Option<&str> {
+            rp.script
+                .as_ref()
+                .and_then(|s| s.font_h_ansi.as_deref())
+                .or(rp.font_name.as_deref())
+        }
+        let mut font = self
+            .doc_defaults
+            .as_ref()
+            .and_then(|d| d.run_properties.as_ref())
+            .and_then(layer);
+        let chain_font = |sid: &str| {
+            self.chain(sid)
+                .rev()
+                .find_map(|style| style.run_properties.as_ref().and_then(layer))
+        };
+        if let Some(f) = paragraph_style_id.and_then(chain_font) {
+            font = Some(f);
+        }
+        if let Some(f) = direct
+            .and_then(|d| d.style_id.as_deref())
+            .and_then(chain_font)
+        {
+            font = Some(f);
+        }
+        if let Some(f) = direct.and_then(layer) {
+            font = Some(f);
+        }
+        font
+    }
+
     /// Fold the effective paragraph formatting: document defaults, then the
     /// style chain, then the paragraph's own `w:pPr`.
     pub fn effective_paragraph_properties(
@@ -320,6 +422,24 @@ impl StyleSheet {
         out
     }
 
+    /// [`Self::effective_paragraph_properties_in`] without the tab stops and
+    /// text: the flags, indents, spacing and numbering only, for a consumer
+    /// that folds the chain for every paragraph and reads nothing else. A
+    /// style stores its tab stops once and the full fold copies them for
+    /// every level of the chain and every paragraph; this one never does.
+    pub(crate) fn effective_paragraph_flags_in(
+        &self,
+        table: Option<&ParagraphProperties>,
+        direct: Option<&ParagraphProperties>,
+    ) -> ParagraphProperties {
+        let mut out =
+            self.paragraph_style_base_with(true, table, direct.and_then(|d| d.style_id.as_deref()));
+        if let Some(d) = direct {
+            out.overlay(&d.clone_light());
+        }
+        out
+    }
+
     /// Everything a paragraph inherits before its own `w:pPr`: document
     /// defaults, the table layer, then the paragraph style chain.
     pub(crate) fn paragraph_style_base(
@@ -327,18 +447,37 @@ impl StyleSheet {
         table: Option<&ParagraphProperties>,
         paragraph_style_id: Option<&str>,
     ) -> ParagraphProperties {
+        self.paragraph_style_base_with(false, table, paragraph_style_id)
+    }
+
+    /// [`Self::paragraph_style_base`], with `light` leaving out the tab stops
+    /// and text of every layer (see [`ParagraphProperties::clone_light`]).
+    fn paragraph_style_base_with(
+        &self,
+        light: bool,
+        table: Option<&ParagraphProperties>,
+        paragraph_style_id: Option<&str>,
+    ) -> ParagraphProperties {
+        let layer = |out: &mut ParagraphProperties, pp: &ParagraphProperties| {
+            if light {
+                out.overlay(&pp.clone_light());
+            } else {
+                out.overlay(pp);
+            }
+        };
         let mut out = self
             .doc_defaults
             .as_ref()
-            .and_then(|d| d.paragraph_properties.clone())
+            .and_then(|d| d.paragraph_properties.as_ref())
+            .map(|pp| if light { pp.clone_light() } else { pp.clone() })
             .unwrap_or_default();
         if let Some(t) = table {
-            out.overlay(t);
+            layer(&mut out, t);
         }
         if let Some(pid) = paragraph_style_id {
             for style in self.chain(pid) {
                 if let Some(pp) = style.paragraph_properties.as_ref() {
-                    out.overlay(pp);
+                    layer(&mut out, pp);
                 }
             }
         }

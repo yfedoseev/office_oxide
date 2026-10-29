@@ -64,7 +64,7 @@ doc.free();
 ## Why office-oxide-wasm?
 
 - **Portable** — runs anywhere JavaScript runs: browsers, Node.js, Deno, Bun, Cloudflare Workers
-- **Reliable** — 100% pass rate on valid Office files (6,062-file corpus); zero failures on legitimate documents
+- **Reliable** — opens 97.3% of a 10,386-file test collection; the rest are encrypted, truncated or corrupt files
 - **Complete** — 6 formats: DOCX, XLSX, PPTX + legacy DOC, XLS, PPT
 - **Permissive** — MIT / Apache-2.0, no AGPL or GPL restrictions
 - **No native build** — pure WASM bundle, works without node-gyp or a C compiler
@@ -78,6 +78,8 @@ Two classes: `WasmDocument` reads, `WasmEditableDocument` edits.
 | Method | Description |
 | --- | --- |
 | `new WasmDocument(bytes, format)` | Open from `Uint8Array`. `format`: `"docx" \| "xlsx" \| "pptx" \| "doc" \| "xls" \| "ppt"`. |
+| `WasmDocument.openWith(bytes, format, options)` | Open under a `WasmParseOptions` (below). The options are borrowed, so one object can open any number of documents. |
+| `.damage()` | What is wrong with the document: an array of `{kind, part, detail}` (`kind`: `unreadable_part`, `truncated` or `recovered`); empty when sound. |
 | `.formatName()` | Detected format as a string. |
 | `.plainText()` | Extract plain text. |
 | `.toMarkdown()` | Convert to Markdown (images dropped). |
@@ -85,6 +87,21 @@ Two classes: `WasmDocument` reads, `WasmEditableDocument` edits.
 | `.toHtml()` | Convert to an HTML fragment. |
 | `.toIr()` | Return the format-agnostic document IR (JS object). |
 | `.free()` | Release the underlying WASM memory. `[Symbol.dispose]` is also supported. |
+
+### `WasmParseOptions`
+
+Options for one document; nothing global changes. `new WasmParseOptions(true)`
+starts from tighter limits and makes a document that cannot be read completely
+throw (the message contains `incomplete`). `.set(name, value)` sets any option by
+name (`WasmParseOptions.names()` lists them): a limit such as `text_chars` or
+`part_bytes` with a number (`Infinity` for none), `include_hidden_text` and
+`include_deleted_text` with a boolean, `on_incomplete` with `"report"` or `"error"`.
+
+```js
+const opts = new WasmParseOptions(true);
+opts.set("text_chars", 1_000_000);
+const doc = WasmDocument.openWith(bytes, "docx", opts); // throws if incomplete
+```
 
 ### `WasmEditableDocument`
 
@@ -143,4 +160,4 @@ MIT OR Apache-2.0
 
 ---
 
-**WASM** + **Rust core** | MIT / Apache-2.0 | 100% pass rate on valid Office files (6,062-file corpus) | Browser + Node.js + edge runtimes | 6 formats
+**WASM** + **Rust core** | MIT / Apache-2.0 | Opens 97.3% of a 10,386-file test collection | Browser + Node.js + edge runtimes | 6 formats

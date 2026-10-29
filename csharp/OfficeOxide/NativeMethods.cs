@@ -19,6 +19,7 @@ internal static partial class NativeMethods
     internal const int OfficeErrExtraction = 4;
     internal const int OfficeErrInternal = 5;
     internal const int OfficeErrUnsupported = 6;
+    internal const int OfficeErrIncomplete = 7;
 
     internal const int OfficeCellEmpty = 0;
     internal const int OfficeCellString = 1;
@@ -39,6 +40,33 @@ internal static partial class NativeMethods
 
     [LibraryImport(Lib, EntryPoint = "office_oxide_detect_format", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial IntPtr OfficeOxideDetectFormat(string path);
+
+    // ── Parse options ──────────────────────────────────────────────────
+
+    [LibraryImport(Lib, EntryPoint = "office_options_new")]
+    internal static partial IntPtr OfficeOptionsNew();
+
+    [LibraryImport(Lib, EntryPoint = "office_options_strict")]
+    internal static partial IntPtr OfficeOptionsStrict();
+
+    [LibraryImport(Lib, EntryPoint = "office_options_free")]
+    internal static partial void OfficeOptionsFree(IntPtr handle);
+
+    [LibraryImport(Lib, EntryPoint = "office_options_set", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial int OfficeOptionsSet(IntPtr handle, string name, ulong value);
+
+    [LibraryImport(Lib, EntryPoint = "office_options_names")]
+    internal static partial IntPtr OfficeOptionsNames();
+
+    [LibraryImport(Lib, EntryPoint = "office_document_open_with", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial IntPtr OfficeDocumentOpenWith(string path, IntPtr options, out int errorCode);
+
+    [LibraryImport(Lib, EntryPoint = "office_document_open_from_bytes_with", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial IntPtr OfficeDocumentOpenFromBytesWith(
+        [In] byte[] data, nuint len, string format, IntPtr options, out int errorCode);
+
+    [LibraryImport(Lib, EntryPoint = "office_document_damage_json")]
+    internal static partial IntPtr OfficeDocumentDamageJson(IntPtr handle, out int errorCode);
 
     // ── Document (read-only) ───────────────────────────────────────────
 

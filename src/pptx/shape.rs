@@ -48,8 +48,9 @@ pub struct PictureShape {
     /// Relationship ID (`r:embed`) of the underlying media part, if any.
     pub embed_rid: Option<String>,
     /// Raw image bytes resolved via `embed_rid`, if the slide carried a
-    /// resolvable IMAGE relationship at parse time.
-    pub data: Option<Vec<u8>>,
+    /// resolvable IMAGE relationship at parse time. Shared (`Arc`): every
+    /// picture that embeds one media part holds the same bytes.
+    pub data: Option<std::sync::Arc<[u8]>>,
     /// Image format inferred from the relationship target extension or
     /// byte signature (e.g. `"png"`, `"jpeg"`, `"gif"`, `"emf"`).
     pub format: Option<String>,
@@ -58,7 +59,7 @@ pub struct PictureShape {
     /// Target of a *linked* picture — `<a:blip r:link="rIdN"/>`, whose
     /// relationship points outside the package (usually a URL). The image
     /// bytes are not in the file; this is where they live.
-    pub link_target: Option<String>,
+    pub link_target: Option<std::sync::Arc<str>>,
     /// The audio or video clip this picture stands for, when the picture is
     /// the poster frame of a media shape.
     pub media: Option<MediaReference>,
@@ -73,7 +74,7 @@ pub struct MediaReference {
     pub kind: MediaKind,
     /// The clip's location: a URL when `external`, otherwise the resolved
     /// part name inside the package (e.g. `/ppt/media/media1.mp4`).
-    pub target: String,
+    pub target: std::sync::Arc<str>,
     /// Whether the clip lives outside the package.
     pub external: bool,
 }
@@ -102,7 +103,7 @@ pub struct OleObject {
     pub rel_id: Option<String>,
     /// Bytes of the preview picture PowerPoint draws in place of the
     /// object, when the file carries one.
-    pub preview_data: Option<Vec<u8>>,
+    pub preview_data: Option<std::sync::Arc<[u8]>>,
     /// Format of `preview_data` (e.g. `"png"`, `"emf"`).
     pub preview_format: Option<String>,
 }
@@ -144,11 +145,20 @@ pub enum GraphicContent {
     /// its `ppt/charts/chartN.xml` part), or the inline `<a:t>` text of an
     /// unrecognised graphic. The graphic is not drawn, but its words are
     /// real document content.
-    Text(Vec<String>),
+    Text(std::sync::Arc<[String]>),
     /// An embedded or linked OLE object and its preview picture.
     OleObject(OleObject),
     /// Unsupported or unrecognised graphic type.
     Unknown,
+}
+
+/// The characters a copy of `lines` costs the text budget: each line's bytes,
+/// plus `per_line` for what a copy adds around it (a separator in joined
+/// text, an IR paragraph). Saturating, so a hostile length cannot wrap.
+pub(crate) fn lines_cost(lines: &[String], per_line: usize) -> usize {
+    lines
+        .iter()
+        .fold(0usize, |sum, l| sum.saturating_add(l.len()).saturating_add(per_line))
 }
 
 /// A connector line (`<p:cxnSp>`).
@@ -338,10 +348,11 @@ pub struct HyperlinkInfo {
 /// Hyperlink destination type.
 #[derive(Debug, Clone)]
 pub enum HyperlinkTarget {
-    /// External URL (resolved from the slide relationship).
-    External(String),
+    /// External URL (resolved from the slide relationship). Runs that name
+    /// the same relationship share one allocation.
+    External(std::sync::Arc<str>),
     /// Internal slide/anchor reference.
-    Internal(String),
+    Internal(std::sync::Arc<str>),
 }
 
 // ---------------------------------------------------------------------------

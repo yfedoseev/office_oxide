@@ -45,11 +45,14 @@ pub use shape::{
 };
 pub use slide::Slide;
 
+/// The children that open every `p:spTree` and are not shapes.
+const SHAPE_TREE_HEAD: &[&str] = &["nvGrpSpPr", "grpSpPr"];
+
 use std::io::{Read, Seek};
 use std::path::Path;
 
 use crate::core::opc::OpcReader;
-use crate::core::relationships::{Relationships, rel_types};
+use crate::core::relationships::{Relationships, TargetMode, rel_types};
 use crate::core::theme::Theme;
 use log::debug;
 
@@ -65,6 +68,9 @@ const REL_MODERN_AUTHORS: &str =
 /// A parsed PPTX document.
 #[derive(Debug, Clone)]
 pub struct PptxDocument {
+    /// The size of the file this document was read from (0 when unknown): small
+    /// inputs get a text budget scaled to them (see [`crate::limits`]).
+    pub(crate) input_bytes: u64,
     /// Metadata from `ppt/presentation.xml` (slide list, dimensions).
     pub presentation: PresentationInfo,
     /// Parsed slides, in presentation order.
@@ -95,6 +101,12 @@ pub struct PptxDocument {
     /// slide or comments part. Each was skipped so the rest of the deck
     /// could be extracted; a non-empty list means content is missing.
     pub unreadable_parts: Vec<(String, String)>,
+    /// How many unreadable parts beyond the first 100 in [`Self::unreadable_parts`]
+    /// were left out of the list.
+    pub unreadable_parts_omitted: usize,
+    /// Unreadable parts that hold no text (the theme): in the metadata
+    /// warnings only; they change neither the text nor `text_truncated`.
+    pub(crate) cosmetic_parts: Vec<(String, String)>,
     /// The slide layouts the slides use, in first-use order
     /// ([`Slide::layout_index`] points here). Their static text belongs to
     /// no single slide: every rendering carries it once, after the slides;
@@ -107,6 +119,14 @@ pub struct PptxDocument {
 impl PptxDocument {
     /// Open a PPTX file from a file path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let bytes = std::fs::metadata(path.as_ref()).map_or(0, |m| m.len());
+        let _scale = crate::limits::InputSizeScope::new(bytes);
+        let mut doc = Self::open_unscaled(path)?;
+        doc.input_bytes = bytes;
+        Ok(doc)
+    }
+
+    fn open_unscaled(path: impl AsRef<Path>) -> Result<Self> {
         let reader = OpcReader::open(path)?;
         Self::from_opc(reader)
     }
@@ -114,12 +134,29 @@ impl PptxDocument {
     /// Open a PPTX file using memory-mapped I/O for better performance on large files.
     #[cfg(feature = "mmap")]
     pub fn open_mmap(path: impl AsRef<Path>) -> Result<Self> {
+        let bytes = std::fs::metadata(path.as_ref()).map_or(0, |m| m.len());
+        let _scale = crate::limits::InputSizeScope::new(bytes);
+        let mut doc = Self::open_mmap_unscaled(path)?;
+        doc.input_bytes = bytes;
+        Ok(doc)
+    }
+
+    #[cfg(feature = "mmap")]
+    fn open_mmap_unscaled(path: impl AsRef<Path>) -> Result<Self> {
         let reader = OpcReader::open_mmap(path)?;
         Self::from_opc(reader)
     }
 
     /// Open a PPTX document from any `Read + Seek` source.
     pub fn from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
+        let bytes = crate::limits::stream_len(&mut reader);
+        let _scale = crate::limits::InputSizeScope::new(bytes);
+        let mut doc = Self::from_reader_unscaled(reader)?;
+        doc.input_bytes = bytes;
+        Ok(doc)
+    }
+
+    fn from_reader_unscaled<R: Read + Seek>(mut reader: R) -> Result<Self> {
         // A password-protected PPTX is a CFB container, not a zip at all.
         // See the identical check in docx::DocxDocument::from_reader.
         if crate::cfb::is_cfb_container(&mut reader).map_err(crate::core::Error::from)? {
@@ -153,24 +190,22 @@ impl PptxDocument {
         let app_properties = crate::core::properties::read_app_properties(&mut opc);
         let mut package_properties = crate::core::properties::read_package_properties(&mut opc);
         let main_part = opc.main_document_part()?;
-        let pres_rels = opc.read_rels_for(&main_part)?;
+        // A package or presentation relationships part the zip cannot decode
+        // does not refuse the document: it reads as it did when such a part
+        // was taken for absent (no relationships), with the loss reported
+        // below, among the parts the reader could not use.
+        let mut early_problems: Vec<(String, String)> = Vec::new();
+        if let Some(why) = opc.package_rels_problem() {
+            early_problems.push(("/_rels/.rels".to_string(), why.to_string()));
+        }
+        let pres_rels = match opc.read_rels_for(&main_part) {
+            Ok(rels) => rels,
+            Err(e) => {
+                early_problems.push((main_part.rels_path(), e.to_string()));
+                crate::core::relationships::Relationships::empty()
+            },
+        };
         let has_macros = pres_rels.has_vba_project();
-
-        // Parse theme
-        // See the DOCX reader: a malformed theme is not a reason to refuse
-        // the whole presentation.
-        let theme = pres_rels
-            .first_by_type(rel_types::THEME)
-            .and_then(|rel| main_part.resolve_relative(&rel.target).ok())
-            .filter(|pn| opc.has_part(pn))
-            .and_then(|pn| opc.read_part(&pn).ok())
-            .and_then(|data| match Theme::parse(&data) {
-                Ok(t) => Some(t),
-                Err(e) => {
-                    debug!("PptxDocument: ignoring unreadable theme part: {e}");
-                    None
-                },
-            });
 
         // Parse presentation.xml
         let pres_data = opc.read_part(&main_part)?;
@@ -183,11 +218,42 @@ impl PptxDocument {
         // is an error only when no slide at all could be read. (An
         // unreadable notes part used to fail the whole deck while an
         // unresolvable slide relationship vanished silently.)
-        let mut unreadable_parts: Vec<(String, String)> = Vec::new();
-        let mut record = |part: &str, err: &dyn std::fmt::Display| {
-            log::warn!("pptx: skipping unreadable part {part}: {err}");
-            unreadable_parts.push((part.to_string(), err.to_string()));
+        // The record is bounded (see `core::unreadable`) and lives in the
+        // part cache, which meets most of the failures.
+        let mut parts = PartCache {
+            presentation_default: std::sync::Arc::new(master::parse_default_text_style(&pres_data)),
+            ..Default::default()
         };
+
+        // Parse theme
+        // See the DOCX reader: a malformed theme is not a reason to refuse
+        // the whole presentation, but it is reported.
+        let theme = pres_rels
+            .first_by_type(rel_types::THEME)
+            // A relationship to a place outside the package is not a part.
+            .filter(|rel| rel.target_mode == TargetMode::Internal)
+            .and_then(|rel| match main_part.resolve_relative(&rel.target) {
+                Ok(pn) => Some(pn),
+                Err(e) => {
+                    parts.unreadable.record_cosmetic(&rel.target, &e);
+                    None
+                },
+            })
+            .filter(|pn| opc.has_part(pn))
+            .and_then(|pn| match opc.read_part(&pn) {
+                Ok(data) => Some((pn, data)),
+                Err(e) => {
+                    parts.unreadable.record_cosmetic(pn.as_str(), &e);
+                    None
+                },
+            })
+            .and_then(|(pn, data)| match Theme::parse(&data) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    parts.unreadable.record_cosmetic(pn.as_str(), &e);
+                    None
+                },
+            });
 
         // Comment author names live in presentation-level parts, keyed by
         // the id each comment carries. Both the legacy and the modern part
@@ -198,15 +264,23 @@ impl PptxDocument {
                 continue;
             }
             let Ok(part) = main_part.resolve_relative(&rel.target) else {
-                record(&rel.target, &"unresolvable comment-authors target");
+                parts
+                    .unreadable
+                    .record(&rel.target, &"unresolvable comment-authors target");
                 continue;
             };
             if !opc.has_part(&part) {
                 continue;
             }
             match opc.read_part(&part) {
-                Ok(data) => comment_authors.extend(slide::parse_comment_authors(&data)),
-                Err(e) => record(part.as_str(), &e),
+                Ok(data) => {
+                    let (found, error) = slide::parse_comment_authors(&data);
+                    if let Some(error) = error {
+                        parts.unreadable.record(part.as_str(), &error);
+                    }
+                    comment_authors.extend(found);
+                },
+                Err(e) => parts.unreadable.record(part.as_str(), &e),
             }
         }
 
@@ -217,24 +291,21 @@ impl PptxDocument {
             /// `Err` when the slide part itself could not be read.
             slide_data: std::result::Result<Vec<u8>, String>,
             slide_rels: Relationships,
-            notes: Option<NotesBundle>,
-            comments_data: Vec<Vec<u8>>,
+            /// The slide's notes, parsed once per notes part and shared by
+            /// every slide that relates to it.
+            notes: Option<std::sync::Arc<TextBody>>,
+            comments_data: Vec<(String, std::sync::Arc<[u8]>)>,
             /// rId → (raw bytes, format-extension lowercase like "png" / "jpeg").
             /// Pre-resolved here in Phase 1 so the parallel slide parser
             /// (Phase 2) doesn't need access to the OPC reader.
-            media: std::collections::HashMap<String, (Vec<u8>, String)>,
+            media: std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
             /// rId → text lines of a chart part (`ppt/charts/chartN.xml`)
             /// or SmartArt data part (`ppt/diagrams/dataN.xml`). The slide
             /// XML holds only the reference; the text lives in the part.
-            part_text: std::collections::HashMap<String, Vec<String>>,
+            part_text: slide::PartText,
             /// Index into `layouts` of the slide's layout, when its
             /// layout relationship resolves.
             layout_index: Option<usize>,
-        }
-        struct NotesBundle {
-            part_name: String,
-            data: Vec<u8>,
-            rels: Relationships,
         }
         impl SlideBundle {
             fn unreadable(part_name: String, err: &str) -> Self {
@@ -252,12 +323,36 @@ impl PptxDocument {
         }
 
         // Layouts, masters, images and charts are shared by many slides;
-        // each is read and parsed at most once.
-        let mut parts = PartCache {
-            presentation_default: std::sync::Arc::new(master::parse_default_text_style(&pres_data)),
-            ..Default::default()
-        };
+        // each is read and parsed at most once, and so is a comments part.
+        let mut comments_cache: std::collections::HashMap<
+            crate::core::opc::PartName,
+            Option<std::sync::Arc<[u8]>>,
+        > = std::collections::HashMap::new();
+        // Every distinct slide is a part of the package, so a slide list
+        // longer than the package may hold entries can only repeat itself.
+        if presentation.slides.len() > crate::limits::max_package_entries() {
+            return Err(crate::core::Error::PackageLimit(format!(
+                "the slide list names {} slides; the limit is {} (the package entry limit)",
+                presentation.slides.len(),
+                crate::limits::max_package_entries()
+            ))
+            .into());
+        }
+        // Notes parts already read, by part name: the body parsed from each
+        // (`None` when absent, unreadable or empty). Several slides can
+        // relate to one notes part; reading and holding it per slide
+        // multiplied its size by the slide count.
+        let mut notes_cache: std::collections::HashMap<
+            crate::core::opc::PartName,
+            Option<std::sync::Arc<TextBody>>,
+        > = std::collections::HashMap::new();
         let mut bundles = Vec::with_capacity(presentation.slides.len());
+        // A slide part is read and kept once however many `p:sldId` entries
+        // name it (ECMA-376 Part 1 §19.2.1.34: the list orders the slides
+        // of the presentation; a slide is one part). Repeats would
+        // otherwise re-parse, store and render the same part once per entry.
+        let mut seen_slides: std::collections::HashSet<crate::core::opc::PartName> =
+            std::collections::HashSet::new();
         for (slide_idx, slide_id) in presentation.slides.iter().enumerate() {
             // Resolve by rel_id, or by the `slideN.xml` convention when the
             // entry carries no r:id.
@@ -271,26 +366,39 @@ impl PptxDocument {
                     .map_err(|e| (candidate.clone(), e.to_string()))
             };
             let part_name = match resolved {
+                Ok(pn) if !seen_slides.insert(pn.clone()) => {
+                    parts.unreadable.record(
+                        pn.as_str(),
+                        &"the slide list names this part more than once; \
+                        only its first entry is kept",
+                    );
+                    continue;
+                },
                 Ok(pn) if opc.has_part(&pn) => pn,
                 Ok(pn) => {
                     let name = pn.as_str().to_string();
-                    record(&name, &"the part is missing from the package");
+                    parts
+                        .unreadable
+                        .record(&name, &"the part is missing from the package");
                     bundles.push(SlideBundle::unreadable(name, "the part is missing"));
                     continue;
                 },
                 Err((what, err)) => {
-                    record(&what, &err);
+                    parts.unreadable.record(&what, &err);
                     bundles.push(SlideBundle::unreadable(what, &err));
                     continue;
                 },
             };
-            let slide_rels = opc
-                .read_rels_for(&part_name)
-                .unwrap_or_else(|_| Relationships::empty());
+            // A relationships part that cannot be read leaves the slide with
+            // none, and says so.
+            let slide_rels = opc.read_rels_for(&part_name).unwrap_or_else(|e| {
+                parts.unreadable.record(&part_name.rels_path(), &e);
+                Relationships::empty()
+            });
             let slide_data = match opc.read_part(&part_name) {
                 Ok(d) => Ok(d),
                 Err(e) => {
-                    record(part_name.as_str(), &e);
+                    parts.unreadable.record(part_name.as_str(), &e);
                     Err(e.to_string())
                 },
             };
@@ -299,30 +407,85 @@ impl PptxDocument {
             // relationships.
             let layout_index = slide_rels
                 .first_by_type(rel_types::SLIDE_LAYOUT)
-                .and_then(|rel| part_name.resolve_relative(&rel.target).ok())
+                .filter(|rel| rel.target_mode == TargetMode::Internal)
+                .and_then(|rel| match part_name.resolve_relative(&rel.target) {
+                    Ok(layout_part) => Some(layout_part),
+                    Err(e) => {
+                        parts.unreadable.record(&rel.target, &e);
+                        None
+                    },
+                })
                 .and_then(|layout_part| parts.layout(&mut opc, &layout_part));
 
             let notes = match slide_rels.first_by_type(rel_types::NOTES_SLIDE) {
                 None => None,
+                // Outside the package: not a part.
+                Some(notes_rel) if notes_rel.target_mode == TargetMode::External => None,
                 Some(notes_rel) => match part_name.resolve_relative(&notes_rel.target) {
                     Err(e) => {
-                        record(&notes_rel.target, &e);
+                        parts.unreadable.record(&notes_rel.target, &e);
                         None
                     },
                     // A notes relationship to an absent part: nothing to read.
                     Ok(notes_part) if !opc.has_part(&notes_part) => None,
-                    Ok(notes_part) => match opc.read_part(&notes_part) {
-                        Ok(data) => Some(NotesBundle {
-                            part_name: notes_part.as_str().to_string(),
-                            data,
-                            rels: opc
-                                .read_rels_for(&notes_part)
-                                .unwrap_or_else(|_| Relationships::empty()),
-                        }),
-                        Err(e) => {
-                            record(notes_part.as_str(), &e);
-                            None
-                        },
+                    Ok(notes_part) => {
+                        if let Some(cached) = notes_cache.get(&notes_part) {
+                            cached.clone()
+                        } else {
+                            let body = match opc.read_part(&notes_part) {
+                                Ok(data) => {
+                                    // Unreadable relationships leave the notes
+                                    // without their links and pictures, and say so.
+                                    let rels = opc.read_rels_for(&notes_part).unwrap_or_else(|e| {
+                                        parts.unreadable.record(&notes_part.rels_path(), &e);
+                                        Relationships::empty()
+                                    });
+                                    match slide::extract_notes_body(&data, &rels) {
+                                        Ok(body) => body.map(std::sync::Arc::new),
+                                        Err(e) => {
+                                            // Notes malformed part-way keep the
+                                            // shapes before the damage.
+                                            let salvaged = crate::core::xml::salvage_prefix(
+                                                &data,
+                                                3,
+                                                Some("spTree"),
+                                                SHAPE_TREE_HEAD,
+                                            )
+                                            .and_then(|(prefix, shapes)| {
+                                                slide::extract_notes_body(&prefix, &rels)
+                                                    .ok()
+                                                    .map(|body| (body, shapes))
+                                            });
+                                            match salvaged {
+                                                Some((body, shapes)) => {
+                                                    parts.unreadable.record(
+                                                        notes_part.as_str(),
+                                                        &format!(
+                                                            "the XML is malformed after {shapes} \
+                                                             shapes; the rest of the notes was \
+                                                             not read"
+                                                        ),
+                                                    );
+                                                    body.map(std::sync::Arc::new)
+                                                },
+                                                None => {
+                                                    parts
+                                                        .unreadable
+                                                        .record(notes_part.as_str(), &e);
+                                                    None
+                                                },
+                                            }
+                                        },
+                                    }
+                                },
+                                Err(e) => {
+                                    parts.unreadable.record(notes_part.as_str(), &e);
+                                    None
+                                },
+                            };
+                            notes_cache.insert(notes_part, body.clone());
+                            body
+                        }
                     },
                 },
             };
@@ -341,16 +504,35 @@ impl PptxDocument {
             let comment_parts: Vec<_> = slide_rels
                 .all()
                 .iter()
-                .filter(|rel| rel.rel_type.ends_with("/comments"))
-                .filter_map(|rel| part_name.resolve_relative(&rel.target).ok())
+                .filter(|rel| {
+                    rel.rel_type.ends_with("/comments") && rel.target_mode == TargetMode::Internal
+                })
+                .filter_map(|rel| match part_name.resolve_relative(&rel.target) {
+                    Ok(pn) => Some(pn),
+                    Err(e) => {
+                        parts.unreadable.record(&rel.target, &e);
+                        None
+                    },
+                })
                 .filter(|pn| opc.has_part(pn))
                 .collect();
-            let mut comments_data: Vec<Vec<u8>> = Vec::new();
+            let mut comments_data: Vec<(String, std::sync::Arc<[u8]>)> = Vec::new();
             for pn in comment_parts {
-                match opc.read_part(&pn) {
-                    Ok(data) => comments_data.push(data),
-                    Err(e) => record(pn.as_str(), &e),
+                if !comments_cache.contains_key(&pn) {
+                    let read = match opc.read_part(&pn) {
+                        Ok(data) => Some(std::sync::Arc::<[u8]>::from(data)),
+                        Err(e) => {
+                            parts.unreadable.record(pn.as_str(), &e);
+                            None
+                        },
+                    };
+                    comments_cache.insert(pn.clone(), read);
                 }
+                comments_data.extend(
+                    comments_cache[&pn]
+                        .clone()
+                        .map(|data| (pn.as_str().to_string(), data)),
+                );
             }
 
             bundles.push(SlideBundle {
@@ -367,12 +549,32 @@ impl PptxDocument {
         let PartCache {
             layouts: layout_entries,
             masters: master_entries,
+            unreadable: mut unreadable_parts,
             ..
         } = parts;
+        for (part, why) in &early_problems {
+            unreadable_parts.record(part, why);
+        }
 
         // Phase 2: parse slides (parallel when feature enabled). Each slide
         // yields its parts that could not be used, merged in order below.
         type ParsedSlide = (Slide, Vec<(String, String)>);
+        // A comments part several slides name is parsed once.
+        let mut parsed_comments: std::collections::HashMap<
+            String,
+            (std::sync::Arc<[slide::SlideComment]>, Option<String>),
+        > = std::collections::HashMap::new();
+        for b in &bundles {
+            for (comments_part, data) in &b.comments_data {
+                parsed_comments
+                    .entry(comments_part.clone())
+                    .or_insert_with(|| {
+                        let (comments, error) = slide::parse_comments(data, &comment_authors);
+                        (std::sync::Arc::from(comments), error)
+                    });
+            }
+        }
+        let parsed_comments = &parsed_comments;
         let parsed = crate::core::parallel::map_collect(
             bundles,
             |b| -> std::result::Result<ParsedSlide, std::convert::Infallible> {
@@ -389,26 +591,66 @@ impl PptxDocument {
                     Err(e) => return Ok((unreadable_slide(e.clone()), problems)),
                 };
                 let name = xml_csl_name(data);
-                let mut parsed =
-                    match Slide::parse(data, name, &b.slide_rels, &b.media, &b.part_text) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            problems.push((b.part_name.clone(), e.to_string()));
-                            return Ok((unreadable_slide(e.to_string()), problems));
-                        },
-                    };
+                // A slide cut off mid-element parses to what was read before
+                // the cut and reports success, so the root must have closed.
+                let whole = crate::core::xml::check_root_closed(data, &b.part_name, "sld")
+                    .and_then(|()| {
+                        Slide::parse(data, name.clone(), &b.slide_rels, &b.media, &b.part_text)
+                    });
+                let mut parsed = match whole {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // A slide malformed part-way keeps the shapes before
+                        // the damage, and the loss is reported.
+                        let salvaged = crate::core::xml::salvage_prefix(
+                            data,
+                            3,
+                            Some("spTree"),
+                            SHAPE_TREE_HEAD,
+                        )
+                        .and_then(|(prefix, shapes)| {
+                            Slide::parse(&prefix, name, &b.slide_rels, &b.media, &b.part_text)
+                                .ok()
+                                .map(|slide| (slide, shapes))
+                        });
+                        match salvaged {
+                            Some((slide, shapes)) => {
+                                problems.push((
+                                    b.part_name.clone(),
+                                    format!(
+                                        "the XML is malformed after {shapes} shapes; the rest \
+                                         of the slide was not read"
+                                    ),
+                                ));
+                                slide
+                            },
+                            None => {
+                                problems.push((b.part_name.clone(), e.to_string()));
+                                return Ok((unreadable_slide(e.to_string()), problems));
+                            },
+                        }
+                    },
+                };
                 parsed.layout_index = b.layout_index;
-                if let Some(notes) = &b.notes {
-                    match slide::extract_notes_body(&notes.data, &notes.rels) {
-                        Ok(body) => parsed.notes = body,
-                        Err(e) => problems.push((notes.part_name.clone(), e.to_string())),
+                parsed.notes = b.notes.clone();
+                // A part is taken once per slide however often it is named. One
+                // part is shared, not copied: a deck of N slides that name one
+                // large comments part holds it once.
+                let mut taken: Vec<&std::sync::Arc<[slide::SlideComment]>> = Vec::new();
+                let mut seen_parts = std::collections::HashSet::new();
+                for (comments_part, _) in &b.comments_data {
+                    if !seen_parts.insert(comments_part) {
+                        continue;
+                    }
+                    let Some((comments, error)) = parsed_comments.get(comments_part) else {
+                        continue;
+                    };
+                    taken.push(comments);
+                    if let Some(error) = error {
+                        problems.push((comments_part.clone(), error.clone()));
                     }
                 }
-                for data in &b.comments_data {
-                    parsed
-                        .comments
-                        .extend(slide::parse_comments(data, &comment_authors));
-                }
+                parsed.comment_parts = taken.into_iter().map(std::sync::Arc::clone).collect();
                 let chain = b
                     .layout_index
                     .and_then(|i| layout_entries.get(i))
@@ -426,12 +668,17 @@ impl PptxDocument {
         let mut slides = Vec::with_capacity(parsed.len());
         for (slide, problems) in parsed {
             for (part, err) in problems {
-                record(&part, &err);
+                unreadable_parts.record(&part, &err);
             }
             slides.push(slide);
         }
         if !slides.is_empty() && slides.iter().all(|s| s.parse_error.is_some()) {
-            let (part, err) = &unreadable_parts[0];
+            // Name a slide: another part (a theme met first) did not decide
+            // that no slide could be read.
+            let (part, err) = slides
+                .iter()
+                .find_map(|s| s.parse_error.as_ref().map(|e| (s.name.clone(), e.clone())))
+                .unwrap_or_default();
             return Err(crate::core::Error::MalformedXml(format!(
                 "no slide could be read; {part}: {err}"
             ))
@@ -454,7 +701,14 @@ impl PptxDocument {
             if !(lower.ends_with(".ttf") || lower.ends_with(".otf")) {
                 continue;
             }
-            if let Ok(data) = opc.read_part(&name) {
+            let data = match opc.read_part(&name) {
+                Ok(data) => Some(data),
+                Err(e) => {
+                    unreadable_parts.record(&s, &e);
+                    None
+                },
+            };
+            if let Some(data) = data {
                 let basename = s.rsplit('/').next().unwrap_or("font");
                 let face = crate::docx::strip_embedded_font_filename(basename);
                 let font_name = if face.is_empty() {
@@ -472,7 +726,10 @@ impl PptxDocument {
             embedded_fonts.len()
         );
         package_properties.crc_mismatched_parts = opc.crc_mismatched_parts();
+        let (unreadable_parts, unreadable_parts_omitted, cosmetic_parts) =
+            unreadable_parts.finish_with_cosmetic();
         Ok(PptxDocument {
+            input_bytes: 0,
             presentation,
             slides,
             theme,
@@ -482,6 +739,8 @@ impl PptxDocument {
             package_properties,
             has_macros,
             unreadable_parts,
+            unreadable_parts_omitted,
+            cosmetic_parts,
             layouts,
             masters,
         })
@@ -564,9 +823,16 @@ struct PartCache {
     masters: Vec<MasterEntry>,
     master_index: std::collections::HashMap<crate::core::opc::PartName, Option<usize>>,
     /// Target part → (bytes, extension); `None` when unreadable.
-    images: std::collections::HashMap<crate::core::opc::PartName, Option<(Vec<u8>, String)>>,
+    images: std::collections::HashMap<
+        crate::core::opc::PartName,
+        Option<(std::sync::Arc<[u8]>, String)>,
+    >,
     /// (target part, is-chart) → text lines.
-    part_text: std::collections::HashMap<(crate::core::opc::PartName, bool), Vec<String>>,
+    part_text:
+        std::collections::HashMap<(crate::core::opc::PartName, bool), std::sync::Arc<[String]>>,
+    /// The parts that could not be read, from here and from the reader
+    /// that owns this cache; each part is tried once.
+    unreadable: crate::core::unreadable::UnreadableParts,
     /// Every part this cache decompressed, in order — what the caching
     /// tests count.
     #[cfg(test)]
@@ -574,6 +840,34 @@ struct PartCache {
 }
 
 impl PartCache {
+    /// The bytes of `part`, or `None` with the failure recorded.
+    fn read_or_record<R: Read + Seek>(
+        &mut self,
+        opc: &mut OpcReader<R>,
+        part: &crate::core::opc::PartName,
+    ) -> Option<Vec<u8>> {
+        match opc.read_part(part) {
+            Ok(data) => Some(data),
+            Err(e) => {
+                self.unreadable.record(part.as_str(), &e);
+                None
+            },
+        }
+    }
+
+    /// The relationships of `part`; empty, with the failure recorded, when
+    /// its relationships part cannot be read.
+    fn rels_or_record<R: Read + Seek>(
+        &mut self,
+        opc: &mut OpcReader<R>,
+        part: &crate::core::opc::PartName,
+    ) -> Relationships {
+        opc.read_rels_for(part).unwrap_or_else(|e| {
+            self.unreadable.record(&part.rels_path(), &e);
+            Relationships::empty()
+        })
+    }
+
     /// The index of the layout at `part`, reading it (and its master) the
     /// first time it is seen.
     fn layout<R: Read + Seek>(
@@ -597,15 +891,20 @@ impl PartCache {
         if !opc.has_part(part) {
             return None;
         }
-        let data = opc.read_part(part).ok()?;
+        let data = self.read_or_record(opc, part)?;
         #[cfg(test)]
         self.reads.borrow_mut().push(part.as_str().to_string());
-        let rels = opc
-            .read_rels_for(part)
-            .unwrap_or_else(|_| Relationships::empty());
+        let rels = self.rels_or_record(opc, part);
         let master_index = rels
             .first_by_type(rel_types::SLIDE_MASTER)
-            .and_then(|rel| part.resolve_relative(&rel.target).ok())
+            .filter(|rel| rel.target_mode == TargetMode::Internal)
+            .and_then(|rel| match part.resolve_relative(&rel.target) {
+                Ok(mp) => Some(mp),
+                Err(e) => {
+                    self.unreadable.record(&rel.target, &e);
+                    None
+                },
+            })
             .and_then(|mp| self.master(opc, &mp));
         let (shapes, hide_master) = self.parse_shapes(opc, part, &rels, &data);
         let (master_placeholders, master_text_styles) = match master_index {
@@ -642,12 +941,10 @@ impl PartCache {
             if !opc.has_part(part) {
                 return None;
             }
-            let data = opc.read_part(part).ok()?;
+            let data = self.read_or_record(opc, part)?;
             #[cfg(test)]
             self.reads.borrow_mut().push(part.as_str().to_string());
-            let rels = opc
-                .read_rels_for(part)
-                .unwrap_or_else(|_| Relationships::empty());
+            let rels = self.rels_or_record(opc, part);
             let (shapes, _) = self.parse_shapes(opc, part, &rels, &data);
             self.masters.push(MasterEntry {
                 info: layout::SlideMaster {
@@ -678,8 +975,31 @@ impl PartCache {
         match Slide::parse(data, String::new(), rels, &media, &part_text) {
             Ok(s) => (s.shapes, s.hide_master_shapes),
             Err(e) => {
-                log::warn!("pptx: shapes of {part} are unreadable: {e}");
-                (Vec::new(), false)
+                // Malformed part-way: the shapes before the damage are kept,
+                // as for a slide, and the loss is reported.
+                let salvaged =
+                    crate::core::xml::salvage_prefix(data, 3, Some("spTree"), SHAPE_TREE_HEAD)
+                        .and_then(|(prefix, shapes)| {
+                            Slide::parse(&prefix, String::new(), rels, &media, &part_text)
+                                .ok()
+                                .map(|s| (s, shapes))
+                        });
+                match salvaged {
+                    Some((s, shapes)) => {
+                        self.unreadable.record(
+                            part.as_str(),
+                            &format!(
+                                "the XML is malformed after {shapes} shapes; the rest of the \
+                                 part was not read"
+                            ),
+                        );
+                        (s.shapes, s.hide_master_shapes)
+                    },
+                    None => {
+                        self.unreadable.record(part.as_str(), &e);
+                        (Vec::new(), false)
+                    },
+                }
             },
         }
     }
@@ -690,7 +1010,7 @@ impl PartCache {
         opc: &mut OpcReader<R>,
         source: &crate::core::opc::PartName,
         rels: &Relationships,
-    ) -> std::collections::HashMap<String, (Vec<u8>, String)> {
+    ) -> std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)> {
         let mut media = std::collections::HashMap::new();
         for rel in rels.all() {
             if rel.rel_type != rel_types::IMAGE
@@ -698,14 +1018,24 @@ impl PartCache {
             {
                 continue;
             }
-            let Ok(target) = source.resolve_relative(&rel.target) else {
-                continue;
+            let target = match source.resolve_relative(&rel.target) {
+                Ok(target) => target,
+                Err(e) => {
+                    self.unreadable.record(&rel.target, &e);
+                    continue;
+                },
             };
             let entry = self.images.entry(target).or_insert_with_key(|target| {
                 if !opc.has_part(target) {
                     return None;
                 }
-                let bytes = opc.read_part(target).ok()?;
+                let bytes = match opc.read_part(target) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        self.unreadable.record(target.as_str(), &e);
+                        return None;
+                    },
+                };
                 #[cfg(test)]
                 self.reads.borrow_mut().push(target.as_str().to_string());
                 let ext = std::path::Path::new(target.as_str())
@@ -713,7 +1043,7 @@ impl PartCache {
                     .and_then(|s| s.to_str())
                     .map(|s| s.to_ascii_lowercase())
                     .unwrap_or_else(|| guess_format_from_bytes(&bytes).to_string());
-                Some((bytes, ext))
+                Some((bytes.into(), ext))
             });
             if let Some(found) = entry {
                 media.insert(rel.id.clone(), found.clone());
@@ -729,36 +1059,62 @@ impl PartCache {
         opc: &mut OpcReader<R>,
         source: &crate::core::opc::PartName,
         rels: &Relationships,
-    ) -> std::collections::HashMap<String, Vec<String>> {
-        let mut out = std::collections::HashMap::new();
+    ) -> slide::PartText {
+        let mut out = slide::PartText::new();
         for rel in rels.all() {
             let is_chart = rel.rel_type == rel_types::CHART;
             if !is_chart && rel.rel_type != rel_types::DIAGRAM_DATA {
                 continue;
             }
-            let Ok(target) = source.resolve_relative(&rel.target) else {
+            if rel.target_mode == TargetMode::External {
                 continue;
+            }
+            let target = match source.resolve_relative(&rel.target) {
+                Ok(target) => target,
+                Err(e) => {
+                    self.unreadable.record(&rel.target, &e);
+                    continue;
+                },
             };
             let lines =
                 self.part_text
                     .entry((target, is_chart))
                     .or_insert_with_key(|(target, _)| {
                         if !opc.has_part(target) {
-                            return Vec::new();
+                            return std::sync::Arc::from(Vec::new());
                         }
-                        let Ok(data) = opc.read_part(target) else {
-                            return Vec::new();
+                        let data = match opc.read_part(target) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                self.unreadable.record(target.as_str(), &e);
+                                return std::sync::Arc::from(Vec::new());
+                            },
                         };
                         #[cfg(test)]
                         self.reads.borrow_mut().push(target.as_str().to_string());
-                        if is_chart {
-                            crate::core::chart::chart_text_lines(&data)
+                        std::sync::Arc::from(if is_chart {
+                            let (lines, damage) =
+                                crate::core::chart::chart_text_lines_checked(&data);
+                            if let Some(damage) = damage {
+                                self.unreadable.record(
+                                    target.as_str(),
+                                    &format!("{damage}; the rest of its text is missing"),
+                                );
+                            }
+                            lines
                         } else {
-                            slide::diagram_data_text_lines(&data)
-                        }
+                            let (lines, damage) = slide::diagram_data_text_lines(&data);
+                            if let Some(damage) = damage {
+                                self.unreadable.record(
+                                    target.as_str(),
+                                    &format!("{damage}; the rest of its text is missing"),
+                                );
+                            }
+                            lines
+                        })
                     });
             if !lines.is_empty() {
-                out.insert(rel.id.clone(), lines.clone());
+                out.insert(rel.id.clone(), std::sync::Arc::clone(lines));
             }
         }
         out
@@ -1033,7 +1389,7 @@ mod part_cache_tests {
             let media = parts.media_for(&mut opc, &slide, &rels);
             assert_eq!(media["rId2"].1, "png");
             let text = parts.part_text_for(&mut opc, &slide, &rels);
-            assert_eq!(text["rId3"], vec!["Title: Revenue".to_string()]);
+            assert_eq!(&*text["rId3"], &["Title: Revenue".to_string()][..]);
         }
         let reads = parts.reads.borrow();
         let mut sorted = reads.clone();
@@ -1050,6 +1406,79 @@ mod part_cache_tests {
         );
         assert_eq!(parts.layouts.len(), 1);
         assert_eq!(parts.masters.len(), 1);
+    }
+
+    /// Three slides that name one comments part, which holds two comments.
+    fn shared_comments_package() -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default();
+        let mut add = |name: &str, data: &[u8]| {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(data).unwrap();
+        };
+        add(
+            "[Content_Types].xml",
+            br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/></Types>"#,
+        );
+        add(
+            "_rels/.rels",
+            &rels(&[("rId1", rel_types::OFFICE_DOCUMENT, "ppt/presentation.xml")]),
+        );
+        add(
+            "ppt/presentation.xml",
+            br#"<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/><p:sldId id="257" r:id="rId2"/><p:sldId id="258" r:id="rId3"/></p:sldIdLst></p:presentation>"#,
+        );
+        add(
+            "ppt/_rels/presentation.xml.rels",
+            &rels(&[
+                ("rId1", rel_types::SLIDE, "slides/slide1.xml"),
+                ("rId2", rel_types::SLIDE, "slides/slide2.xml"),
+                ("rId3", rel_types::SLIDE, "slides/slide3.xml"),
+            ]),
+        );
+        let ns = r#"xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main""#;
+        for n in 1..=3 {
+            add(
+                &format!("ppt/slides/slide{n}.xml"),
+                format!(r#"<p:sld {ns}><p:cSld><p:spTree/></p:cSld></p:sld>"#).as_bytes(),
+            );
+            add(
+                &format!("ppt/slides/_rels/slide{n}.xml.rels"),
+                &rels(&[(
+                    "rId1",
+                    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments",
+                    "../comments/comment1.xml",
+                )]),
+            );
+        }
+        add(
+            "ppt/comments/comment1.xml",
+            format!(
+                r#"<p:cmLst {ns}><p:cm authorId="0"><p:text>first remark</p:text></p:cm><p:cm authorId="0"><p:text>second remark</p:text></p:cm></p:cmLst>"#
+            )
+            .as_bytes(),
+        );
+        zip.finish().unwrap().into_inner()
+    }
+
+    /// A comments part several slides name was parsed again for each of
+    /// them. It is parsed once, and every slide still gets its comments.
+    #[test]
+    fn test_a_comments_part_shared_by_slides_is_parsed_once() {
+        slide::COMMENT_PARSES.with(|n| n.set(0));
+        let doc = PptxDocument::from_reader(Cursor::new(shared_comments_package())).unwrap();
+        assert_eq!(doc.slides.len(), 3);
+        for slide in &doc.slides {
+            let texts: Vec<_> = slide.comments().map(|c| c.text.as_str()).collect();
+            assert_eq!(texts, ["first remark", "second remark"]);
+        }
+        assert_eq!(slide::COMMENT_PARSES.with(|n| n.get()), 1);
+        // Shared, not copied: every slide holds the one allocation.
+        let first = &doc.slides[0].comment_parts;
+        assert_eq!(first.len(), 1);
+        for other in &doc.slides[1..] {
+            assert!(std::sync::Arc::ptr_eq(&first[0], &other.comment_parts[0]));
+        }
     }
 
     /// Byte-sniffed image formats, used when a relationship target has no

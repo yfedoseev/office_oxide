@@ -14,10 +14,29 @@
 
 pub use crate::cfb::blip::BlipFormat as ImageFormat;
 pub use crate::cfb::blip::BlipImage as DocImage;
-use crate::cfb::blip::extract_one_blip;
+use crate::cfb::blip::{BlipDiagnostics, extract_one_blip};
+use crate::limits::InflateBudget;
 
 /// Extract images from a DOC Data stream by scanning for BLIP record signatures.
+///
+/// The stream's compressed metafiles share the document's allowance of
+/// inflated image bytes (`limits::set_max_memory_bytes`).
 pub fn extract_images(data: &[u8]) -> Vec<DocImage> {
+    extract_images_diagnosed(data).0
+}
+
+/// [`extract_images`], also reporting what was left out because of a limit.
+pub(crate) fn extract_images_diagnosed(data: &[u8]) -> (Vec<DocImage>, BlipDiagnostics) {
+    let mut diag = BlipDiagnostics::default();
+    let images = extract_images_within(data, &mut InflateBudget::new(), &mut diag);
+    (images, diag)
+}
+
+fn extract_images_within(
+    data: &[u8],
+    budget: &mut InflateBudget,
+    diag: &mut BlipDiagnostics,
+) -> Vec<DocImage> {
     let mut images = Vec::new();
     let mut pos = 0;
 
@@ -40,7 +59,9 @@ pub fn extract_images(data: &[u8]) -> Vec<DocImage> {
             // signature check this heuristic scan needs to reject byte
             // runs that only look like a record header, applied to the
             // decoded image rather than to still-compressed bytes.
-            if let Some(mut img) = extract_one_blip(data, rec_type, inst, data_start, data_end) {
+            if let Some(mut img) =
+                extract_one_blip(data, rec_type, inst, data_start, data_end, budget, diag)
+            {
                 if has_valid_signature(rec_type, &img.data) {
                     img.index = images.len();
                     images.push(img);
@@ -245,6 +266,35 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, ImageFormat::Emf);
         assert_eq!(images[0].data, emf);
+    }
+
+    /// The compressed metafiles of a `Data` stream share the document's
+    /// allowance of inflated bytes.
+    #[test]
+    fn test_scan_spends_one_inflation_allowance_across_pictures() {
+        use std::io::Write;
+        let mut emf = vec![0x01, 0x00, 0x00, 0x00, 0x6C, 0x00, 0x00, 0x00];
+        emf.resize(1 << 20, 0);
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&emf).unwrap();
+        let z = enc.finish().unwrap();
+        let mut body = vec![0u8; 16];
+        body.extend_from_slice(&(emf.len() as u32).to_le_bytes());
+        body.extend_from_slice(&[0u8; 24]);
+        body.extend_from_slice(&(z.len() as u32).to_le_bytes());
+        body.extend_from_slice(&[0x00, 0xFE]);
+        body.extend_from_slice(&z);
+        let mut record = Vec::new();
+        record.extend_from_slice(&(0x3D4u16 << 4).to_le_bytes());
+        record.extend_from_slice(&0xF01Au16.to_le_bytes());
+        record.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        record.extend(body);
+        let data: Vec<u8> = (0..4).flat_map(|_| record.clone()).collect();
+        let mut budget = InflateBudget::with_limit(5 << 19);
+        assert_eq!(
+            extract_images_within(&data, &mut budget, &mut BlipDiagnostics::default()).len(),
+            2
+        );
     }
 
     /// A `PICF` + WMF picture (Word 6.0/95, or a non-shape picture in a

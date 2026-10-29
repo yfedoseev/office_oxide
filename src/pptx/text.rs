@@ -4,6 +4,43 @@ use super::shape::{
 };
 
 impl PptxDocument {
+    /// What was lost to the parts that could not be read, one warning for
+    /// each part listed and one for the rest, as `Metadata::warnings` lists
+    /// them and as every rendering writes them. Empty when every part read.
+    pub(crate) fn unreadable_warnings(&self) -> Vec<String> {
+        self.unreadable_parts
+            .iter()
+            .chain(self.cosmetic_parts.iter())
+            .map(|(part, err)| format!("skipped unreadable part {part}: {err}"))
+            .chain(
+                (self.unreadable_parts_omitted > 0).then(|| {
+                    crate::core::unreadable::omitted_warning(self.unreadable_parts_omitted)
+                }),
+            )
+            .collect()
+    }
+
+    /// The warnings for the unreadable parts that can change the text, and
+    /// for the rest left out of the list: what every rendering writes in
+    /// band. A part that holds no text (a theme, a font) is only in
+    /// [`Self::unreadable_warnings`].
+    pub(crate) fn unreadable_text_warnings(&self) -> Vec<String> {
+        self.unreadable_parts
+            .iter()
+            .map(|(part, err)| format!("skipped unreadable part {part}: {err}"))
+            .chain(
+                (self.unreadable_parts_omitted > 0).then(|| {
+                    crate::core::unreadable::omitted_warning(self.unreadable_parts_omitted)
+                }),
+            )
+            .collect()
+    }
+
+    /// Whether a part that can change the text could not be read.
+    pub(crate) fn unreadable_loses_text(&self) -> bool {
+        self.unreadable_parts_omitted > 0 || !self.unreadable_parts.is_empty()
+    }
+
     /// Extract plain text from the entire presentation.
     ///
     /// Shapes are spatially sorted (top-to-bottom, left-to-right) per slide.
@@ -14,14 +51,39 @@ impl PptxDocument {
     /// [`super::layout::MASTER_TEXT_SECTION_TITLE`]; see the
     /// [`super::layout`] module.
     pub fn plain_text(&self) -> String {
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
+        let _text_scope = crate::limits::begin_copied_text_budget();
         let mut parts = Vec::new();
+        // Notes shared by many slides are printed with each (see
+        // `crate::limits`), so the slides' text is charged to the budget.
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
+        let mut budget = crate::limits::TextBudget::new();
         for (i, _) in self.slides.iter().enumerate() {
-            if let Some(text) = self.slide_plain_text(i) {
+            if let Some(text) = self.slide_plain(i) {
                 if !text.is_empty() {
+                    if !budget.charge(text.chars().count()) {
+                        break;
+                    }
                     parts.push(text);
                 }
             }
         }
+        if budget.exhausted() {
+            parts.push(budget.notice());
+        }
+        // The parts that could not be read, charged to the budget before
+        // the budget's own notice is read.
+        let unreadable = crate::core::unreadable::report_lines(
+            &self.unreadable_text_warnings(),
+            crate::core::unreadable::ReportTarget::Plain,
+        );
+        if !unreadable.is_empty() {
+            parts.push(unreadable.join("\n"));
+        }
+        // Chart and SmartArt text is shared by the frames that name it and
+        // copied into the output once per frame; past the copied-text budget
+        // a frame's text is left out.
+        parts.extend(crate::limits::copied_text_notice());
         let master: Vec<String> = self
             .master_static_bodies()
             .into_iter()
@@ -40,6 +102,19 @@ impl PptxDocument {
 
     /// Extract plain text from a single slide by index.
     pub fn slide_plain_text(&self, index: usize) -> Option<String> {
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
+        let _text_scope = crate::limits::begin_copied_text_budget();
+        let mut text = self.slide_plain(index)?;
+        if let Some(notice) = crate::limits::copied_text_notice() {
+            text.push_str("\n\n");
+            text.push_str(&notice);
+        }
+        Some(text)
+    }
+
+    /// [`Self::slide_plain_text`] within the copied-text budget the caller
+    /// has begun.
+    fn slide_plain(&self, index: usize) -> Option<String> {
         let slide = self.slides.get(index)?;
         if let Some(ref err) = slide.parse_error {
             return Some(unreadable_slide_notice(&slide.name, err));
@@ -67,7 +142,7 @@ impl PptxDocument {
         // Slide comments are review content; `to_ir()` carries them as
         // endnotes, and this direct renderer dropped them — a slide whose
         // only content was its comments came back empty.
-        for c in &slide.comments {
+        for c in slide.comments() {
             result.push_str("\n\n");
             result.push_str(&comment_marker(c.author.as_deref()));
             result.push_str(": ");
@@ -82,12 +157,33 @@ impl PptxDocument {
     /// Layout and master static text follows the slides once, as for
     /// [`Self::plain_text`].
     pub fn to_markdown(&self) -> String {
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
+        let _text_scope = crate::limits::begin_copied_text_budget();
         let mut parts = Vec::new();
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
+        let mut budget = crate::limits::TextBudget::new();
         for (i, _) in self.slides.iter().enumerate() {
-            if let Some(md) = self.slide_to_markdown(i) {
+            if let Some(md) = self.slide_markdown(i) {
+                if !budget.charge(md.chars().count()) {
+                    break;
+                }
                 parts.push(md);
             }
         }
+        if budget.exhausted() {
+            parts.push(budget.notice());
+        }
+        // The parts that could not be read, as in plain_text().
+        let unreadable = crate::core::unreadable::report_lines(
+            &self.unreadable_text_warnings(),
+            crate::core::unreadable::ReportTarget::Markdown,
+        );
+        if !unreadable.is_empty() {
+            parts.push(unreadable.join("\n\n"));
+        }
+        // A picture's link target is copied into the output once per picture;
+        // past the copied-text budget the picture is named without it.
+        parts.extend(crate::limits::copied_text_notice());
         let mut out = parts.join("\n\n");
         let master: Vec<String> = self
             .master_static_bodies()
@@ -111,6 +207,19 @@ impl PptxDocument {
 
     /// Convert a single slide to markdown by index.
     pub fn slide_to_markdown(&self, index: usize) -> Option<String> {
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
+        let _text_scope = crate::limits::begin_copied_text_budget();
+        let mut md = self.slide_markdown(index)?;
+        if let Some(notice) = crate::limits::copied_text_notice() {
+            md.push_str("\n\n");
+            md.push_str(&notice);
+        }
+        Some(md)
+    }
+
+    /// [`Self::slide_to_markdown`] within the copied-text budget the caller
+    /// has begun.
+    fn slide_markdown(&self, index: usize) -> Option<String> {
         let slide = self.slides.get(index)?;
         if let Some(ref err) = slide.parse_error {
             return Some(format!(
@@ -156,7 +265,7 @@ impl PptxDocument {
                 result.push('\n');
             }
         }
-        for c in &slide.comments {
+        for c in slide.comments() {
             result.push_str(&format!(
                 "> **{}:** {}\n\n",
                 comment_marker(c.author.as_deref()),
@@ -226,7 +335,14 @@ fn collect_text_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePositio
                 // same dual-renderer gap already hit for XLS dates
                 // and XLSX formulas, this time for chart text.
                 GraphicContent::Text(lines) => {
-                    let text = lines.join("\n");
+                    // Joined text is a copy of the part's shared lines:
+                    // charged before it is made.
+                    let text =
+                        if crate::limits::charge_copied_text(super::shape::lines_cost(lines, 1)) {
+                            lines.join("\n")
+                        } else {
+                            String::new()
+                        };
                     if !text.is_empty() {
                         entries.push((gf.position.clone(), text));
                     }
@@ -378,6 +494,7 @@ fn collect_markdown_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePos
                 let src = pic
                     .link_target
                     .as_deref()
+                    .filter(|u| crate::limits::charge_copied_text(u.len()))
                     .and_then(crate::ir_render::safe_url)
                     .map(|u| crate::ir_render::escape_markdown_url(&u))
                     .unwrap_or_default();
@@ -399,7 +516,12 @@ fn collect_markdown_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePos
                     }
                 },
                 GraphicContent::Text(lines) => {
-                    let md = lines.join("\n");
+                    let md =
+                        if crate::limits::charge_copied_text(super::shape::lines_cost(lines, 1)) {
+                            lines.join("\n")
+                        } else {
+                            String::new()
+                        };
                     if !md.is_empty() {
                         entries.push((gf.position.clone(), md));
                     }
@@ -530,6 +652,7 @@ mod tests {
 
     fn make_doc(slides: Vec<Slide>) -> PptxDocument {
         PptxDocument {
+            input_bytes: 0,
             core_properties: None,
             app_properties: None,
             package_properties: Default::default(),
@@ -542,6 +665,8 @@ mod tests {
             theme: None,
             embedded_fonts: Vec::new(),
             unreadable_parts: Vec::new(),
+            unreadable_parts_omitted: 0,
+            cosmetic_parts: Vec::new(),
             layouts: Vec::new(),
             masters: Vec::new(),
         }
@@ -667,7 +792,7 @@ mod tests {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![text_shape("Text", "Hello", 0, 0)],
-            notes: Some(notes_body(&["Speaker notes"])),
+            notes: Some(std::sync::Arc::new(notes_body(&["Speaker notes"]))),
             background_rgb: None,
             ..Default::default()
         }]);
@@ -790,7 +915,7 @@ mod tests {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![text_shape("Text", "Content", 0, 0)],
-            notes: Some(notes_body(&["Note line 1", "Note line 2"])),
+            notes: Some(std::sync::Arc::new(notes_body(&["Note line 1", "Note line 2"]))),
             background_rgb: None,
             ..Default::default()
         }]);
@@ -831,7 +956,7 @@ mod tests {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![text_shape("Text", "Content", 0, 0)],
-            notes: Some(notes),
+            notes: Some(std::sync::Arc::new(notes)),
             background_rgb: None,
             ..Default::default()
         }]);
@@ -1094,10 +1219,10 @@ mod tests {
                     cx: 9000,
                     cy: 3000,
                 }),
-                content: GraphicContent::Text(vec![
+                content: GraphicContent::Text(std::sync::Arc::from(vec![
                     "Title: Dollars per Group".to_string(),
                     "Categories: Group 1, Group 2".to_string(),
-                ]),
+                ])),
             })],
             notes: None,
             background_rgb: None,
@@ -1137,9 +1262,7 @@ mod tests {
                             italic: None,
                             strikethrough: false,
                             hyperlink: Some(HyperlinkInfo {
-                                target: HyperlinkTarget::External(
-                                    "https://example.com".to_string(),
-                                ),
+                                target: HyperlinkTarget::External("https://example.com".into()),
                                 tooltip: None,
                             }),
                             font_size_hundredths_pt: None,

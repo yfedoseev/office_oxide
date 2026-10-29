@@ -27,7 +27,6 @@ use super::workbook::{SheetInfo, SheetState, WorkbookInfo};
 use super::worksheet::{Row, Worksheet};
 use super::{Result, XlsxDocument};
 use crate::core::opc::{self, ZipEntryIndex};
-use crate::core::relationships::Relationships;
 use crate::ir::SheetKind;
 
 // Record ids ([MS-XLSB] §2.3, decimal as the specification lists them).
@@ -72,22 +71,30 @@ pub(super) fn from_zip<R: Read + Seek>(
     entries: &ZipEntryIndex,
 ) -> Result<XlsxDocument> {
     let wb = opc::read_zip_entry(archive, entries, WORKBOOK)?;
-    let rels = match opc::read_zip_entry(archive, entries, WORKBOOK_RELS) {
-        Ok(d) => Relationships::parse(&d).unwrap_or_else(|_| Relationships::empty()),
-        Err(_) => Relationships::empty(),
-    };
+    let mut shared = super::shared_parts::SharedParts::default();
+    let rels = super::read_rels_reporting(archive, entries, WORKBOOK_RELS, &mut shared.unreadable);
     let (sheets, date1904) = parse_workbook(&wb);
-    let shared_strings = match opc::read_zip_entry(archive, entries, SHARED_STRINGS) {
-        Ok(d) => parse_shared_strings(&d),
-        Err(_) => SharedStringTable {
+    // A workbook without a part simply lacks what it holds; one whose part
+    // is there and cannot be read has it damaged, which is reported.
+    let mut read_optional = |path: &str| match opc::read_zip_entry(archive, entries, path) {
+        Ok(data) => Some(data),
+        Err(crate::core::Error::MissingPart(_)) => None,
+        Err(e) => {
+            log::warn!("xlsb: part {path} unreadable: {e}");
+            shared.unreadable.record(entries, path, &e.to_string());
+            None
+        },
+    };
+    let shared_strings = match read_optional(SHARED_STRINGS) {
+        Some(d) => parse_shared_strings(&d),
+        None => SharedStringTable {
             strings: Vec::new(),
         },
     };
-    let styles = opc::read_zip_entry(archive, entries, STYLES)
-        .ok()
-        .map(|d| parse_styles(&d));
+    let styles = read_optional(STYLES).map(|d| parse_styles(&d));
     let mut worksheets = Vec::with_capacity(sheets.len());
-    let mut unreadable_sheets = Vec::new();
+    let mut unreadable_sheets = super::shared_parts::ReportList::default();
+    let mut sheet_parts = super::SheetPartClaims::default();
     for (i, info) in sheets.iter().enumerate() {
         let rel = rels.get_by_id(&info.rel_id);
         // A macro sheet has the same cell records as a worksheet (its part
@@ -100,17 +107,18 @@ pub(super) fn from_zip<R: Read + Seek>(
         let path = rel
             .map(|r| super::resolve_relative_zip_path("xl/workbook.bin", &r.target))
             .unwrap_or_else(|| format!("xl/worksheets/sheet{}.bin", i + 1));
+        if let Err(reason) = sheet_parts.claim(entries, &path, &info.name) {
+            log::warn!("xlsb: sheet {:?}: {reason}", info.name);
+            unreadable_sheets.record_item(&info.name, &reason);
+            continue;
+        }
         if matches!(kind, SheetKind::Chart | SheetKind::Dialog) {
             let mut ws = Worksheet::without_cells(info.name.clone(), kind);
             ws.state = info.state;
             if kind == SheetKind::Chart {
-                for chart in super::chartsheet_chart_parts(archive, entries, &path) {
-                    if let Ok(data) = XlsxDocument::read_xml_entry(archive, entries, &chart) {
-                        let text = super::extract_chart_text(&data);
-                        if !text.is_empty() {
-                            ws.chart_text.push(text);
-                        }
-                    }
+                for chart in shared.chartsheet_chart_parts(archive, entries, &path) {
+                    ws.chart_text
+                        .extend(shared.chart_text(archive, entries, &chart));
                 }
             }
             worksheets.push(ws);
@@ -120,11 +128,11 @@ pub(super) fn from_zip<R: Read + Seek>(
             Ok(data) => data,
             Err(crate::core::Error::MissingPart(_)) => {
                 unreadable_sheets
-                    .push((info.name.clone(), format!("worksheet part {path} not found")));
+                    .record_item(&info.name, &format!("worksheet part {path} not found"));
                 continue;
             },
             Err(e) => {
-                unreadable_sheets.push((info.name.clone(), format!("worksheet part {path}: {e}")));
+                unreadable_sheets.record_item(&info.name, &format!("worksheet part {path}: {e}"));
                 continue;
             },
         };
@@ -140,7 +148,10 @@ pub(super) fn from_zip<R: Read + Seek>(
     } = XlsxDocument::read_package_metadata(archive, entries);
     package_properties.crc_mismatched_parts = entries.crc_mismatched_parts();
     let has_macros = rels.has_vba_project();
+    let (unreadable_sheets, unreadable_sheets_omitted, _) = unreadable_sheets.finish();
+    let (unreadable_parts, unreadable_parts_omitted, cosmetic_parts) = shared.unreadable.finish();
     Ok(XlsxDocument {
+        input_bytes: 0,
         workbook: WorkbookInfo {
             sheets,
             defined_names: Vec::new(),
@@ -157,8 +168,13 @@ pub(super) fn from_zip<R: Read + Seek>(
         package_properties,
         has_macros,
         unreadable_sheets,
+        unreadable_sheets_omitted,
+        unreadable_parts,
+        unreadable_parts_omitted,
+        cosmetic_parts,
         styles_data: None,
         theme_data: None,
+        render_cache: Default::default(),
     })
 }
 
@@ -400,14 +416,8 @@ fn parse_sheet(data: &[u8], name: String) -> Worksheet {
             index: row + 1,
             cells: Vec::new(),
         });
-        r.cells.push(Cell {
-            reference: CellRef { col, row },
-            value,
-            style_index: Some(style),
-            formula: None,
-            rich_runs: None,
-            vm: None,
-        });
+        r.cells
+            .push(Cell::new(CellRef { col, row }, value, Some(style)));
     };
     for rec in records(data) {
         let d = rec.data;
@@ -664,6 +674,85 @@ mod tests {
         s.extend(rec(BRT_CELL_ST, &cell(0, 0, &wide(text))));
         s.extend(rec(BRT_CELL_BOOL, &cell(1, 0, &[1])));
         s
+    }
+
+    /// Sheets that name one part are not read and parsed once each: the first
+    /// owns the part, the others are reported as unreadable.
+    #[test]
+    fn test_xlsb_sheets_naming_one_part_are_read_once() {
+        use crate::core::relationships::rel_types;
+        let mut wb = Vec::new();
+        for i in 1..=20 {
+            wb.extend(bundle_sheet(0, i, "rId1", &format!("S{i}")));
+        }
+        let rels = format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{}" Target="worksheets/sheet1.bin"/></Relationships>"#,
+            rel_types::WORKSHEET
+        );
+        let data = string_and_bool_sheet("only cell");
+        let bytes = super::super::test_support::zip_parts(&[
+            (WORKBOOK, &wb),
+            (WORKBOOK_RELS, rels.as_bytes()),
+            ("xl/worksheets/sheet1.bin", &data),
+        ]);
+        let doc = super::super::test_support::open_bytes(bytes);
+        assert_eq!(doc.worksheets.len(), 1);
+        assert_eq!(doc.unreadable_sheets.len(), 19);
+    }
+
+    /// A shared-strings or styles part the zip cannot decode (compression
+    /// method 99, APPNOTE 4.4.5) is reported; one the package lacks is not.
+    #[test]
+    fn test_xlsb_part_that_cannot_be_decoded_is_reported_not_taken_for_absent() {
+        use crate::core::relationships::rel_types;
+        let wb = bundle_sheet(0, 1, "rId1", "S");
+        let rels = format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{}" Target="worksheets/sheet1.bin"/></Relationships>"#,
+            rel_types::WORKSHEET
+        );
+        let data = string_and_bool_sheet("cell");
+        let parts: &[(&str, &[u8])] = &[
+            (WORKBOOK, &wb),
+            (WORKBOOK_RELS, rels.as_bytes()),
+            ("xl/worksheets/sheet1.bin", &data),
+            (SHARED_STRINGS, b"sst"),
+            (STYLES, b"xfs"),
+        ];
+        let intact =
+            super::super::test_support::open_bytes(super::super::test_support::zip_parts(parts));
+        assert!(intact.unreadable_parts.is_empty(), "{:?}", intact.unreadable_parts);
+        for part in [SHARED_STRINGS, STYLES] {
+            let mut bytes = super::super::test_support::zip_parts(parts);
+            let mut patched = 0;
+            for at in 0..bytes.len() - 46 {
+                // Local header: method at 8, name at 30; central: method at
+                // 10, name at 46 (APPNOTE 4.3.7, 4.3.12).
+                let (method, name_at, len_at) = match &bytes[at..at + 4] {
+                    [0x50, 0x4b, 0x03, 0x04] => (at + 8, at + 30, at + 26),
+                    [0x50, 0x4b, 0x01, 0x02] => (at + 10, at + 46, at + 28),
+                    _ => continue,
+                };
+                let len = u16::from_le_bytes([bytes[len_at], bytes[len_at + 1]]) as usize;
+                if bytes.get(name_at..name_at + len) == Some(part.as_bytes()) {
+                    bytes[method..method + 2].copy_from_slice(&99u16.to_le_bytes());
+                    patched += 1;
+                }
+            }
+            assert_eq!(patched, 2);
+            let doc = super::super::test_support::open_bytes(bytes);
+            assert!(
+                doc.unreadable_parts
+                    .iter()
+                    .any(|(p, why)| p.contains(part) && !why.contains("missing")),
+                "{part}: {:?}",
+                doc.unreadable_parts
+            );
+        }
+        // Absent parts are not damaged ones.
+        let bare = super::super::test_support::open_bytes(super::super::test_support::zip_parts(
+            &parts[..3],
+        ));
+        assert!(bare.unreadable_parts.is_empty(), "{:?}", bare.unreadable_parts);
     }
 
     /// The `.xlsb` reader dropped macro sheets, chartsheets and dialog

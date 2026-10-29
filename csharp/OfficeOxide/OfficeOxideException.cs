@@ -6,6 +6,9 @@ public sealed class OfficeOxideException : Exception
     /// <summary>The underlying FFI error code (see <see cref="OfficeOxideErrorCode"/>).</summary>
     public int Code { get; }
 
+    /// <summary>Whether the document was read but is known to be incomplete (see <see cref="ParseOptions.OnIncomplete"/>).</summary>
+    public bool IsIncomplete => Code == OfficeOxideErrorCode.Incomplete;
+
     /// <summary>The operation that produced the error (e.g. "Open", "ToMarkdown").</summary>
     public string Operation { get; }
 
@@ -25,6 +28,7 @@ public sealed class OfficeOxideException : Exception
         OfficeOxideErrorCode.Extraction => "extraction failed",
         OfficeOxideErrorCode.Internal => "internal error",
         OfficeOxideErrorCode.Unsupported => "unsupported format",
+        OfficeOxideErrorCode.Incomplete => "incomplete document",
         _ => $"code={code}",
     };
 }
@@ -39,4 +43,6 @@ public static class OfficeOxideErrorCode
     public const int Extraction = 4;
     public const int Internal = 5;
     public const int Unsupported = 6;
+    /// <summary>Read, but known to be incomplete, and the options asked for an error then.</summary>
+    public const int Incomplete = 7;
 }

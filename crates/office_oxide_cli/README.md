@@ -44,7 +44,7 @@ office-oxide ir document.docx
 
 ## Performance
 
-Powered by [office_oxide](https://crates.io/crates/office_oxide) — the fastest Office document processing library in Rust. 100% pass rate on valid Office files (6,062-file corpus).
+Powered by [office_oxide](https://crates.io/crates/office_oxide) — the fastest Office document processing library in Rust. Opens 97.3% of a 10,386-file test collection.
 
 ## License
 

@@ -5,6 +5,12 @@
 //! this, so any compressed non-Western-European text was corrupted by
 //! construction, whether or not a real example was on hand to prove it.
 
+/// A pseudo language ID for a document whose FIB marks a Macintosh character
+/// set (`FibBase.chs` = 0x0100): its 8-bit text is Mac Roman whatever the
+/// document's language. `0xFFFF` is not a Windows LCID, so it cannot collide
+/// with a real `lid`; it travels wherever the `lid` does.
+pub(crate) const MAC_TEXT: u16 = 0xFFFF;
+
 /// Map a FIB `lid` (Windows LCID) to the codepage compressed text in
 /// that language is stored in. Only the primary language id (the low 10
 /// bits) determines the codepage — the sublanguage/region bits (e.g.
@@ -13,6 +19,9 @@
 /// unrecognized/neutral `lid`, matching Word's own default and every
 /// codepage-unaware caller's existing behavior.
 pub(crate) fn codepage_for_lid(lid: u16) -> u16 {
+    if lid == MAC_TEXT {
+        return 10000; // Mac Roman
+    }
     let primary = lid & 0x03FF;
     match primary {
         // Russian, Bulgarian, Ukrainian, Belarusian.
@@ -28,6 +37,28 @@ pub(crate) fn codepage_for_lid(lid: u16) -> u16 {
         0x1E => 874,         // Thai
         _ => 1252,
     }
+}
+
+/// A language ID whose code page is the one a font character set (`chs`,
+/// [MS-DOC] §2.9.102 `FFN`, the Windows `LOGFONT` charset) names; `None` for
+/// the Western, symbol, OEM and default sets, which are Windows-1252 already.
+pub(crate) fn lid_for_charset(chs: u8) -> Option<u16> {
+    Some(match chs {
+        0x80 => 0x0411, // SHIFTJIS_CHARSET, 932
+        0x81 => 0x0412, // HANGUL_CHARSET, 949
+        0x86 => 0x0804, // GB2312_CHARSET, 936
+        0x88 => 0x0404, // CHINESEBIG5_CHARSET, 950
+        0xA1 => 0x0408, // GREEK_CHARSET, 1253
+        0xA2 => 0x041F, // TURKISH_CHARSET, 1254
+        0xA3 => 0x042A, // VIETNAMESE_CHARSET, 1258
+        0xB1 => 0x040D, // HEBREW_CHARSET, 1255
+        0xB2 => 0x0401, // ARABIC_CHARSET, 1256
+        0xBA => 0x0425, // BALTIC_CHARSET, 1257
+        0xCC => 0x0419, // RUSSIAN_CHARSET, 1251
+        0xDE => 0x041E, // THAI_CHARSET, 874
+        0xEE => 0x0415, // EASTEUROPE_CHARSET, 1250
+        _ => return None,
+    })
 }
 
 /// Decode one compressed-text byte using the codepage its FIB `lid`
@@ -78,5 +109,18 @@ mod tests {
     fn test_default_lid_matches_the_old_cp1252_behavior() {
         assert_eq!(decode_byte(0x93, 0x0409), '\u{201C}');
         assert_eq!(decode_byte(0x93, 0x0409), super::super::piece_table::cp1252_to_char(0x93));
+    }
+
+    /// A Macintosh-authored document stores its 8-bit text in Mac Roman:
+    /// 0xD5 is the right single quote and 0x8E is e-acute, which Windows-1252
+    /// reads as `Õ` and `Ž`.
+    #[test]
+    fn test_macintosh_text_decodes_as_mac_roman() {
+        assert_eq!(decode_byte(0xD5, MAC_TEXT), '\u{2019}');
+        assert_eq!(decode_byte(0x8E, MAC_TEXT), '\u{e9}');
+        assert_eq!(decode_byte(b'a', MAC_TEXT), 'a');
+        assert_eq!(codepage_for_lid(MAC_TEXT), 10000);
+        // A byte that is the same in both is unchanged for a Windows document.
+        assert_eq!(decode_byte(0xD5, 0x0409), 'Õ');
     }
 }

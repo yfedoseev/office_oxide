@@ -63,6 +63,14 @@ const n = {
   detectFormat: lib.func('const char* office_oxide_detect_format(const char* path)'),
   documentOpen: lib.func('void* office_document_open(const char* path, _Out_ int* error_code)'),
   documentOpenFromBytes: lib.func('void* office_document_open_from_bytes(const uint8_t* data, size_t len, const char* format, _Out_ int* error_code)'),
+  documentOpenWith: lib.func('void* office_document_open_with(const char* path, void* options, _Out_ int* error_code)'),
+  documentOpenFromBytesWith: lib.func('void* office_document_open_from_bytes_with(const uint8_t* data, size_t len, const char* format, void* options, _Out_ int* error_code)'),
+  documentDamageJson: lib.func('HeapStr office_document_damage_json(void* handle, _Out_ int* error_code)'),
+  optionsNew: lib.func('void* office_options_new()'),
+  optionsStrict: lib.func('void* office_options_strict()'),
+  optionsFree: lib.func('void office_options_free(void* handle)'),
+  optionsSet: lib.func('int32_t office_options_set(void* handle, const char* name, uint64_t value)'),
+  optionsNames: lib.func('HeapStr office_options_names()'),
   documentFree: lib.func('void office_document_free(void* handle)'),
   documentFormat: lib.func('const char* office_document_format(void* handle)'),
   documentPlainText: lib.func('HeapStr office_document_plain_text(void* handle, _Out_ int* error_code)'),
@@ -112,6 +120,7 @@ const n = {
 const ERROR_KINDS = {
   0: 'ok', 1: 'invalid argument', 2: 'io error', 3: 'parse error',
   4: 'extraction failed', 5: 'internal error', 6: 'unsupported format',
+  7: 'incomplete document',
 };
 
 class OfficeOxideError extends Error {
@@ -180,23 +189,81 @@ function takeBytes(ptr, len) {
   }
 }
 
+/**
+ * Options for one document: limits, which text is kept, and whether an
+ * incomplete result is an error. `new ParseOptions({ strict: true })` starts
+ * from tighter limits and makes a document that cannot be read completely
+ * throw (`code` 7); the other keys set options by name (`ParseOptions.names()`):
+ * a limit such as `text_chars` or `part_bytes` with a number or bigint (`Infinity`
+ * for none), `include_hidden_text` / `include_deleted_text` with a boolean,
+ * `on_incomplete` with `'report'` or `'error'`.
+ */
+class ParseOptions {
+  constructor({ strict = false, ...options } = {}) {
+    this._h = strict ? n.optionsStrict() : n.optionsNew();
+    try {
+      for (const [name, value] of Object.entries(options)) this.set(name, value);
+    } catch (err) {
+      this.close();
+      throw err;
+    }
+  }
+
+  set(name, value) {
+    if (!this._h) throw new Error('ParseOptions is closed');
+    const MAX = 2n ** 64n - 1n;
+    const bad = () => new TypeError(`option ${name}: expected a non-negative integer (at most 2**64-1), a boolean, 'max' / Infinity for no bound, or for on_incomplete 'report' or 'error'`);
+    let v;
+    if (typeof value === 'boolean') v = value ? 1n : 0n;
+    else if (name === 'on_incomplete' && value === 'report') v = 0n;
+    else if (name === 'on_incomplete' && value === 'error') v = 1n;
+    else if (name !== 'on_incomplete' && (value === Infinity || value === 'max')) v = MAX;
+    else if (typeof value === 'bigint' && value >= 0n && value <= MAX) v = value;
+    else if (Number.isInteger(value) && value >= 0) v = BigInt(value);
+    else throw bad();
+    if (v > MAX) throw bad();
+    const rc = n.optionsSet(this._h, name, v);
+    if (rc !== 0) {
+      throw new OfficeOxideError(rc, 'ParseOptions.set', `unknown option '${name}'; the options are: ${ParseOptions.names().join(', ')}`);
+    }
+    return this;
+  }
+
+  static names() { return n.optionsNames().split(','); }
+
+  _handle() { if (!this._h) throw new Error('ParseOptions is closed'); return this._h; }
+  close() { if (this._h) { n.optionsFree(this._h); this._h = null; } }
+  [Symbol.dispose]() { this.close(); }
+}
+
 class Document {
   constructor(h, src = null) { this._h = h; this._src = src; }
 
-  static open(p) {
+  /** Open a document; `options` is an optional `ParseOptions` for this document only. */
+  static open(p, options = null) {
     const e = [0];
-    const h = n.documentOpen(p, e);
+    const h = options
+      ? n.documentOpenWith(p, options._handle(), e)
+      : n.documentOpen(p, e);
     if (!h) throw new OfficeOxideError(e[0], 'open');
     return new Document(h, p);
   }
 
-  static fromBytes(data, fmt) {
+  static fromBytes(data, fmt, options = null) {
     if (!(data instanceof Uint8Array)) throw new TypeError('data must be a Uint8Array or Buffer');
     const e = [0];
-    const h = n.documentOpenFromBytes(data, data.length, fmt, e);
+    const h = options
+      ? n.documentOpenFromBytesWith(data, data.length, fmt, options._handle(), e)
+      : n.documentOpenFromBytes(data, data.length, fmt, e);
     if (!h) throw new OfficeOxideError(e[0], 'fromBytes');
     return new Document(h);
   }
+
+  /**
+   * What is wrong with the document: an array of `{kind, part, detail}`
+   * (`kind`: `unreadable_part`, `truncated` or `recovered`); empty when sound.
+   */
+  damage() { return JSON.parse(this._call(n.documentDamageJson, 'damage')); }
 
   _ensure() { if (!this._h) throw new Error('Document is closed'); }
 
@@ -449,6 +516,7 @@ class PptxWriter {
 }
 
 module.exports = {
+  ParseOptions,
   OfficeOxideError,
   Document,
   EditableDocument,

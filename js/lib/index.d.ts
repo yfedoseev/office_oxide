@@ -17,16 +17,43 @@ export type WriterCellValue = CellValue | bigint | Formula;
 
 /**
  * A failed call. `code`: 1 invalid argument, 2 I/O, 3 parse, 4 extraction,
- * 5 internal, 6 unsupported format or out-of-range target (nothing written).
+ * 5 internal, 6 unsupported format or out-of-range target (nothing written),
+ * 7 the document is incomplete and the options asked for an error.
  */
 export class OfficeOxideError extends Error {
   readonly code: number;
   readonly operation: string;
 }
 
+/** A value `ParseOptions.set` accepts: a count, a boolean, `Infinity`/`'max'` for no bound, or for `on_incomplete` `'report'`/`'error'`. */
+export type OptionValue = number | bigint | boolean | 'max' | 'report' | 'error';
+
+/**
+ * Options for one document: limits, which text is kept, and whether an
+ * incomplete result is an error. Nothing global changes. Pass `strict: true`
+ * for tighter limits and an error (code 7) on a document that cannot be read
+ * completely; other keys set options by name (see `ParseOptions.names()`).
+ */
+export class ParseOptions implements Disposable {
+  constructor(options?: { strict?: boolean } & Record<string, OptionValue | undefined>);
+  set(name: string, value: OptionValue): this;
+  static names(): string[];
+  close(): void;
+  [Symbol.dispose](): void;
+}
+
+/** One thing wrong with a document. */
+export interface Damage {
+  kind: 'unreadable_part' | 'truncated' | 'recovered';
+  part: string | null;
+  detail: string;
+}
+
 export class Document implements Disposable {
-  static open(path: string): Document;
-  static fromBytes(data: Uint8Array, format: DocumentFormat): Document;
+  static open(path: string, options?: ParseOptions): Document;
+  static fromBytes(data: Uint8Array, format: DocumentFormat, options?: ParseOptions): Document;
+  /** What is wrong with the document; empty when sound. Converts the document once. */
+  damage(): Damage[];
   readonly format: DocumentFormat | null;
   plainText(): string;
   toMarkdown(): string;

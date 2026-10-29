@@ -13,12 +13,51 @@ use super::table::Table;
 // ---------------------------------------------------------------------------
 
 impl DocxDocument {
+    /// What was lost to the parts that could not be read, one warning for
+    /// each part listed and one for the rest, as `Metadata::warnings` lists
+    /// them and as every rendering writes them. Empty when every part read.
+    pub(crate) fn unreadable_warnings(&self) -> Vec<String> {
+        self.unreadable_parts
+            .iter()
+            .chain(self.cosmetic_parts.iter())
+            .map(|p| format!("skipped unreadable part {p}"))
+            .chain(
+                (self.unreadable_parts_omitted > 0).then(|| {
+                    crate::core::unreadable::omitted_warning(self.unreadable_parts_omitted)
+                }),
+            )
+            .collect()
+    }
+
+    /// The warnings for the unreadable parts that lost text, and for the
+    /// rest left out of the list: what every rendering writes in band. A
+    /// part that holds no text (the theme) is only in
+    /// [`Self::unreadable_warnings`].
+    pub(crate) fn unreadable_text_warnings(&self) -> Vec<String> {
+        self.unreadable_parts
+            .iter()
+            .map(|p| format!("skipped unreadable part {p}"))
+            .chain(
+                (self.unreadable_parts_omitted > 0).then(|| {
+                    crate::core::unreadable::omitted_warning(self.unreadable_parts_omitted)
+                }),
+            )
+            .collect()
+    }
+
+    /// Whether a part that held text could not be read.
+    pub(crate) fn unreadable_loses_text(&self) -> bool {
+        self.unreadable_parts_omitted > 0 || !self.unreadable_parts.is_empty()
+    }
+
     /// Extract all text as a plain string. Paragraphs are separated by newlines.
     ///
     /// Headers and footers are included, matching `to_markdown` and the IR
     /// renderers. All three used to disagree, so a consumer's word count
     /// changed depending on which method they called.
     pub fn plain_text(&self) -> String {
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
+        let _text_scope = crate::limits::begin_copied_text_budget();
         let mut out = String::new();
         let styles = self.styles.as_ref();
         for hf in self
@@ -64,6 +103,28 @@ impl DocxDocument {
         while out.ends_with('\n') {
             out.pop();
         }
+        // The parts that could not be read are listed first: the report is
+        // charged to the budget before the budget's own notice is read.
+        let unreadable = crate::core::unreadable::report_lines(
+            &self.unreadable_text_warnings(),
+            crate::core::unreadable::ReportTarget::Plain,
+        );
+        if !unreadable.is_empty() {
+            out.push_str("\n\n");
+            out.push_str(&unreadable.join("\n"));
+        }
+        // A chart's text is stored once and written once per drawing that
+        // names it; when the copies outgrew the text budget the drawings past
+        // it were written without it, and the output says so. So does a link
+        // whose target was cut while reading: the text has no targets, but
+        // every rendering of one document reports the same losses.
+        for notice in crate::limits::copied_text_notice()
+            .into_iter()
+            .chain(self.link_notice.clone())
+        {
+            out.push_str("\n\n");
+            out.push_str(&notice);
+        }
         out
     }
 
@@ -74,6 +135,8 @@ impl DocxDocument {
     /// of every page. Without this, simple-but-meaningful artefacts like
     /// `My header` / `My footer` are silently dropped.
     pub fn to_markdown(&self) -> String {
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
+        let _text_scope = crate::limits::begin_copied_text_budget();
         let mut out = String::new();
         let ctx = MarkdownCtx {
             styles: self.styles.as_ref(),
@@ -126,8 +189,35 @@ impl DocxDocument {
         while out.ends_with('\n') {
             out.pop();
         }
+        // The parts that could not be read, as in plain_text().
+        let unreadable = crate::core::unreadable::report_lines(
+            &self.unreadable_text_warnings(),
+            crate::core::unreadable::ReportTarget::Markdown,
+        );
+        if !unreadable.is_empty() {
+            out.push_str("\n\n");
+            out.push_str(&unreadable.join("\n\n"));
+        }
+        // A link target is shared in the document and copied into the output
+        // once per link; when the copies outgrew the text budget the links
+        // past it were written without their targets, and the output says so.
+        for notice in crate::limits::copied_text_notice()
+            .into_iter()
+            .chain(self.link_notice.clone())
+        {
+            out.push_str("\n\n");
+            out.push_str(&notice);
+        }
         out
     }
+}
+
+/// Charge the lines of a chart or diagram, which a drawing writes out again
+/// for every drawing that names the same part, to the copied-text budget.
+/// `false` when they do not fit: the drawing is written without them.
+fn charge_drawing_text(lines: &[&str]) -> bool {
+    let chars: usize = lines.iter().map(|l| l.len() + 1).sum();
+    crate::limits::charge_copied_text(chars)
 }
 
 /// Split parsed `HeaderFooter` entries into headers vs footers and
@@ -172,6 +262,9 @@ struct HiddenCtx<'a> {
 
 impl HiddenCtx<'_> {
     fn is_hidden(&self, run: &Run) -> bool {
+        if crate::read_options::include_hidden_text() {
+            return false;
+        }
         match self.styles {
             Some(sheet) => sheet.effective_hidden_in(
                 self.table,
@@ -252,7 +345,8 @@ fn plain_text_run(run: &Run, ctx: HiddenCtx<'_>, out: &mut String) {
                     .chain(d.dgm_text.iter())
                     .map(String::as_str)
                     .collect();
-                if !lines.is_empty() {
+                // Charged before it is written: the text is stored once.
+                if !lines.is_empty() && charge_drawing_text(&lines) {
                     if !out.is_empty() && !out.ends_with(['\n', ' ', '\t']) {
                         out.push('\n');
                     }
@@ -324,7 +418,10 @@ fn plain_text_table(table: &Table, styles: Option<&StyleSheet>, out: &mut String
             .cells
             .iter()
             .enumerate()
-            .filter(|(_, c)| !c.properties.as_ref().is_some_and(|p| p.deleted))
+            .filter(|(_, c)| {
+                crate::read_options::include_deleted_text()
+                    || !c.properties.as_ref().is_some_and(|p| p.deleted)
+            })
             .collect();
         for (i, (cell_idx, cell)) in cells.iter().enumerate() {
             if i > 0 {
@@ -476,7 +573,7 @@ fn markdown_blocks_inner(
                 let effective = ctx
                     .styles
                     .map(|sheet| {
-                        sheet.effective_paragraph_properties_in(
+                        sheet.effective_paragraph_flags_in(
                             ctx.table.map(|l| &l.paragraph),
                             p.properties.as_ref(),
                         )
@@ -585,6 +682,13 @@ fn markdown_blocks_inner(
                             flush_run(&mut pending, out);
                             let text = runs_to_plain_text(&hl.runs, hidden);
                             match &hl.target {
+                                // Past the budget the link text stays,
+                                // unlinked.
+                                HyperlinkTarget::External(url)
+                                    if !crate::limits::charge_copied_text(url.len()) =>
+                                {
+                                    out.push_str(&text);
+                                },
                                 HyperlinkTarget::External(url) => {
                                     out.push('[');
                                     out.push_str(&text);
@@ -648,11 +752,8 @@ impl RunStyle {
         let effective;
         let rp = match hidden.styles {
             Some(sheet) => {
-                effective = sheet.effective_run_properties_in(
-                    hidden.table,
-                    hidden.paragraph_style_id,
-                    direct,
-                );
+                effective =
+                    sheet.effective_run_flags_in(hidden.table, hidden.paragraph_style_id, direct);
                 Some(&effective)
             },
             None => direct,
@@ -791,7 +892,7 @@ fn markdown_drawing(drawing: &DrawingInfo, out: &mut String) {
         .chain(drawing.dgm_text.iter())
         .map(String::as_str)
         .collect();
-    if !lines.is_empty() {
+    if !lines.is_empty() && charge_drawing_text(&lines) {
         if !out.is_empty() && !out.ends_with(['\n', ' ', '\t']) {
             out.push('\n');
         }
@@ -804,6 +905,7 @@ fn markdown_drawing(drawing: &DrawingInfo, out: &mut String) {
     if let Some(url) = drawing
         .linked_image
         .as_deref()
+        .filter(|u| crate::limits::charge_copied_text(u.len()))
         .and_then(crate::ir_render::safe_url)
     {
         out.push_str("![");
@@ -855,12 +957,10 @@ fn markdown_table(table: &Table, ctx: &MarkdownCtx, out: &mut String) {
     for (row_idx, row) in table.rows.iter().enumerate() {
         let mut cells: Vec<String> = Vec::new();
         // Same tracked-changes policy as plain_text_table.
-        for (cell_idx, cell) in row
-            .cells
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| !c.properties.as_ref().is_some_and(|p| p.deleted))
-        {
+        for (cell_idx, cell) in row.cells.iter().enumerate().filter(|(_, c)| {
+            crate::read_options::include_deleted_text()
+                || !c.properties.as_ref().is_some_and(|p| p.deleted)
+        }) {
             // Cells keep their inline formatting, as the IR renderer's
             // cells do; rendering them as plain text dropped every bold
             // and italic span inside a table on this surface alone.

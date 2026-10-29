@@ -149,6 +149,15 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // (older/malformed files), every field is `None` and the generic
     // TextBox fallback in the loop below still applies.
     let hfs = doc.header_footers();
+    // Every section gets its own copy of the stories it shows, so a document
+    // of thousands of sections multiplies one header into thousands. The
+    // first copy of a story is the text the piece table already charged to
+    // the document's budget; each further copy of the same story is charged
+    // to what is left of it before it is made, and the section that does not
+    // fit, and those after it, get no header or footer.
+    let mut hf_budget = doc.text_budget();
+    let mut first_copies: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut headers_cut = false;
     let mut sections: Vec<Section> = section_bodies
         .into_iter()
         .enumerate()
@@ -159,6 +168,25 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
                 ..Default::default()
             };
             if let Some(hf) = hfs.get(i).or(hfs.last()) {
+                let stories = [
+                    &hf.even_header,
+                    &hf.odd_header,
+                    &hf.even_footer,
+                    &hf.odd_footer,
+                    &hf.first_header,
+                    &hf.first_footer,
+                ];
+                let size: usize = stories
+                    .iter()
+                    .filter_map(|s| s.as_deref())
+                    // A story seen for the first time is already paid for.
+                    .filter(|s| !first_copies.insert(s.as_ptr() as usize))
+                    .map(str::len)
+                    .sum();
+                if !hf_budget.charge(size) {
+                    headers_cut = true;
+                    return section;
+                }
                 section.even_page_header = hf.even_header.as_deref().map(text_to_header_footer);
                 section.header = hf.odd_header.as_deref().map(text_to_header_footer);
                 section.even_page_footer = hf.even_footer.as_deref().map(text_to_header_footer);
@@ -169,6 +197,9 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             section
         })
         .collect();
+    if headers_cut {
+        warnings.push(hf_budget.notice());
+    }
     let header_footer_structured = hfs.iter().any(|hf| !hf.is_empty());
 
     // Footnotes, headers, comments, endnotes and text boxes live after the
@@ -277,6 +308,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // document was silently dropped on conversion even though the bytes
     // were already in hand.
     crate::convert_xls::append_legacy_images(&mut sections, doc.images());
+    warnings.extend(doc.image_warnings());
 
     // Embedded OLE objects — at minimum, recognize each
     // object exists and surface its identity, even without extracting
@@ -294,6 +326,16 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
                 data: None,
                 ..Default::default()
             }));
+            // The text of an embedded Word document, which the placeholder
+            // stands for, follows it.
+            for line in obj.text.iter().flat_map(|t| t.lines()) {
+                if !line.trim().is_empty() {
+                    last.elements.push(Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan::plain(line))],
+                        ..Default::default()
+                    }));
+                }
+            }
         }
     }
 
@@ -317,7 +359,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             created: summary.and_then(|s| s.created.clone()),
             modified: summary.and_then(|s| s.modified.clone()),
             has_macros: doc.has_macros(),
-            text_truncated: !doc.text_complete(),
+            text_truncated: !doc.text_complete() || headers_cut || doc.images_left_out(),
             warnings,
             ..crate::core::core_properties::legacy_metadata_extras(summary)
         },

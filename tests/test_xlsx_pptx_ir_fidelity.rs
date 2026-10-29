@@ -315,7 +315,8 @@ fn test_prose_mode_keeps_every_cell_of_a_multi_cell_row() {
 
 /// A sheet whose part is not well-formed (a damaged archive) is skipped
 /// and named, and the intact sheets are returned; the whole workbook
-/// used to fail. The loss is on record: a section holding the notice,
+/// used to fail. The loss is on record: a section holding the notice (titled
+/// by a fixed label, the name being in its line),
 /// and `Metadata::text_truncated`.
 #[test]
 fn test_an_unreadable_sheet_is_reported_and_the_others_are_kept() {
@@ -331,7 +332,7 @@ fn test_an_unreadable_sheet_is_reported_and_the_others_are_kept() {
     assert_eq!(
         ir.sections
             .iter()
-            .filter(|s| s.title.as_deref() == Some("Bad"))
+            .filter(|s| s.title.as_deref() == Some("Unreadable sheet"))
             .count(),
         1
     );

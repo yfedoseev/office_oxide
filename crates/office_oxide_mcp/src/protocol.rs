@@ -43,6 +43,13 @@ pub fn handle_tools_list(id: &Value) -> Value {
                                     "Output format (default: text). \
                                      `markdown-with-images` embeds each image inline as \
                                      [image-base64:...] at its position in the flow."
+                            },
+                            "strict": {
+                                "type": "boolean",
+                                "description":
+                                    "Read untrusted input: tighter limits, and an error \
+                                     instead of a partial result when part of the document \
+                                     cannot be read or a limit cut it (default: false)"
                             }
                         },
                         "required": ["file_path"]
@@ -91,6 +98,13 @@ pub fn handle_tools_list(id: &Value) -> Value {
                             "file_path": {
                                 "type": "string",
                                 "description": "Path to the document file"
+                            },
+                            "strict": {
+                                "type": "boolean",
+                                "description":
+                                    "Read untrusted input: tighter limits, and an error \
+                                     instead of a partial result when part of the document \
+                                     cannot be read or a limit cut it (default: false)"
                             }
                         },
                         "required": ["file_path"]
@@ -119,15 +133,58 @@ pub fn handle_tools_call(id: &Value, params: &Value) -> Value {
     }
 }
 
-/// Largest `extract` result the server will return, in bytes.
+/// Largest `extract` result the server will return, in UTF-8 bytes.
 ///
 /// A tool result is one JSON string held in memory (and then escaped into a
 /// second copy for the response line), and no MCP client can put tens of
 /// megabytes in front of a model anyway. The CLI documents what an unbounded
 /// buffer did on large workbooks — multi-gigabyte RSS and OOM kills — so an
 /// oversized result is refused with a message saying so, rather than
-/// silently truncated.
+/// silently truncated. The limit counts bytes, not characters: a character
+/// is one to four bytes, so text in a script that needs more than one (CJK,
+/// say) reaches the limit at fewer characters than ASCII does.
 const MAX_EXTRACT_BYTES: usize = 32 * 1024 * 1024;
+
+/// The memory budget one tool call may spend on what a small file can multiply
+/// (see `office_oxide::limits::max_memory_bytes`): 192 MiB, which allows a
+/// picture of 24 MiB.
+///
+/// Images reach a result only as base64 (`markdown-with-images`, `ir`), which
+/// is four thirds of the bytes, so this keeps them near [`MAX_EXTRACT_BYTES`].
+const MAX_EXTRACT_MEMORY_BYTES: u64 = 192 * 1024 * 1024;
+
+/// The options a tool call reads its document under: the library's per-document
+/// budgets brought down to what one tool result can hold.
+///
+/// The renderers build their whole output before it can be measured, and the
+/// library's default text budget (256 Mi characters) lets a spreadsheet run
+/// to gigabytes before the size check could refuse it. Under these options the
+/// text budget is [`MAX_EXTRACT_BYTES`] characters, so a spreadsheet's output
+/// stops there with the library's usual truncation notice; the image budget
+/// is lowered the same way. A budget that is already lower is kept.
+///
+/// The options belong to the call: nothing process-wide is changed, so calls
+/// no longer have to be serialised against each other or against a library
+/// user's own settings. With `"strict": true` the document is read under the
+/// library's strict limits and refused if it cannot be read completely.
+///
+/// Only the tools that convert a document to text or to the IR take them:
+/// `extract`, and `info`, which converts the whole document to read its
+/// metadata (it would otherwise build an IR of up to the default budget,
+/// gigabytes for a hostile spreadsheet; a document with more than 32 Mi
+/// characters of text is reported there as incompletely extracted).
+/// `replace_text` edits the package's XML in place and reads none of these
+/// budgets.
+fn tool_options(args: &Value) -> office_oxide::options::ParseOptions {
+    let mut options = if args["strict"].as_bool().unwrap_or(false) {
+        office_oxide::options::ParseOptions::strict()
+    } else {
+        office_oxide::options::ParseOptions::default()
+    };
+    options.limits.text_chars = options.limits.text_chars.min(MAX_EXTRACT_BYTES);
+    options.limits.memory_bytes = options.limits.memory_bytes.min(MAX_EXTRACT_MEMORY_BYTES);
+    options
+}
 
 fn call_extract(id: &Value, args: &Value) -> Value {
     let Some(file_path) = args["file_path"].as_str() else {
@@ -135,7 +192,9 @@ fn call_extract(id: &Value, args: &Value) -> Value {
     };
     let format = args["format"].as_str().unwrap_or("text");
 
-    let doc = match office_oxide::Document::open(file_path) {
+    // The options apply to the opening too: the legacy spreadsheet reader
+    // copies shared strings into cells as it opens.
+    let doc = match office_oxide::Document::open_with(file_path, &tool_options(args)) {
         Ok(d) => d,
         Err(e) => return tool_error(id, &e.to_string()),
     };
@@ -153,44 +212,50 @@ fn call_extract(id: &Value, args: &Value) -> Value {
 }
 
 /// Render `doc` in `format`, refusing a result larger than `limit` bytes.
+///
+/// Only a spreadsheet is produced as it is written, so only there does the
+/// bounded buffer stop the work at the limit. Every other format has no
+/// streaming writer in the library: its text, Markdown or HTML is built whole
+/// (the IR is built whole, then serialised into the buffer) before the buffer
+/// can refuse it, and memory is bounded there by the library's text and image
+/// budgets (see [`tool_options`]), not by `limit`.
 fn render(doc: &office_oxide::Document, format: &str, limit: usize) -> Result<String, String> {
-    let content = match format {
-        "text" => doc.plain_text(),
-        "markdown" => doc.to_markdown(),
+    // Every format is written through a bounded buffer, so an oversized
+    // document stops at the limit instead of building the whole string (and
+    // a spreadsheet is produced a sheet at a time).
+    let mut out = BoundedBuf {
+        buf: Vec::new(),
+        limit,
+        exceeded: false,
+    };
+    let written = match format {
+        "text" => doc.write_plain_text(&mut out),
+        "markdown" => doc.write_markdown(&mut out),
         // Images are dropped from plain markdown entirely; this keeps both
         // their content and their position in one self-contained string.
         "markdown-with-images" => {
             use office_oxide::ir_render::{ImageEmbed, MarkdownOptions};
-            doc.to_markdown_with(MarkdownOptions {
-                image_embed: ImageEmbed::Base64,
-            })
+            doc.write_markdown_with(
+                MarkdownOptions {
+                    image_embed: ImageEmbed::Base64,
+                },
+                &mut out,
+            )
         },
-        "html" => doc.to_html(),
-        // The IR is serialised through a bounded writer, so an oversized
-        // document stops at the limit instead of building the whole string.
-        "ir" => {
-            let mut out = BoundedBuf {
-                buf: Vec::new(),
-                limit,
-                exceeded: false,
-            };
-            match serde_json::to_writer_pretty(&mut out, &doc.to_ir()) {
-                Ok(()) => String::from_utf8(out.buf).map_err(|e| e.to_string())?,
-                Err(_) if out.exceeded => return Err(too_large(format, limit)),
-                Err(e) => return Err(e.to_string()),
-            }
-        },
+        "html" => doc.write_html(&mut out),
+        "ir" => serde_json::to_writer_pretty(&mut out, &doc.to_ir()).map_err(std::io::Error::from),
         other => return Err(format!("unknown format: {other}")),
     };
-    if content.len() > limit {
-        return Err(too_large(format, limit));
+    match written {
+        Ok(()) => String::from_utf8(out.buf).map_err(|e| e.to_string()),
+        Err(_) if out.exceeded => Err(too_large(format, limit)),
+        Err(e) => Err(e.to_string()),
     }
-    Ok(content)
 }
 
 fn too_large(format: &str, limit: usize) -> String {
     format!(
-        "the {format} output of this document exceeds the {} MiB limit for one tool result; \
+        "the {format} output of this document exceeds the {} MiB (UTF-8 bytes) limit for one tool result; \
          try a more compact format (\"text\" or \"markdown\"), or run the office-oxide CLI, \
          which streams its output",
         limit / (1024 * 1024)
@@ -263,7 +328,7 @@ fn call_info(id: &Value, args: &Value) -> Value {
         return error_response(id, INVALID_PARAMS, "missing file_path");
     };
 
-    let doc = match office_oxide::Document::open(file_path) {
+    let doc = match office_oxide::Document::open_with(file_path, &tool_options(args)) {
         Ok(d) => d,
         Err(e) => return tool_error(id, &e.to_string()),
     };
@@ -357,6 +422,45 @@ fn tool_error(id: &Value, message: &str) -> Value {
 mod tests {
     use super::*;
 
+    /// Serialises the tests that lower a process-wide limit against the ones
+    /// that open and render documents under the defaults: the test that bounds
+    /// the budgets holds the write lock, the others the read lock.
+    static LIMITS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    fn default_limits() -> std::sync::RwLockReadGuard<'static, ()> {
+        LIMITS.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The text and image budgets set for the length of a test and put back
+    /// when it ends, however it ends. Holds the write lock: no test that
+    /// opens documents under the defaults (they hold the read lock) runs
+    /// meanwhile, and no tool call lowers the budgets meanwhile.
+    struct TestLimits {
+        before: (usize, u64),
+        _lock: std::sync::RwLockWriteGuard<'static, ()>,
+    }
+
+    impl TestLimits {
+        fn bound_to(text_chars: usize, memory_bytes: u64) -> Self {
+            let lock = LIMITS.write().unwrap_or_else(|e| e.into_inner());
+            let before =
+                (office_oxide::limits::max_text_chars(), office_oxide::limits::max_memory_bytes());
+            office_oxide::limits::set_max_text_chars(text_chars);
+            office_oxide::limits::set_max_memory_bytes(memory_bytes);
+            Self {
+                before,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for TestLimits {
+        fn drop(&mut self) {
+            office_oxide::limits::set_max_text_chars(self.before.0);
+            office_oxide::limits::set_max_memory_bytes(self.before.1);
+        }
+    }
+
     /// A unique scratch directory for one test.
     fn scratch_dir(tag: &str) -> std::path::PathBuf {
         let dir =
@@ -377,6 +481,7 @@ mod tests {
     /// every format, including the streamed IR path.
     #[test]
     fn test_extract_refuses_output_over_the_size_limit() {
+        let _defaults = default_limits();
         let dir = scratch_dir("size_limit");
         let path = dir.join("doc.docx");
         write_docx(&path, &"lorem ipsum ".repeat(200));
@@ -389,6 +494,186 @@ mod tests {
             // At exactly its own size it still fits.
             assert_eq!(render(&doc, format, full.len()).unwrap(), full, "{format}");
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A spreadsheet whose text outgrows the text budget is cut at it with the
+    /// library's notice, in the rendering and in `info`, instead of being
+    /// built whole and then refused.
+    #[test]
+    fn test_budgets_bound_what_a_spreadsheet_renders_before_the_size_check() {
+        use office_oxide::xlsx::write::{CellData, XlsxWriter};
+        let dir = scratch_dir("budget");
+        let path = dir.join("book.xlsx");
+        let mut w = XlsxWriter::new();
+        {
+            let mut sheet = w.add_sheet("S");
+            for _ in 0..400 {
+                sheet.add_row(vec![CellData::String("x".repeat(50))]);
+            }
+        }
+        w.save(&path).unwrap();
+        let scope = TestLimits::bound_to(2_000, 8_000);
+        let doc = office_oxide::Document::open_with(&path, &tool_options(&json!({}))).unwrap();
+        let cut = render(&doc, "markdown", usize::MAX);
+        let info = call_info(&json!(1), &json!({ "file_path": path.to_str().unwrap() }));
+        drop(scope);
+        let _defaults = default_limits();
+        // The document keeps the options it was opened with, so the whole text
+        // comes from one opened without them.
+        let whole = office_oxide::Document::open(&path).unwrap();
+        let full = render(&whole, "text", usize::MAX).unwrap();
+        assert!(full.len() >= 20_000);
+
+        let cut = cut.unwrap();
+        assert!(cut.len() < full.len() / 2, "{} bytes of {}", cut.len(), full.len());
+        let info = info["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(info.contains("\"text_truncated\":true"), "{info}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A test that fails inside the scope still puts the budgets back, and
+    /// the lock it held is usable afterwards, so one failing test cannot
+    /// leave its limits behind for the others.
+    #[test]
+    fn test_test_limits_restore_the_limits_when_the_test_inside_it_panics() {
+        let _defaults = default_limits();
+        let before =
+            (office_oxide::limits::max_text_chars(), office_oxide::limits::max_memory_bytes());
+        drop(_defaults);
+        let panicked = std::panic::catch_unwind(|| {
+            let _scope = TestLimits::bound_to(123, 45);
+            assert_eq!(office_oxide::limits::max_text_chars(), 123);
+            assert_eq!(office_oxide::limits::max_memory_bytes(), 45);
+            panic!("an assertion inside the scope fails");
+        });
+        assert!(panicked.is_err());
+        let _defaults = default_limits();
+        assert_eq!(
+            (office_oxide::limits::max_text_chars(), office_oxide::limits::max_memory_bytes()),
+            before
+        );
+    }
+
+    /// A tool call's options cap the budgets at what one result can hold, keep
+    /// a lower process-wide budget, and change nothing process-wide.
+    #[test]
+    fn test_tool_options_cap_the_budgets_without_touching_the_process() {
+        use office_oxide::limits::{max_memory_bytes, max_text_chars};
+        {
+            let _limits = TestLimits::bound_to(usize::MAX, u64::MAX);
+            let options = tool_options(&json!({}));
+            assert_eq!(options.limits.text_chars, MAX_EXTRACT_BYTES);
+            assert_eq!(options.limits.memory_bytes, MAX_EXTRACT_MEMORY_BYTES);
+            assert_eq!((max_text_chars(), max_memory_bytes()), (usize::MAX, u64::MAX));
+        }
+        let _limits = TestLimits::bound_to(1_000, 500);
+        let options = tool_options(&json!({}));
+        assert_eq!(
+            (options.limits.text_chars, options.limits.memory_bytes),
+            (1_000, 500),
+            "a lower budget is kept"
+        );
+    }
+
+    /// `"strict": true` reads under the strict limits and refuses a document
+    /// that cannot be read completely; without it the readable part is returned.
+    #[test]
+    fn test_strict_refuses_an_incomplete_document() {
+        use office_oxide::core::opc::{OpcWriter, PartName};
+        use office_oxide::core::relationships::rel_types;
+        let _defaults = default_limits();
+        let dir = scratch_dir("strict");
+        let path = dir.join("cut.docx");
+        let body = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>kept</w:t></w:r></w:p><w:p><w:r><w:t>cut"#;
+        let mut writer = OpcWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+        writer
+            .add_part(
+                &PartName::new("/word/document.xml").unwrap(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                body.as_bytes(),
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        std::fs::write(&path, writer.finish().unwrap().into_inner()).unwrap();
+        let file = path.to_str().unwrap();
+
+        for tool in ["extract", "info"] {
+            let lenient = handle_tools_call(
+                &json!(1),
+                &json!({ "name": tool, "arguments": { "file_path": file } }),
+            );
+            assert!(lenient["result"]["isError"].is_null(), "{tool}: {lenient}");
+            let strict = handle_tools_call(
+                &json!(1),
+                &json!({ "name": tool, "arguments": { "file_path": file, "strict": true } }),
+            );
+            assert_eq!(strict["result"]["isError"], json!(true), "{tool}: {strict}");
+            let message = strict["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                message.contains("incomplete") && message.contains("word/document.xml"),
+                "{message}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `extract` and `info` leave the process's budgets as they found them,
+    /// and `replace_text`, which edits the package's XML and reads none of
+    /// them, is not cut short by tiny ones.
+    #[test]
+    fn test_tool_calls_restore_the_budgets_and_replace_text_ignores_them() {
+        use office_oxide::limits::{max_memory_bytes, max_text_chars};
+        let dir = scratch_dir("restore");
+        let path = dir.join("doc.docx");
+        let text = "lorem ipsum ".repeat(200);
+        write_docx(&path, &text);
+        let arguments = json!({ "file_path": path.to_str().unwrap() });
+        let _limits = TestLimits::bound_to(10_000_000_000, 10_000_000_000);
+        for tool in ["extract", "info"] {
+            let out =
+                handle_tools_call(&json!(1), &json!({ "name": tool, "arguments": arguments }));
+            assert!(out["result"]["isError"].is_null(), "{tool}: {out}");
+            assert_eq!(
+                (max_text_chars(), max_memory_bytes()),
+                (10_000_000_000, 10_000_000_000),
+                "{tool} left the budgets lowered"
+            );
+        }
+        office_oxide::limits::set_max_text_chars(3);
+        let out = handle_tools_call(
+            &json!(1),
+            &json!({
+                "name": "replace_text",
+                "arguments": {
+                    "file_path": path.to_str().unwrap(), "find": "ipsum", "replace": "dolor"
+                }
+            }),
+        );
+        let message = out["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(message.starts_with("replaced 200 occurrence(s)"), "{out}");
+        office_oxide::limits::set_max_text_chars(10_000_000_000);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The size limit counts UTF-8 bytes, not characters: 100 CJK characters
+    /// are 300 bytes and do not fit a 200 byte limit though 100 < 200.
+    #[test]
+    fn test_the_result_limit_counts_bytes_not_characters() {
+        let _defaults = default_limits();
+        let dir = scratch_dir("bytes");
+        let path = dir.join("doc.docx");
+        let text = "\u{4e2d}".repeat(100);
+        write_docx(&path, &text);
+        let doc = office_oxide::Document::open(&path).unwrap();
+        assert_eq!(render(&doc, "text", 300).unwrap().len(), 300);
+        let err = render(&doc, "text", 299).expect_err("300 bytes do not fit 299");
+        assert!(err.contains("exceeds") && err.contains("bytes"), "{err}");
+        let err = render(&doc, "text", 200).expect_err("100 characters, 300 bytes");
+        assert!(err.contains("exceeds"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -445,6 +730,7 @@ mod tests {
     /// keywords and the dates were parsed but not reported.
     #[test]
     fn test_info_reports_metadata_and_the_truncation_warning() {
+        let _defaults = default_limits();
         use office_oxide::format::DocumentFormat;
         use office_oxide::ir::Metadata;
         let mut metadata = Metadata {
@@ -487,6 +773,7 @@ mod tests {
     /// original with the result while reporting success.
     #[test]
     fn test_replace_text_with_empty_find_is_an_error_and_leaves_the_file_alone() {
+        let _defaults = default_limits();
         let dir = scratch_dir("empty_find");
         let path = dir.join("doc.docx");
         write_docx(&path, "Hello world");

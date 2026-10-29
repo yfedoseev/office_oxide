@@ -96,3 +96,134 @@ fn test_an_intact_package_carries_no_integrity_warning() {
         .unwrap();
     assert!(doc.to_ir().metadata.warnings.is_empty());
 }
+
+/// A deflated zip of the same package, with the recorded CRC-32 and sizes of
+/// one entry rewritten in both its local and central headers.
+fn deflated_zip(parts: &[(&str, String)]) -> Vec<u8> {
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let deflated = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, body) in parts {
+        zip.start_file(*name, deflated).unwrap();
+        zip.write_all(body.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+fn replace_le32(data: &mut [u8], from: u32, to: u32) -> usize {
+    let (from, to) = (from.to_le_bytes(), to.to_le_bytes());
+    let mut n = 0;
+    let mut at = 0;
+    while at + 4 <= data.len() {
+        if data[at..at + 4] == from {
+            data[at..at + 4].copy_from_slice(&to);
+            n += 1;
+            at += 4;
+        } else {
+            at += 1;
+        }
+    }
+    n
+}
+
+fn crc_of(body: &str) -> u32 {
+    let mut crc = flate2::Crc::new();
+    crc.update(body.as_bytes());
+    crc.sum()
+}
+
+fn workbook_parts() -> Vec<(&'static str, String)> {
+    let stored = workbook_with_two_sheets();
+    let mut zip = zip::ZipArchive::new(Cursor::new(stored)).unwrap();
+    let mut parts = Vec::new();
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).unwrap();
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut f, &mut body).unwrap();
+        let name: &'static str = Box::leak(f.name().unwrap().to_string().into_boxed_str());
+        parts.push((name, body));
+    }
+    parts
+}
+
+#[test]
+fn test_a_deflated_sheet_failing_its_crc_keeps_its_own_cells_and_is_reported() {
+    let parts = workbook_parts();
+    let body = parts
+        .iter()
+        .find(|(n, _)| *n == "xl/worksheets/sheet2.xml")
+        .unwrap()
+        .1
+        .clone();
+    let mut data = deflated_zip(&parts);
+    let crc = crc_of(&body);
+    assert_eq!(replace_le32(&mut data, crc, crc ^ 1), 2, "local and central header");
+
+    let doc = Document::from_reader(Cursor::new(data), DocumentFormat::Xlsx).unwrap();
+    let text = doc.plain_text();
+    assert!(text.contains("alpha"), "{text}");
+    assert!(text.contains("bravo-marker"), "{text}");
+    assert!(
+        doc.to_ir()
+            .metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("xl/worksheets/sheet2.xml") && w.contains("CRC-32")),
+        "{:?}",
+        doc.to_ir().metadata.warnings
+    );
+}
+
+/// A deflate stream that decodes completely to a different length than the
+/// entry declares is a damaged header, not damaged content (an edit that
+/// rewrote line endings does this): the bytes are kept, as for a bad CRC-32,
+/// and the entry is reported.
+#[test]
+fn test_a_sheet_that_differs_from_its_declared_size_keeps_its_cells_and_is_reported() {
+    for delta in [-20i64, 20] {
+        let parts = workbook_parts();
+        let body = parts
+            .iter()
+            .find(|(n, _)| *n == "xl/worksheets/sheet2.xml")
+            .unwrap()
+            .1
+            .clone();
+        let mut data = deflated_zip(&parts);
+        let len = body.len() as u32;
+        assert_eq!(replace_le32(&mut data, len, (len as i64 + delta) as u32), 2);
+
+        let doc = Document::from_reader(Cursor::new(data), DocumentFormat::Xlsx).unwrap();
+        let text = doc.plain_text();
+        assert!(text.contains("alpha"), "{delta}: {text}");
+        assert!(text.contains("bravo-marker"), "{delta}: {text}");
+        let warnings = doc.to_ir().metadata.warnings;
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("xl/worksheets/sheet2.xml") && w.contains("declared size")),
+            "{delta}: {warnings:?}"
+        );
+    }
+}
+
+/// The tolerance is bounded by what the header declares: an entry that
+/// inflates far past its declared size is refused, not read to the part limit.
+#[test]
+fn test_an_entry_that_inflates_far_past_its_declared_size_is_still_refused() {
+    let mut parts = workbook_parts();
+    let big = sheet(&"x".repeat(4 * 1024 * 1024));
+    parts
+        .iter_mut()
+        .find(|(n, _)| *n == "xl/worksheets/sheet2.xml")
+        .unwrap()
+        .1 = big.clone();
+    let mut data = deflated_zip(&parts);
+    let len = big.len() as u32;
+    assert_eq!(replace_le32(&mut data, len, 1000), 2);
+
+    let doc = Document::from_reader(Cursor::new(data), DocumentFormat::Xlsx).unwrap();
+    let text = doc.plain_text();
+    assert!(text.contains("alpha"), "{text}");
+    assert!(!text.contains("xxxxxxxx"), "the oversized entry must not be read");
+    assert!(text.contains("unreadable sheet \"Second\""), "{text}");
+}

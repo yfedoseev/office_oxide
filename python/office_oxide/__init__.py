@@ -21,7 +21,9 @@ Editing::
 from office_oxide._native import (
     Document,
     EditableDocument,
+    IncompleteDocumentError,
     OfficeOxideError,
+    ParseOptions,
     PptxWriter,
     XlsxWriter,
     create_from_markdown,
@@ -36,7 +38,9 @@ __version__ = version()
 __all__ = [
     "Document",
     "EditableDocument",
+    "IncompleteDocumentError",
     "OfficeOxideError",
+    "ParseOptions",
     "PptxWriter",
     "XlsxWriter",
     "__version__",

@@ -1831,10 +1831,11 @@ fn test_carriage_return_is_a_line_break() {
 
 #[test]
 fn test_symbol_runs_produce_a_character() {
-    // The Wingdings bullet lives in the private-use area; map it to U+2022
-    // rather than emitting an unrenderable code point.
+    // Word's list bullet is code 0xB7 of the Symbol font, stored as the
+    // private-use code point U+F0B7; it must come out as the bullet, not as an
+    // unrenderable code point. (In Wingdings the same code is a clock face.)
     let ir = Docx::new(
-        r#"<w:p><w:r><w:sym w:font="Wingdings" w:char="F0B7"/><w:t> item</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:sym w:font="Symbol" w:char="F0B7"/><w:t> item</w:t></w:r></w:p>"#,
     )
     .ir();
     assert_eq!(para_text(para(&ir, 0)), "\u{2022} item");

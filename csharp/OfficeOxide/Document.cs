@@ -46,6 +46,37 @@ public sealed class Document : IDisposable
         return new Document(h, path);
     }
 
+    /// <summary>Open a document from a file path under <paramref name="options"/> (null: the process-wide settings).</summary>
+    public static Document Open(string path, ParseOptions? options)
+    {
+        var h = NativeMethods.OfficeDocumentOpenWith(path, options?.Handle ?? IntPtr.Zero, out var err);
+        if (h == IntPtr.Zero) throw new OfficeOxideException(err, "Open");
+        return new Document(h, path);
+    }
+
+    /// <summary>Open a document from an in-memory buffer under <paramref name="options"/> (null: the process-wide settings).</summary>
+    public static Document FromBytes(byte[] data, string format, ParseOptions? options)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+        var h = NativeMethods.OfficeDocumentOpenFromBytesWith(
+            data, (nuint)data.Length, format, options?.Handle ?? IntPtr.Zero, out var err);
+        if (h == IntPtr.Zero) throw new OfficeOxideException(err, "FromBytes");
+        return new Document(h, null);
+    }
+
+    /// <summary>
+    /// What is wrong with the document: parts that could not be read, output a limit
+    /// cut, repairs that left the content intact. Empty for a sound document.
+    /// Converts the document once.
+    /// </summary>
+    public DocumentDamage[] Damage()
+    {
+        EnsureOpen();
+        var ptr = NativeMethods.OfficeDocumentDamageJson(_handle, out var err);
+        if (ptr == IntPtr.Zero) throw new OfficeOxideException(err, nameof(Damage));
+        return DocumentDamage.Parse(NativeMethods.PtrToStringAndFree(ptr) ?? "[]");
+    }
+
     /// <summary>Open a document from an in-memory buffer. <paramref name="format"/> is one of "docx"/"xlsx"/"pptx"/"doc"/"xls"/"ppt".</summary>
     public static Document FromBytes(byte[] data, string format)
     {

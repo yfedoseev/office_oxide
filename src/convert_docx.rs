@@ -102,7 +102,15 @@ impl<'a, 'd> Cx<'a, 'd> {
         let base = match cached {
             Some(b) => b,
             None => {
-                let b = Rc::new(sheet.run_style_base(layer, pkey, ckey));
+                // The memo keeps the fold for the whole conversion, one per
+                // table-style layer: its text is charged, and left out once
+                // the budget cannot take it.
+                let fold = sheet.run_style_base(layer, pkey, ckey);
+                let b = Rc::new(if crate::limits::charge_copied_text(fold.heap_chars()) {
+                    fold
+                } else {
+                    fold.clone_light()
+                });
                 self.folds.runs.borrow_mut().insert(key, Rc::clone(&b));
                 b
             },
@@ -110,7 +118,14 @@ impl<'a, 'd> Cx<'a, 'd> {
         Some(match direct {
             None => EffectiveRun::Inherited(base),
             Some(d) => {
-                let mut own = (*base).clone();
+                // The fold's text (face names) is copied for this run; once
+                // the budget cannot take it the run keeps its formatting
+                // without the names, and the conversion says so.
+                let mut own = if crate::limits::charge_copied_text(base.heap_chars()) {
+                    (*base).clone()
+                } else {
+                    base.clone_light()
+                };
                 own.overlay(d);
                 EffectiveRun::Own(own)
             },
@@ -137,7 +152,13 @@ impl<'a, 'd> Cx<'a, 'd> {
         let base = match cached {
             Some(b) => b,
             None => {
-                let b = Rc::new(sheet.paragraph_style_base(layer, pkey));
+                // Kept for the whole conversion, like the run folds: charged.
+                let fold = sheet.paragraph_style_base(layer, pkey);
+                let b = Rc::new(if crate::limits::charge_copied_text(fold.heap_chars()) {
+                    fold
+                } else {
+                    fold.clone_light()
+                });
                 self.folds
                     .paragraphs
                     .borrow_mut()
@@ -145,7 +166,15 @@ impl<'a, 'd> Cx<'a, 'd> {
                 b
             },
         };
-        let mut out = (*base).clone();
+        // The fold's tab stops and names are copied for this paragraph, and
+        // the IR holds the tab stops again; once the budget cannot take them
+        // the paragraph keeps the rest of its formatting without them, and
+        // the conversion says so.
+        let mut out = if crate::limits::charge_copied_text(base.heap_chars()) {
+            (*base).clone()
+        } else {
+            base.clone_light()
+        };
         if let Some(d) = direct {
             out.overlay(d);
         }
@@ -153,7 +182,23 @@ impl<'a, 'd> Cx<'a, 'd> {
     }
 }
 
+/// A header or footer converted once, with what a copy of it costs.
+#[derive(Clone)]
+struct SharedStory {
+    part: HeaderFooter,
+    /// The serialised size of a copy, pictures' bytes excluded.
+    text_chars: usize,
+    /// The bytes of the pictures a copy holds.
+    image_bytes: usize,
+    /// The same story with its pictures' bytes removed, and its serialised
+    /// size, made the first time a copy has to be made without them.
+    without_images: Option<(HeaderFooter, usize)>,
+}
+
 pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
+    let _image_scope = crate::limits::begin_image_budget();
+    let _scale = crate::limits::InputSizeScope::new(doc.input_bytes);
+    let _text_scope = crate::limits::begin_copied_text_budget();
     let folds = StyleFolds::default();
     let cx = Cx {
         doc,
@@ -200,12 +245,19 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
     // `Section.header` as soon as any section had an unequal number of
     // header and footer refs, and gave every section every other section's
     // headers on top of that.
-    let mut hf_iter = doc.headers_footers.iter();
+    // Each stored entry is converted once; a section that shares it gets a
+    // copy. A copy is charged before it is made: its image bytes to the image
+    // budget, like a body picture's, and the rest of its serialised form (text,
+    // structure, link targets, tooltips) to the text budget, so that a package
+    // of many sections over one large header cannot multiply it without bound.
+    // When the image budget cannot take another copy of the images, the copy
+    // keeps its text and its pictures lose their bytes.
+    let mut hf_converted: Vec<Option<Option<SharedStory>>> = vec![None; doc.headers_footers.len()];
     let mut per_section: Vec<SectionHeaders> = Vec::new();
-    for sp in &doc.sections {
+    for slots in &doc.hf_by_ref {
         let mut slot = SectionHeaders::default();
-        for _ in 0..(sp.header_refs.len() + sp.footer_refs.len()) {
-            let Some(hf) = hf_iter.next() else { break };
+        for idx in slots.iter().flatten().copied() {
+            let hf = &doc.headers_footers[idx];
             // A first-page part in a section without `w:titlePg` is never
             // shown by Word; carrying it made every surface print it and
             // the writer, which emits `w:titlePg` for any first-page
@@ -213,15 +265,54 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             if !hf.active {
                 continue;
             }
-            let mut tmp: Vec<Element> = Vec::new();
-            convert_block_elements(&hf.content, &mut tmp, doc);
-            if tmp
-                .iter()
-                .all(|e| matches!(e, Element::Paragraph(p) if p.content.is_empty()))
-            {
+            let converted = hf_converted[idx].get_or_insert_with(|| {
+                let mut tmp: Vec<Element> = Vec::new();
+                convert_block_elements(&hf.content, &mut tmp, doc);
+                if tmp
+                    .iter()
+                    .all(|e| matches!(e, Element::Paragraph(p) if p.content.is_empty()))
+                {
+                    None
+                } else {
+                    // The pictures' bytes, and what they add to the serialised
+                    // form (base64).
+                    let (mut image_bytes, mut image_base64) = (0usize, 0usize);
+                    crate::ir::for_each_image_mut(&mut tmp, |i| {
+                        let n = i.data.as_ref().map_or(0, Vec::len);
+                        image_bytes = image_bytes.saturating_add(n);
+                        image_base64 = image_base64.saturating_add(n.div_ceil(3) * 4);
+                    });
+                    let json = serde_json::to_vec(&tmp).map_or(usize::MAX, |v| v.len());
+                    Some(SharedStory {
+                        part: HeaderFooter { content: tmp },
+                        text_chars: json.saturating_sub(image_base64),
+                        image_bytes,
+                        without_images: None,
+                    })
+                }
+            });
+            let Some(story) = converted.as_mut() else {
                 continue;
-            }
-            let part = HeaderFooter { content: tmp };
+            };
+            let part = if crate::limits::charge_image_bytes(story.image_bytes) {
+                if !crate::limits::charge_copied_text(story.text_chars) {
+                    continue;
+                }
+                story.part.clone()
+            } else {
+                // No room for another copy of the pictures: the copy keeps
+                // its text, and its pictures their place without bytes.
+                let (stripped, chars) = story.without_images.get_or_insert_with(|| {
+                    let mut part = story.part.clone();
+                    crate::ir::for_each_image_mut(&mut part.content, |i| i.data = None);
+                    let chars = serde_json::to_vec(&part.content).map_or(usize::MAX, |v| v.len());
+                    (part, chars)
+                });
+                if !crate::limits::charge_copied_text(*chars) {
+                    continue;
+                }
+                stripped.clone()
+            };
             let target = match (hf.is_header, hf.hf_type) {
                 (true, crate::docx::HeaderFooterType::First) => &mut slot.first_header,
                 (true, crate::docx::HeaderFooterType::Even) => &mut slot.even_header,
@@ -379,9 +470,52 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
         }
     }
 
+    // Pictures left without their bytes are reported like every other cut:
+    // the truncation flag, one warning naming the limit, and a notice in the
+    // document itself (the last section ends with it, as a spreadsheet's
+    // sheet does), so a rendering that embeds pictures does not lose them
+    // silently. Read after every conversion above: copies in headers and
+    // footers are charged too.
+    let image_cut = crate::limits::image_budget_warning();
+    if image_cut.is_some()
+        && let Some(last) = ir_sections.last_mut()
+    {
+        last.elements.push(Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan::plain(format!(
+                "[some pictures not shown: together they exceed the {} byte picture budget \
+                 (office_oxide::limits::set_max_memory_bytes)]",
+                crate::limits::max_image_bytes()
+            )))],
+            ..Default::default()
+        }));
+    }
+
+    // The parts that could not be read end the last section, one paragraph
+    // each, as a spreadsheet's report does; charged to the text budget before
+    // the budget's notice is read below.
+    let unreadable_warnings = doc.unreadable_warnings();
+    let unreadable_lines =
+        crate::core::unreadable::report_ir_lines(&doc.unreadable_text_warnings());
+    if !unreadable_lines.is_empty() {
+        if ir_sections.is_empty() {
+            ir_sections.push(Section::default());
+        }
+        if let Some(last) = ir_sections.last_mut() {
+            last.elements
+                .extend(unreadable_lines.into_iter().map(|line| {
+                    Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan::plain(line))],
+                        ..Default::default()
+                    })
+                }));
+        }
+    }
+
     // Real document metadata beats a title guessed from the first heading,
     // but the guess stays as the fallback for files with no core properties.
     let cp = doc.core_properties.as_ref();
+    // Read after every conversion above: links in the body are charged too.
+    let copied_text_notice = crate::limits::copied_text_notice();
     DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Docx,
@@ -399,11 +533,15 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
-            text_truncated: !doc.unreadable_parts.is_empty(),
-            warnings: doc
-                .unreadable_parts
-                .iter()
-                .map(|p| format!("skipped unreadable part {p}"))
+            text_truncated: doc.unreadable_loses_text()
+                || copied_text_notice.is_some()
+                || doc.link_notice.is_some()
+                || image_cut.is_some(),
+            warnings: unreadable_warnings
+                .into_iter()
+                .chain(copied_text_notice)
+                .chain(doc.link_notice.clone())
+                .chain(image_cut)
                 .chain(crate::core::core_properties::package_warnings(Some(
                     &doc.package_properties,
                 )))
@@ -416,6 +554,19 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
                                 "{} paragraph style name(s) were not exposed because they exceed \
                                  255 characters or contain control characters",
                                 s.unusable_style_names
+                            )
+                        }),
+                )
+                .chain(
+                    doc.styles
+                        .as_ref()
+                        .filter(|s| s.styles_left_out > 0)
+                        .map(|s| {
+                            format!(
+                                "{} style(s) were left out because the style sheet holds more \
+                                 than {} styles",
+                                s.styles_left_out,
+                                crate::docx::styles::MAX_STYLES
                             )
                         }),
                 )
@@ -1020,7 +1171,7 @@ fn collect_paragraph_inline_images(
                     // A linked picture has no bytes in the package, only
                     // its target; it used to be dropped without trace.
                     let (data, ext) = match embedded_image(d, doc) {
-                        Some((data, ext)) => (Some(data), ext),
+                        Some((data, ext)) => (data, ext),
                         None if d.linked_image.is_some() => (None, None),
                         None => continue,
                     };
@@ -1036,7 +1187,7 @@ fn collect_paragraph_inline_images(
                         alt_text: d.description.clone(),
                         decorative: d.decorative,
                         data,
-                        source_url: d.linked_image.clone(),
+                        source_url: linked_image_url(d),
                         format,
                         display_width_emu: Some(d.width.0.max(0) as u64),
                         display_height_emu: Some(d.height.0.max(0) as u64),
@@ -1063,6 +1214,12 @@ fn collect_paragraph_chart_text(p: &crate::docx::Paragraph, out: &mut Vec<Elemen
                     continue;
                 };
                 for line in d.chart_text.iter().chain(d.dgm_text.iter()) {
+                    // The part's text is stored once and copied for every
+                    // drawing that names the part: charged before it is
+                    // copied, and left out once the budget is spent.
+                    if !crate::limits::charge_copied_text(line.len()) {
+                        break;
+                    }
                     out.push(Element::Paragraph(Paragraph {
                         content: vec![InlineContent::Text(TextSpan::plain(line.clone()))],
                         ..Default::default()
@@ -1170,7 +1327,7 @@ fn drawing_to_float_element(
     }
 
     let (data, ext) = match embedded_image(d, doc) {
-        Some((data, ext)) => (Some(data), ext),
+        Some((data, ext)) => (data, ext),
         None if d.linked_image.is_some() => (None, None),
         None => return None,
     };
@@ -1183,7 +1340,7 @@ fn drawing_to_float_element(
         alt_text: d.description.clone(),
         decorative: d.decorative,
         data,
-        source_url: d.linked_image.clone(),
+        source_url: linked_image_url(d),
         format,
         display_width_emu: Some(width_emu),
         display_height_emu: Some(height_emu),
@@ -1201,16 +1358,31 @@ fn drawing_to_float_element(
     }))
 }
 
+/// A linked picture's target as an owned URL, charged to the copied-text
+/// budget before it is copied; `None` once the budget is spent.
+fn linked_image_url(d: &crate::docx::DrawingInfo) -> Option<String> {
+    d.linked_image
+        .as_deref()
+        .filter(|url| crate::limits::charge_copied_text(url.len()))
+        .map(str::to_string)
+}
+
 /// A drawing's embedded picture bytes and file extension, if the package
 /// holds them.
+///
+/// The bytes are shared in the document and copied into each IR `Image`;
+/// each copy is charged to the image-byte budget (`limits::set_max_memory_bytes`)
+/// and, once it is spent, the image keeps its place without its bytes.
 fn embedded_image(
     d: &crate::docx::DrawingInfo,
     doc: &crate::docx::DocxDocument,
-) -> Option<(Vec<u8>, Option<String>)> {
+) -> Option<(Option<Vec<u8>>, Option<String>)> {
     if d.relationship_id.is_empty() {
         return None;
     }
-    doc.images.get(&d.relationship_id).cloned()
+    let (data, ext) = doc.images.get(&d.relationship_id)?;
+    let copy = crate::limits::charge_image_bytes(data.len()).then(|| data.to_vec());
+    Some((copy, ext.clone()))
 }
 
 /// Translate a paragraph's `<w:jc>` justification into the IR's
@@ -1327,11 +1499,16 @@ struct RunContext<'a, 'd> {
 /// links become fragment references (`#bookmark`) rather than being
 /// dropped — a table-of-contents built from internal links used to lose
 /// every one of its destinations.
-fn hyperlink_url(hl: &crate::docx::Hyperlink) -> Option<String> {
+///
+/// The external target is borrowed from the document, where every link that
+/// names it shares one allocation; a copy is made, and charged, only where the
+/// URL lands in an IR span.
+fn hyperlink_url(hl: &crate::docx::Hyperlink) -> Option<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
     match &hl.target {
-        crate::docx::HyperlinkTarget::External(url) => Some(url.clone()),
+        crate::docx::HyperlinkTarget::External(url) => Some(Cow::Borrowed(url)),
         crate::docx::HyperlinkTarget::Internal(anchor) if !anchor.is_empty() => {
-            Some(format!("#{anchor}"))
+            Some(Cow::Owned(format!("#{anchor}")))
         },
         crate::docx::HyperlinkTarget::Internal(_) => None,
     }
@@ -1421,7 +1598,9 @@ fn convert_run_content(
     // and the CLI's JSON projection automatically in agreement, instead
     // of risking a 5th instance of this crate's "two renderers disagree"
     // flaw.
-    if effective.and_then(|rp| rp.hidden).unwrap_or(false) {
+    if effective.and_then(|rp| rp.hidden).unwrap_or(false)
+        && !crate::read_options::include_hidden_text()
+    {
         return;
     }
     let no_properties;
@@ -1507,6 +1686,19 @@ fn convert_run_content(
     // `crate::core::units::HalfPoint::from_word_sz`).
     let push_text = |text: &str, content: &mut Vec<InlineContent>| {
         eff.for_each_script_segment(text, ascii, |piece, face| {
+            // Each span owns its link, so the URL and the hover text are
+            // charged before they are copied; once the budget is spent the
+            // text stays, unlinked.
+            let link = link.filter(|(url, tip)| {
+                crate::limits::charge_copied_text(url.len() + tip.map_or(0, str::len))
+            });
+            // The face name is stored once (in a style or the theme) and
+            // copied into every span: charged before it is, and left off
+            // once the budget is spent.
+            let font_name = face
+                .font_name
+                .filter(|n| crate::limits::charge_copied_text(n.len()))
+                .map(str::to_string);
             content.push(InlineContent::Text(TextSpan {
                 text: piece.to_string(),
                 bold,
@@ -1517,7 +1709,7 @@ fn convert_run_content(
                 font_size_half_pt: face
                     .font_size
                     .map(|hp| crate::core::units::HalfPoint::from_word_sz(hp.0).0),
-                font_name: face.font_name.map(str::to_string),
+                font_name,
                 color: text_color,
                 underline: underline.clone(),
                 highlight,
@@ -1797,15 +1989,17 @@ fn convert_list_group(
 }
 
 /// One numbering level's marker, as the IR's `List` describes it.
-struct LevelMarker {
+struct LevelMarker<'a> {
     ordered: bool,
     style: Option<ListStyle>,
-    pattern: Option<String>,
+    /// Borrowed from the numbering level: it is copied into a list only
+    /// after the copy is charged.
+    pattern: Option<&'a str>,
     alignment: Option<ParagraphAlignment>,
 }
 
-impl LevelMarker {
-    fn of(level: &crate::docx::numbering::NumberingLevel, ilvl: u8) -> Self {
+impl<'a> LevelMarker<'a> {
+    fn of(level: &'a crate::docx::numbering::NumberingLevel, ilvl: u8) -> Self {
         use crate::docx::NumberFormat as NF;
         let ordered = !matches!(level.format, NF::Bullet | NF::None);
         // Only an ordered level's `w:lvlText` is a pattern around a counter;
@@ -1814,7 +2008,7 @@ impl LevelMarker {
         // so only a different pattern is reported.
         let plain = format!("%{}.", u32::from(ilvl) + 1);
         let pattern = (ordered && !level.level_text.is_empty() && level.level_text != plain)
-            .then(|| level.level_text.clone());
+            .then_some(level.level_text.as_str());
         let alignment = level.justification.as_ref().and_then(|jc| match jc {
             crate::docx::Justification::Center => Some(ParagraphAlignment::Center),
             crate::docx::Justification::Right => Some(ParagraphAlignment::Right),
@@ -1839,7 +2033,7 @@ fn apply_level_markers(
     list: &mut List,
     items: &[(u8, Vec<InlineContent>)],
     next_item: &mut usize,
-    markers: &std::collections::HashMap<u8, LevelMarker>,
+    markers: &std::collections::HashMap<u8, LevelMarker<'_>>,
     // `Some(top level)` for the top list; `None` for a sub-list, whose
     // level is its first item's.
     top_ilvl: Option<u8>,
@@ -1848,7 +2042,13 @@ fn apply_level_markers(
     let ilvl = top_ilvl.or_else(|| items.get(*next_item).map(|(l, _)| *l));
     if let Some(m) = ilvl.and_then(|l| markers.get(&l)) {
         list.ordered = m.ordered;
-        list.marker_pattern = m.pattern.clone();
+        // The level's text is stored once and copied into every list that
+        // uses the level: charged before it is, and left off (the list is
+        // numbered `%N.`) once the budget is spent.
+        list.marker_pattern = m
+            .pattern
+            .filter(|p| crate::limits::charge_copied_text(p.len()))
+            .map(str::to_string);
         list.marker_alignment = m.alignment.clone();
         if !is_top {
             list.style = m.style.clone();
@@ -2020,7 +2220,8 @@ fn convert_table(table: &crate::docx::Table, doc: &Cx<'_, '_>) -> Element {
             // (spans are resolved per cell above), exactly like a
             // vMerge-continue cell's, so later real cells in the row don't
             // shift into the wrong column.
-            let is_deleted = cell.properties.as_ref().is_some_and(|p| p.deleted);
+            let is_deleted = cell.properties.as_ref().is_some_and(|p| p.deleted)
+                && !crate::read_options::include_deleted_text();
             if is_continue || is_deleted {
                 continue;
             }

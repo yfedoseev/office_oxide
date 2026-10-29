@@ -39,12 +39,193 @@ pub fn create_from_markdown_to_writer<W: Write + Seek>(
     create_from_ir_to_writer(&ir, format, writer)
 }
 
+/// The most columns an Excel worksheet has; a table is placed within it.
+const XLSX_MAX_COLS: usize = 16_384;
+
+/// The column each cell of `table` goes to in a worksheet, row by row, and
+/// nothing more: a cell goes to the next column its row has not used, skipping
+/// the columns a row-spanning cell from an earlier row still covers (the
+/// sparse, span-driven model every reader uses), and a span is clamped to the
+/// sheet. A cell that would start past the last column is placed at
+/// `XLSX_MAX_COLS`, where the writer refuses it. The writer and the write
+/// budget both place cells with this, so they cannot disagree about how wide a
+/// row is.
+fn xlsx_placement(table: &Table) -> Vec<Vec<usize>> {
+    // Columns still claimed by a row-spanning cell, and the rows left of it
+    // (including the one being placed).
+    let mut active: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    let mut placed = Vec::with_capacity(table.rows.len());
+    for row in &table.rows {
+        let mut col = 0usize;
+        let mut cols = Vec::with_capacity(row.cells.len());
+        for cell in &row.cells {
+            while col < XLSX_MAX_COLS && active.get(&col).is_some_and(|&left| left > 0) {
+                col += 1;
+            }
+            if col >= XLSX_MAX_COLS {
+                cols.push(XLSX_MAX_COLS);
+                continue;
+            }
+            cols.push(col);
+            let span = (cell.col_span.max(1) as usize).min(XLSX_MAX_COLS - col);
+            let rows_spanned = cell.row_span.max(1) as usize;
+            if rows_spanned > 1 {
+                for c in col..col + span {
+                    active.insert(c, rows_spanned);
+                }
+            }
+            col += span;
+        }
+        for left in active.values_mut() {
+            *left = left.saturating_sub(1);
+        }
+        active.retain(|_, left| *left > 0);
+        placed.push(cols);
+    }
+    placed
+}
+
+/// The cells the writer for `format` builds for `table`: its grid, not the
+/// number of cell entries. The `.pptx` writer pads every row to the widest
+/// row; the `.docx` writer lays the table on a grid as wide as the widest
+/// row's column spans (each span, and the width, clamped to
+/// `MAX_TABLE_COLS` as `convert_ir_table` clamps them) and gives every
+/// row that width, filling the cells a row span covers.
+fn written_table_cells(table: &Table, format: DocumentFormat) -> usize {
+    if format == DocumentFormat::Xlsx {
+        // Each row is as wide as its last placed cell: a cell after a wide span
+        // sits far to the right and the row is stored up to it.
+        return xlsx_placement(table)
+            .iter()
+            .map(|cols| cols.last().map_or(0, |&c| c.saturating_add(1)))
+            .fold(0usize, usize::saturating_add);
+    }
+    let width = if format == DocumentFormat::Docx {
+        let max_cols = crate::docx::write::MAX_TABLE_COLS;
+        table
+            .rows
+            .iter()
+            .map(|r| {
+                r.cells
+                    .iter()
+                    .map(|c| (c.col_span.max(1) as usize).min(max_cols))
+                    .fold(0usize, usize::saturating_add)
+                    .min(max_cols)
+            })
+            .max()
+            .unwrap_or(0)
+    } else {
+        table.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0)
+    };
+    table.rows.len().saturating_mul(width)
+}
+
+/// What one cell costs the writer for `format`, in bytes (see
+/// `max_write_bytes`).
+fn bytes_per_cell(format: DocumentFormat) -> u64 {
+    match format {
+        DocumentFormat::Docx => crate::limits::WRITE_BYTES_PER_DOCX_CELL,
+        DocumentFormat::Pptx => crate::limits::WRITE_BYTES_PER_PPTX_CELL,
+        _ => crate::limits::WRITE_BYTES_PER_XLSX_CELL,
+    }
+}
+
+/// Refuse a write that would need more than `max_write_bytes`
+/// for `cells` cells of `format`, for the IR path and for the writers used
+/// directly alike.
+pub(crate) fn check_write_cells(
+    cells: u64,
+    format: DocumentFormat,
+) -> std::result::Result<(), crate::core::Error> {
+    let per_cell = bytes_per_cell(format);
+    let limit = crate::limits::max_write_bytes();
+    if cells.saturating_mul(per_cell) > limit {
+        return Err(crate::core::Error::PackageLimit(format!(
+            "the document holds more than {} table cells, about {limit} bytes to write as \
+             {format:?}; the limit is office_oxide::limits::set_max_memory_bytes",
+            limit / per_cell
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse an IR that exceeds the write limits: more sections than
+/// `max_write_sheets` for `.xlsx`, or tables whose cells the
+/// writer would need more than `max_write_bytes` to build: the
+/// writers build every cell in memory, so the count, weighed by what a cell of
+/// the format costs, is the cost.
+///
+/// Counted with an explicit stack: the IR is `Deserialize` and can nest
+/// deeper than the call stack allows.
+fn check_write_budget(ir: &DocumentIR, format: DocumentFormat) -> Result<()> {
+    if format == DocumentFormat::Xlsx {
+        // One sheet per section; refused before any sheet is built.
+        let limit = crate::limits::max_write_sheets();
+        if ir.sections.len() > limit {
+            return Err(crate::core::Error::PackageLimit(format!(
+                "the document holds {} sections, more than the {limit} worksheets a workbook \
+                 may be written with; Excel allows at most 32,767",
+                ir.sections.len()
+            ))
+            .into());
+        }
+    }
+    if !matches!(format, DocumentFormat::Docx | DocumentFormat::Pptx | DocumentFormat::Xlsx) {
+        return Ok(());
+    }
+    let mut cells = 0u64;
+    let mut stack: Vec<&[Element]> = Vec::new();
+    for s in &ir.sections {
+        stack.push(&s.elements);
+        for hf in [
+            &s.header,
+            &s.footer,
+            &s.first_page_header,
+            &s.first_page_footer,
+            &s.even_page_header,
+            &s.even_page_footer,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            stack.push(&hf.content);
+        }
+    }
+    let mut lists: Vec<&List> = Vec::new();
+    loop {
+        while let Some(list) = lists.pop() {
+            for item in &list.items {
+                stack.push(&item.content);
+                lists.extend(item.nested.as_ref());
+            }
+        }
+        let Some(elements) = stack.pop() else { break };
+        for e in elements {
+            match e {
+                Element::Table(t) => {
+                    cells = cells.saturating_add(written_table_cells(t, format) as u64);
+                    for cell in t.rows.iter().flat_map(|r| &r.cells) {
+                        stack.push(&cell.content);
+                    }
+                    check_write_cells(cells, format)?;
+                },
+                Element::List(l) => lists.push(l),
+                Element::TextBox(t) => stack.push(&t.content),
+                Element::Footnote(n) | Element::Endnote(n) => stack.push(&n.content),
+                _ => {},
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Create a document file from a `DocumentIR`.
 pub fn create_from_ir(
     ir: &DocumentIR,
     format: DocumentFormat,
     path: impl AsRef<Path>,
 ) -> Result<()> {
+    check_write_budget(ir, format)?;
     match format {
         DocumentFormat::Docx => {
             let writer = ir_to_docx(ir);
@@ -69,6 +250,7 @@ pub fn create_from_ir_to_writer<W: Write + Seek>(
     format: DocumentFormat,
     writer: W,
 ) -> Result<()> {
+    check_write_budget(ir, format)?;
     match format {
         DocumentFormat::Docx => {
             let w = ir_to_docx(ir);
@@ -588,28 +770,14 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                             sheet.set_column_width(ci, w.clamp(3.0, 80.0));
                         }
                     }
-                    // Columns currently claimed by a still-open vertical
-                    // merge anchored in an earlier row, mapped to how many
-                    // more rows (including the one about to be processed)
-                    // it still covers. Without this, `col` advanced purely
-                    // by summing `col_span` across each row's own cells —
-                    // but a row-covering merge means the covered rows have
-                    // that column excluded from their own `cells` entirely
-                    // (the sparse, span-driven model every reader already
-                    // uses), so every cell after the gap silently shifted
-                    // left, misplacing content and hyperlinks onto the
-                    // wrong column instead of skipping over the claimed
-                    // one.
-                    let mut active_spans: std::collections::BTreeMap<usize, usize> =
-                        std::collections::BTreeMap::new();
-                    for row in &t.rows {
-                        let mut col = 0usize;
-                        for cell in &row.cells {
-                            while active_spans
-                                .get(&col)
-                                .is_some_and(|&remaining| remaining > 0)
-                            {
-                                col += 1;
+                    // Where each cell goes (see `xlsx_placement`: the columns a
+                    // row-spanning cell from an earlier row still claims are
+                    // skipped, so a cell after the gap is not shifted left).
+                    let placement = xlsx_placement(t);
+                    for (row, cols) in t.rows.iter().zip(&placement) {
+                        for (cell, &col) in row.cells.iter().zip(cols) {
+                            if col >= XLSX_MAX_COLS {
+                                continue;
                             }
                             let text = cell_text(cell);
                             let data = ir_cell_to_cell_data(cell, &text);
@@ -653,25 +821,12 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                                     sheet.set_cell_hyperlink_tooltip(row_cursor, col, tip);
                                 }
                             }
-                            let cs = cell.col_span.max(1) as usize;
+                            let cs = (cell.col_span.max(1) as usize).min(XLSX_MAX_COLS - col);
                             let rs = cell.row_span.max(1) as usize;
                             if cs > 1 || rs > 1 {
                                 sheet.merge_cells(row_cursor, col, rs, cs);
                             }
-                            if rs > 1 {
-                                for c in col..col + cs {
-                                    active_spans.insert(c, rs);
-                                }
-                            }
-                            col += cs;
                         }
-                        // This row is now consumed: every still-open span
-                        // (including any minted just above) has one fewer
-                        // row left to cover.
-                        for v in active_spans.values_mut() {
-                            *v = v.saturating_sub(1);
-                        }
-                        active_spans.retain(|_, v| *v > 0);
                         row_cursor += 1;
                     }
                 },

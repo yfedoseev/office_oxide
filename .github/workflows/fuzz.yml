@@ -43,12 +43,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust (nightly)
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: nightly
 
       - name: Cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz
 
@@ -72,6 +72,12 @@ jobs:
           secs=60
           if [ "$EVENT_NAME" = "schedule" ]; then secs=600; fi
           cargo fuzz run fuzz_parse -- -max_total_time="$secs" -rss_limit_mb=4096
+          # The structure-aware targets reach parsers whole-file fuzzing rarely
+          # gets to (salvage of damaged parts, default-password decryption, the
+          # .doc font table); a short run each.
+          for target in fuzz_ooxml_salvage fuzz_default_password fuzz_doc_header_fonts; do
+            cargo fuzz run "$target" -- -max_total_time=$((secs / 3)) -rss_limit_mb=4096
+          done
 
       # Whole-file fuzzing rarely reaches the legacy style sheet; this target
       # builds a valid .doc around the fuzzer's bytes so every run does.

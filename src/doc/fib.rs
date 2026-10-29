@@ -5,6 +5,32 @@
 
 use super::error::{DocError, Result};
 
+/// Whether `n_fib` is a version of Word. Word 6.0 wrote 0x0065 and Word 95
+/// 0x0068; Word 97 and later 0x00C1 up to 0x0112 (Word 2010). A FIB whose
+/// version is outside that range was overwritten (a damaged header), and the
+/// language ID next to it, which decides how 8-bit text is read, means nothing.
+pub(crate) fn is_word_version(n_fib: u16) -> bool {
+    (0x0065..=0x0200).contains(&n_fib)
+}
+
+/// What to tell the reader about a header whose version is not a Word version.
+/// `from_fonts` is the character set of the font table that gave the 8-bit
+/// text its language instead (see `fonts::language_from_font_charsets`).
+pub(crate) fn damaged_version_warning(n_fib: u16, from_fonts: Option<u8>) -> String {
+    match from_fonts {
+        Some(chs) => format!(
+            "the file header's version number (nFib 0x{n_fib:04X}) is not a Word version, so the \
+             header is damaged and its language is lost; the language of the document's 8-bit \
+             text was taken from the character set (0x{chs:02X}) its fonts declare"
+        ),
+        None => format!(
+            "the file header's version number (nFib 0x{n_fib:04X}) is not a Word version, so the \
+             header is damaged and the language of the document's 8-bit text is unknown; that \
+             text was read as Windows-1252"
+        ),
+    }
+}
+
 /// Parsed FIB fields needed for text extraction.
 #[derive(Debug, Clone, Default)]
 pub struct Fib {
@@ -14,6 +40,9 @@ pub struct Fib {
     /// every compressed run was decoded as CP1252 regardless of the
     /// document's actual authoring locale.
     pub lid: u16,
+    /// FibBase `nFib`, the version of the file's FIB (absolute offset 0x02).
+    /// See [`is_word_version`].
+    pub n_fib: u16,
     /// Which table stream to use: true = "1Table", false = "0Table".
     pub use_table1: bool,
     /// Offset of the CLX (piece table) in the Table stream.
@@ -108,6 +137,11 @@ pub struct Fib {
     /// style sheet is normally the first thing written to the Table stream, so
     /// `0` is its usual value on real files. Test [`lcb_stshf`] for absence.
     pub fc_stshf: u32,
+    /// `fcSttbfFfn` (absolute 0x0112, [MS-DOC] §2.5.6): the font table in the
+    /// Table stream. `lcb_sttbf_ffn` is its size.
+    pub fc_sttbf_ffn: u32,
+    /// See [`Fib::fc_sttbf_ffn`].
+    pub lcb_sttbf_ffn: u32,
     /// Byte length of the style sheet in the Table stream (0x00A6). The only
     /// valid absence test: [MS-DOC] `FibRgFcLcb97` requires this to be
     /// non-zero, and `STSH` states every FIB contains a style sheet.
@@ -145,6 +179,7 @@ impl Fib {
         // FibBase.lid, absolute offset 0x06 (u16 LE) — verified against
         // FibBase's field layout (wIdent, nFib, unused, lid, ...).
         let lid = u16::from_le_bytes([data[0x06], data[0x07]]);
+        let n_fib = u16::from_le_bytes([data[0x02], data[0x03]]);
 
         // Flags at offset 0x0A (u16): [MS-DOC] §2.5.1 FibBase.
         //   bit 8  = fEncrypted
@@ -313,8 +348,15 @@ impl Fib {
             (0, 0)
         };
 
+        let (fc_sttbf_ffn, lcb_sttbf_ffn) = if data.len() > 0x0119 {
+            (read_u32(data, 0x0112), read_u32(data, 0x0116))
+        } else {
+            (0, 0)
+        };
+
         Ok(Self {
             lid,
+            n_fib,
             use_table1,
             clx_offset,
             clx_size,
@@ -351,6 +393,8 @@ impl Fib {
             lcb_plc_spa_mom,
             fc_stshf,
             lcb_stshf,
+            fc_sttbf_ffn,
+            lcb_sttbf_ffn,
         })
     }
 }
@@ -443,6 +487,39 @@ mod tests {
     fn test_too_short_rejected() {
         let data = vec![0u8; 100];
         assert!(Fib::parse(&data).is_err());
+    }
+
+    /// FibBase `chs` (offset 0x0014) = 0x0100 marks a Macintosh character set
+    /// in a Word 6/95 file, whose 8-bit text is then Mac Roman. A Word 97+
+    /// file stores compressed text as Windows-1252 whatever `chs` says (real
+    /// files written with the marker carry accents and ellipses in 1252), so
+    /// the marker must not change how the language alone selects the codepage.
+    #[test]
+    fn test_a_macintosh_charset_marker_does_not_change_word97_text_decoding() {
+        let mut data = build_minimal_fib();
+        data[0x06..0x08].copy_from_slice(&0x040Cu16.to_le_bytes()); // French
+        data[0x12] = 1; // envr
+        data[0x14..0x16].copy_from_slice(&0x0100u16.to_le_bytes());
+        let fib = Fib::parse(&data).unwrap();
+        assert_eq!(fib.lid, 0x040C);
+        assert_eq!(super::super::codepage::codepage_for_lid(fib.lid), 1252);
+    }
+
+    /// Real Word wrote `nFib` 0x65 (Word 6) up to 0x112 (Word 2010 and later); a
+    /// value outside that is a damaged header, whose language ID means nothing.
+    #[test]
+    fn test_only_word_versions_are_word_versions() {
+        for n in [
+            0x0065u16, 0x0068, 0x00C1, 0x00C2, 0x00D9, 0x0101, 0x010C, 0x0110, 0x0112,
+        ] {
+            assert!(is_word_version(n), "{n:#06x}");
+        }
+        for n in [0u16, 0x0064, 0x005A, 0x0200 + 1, 0x2020, 0x20FF, 0xFFFF] {
+            assert!(!is_word_version(n), "{n:#06x}");
+        }
+        let mut data = build_minimal_fib();
+        data[2..4].copy_from_slice(&0x2020u16.to_le_bytes());
+        assert_eq!(Fib::parse(&data).unwrap().n_fib, 0x2020);
     }
 
     #[test]

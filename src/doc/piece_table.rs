@@ -9,6 +9,7 @@
 //! - Unicode (UTF-16LE): 2 bytes per character, fc is used directly
 
 use super::error::{DocError, Result};
+use super::fonts::{SymbolRuns, push_utf16};
 
 /// A single piece descriptor.
 #[derive(Debug, Clone)]
@@ -73,6 +74,22 @@ fn resolve_prm(prm: u16, prcs: &[Vec<u8>]) -> Vec<u8> {
 /// - Optional Grpprl entries (type 0x01): skip them.
 /// - Pcdt entry (type 0x02): the piece table.
 pub fn parse_clx(data: &[u8]) -> Result<Vec<Piece>> {
+    Ok(parse_clx_diagnosed(data)?.pieces)
+}
+
+/// The pieces of a `PlcPcd`, and whether its character positions were out of
+/// order (see [`parse_clx_diagnosed`]).
+pub struct ParsedPieces {
+    pub pieces: Vec<Piece>,
+    /// `true` when some character position was smaller than the one before it,
+    /// which [MS-DOC] §2.8.35 forbids; the pieces were then resolved by the
+    /// lookup rule of §2.4.1 and the text may be misplaced.
+    pub irregular: bool,
+}
+
+/// As [`parse_clx`], also saying whether the table's character positions were
+/// out of order.
+pub fn parse_clx_diagnosed(data: &[u8]) -> Result<ParsedPieces> {
     let mut pos = 0;
 
     // The `RgPrc` array: property-modifier grpprls a piece's `Prm1`
@@ -120,7 +137,7 @@ pub fn parse_clx(data: &[u8]) -> Result<Vec<Piece>> {
 /// - n PCD entries (8 bytes each)
 ///
 /// Where n = (size - 4) / 12 (solve for: (n+1)*4 + n*8 = size)
-fn parse_plc_pcd(data: &[u8], prcs: &[Vec<u8>]) -> Result<Vec<Piece>> {
+fn parse_plc_pcd(data: &[u8], prcs: &[Vec<u8>]) -> Result<ParsedPieces> {
     if data.len() < 8 {
         return Err(DocError::InvalidPieceTable("PlcPcd too small".into()));
     }
@@ -128,7 +145,10 @@ fn parse_plc_pcd(data: &[u8], prcs: &[Vec<u8>]) -> Result<Vec<Piece>> {
     // n pieces: (n+1)*4 + n*8 = data.len() → n = (data.len() - 4) / 12
     let n = (data.len() - 4) / 12;
     if n == 0 {
-        return Ok(Vec::new());
+        return Ok(ParsedPieces {
+            pieces: Vec::new(),
+            irregular: false,
+        });
     }
 
     let cp_array_size = (n + 1) * 4;
@@ -136,21 +156,34 @@ fn parse_plc_pcd(data: &[u8], prcs: &[Vec<u8>]) -> Result<Vec<Piece>> {
         return Err(DocError::InvalidPieceTable("PlcPcd size mismatch".into()));
     }
 
-    let mut pieces = Vec::with_capacity(n);
-
-    for i in 0..n {
-        let cp_start = u32::from_le_bytes([
+    let cp = |i: usize| {
+        u32::from_le_bytes([
             data[i * 4],
             data[i * 4 + 1],
             data[i * 4 + 2],
             data[i * 4 + 3],
-        ]);
-        let cp_end = u32::from_le_bytes([
-            data[(i + 1) * 4],
-            data[(i + 1) * 4 + 1],
-            data[(i + 1) * 4 + 2],
-            data[(i + 1) * 4 + 3],
-        ]);
+        ])
+    };
+    // [MS-DOC] §2.8.35: the CPs MUST ascend without duplicates, and §2.4.1
+    // step 3 finds the text at `cp` as the piece with "the largest i such that
+    // aCp[i] <= cp". That rule is defined for any array, and it makes piece `i`
+    // the one for `cp` exactly when `aCp[i] <= cp` and every later CP is greater
+    // than `cp`: its range is `[aCp[i], min(aCp[i + 1..]))`. For a sorted array
+    // that is `[aCp[i], aCp[i + 1])`, as always; for a table with a wrong
+    // position (a fast-saved file) the ranges stay ascending and disjoint, a
+    // piece left with no range covers nothing, and no subtraction can underflow.
+    let mut later_min = vec![u32::MAX; n + 1];
+    later_min[n] = cp(n);
+    for i in (0..n).rev() {
+        later_min[i] = later_min[i + 1].min(cp(i));
+    }
+    let irregular = (0..n).any(|i| cp(i + 1) < cp(i));
+
+    let mut pieces = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let cp_start = cp(i);
+        let cp_end = later_min[i + 1];
 
         // PCD at offset cp_array_size + i * 8.
         let pcd_offset = cp_array_size + i * 8;
@@ -166,11 +199,9 @@ fn parse_plc_pcd(data: &[u8], prcs: &[Vec<u8>]) -> Result<Vec<Piece>> {
         let is_compressed = (fc & 0x40000000) != 0;
         let prm = u16::from_le_bytes([data[pcd_offset + 6], data[pcd_offset + 7]]);
 
-        // A non-monotonic CP range would underflow later subtractions
-        // (extract_text / decode_cp_range / fc_to_cp). Reject it here so the
-        // malformed piece table surfaces as `Err`, not a panic (AGENTS.md #6).
+        // A piece with no range covers no position (see above).
         if cp_end < cp_start {
-            return Err(DocError::InvalidPieceTable("non-monotonic piece CP range".into()));
+            continue;
         }
 
         pieces.push(Piece {
@@ -182,7 +213,69 @@ fn parse_plc_pcd(data: &[u8], prcs: &[Vec<u8>]) -> Result<Vec<Piece>> {
         });
     }
 
-    Ok(pieces)
+    Ok(ParsedPieces { pieces, irregular })
+}
+
+/// How many times over the `WordDocument` stream's own size the pieces may
+/// read (plus [`PIECE_READ_ALLOWANCE`]). Pieces are meant to select distinct
+/// byte ranges, so they read about the stream's size at most. Fast-saved
+/// files reuse some bytes, and a hostile file points any number of pieces at
+/// the same ones (157 KB of pieces over the same 60 KB paragraph decoded to
+/// 180 MB). Sixteen times the stream is far above any real overlap.
+const PIECE_READ_FACTOR: u64 = 16;
+/// Bytes of slack added to the bound above, so a very small stream is not
+/// held to a ratio of its own length.
+const PIECE_READ_ALLOWANCE: u64 = 1 << 20;
+
+/// What a piece table asks the reader to decode: refuse it when its pieces
+/// read far more than the stream holds, and cut it short where it would
+/// exceed the document's text budget.
+///
+/// A piece whose bytes lie past the end of the stream reads nothing (see
+/// [`piece_backed_cp_end`]) and costs nothing here. Returns whether the
+/// table was cut short; the caller reports that, the way the other readers
+/// report an exhausted text budget.
+pub(crate) fn bound_piece_reads(
+    pieces: &mut Vec<Piece>,
+    word_doc_len: usize,
+    budget: &mut crate::limits::TextBudget,
+) -> Result<bool> {
+    let backed_chars = |piece: &Piece| -> u64 {
+        let backed_end = piece_backed_cp_end(piece, word_doc_len);
+        u64::from(piece.cp_end.min(backed_end).saturating_sub(piece.cp_start))
+    };
+    let bytes_per_char = |piece: &Piece| if piece.is_compressed { 1 } else { 2 };
+    let read: u64 = pieces
+        .iter()
+        .map(|p| backed_chars(p) * bytes_per_char(p))
+        .sum();
+    let allowed = (word_doc_len as u64)
+        .saturating_mul(PIECE_READ_FACTOR)
+        .saturating_add(PIECE_READ_ALLOWANCE);
+    if read > allowed {
+        return Err(DocError::InvalidPieceTable(format!(
+            "the pieces read {read} bytes from a {word_doc_len}-byte WordDocument stream; \
+             pieces that overlap this much are refused"
+        )));
+    }
+    let mut kept = 0usize;
+    let mut cut = false;
+    for piece in pieces.iter_mut() {
+        let want = backed_chars(piece) as usize;
+        let granted = budget.take(want);
+        if granted < want {
+            // Cut the piece where the budget ran out; what follows is dropped.
+            piece.cp_end = piece.cp_start + granted as u32;
+            cut = true;
+            if granted > 0 {
+                kept += 1;
+            }
+            break;
+        }
+        kept += 1;
+    }
+    pieces.truncate(kept);
+    Ok(cut)
 }
 
 /// Whether `pieces` fully covers `[0, text_len)` with no gaps.
@@ -231,6 +324,19 @@ pub fn extract_text_range(
     range_end: u32,
     lid: u16,
 ) -> String {
+    extract_text_range_symbols(word_doc, pieces, range_start, range_end, lid, &SymbolRuns::none())
+}
+
+/// As [`extract_text_range`], with the characters of the runs in a symbol
+/// font (`symbols`) read by that font's table.
+pub fn extract_text_range_symbols(
+    word_doc: &[u8],
+    pieces: &[Piece],
+    range_start: u32,
+    range_end: u32,
+    lid: u16,
+    symbols: &SymbolRuns,
+) -> String {
     let mut text = String::new();
     if range_end <= range_start {
         return text;
@@ -273,7 +379,7 @@ pub fn extract_text_range(
                         u16::from_le_bytes([word_doc[o], word_doc[o + 1]])
                     })
                     .collect();
-                text.push_str(&String::from_utf16_lossy(&chars));
+                push_utf16(&mut text, &chars, piece.cp_start + skip, symbols);
             }
         }
     }
@@ -292,16 +398,18 @@ pub fn extract_text_range(
 /// read and then filtered out of the decoded string, so a deleted range
 /// straddling a piece boundary or a multi-byte encoding still slices
 /// cleanly on a CP boundary.
-pub fn extract_text_range_excluding(
+pub fn extract_text_range_excluding_symbols(
     word_doc: &[u8],
     pieces: &[Piece],
     range_start: u32,
     range_end: u32,
     lid: u16,
     excluded: &[(u32, u32)],
+    symbols: &SymbolRuns,
 ) -> String {
+    let extract = |a, b| extract_text_range_symbols(word_doc, pieces, a, b, lid, symbols);
     if excluded.is_empty() {
-        return extract_text_range(word_doc, pieces, range_start, range_end, lid);
+        return extract(range_start, range_end);
     }
     let mut text = String::new();
     let mut cursor = range_start;
@@ -312,14 +420,35 @@ pub fn extract_text_range_excluding(
             continue;
         }
         if cursor < ex_start {
-            text.push_str(&extract_text_range(word_doc, pieces, cursor, ex_start, lid));
+            text.push_str(&extract(cursor, ex_start));
         }
         cursor = cursor.max(ex_end);
     }
     if cursor < range_end {
-        text.push_str(&extract_text_range(word_doc, pieces, cursor, range_end, lid));
+        text.push_str(&extract(cursor, range_end));
     }
     text
+}
+
+/// As [`extract_text_range_excluding_symbols`], with no run in a symbol font.
+#[cfg(test)]
+pub fn extract_text_range_excluding(
+    word_doc: &[u8],
+    pieces: &[Piece],
+    range_start: u32,
+    range_end: u32,
+    lid: u16,
+    excluded: &[(u32, u32)],
+) -> String {
+    extract_text_range_excluding_symbols(
+        word_doc,
+        pieces,
+        range_start,
+        range_end,
+        lid,
+        excluded,
+        &SymbolRuns::none(),
+    )
 }
 
 /// The largest CP of `piece` that is actually backed by bytes in a stream of
@@ -360,19 +489,20 @@ pub(crate) fn piece_backed_cp_end(piece: &Piece, word_doc_len: usize) -> u32 {
 /// exactly where it belongs, and compressed (8-bit) pieces are decoded by
 /// their own stride. A truncated/out-of-range segment is skipped per-CP
 /// rather than dropping the entire piece, which keeps later ranges aligned.
-pub(crate) fn decode_cp_range(
+pub(crate) fn decode_cp_range_symbols(
     word_doc: &[u8],
     pieces: &[Piece],
     cp_start: u32,
     cp_end: u32,
     lid: u16,
+    symbols: &SymbolRuns,
 ) -> String {
     let mut out = String::new();
     if cp_end <= cp_start {
         return out;
     }
-    // The pieces are in CP order (`parse_plc_pcd` rejects a piece whose
-    // range runs backwards, and each starts where the previous ends), so
+    // The pieces are in CP order (`parse_plc_pcd` drops a piece whose range
+    // runs backwards, and each starts where the previous ends), so
     // the first piece that reaches `cp_start` is a binary search away and
     // the walk stops at the first piece past `cp_end` — not a scan of
     // every piece for every range, which `build_paragraphs` calls once per
@@ -415,10 +545,22 @@ pub(crate) fn decode_cp_range(
                     u16s.push(u16::from_le_bytes([word_doc[off], word_doc[off + 1]]));
                 }
             }
-            out.push_str(&String::from_utf16_lossy(&u16s));
+            push_utf16(&mut out, &u16s, seg_start, symbols);
         }
     }
     out
+}
+
+/// As [`decode_cp_range_symbols`], with no run in a symbol font.
+#[cfg(test)]
+pub(crate) fn decode_cp_range(
+    word_doc: &[u8],
+    pieces: &[Piece],
+    cp_start: u32,
+    cp_end: u32,
+    lid: u16,
+) -> String {
+    decode_cp_range_symbols(word_doc, pieces, cp_start, cp_end, lid, &SymbolRuns::none())
 }
 
 /// Convert a CP1252 byte to a Unicode char.
@@ -1105,28 +1247,99 @@ mod tests {
     // synthetic piece table, no third-party document.
     // --------------------------------------------------------------------
 
-    /// A non-monotonic CP array (`CP[1] < CP[0]`) must surface as `Err`, not
-    /// trigger a subtraction-with-overflow panic when the range is later
-    /// walked. `parse_plc_pcd` validates CP ordering (piece_table.rs:119) and
-    /// returns `Err` on a reversed range, so the later subtraction is always
-    /// on a well-ordered piece.
-    #[test]
-    fn test_parse_clx_rejects_nonmonotonic_cps() {
-        // CLX: Pcdt marker, PlcPcd size 16, CP[0]=10, CP[1]=5 (reversed), one PCD.
-        let mut clx = Vec::new();
-        clx.push(0x02); // Pcdt marker
-        clx.extend_from_slice(&16u32.to_le_bytes()); // PlcPcd size = (n+1)*4 + n*8, n=1
-        clx.extend_from_slice(&10u32.to_le_bytes()); // CP[0]
-        clx.extend_from_slice(&5u32.to_le_bytes()); // CP[1]  (CP[1] < CP[0]!)
-        clx.extend_from_slice(&0u16.to_le_bytes()); // PCD: unused u16
-        clx.extend_from_slice(&0u32.to_le_bytes()); // PCD: fc
-        clx.extend_from_slice(&0u16.to_le_bytes()); // PCD: prm
+    /// A CLX holding a `PlcPcd` over `cps` (one more entry than there are
+    /// pieces); piece `i` is a UTF-16 piece whose `fc` is `2 * (i + 1)`, so the
+    /// piece a character resolves to can be read off its `fc`.
+    fn clx_over(cps: &[u32]) -> Vec<u8> {
+        let n = cps.len() - 1;
+        let mut clx = vec![0x02];
+        clx.extend_from_slice(&((cps.len() * 4 + n * 8) as u32).to_le_bytes());
+        for cp in cps {
+            clx.extend_from_slice(&cp.to_le_bytes());
+        }
+        for i in 0..n {
+            clx.extend_from_slice(&0u16.to_le_bytes()); // PCD: unused u16
+            clx.extend_from_slice(&(2 * (i as u32 + 1)).to_le_bytes()); // PCD: fc
+            clx.extend_from_slice(&0u16.to_le_bytes()); // PCD: prm
+        }
+        clx
+    }
 
-        let pieces = parse_clx(&clx);
-        assert!(
-            pieces.is_err(),
-            "non-monotonic CP array must surface as Err, not panic on subtraction"
-        );
+    /// [MS-DOC] 2.8.35 requires the CP array to ascend, but 2.4.1 step 3 finds
+    /// the text at a position as "the largest i such that aCp[i] <= cp", which is
+    /// defined for any array. A reversed range used to be refused (and, before
+    /// that check, could underflow); it now covers no text and is flagged.
+    #[test]
+    fn test_a_reversed_piece_covers_no_text_and_is_flagged() {
+        let parsed = parse_clx_diagnosed(&clx_over(&[10, 5])).expect("no panic, no error");
+        assert!(parsed.pieces.is_empty(), "{:?}", parsed.pieces);
+        assert!(parsed.irregular);
+    }
+
+    /// One wrong position in a long, otherwise ascending table (a fast-saved
+    /// file): piece 1 ends where the next smaller position begins, and the
+    /// piece whose range is reversed covers nothing.
+    #[test]
+    fn test_one_misplaced_position_is_resolved_by_the_largest_index_rule() {
+        let parsed = parse_clx_diagnosed(&clx_over(&[0, 130, 195, 133, 135])).unwrap();
+        let ranges: Vec<_> = parsed
+            .pieces
+            .iter()
+            .map(|p| (p.cp_start, p.cp_end, p.fc))
+            .collect();
+        // fc is 2 * (index + 1) with the compression bit clear.
+        assert_eq!(ranges, vec![(0, 130, 2), (130, 133, 4), (133, 135, 8)]);
+        assert!(parsed.irregular);
+    }
+
+    #[test]
+    fn test_an_ascending_table_is_unchanged_and_not_flagged() {
+        let parsed = parse_clx_diagnosed(&clx_over(&[0, 10, 10, 25, 40])).unwrap();
+        let ranges: Vec<_> = parsed
+            .pieces
+            .iter()
+            .map(|p| (p.cp_start, p.cp_end))
+            .collect();
+        assert_eq!(ranges, vec![(0, 10), (10, 10), (10, 25), (25, 40)]);
+        assert!(!parsed.irregular);
+        assert_eq!(parse_clx(&clx_over(&[0, 10, 10, 25, 40])).unwrap().len(), 4);
+    }
+
+    /// For arrays of every shape, the pieces resolve each position to the piece
+    /// the specification's rule (the largest `i` with `aCp[i] <= cp`) names, the
+    /// kept ranges ascend without overlapping, and nothing panics.
+    #[test]
+    fn test_pieces_resolve_every_position_as_the_specification_says() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        for round in 0..4000 {
+            let n = 1 + next(24) as usize;
+            let spread = if round % 3 == 0 { 8 } else { 400 };
+            let cps: Vec<u32> = (0..=n).map(|_| next(spread) as u32).collect();
+            let parsed = parse_clx_diagnosed(&clx_over(&cps)).expect("any array parses");
+            let mut previous_end = 0u32;
+            for p in &parsed.pieces {
+                assert!(p.cp_start <= p.cp_end, "{cps:?}");
+                assert!(p.cp_start >= previous_end || p.cp_start == p.cp_end, "{cps:?}");
+                previous_end = p.cp_end;
+            }
+            for cp in 0..=spread as u32 {
+                let named = cps.iter().rposition(|&c| c <= cp).filter(|&i| i < n);
+                let found = parsed
+                    .pieces
+                    .iter()
+                    .find(|p| p.cp_start <= cp && cp < p.cp_end)
+                    .map(|p| (p.fc / 2 - 1) as usize);
+                assert_eq!(found, named, "cp {cp} in {cps:?}");
+            }
+            let sorted = cps.windows(2).all(|w| w[0] <= w[1]);
+            assert_eq!(parsed.irregular, !sorted, "{cps:?}");
+        }
     }
 
     /// The backing clamp must bound the *work* (the CP range actually walked),
@@ -1386,6 +1599,76 @@ mod multi_piece_tests {
         let c = clx(&[(0, 6, 512)]);
         let pieces = parse_clx(&c).expect("parse");
         assert_eq!(extract_text_range(&word_doc, &pieces, 2, 5, 0), "CDE");
+    }
+
+    // ── Bounds on what a piece table makes the reader decode ────────
+
+    fn compressed_piece(cp_start: u32, cp_end: u32, byte_offset: u32) -> Piece {
+        Piece {
+            cp_start,
+            cp_end,
+            fc: (byte_offset * 2) | 0x4000_0000,
+            is_compressed: true,
+            prm_grpprl: Vec::new(),
+        }
+    }
+
+    /// Many pieces over the same bytes read the stream many times over; the
+    /// table is refused rather than expanded.
+    #[test]
+    fn test_pieces_piled_on_the_same_bytes_are_refused() {
+        let stream = vec![b'A'; 4000];
+        let mut pieces: Vec<Piece> = (0..2000u32)
+            .map(|i| compressed_piece(i * 2000, (i + 1) * 2000, 0))
+            .collect();
+        let mut budget = crate::limits::TextBudget::with_limit(usize::MAX);
+        let err = bound_piece_reads(&mut pieces, stream.len(), &mut budget).unwrap_err();
+        assert!(err.to_string().contains("overlap"), "{err}");
+    }
+
+    /// Control, not a regression test: it passes without the bound as well.
+    /// It pins that distinct pieces, and pieces that reuse a few bytes, are
+    /// accepted whole, so the bound above cannot start refusing real files.
+    #[test]
+    fn test_control_pieces_over_distinct_or_slightly_shared_bytes_are_kept() {
+        let stream = vec![b'A'; 4000];
+        let mut pieces = vec![
+            compressed_piece(0, 2000, 0),
+            compressed_piece(2000, 4000, 2000),
+            compressed_piece(4000, 6000, 0),
+        ];
+        let mut budget = crate::limits::TextBudget::with_limit(usize::MAX);
+        assert!(!bound_piece_reads(&mut pieces, stream.len(), &mut budget).unwrap());
+        assert_eq!(pieces.len(), 3);
+    }
+
+    /// A piece whose bytes are not in the stream reads nothing, so it is not
+    /// counted against the bound.
+    #[test]
+    fn test_unbacked_pieces_cost_nothing() {
+        let mut pieces: Vec<Piece> = (0..5000u32)
+            .map(|i| compressed_piece(i * 1000, (i + 1) * 1000, 100_000))
+            .collect();
+        let mut budget = crate::limits::TextBudget::with_limit(usize::MAX);
+        assert!(!bound_piece_reads(&mut pieces, 10, &mut budget).unwrap());
+    }
+
+    /// The text budget cuts the table where it runs out: the piece it ends in
+    /// is shortened, the pieces after it are dropped, and the caller is told.
+    #[test]
+    fn test_text_budget_cuts_the_piece_table() {
+        let stream = vec![b'A'; 6000];
+        let mut pieces = vec![
+            compressed_piece(0, 2000, 0),
+            compressed_piece(2000, 4000, 2000),
+            compressed_piece(4000, 6000, 4000),
+        ];
+        let mut budget = crate::limits::TextBudget::with_limit(3000);
+        assert!(bound_piece_reads(&mut pieces, stream.len(), &mut budget).unwrap());
+        assert_eq!(pieces.len(), 2);
+        assert_eq!(pieces[1].cp_end, 3000);
+        assert_eq!(extract_text_range(&stream, &pieces, 0, 6000, 0).len(), 3000);
+        assert!(budget.exhausted());
     }
 
     // ── Piece table coverage vs the FIB's declared text length ──────

@@ -23,7 +23,7 @@ fn collect_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
             collect_recursive(&path, out);
         } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             match ext.to_ascii_lowercase().as_str() {
-                "docx" | "xlsx" | "pptx" | "xls" => out.push(path),
+                "docx" | "xlsx" | "pptx" | "doc" | "xls" | "ppt" => out.push(path),
                 _ => {}
             }
         }
@@ -128,11 +128,32 @@ fn try_docx_rs(path: &Path) -> Result<String, String> {
 
 type LibFn = fn(&Path) -> Result<String, String>;
 
-fn run_lib(ext_filter: &str, func: LibFn, files: &[PathBuf]) -> Stats {
+/// Files that end the whole process when a *competitor* library reads them
+/// (an allocation it cannot satisfy aborts, which `catch_unwind` cannot
+/// catch), one path per line in the file named by `BENCH_CRASH_LIST`. Such a
+/// file is counted as a failure of that library (`CRASH`) without being read,
+/// so one hostile file does not end the run for every other file.
+fn crash_list() -> &'static std::collections::HashSet<PathBuf> {
+    static LIST: std::sync::OnceLock<std::collections::HashSet<PathBuf>> =
+        std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("BENCH_CRASH_LIST")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|text| text.lines().map(|l| PathBuf::from(l.trim())).collect())
+            .unwrap_or_default()
+    })
+}
+
+fn run_lib(ext_filter: &str, func: LibFn, files: &[PathBuf], competitor: bool) -> Stats {
     let mut stats = Stats::new();
     for path in files {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
         if ext != ext_filter { continue; }
+        if competitor && crash_list().contains(path) {
+            stats.record_err(0.0, "CRASH".to_string());
+            continue;
+        }
 
         let t0 = Instant::now();
         let path_clone = path.clone();
@@ -236,32 +257,32 @@ fn main() {
     let mut results: Vec<(String, String, Stats)> = Vec::new();
 
     if run_all || lib_arg == "office_oxide" {
-        for ext in ["docx", "xlsx", "pptx", "xls"] {
-            let s = run_lib(ext, try_office_oxide, &files);
+        for ext in ["docx", "xlsx", "pptx", "doc", "xls", "ppt"] {
+            let s = run_lib(ext, try_office_oxide, &files, false);
             print_stats("office_oxide", ext, &s);
             results.push(("office_oxide".into(), ext.into(), s));
         }
     }
     if run_all || lib_arg == "calamine" {
         for ext in ["xlsx", "xls"] {
-            let s = run_lib(ext, try_calamine, &files);
+            let s = run_lib(ext, try_calamine, &files, true);
             print_stats("calamine", ext, &s);
             results.push(("calamine".into(), ext.into(), s));
         }
     }
     if run_all || lib_arg == "docx-rs" {
-        let s = run_lib("docx", try_docx_rs, &files);
+        let s = run_lib("docx", try_docx_rs, &files, true);
         print_stats("docx-rs", "docx", &s);
         results.push(("docx-rs".into(), "docx".into(), s));
     }
     if run_all || lib_arg == "dotext" {
-        let s1 = run_lib("docx", try_dotext_docx, &files);
+        let s1 = run_lib("docx", try_dotext_docx, &files, true);
         print_stats("dotext", "docx", &s1);
         results.push(("dotext".into(), "docx".into(), s1));
-        let s2 = run_lib("xlsx", try_dotext_xlsx, &files);
+        let s2 = run_lib("xlsx", try_dotext_xlsx, &files, true);
         print_stats("dotext", "xlsx", &s2);
         results.push(("dotext".into(), "xlsx".into(), s2));
-        let s3 = run_lib("pptx", try_dotext_pptx, &files);
+        let s3 = run_lib("pptx", try_dotext_pptx, &files, true);
         print_stats("dotext", "pptx", &s3);
         results.push(("dotext".into(), "pptx".into(), s3));
     }

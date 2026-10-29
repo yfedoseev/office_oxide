@@ -2,16 +2,14 @@
 //!
 //! A shared string referenced from every cell is rendered once per cell;
 //! nothing else bounds that product, and a 110 KB workbook rendered to
-//! 393 MB. The budget is process-global, so every test in this binary
-//! sets the same low value — the tests are safe to run in parallel with
-//! each other and must not share a binary with tests that render more
-//! than a few kilobytes.
+//! 393 MB. The budget is process-global, so every test holds the scope that
+//! serialises them and puts the default back.
 
 mod common;
 
 use std::io::{Cursor, Write};
 
-use common::{biff, cfb_with_stream};
+use common::{LimitScope, biff, cfb_with_stream};
 use office_oxide::limits::{max_text_chars, set_max_text_chars};
 use office_oxide::{Document, DocumentFormat};
 
@@ -75,7 +73,8 @@ fn assert_truncated(surface: &str, out: &str) {
 
 #[test]
 fn test_xlsx_renderers_stop_at_the_budget_with_a_notice() {
-    set_max_text_chars(BUDGET);
+    let mut limits = LimitScope::new();
+    limits.set(max_text_chars, set_max_text_chars, BUDGET);
     let doc = open_xlsx(8);
     assert_truncated("plain_text", &doc.plain_text());
     assert_truncated("to_markdown", &doc.to_markdown());
@@ -87,7 +86,8 @@ fn test_xlsx_renderers_stop_at_the_budget_with_a_notice() {
 
 #[test]
 fn test_a_workbook_within_the_budget_is_untouched() {
-    set_max_text_chars(BUDGET);
+    let mut limits = LimitScope::new();
+    limits.set(max_text_chars, set_max_text_chars, BUDGET);
     let doc = open_xlsx(2);
     for (surface, out) in [
         ("plain_text", doc.plain_text()),
@@ -104,7 +104,8 @@ fn test_a_workbook_within_the_budget_is_untouched() {
 /// document that fits the lowered value still carries no notice.
 #[test]
 fn test_the_limit_is_configurable() {
-    set_max_text_chars(BUDGET);
+    let mut limits = LimitScope::new();
+    limits.set(max_text_chars, set_max_text_chars, BUDGET);
     assert_eq!(max_text_chars(), BUDGET);
     assert!(!open_xlsx(2).plain_text().contains("character budget"));
     assert!(open_xlsx(3).plain_text().contains("character budget"));
@@ -151,7 +152,8 @@ fn xls_fan_out(cells: u16) -> Vec<u8> {
 
 #[test]
 fn test_xls_open_stops_copying_shared_strings_at_the_budget() {
-    set_max_text_chars(BUDGET);
+    let mut limits = LimitScope::new();
+    limits.set(max_text_chars, set_max_text_chars, BUDGET);
     let doc = Document::from_reader(Cursor::new(xls_fan_out(8)), DocumentFormat::Xls).unwrap();
     let text = doc.plain_text();
     assert_eq!(cells_in(&text, 'y'), 2, "the two cells that fit are kept");
@@ -161,4 +163,181 @@ fn test_xls_open_stops_copying_shared_strings_at_the_budget() {
         text.len()
     );
     assert!(doc.to_ir().metadata.text_truncated, "the workbook is flagged truncated");
+}
+
+/// A document of `sections` sections that all reference one 5,000-character
+/// header part: the part is stored once, but the IR gives each section a
+/// copy, and those copies are charged to the budget.
+fn docx_shared_header(sections: usize) -> Vec<u8> {
+    let rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    let wml = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    let mut body = String::new();
+    for i in 0..sections {
+        body.push_str(&format!(
+            r#"<w:p><w:r><w:t>s{i}</w:t></w:r><w:pPr><w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr></w:pPr></w:p>"#
+        ));
+    }
+    let parts: Vec<(&str, String)> = vec![
+        ("[Content_Types].xml", r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.into()),
+        ("_rels/.rels", format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{rel}/officeDocument" Target="word/document.xml"/></Relationships>"#)),
+        ("word/document.xml", format!(r#"<w:document xmlns:w="{wml}" xmlns:r="{rel}"><w:body>{body}</w:body></w:document>"#)),
+        ("word/_rels/document.xml.rels", format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{rel}/header" Target="header1.xml"/></Relationships>"#)),
+        ("word/header1.xml", format!(r#"<w:hdr xmlns:w="{wml}"><w:p><w:r><w:t>{}</w:t></w:r></w:p></w:hdr>"#, "z".repeat(5_000))),
+    ];
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
+    for (name, data) in parts {
+        zip.start_file(name, opts).unwrap();
+        zip.write_all(data.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+#[test]
+fn test_docx_ir_stops_copying_a_shared_header_at_the_budget() {
+    let mut limits = LimitScope::new();
+    limits.set(max_text_chars, set_max_text_chars, BUDGET);
+    let doc =
+        Document::from_reader(Cursor::new(docx_shared_header(8)), DocumentFormat::Docx).unwrap();
+    let ir = doc.to_ir();
+    let with_header = ir.sections.iter().filter(|s| s.header.is_some()).count();
+    assert_eq!(with_header, 2, "the two copies that fit are kept");
+    assert!(ir.metadata.text_truncated, "the document is flagged truncated");
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("character budget")),
+        "{:?}",
+        ir.metadata.warnings
+    );
+}
+
+/// A configured limit is the ceiling for every input, whatever its size and
+/// whatever the floor a small input would otherwise get.
+#[test]
+fn test_a_configured_ceiling_applies_to_every_input_size() {
+    let mut limits = LimitScope::new();
+    limits.set(max_text_chars, set_max_text_chars, BUDGET);
+    let small = xlsx_fan_out(3);
+    let large = xlsx_fan_out(20);
+    assert!(large.len() > small.len());
+    let cut = |bytes: Vec<u8>| {
+        let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx).unwrap();
+        cells_in(&doc.plain_text(), 'x')
+    };
+    // Both stop after the two cells that fit in the budget.
+    assert_eq!((cut(small), cut(large)), (2, 2));
+}
+
+/// The truncation notice says where to raise the budget.
+#[test]
+fn test_the_truncation_notice_names_the_setter() {
+    let mut limits = LimitScope::new();
+    limits.set(max_text_chars, set_max_text_chars, BUDGET);
+    let text = open_xlsx(8).plain_text();
+    assert!(
+        text.contains("set_max_text_chars"),
+        "{}",
+        &text[text.len().saturating_sub(300)..]
+    );
+}
+
+/// A workbook whose one shared string of `chars` characters is named by
+/// `cells` cells, plus `padding` incompressible bytes in a part nothing reads.
+/// Deflated, the character data costs a few KB however long it is.
+fn xlsx_big_string(chars: usize, cells: usize, padding: usize) -> Vec<u8> {
+    let big = "x".repeat(chars);
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let deflated: zip::write::FileOptions<'_, '_, ()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let stored: zip::write::FileOptions<'_, '_, ()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let mut row = String::from(
+        r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>"#,
+    );
+    for r in 1..=cells {
+        row.push_str(&format!(r#"<row r="{r}"><c r="A{r}" t="s"><v>0</v></c></row>"#));
+    }
+    row.push_str("</sheetData></worksheet>");
+    let parts: Vec<(&str, String)> = vec![
+        ("[Content_Types].xml", r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#.into()),
+        ("_rels/.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#.into()),
+        ("xl/workbook.xml", r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#.into()),
+        ("xl/_rels/workbook.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>"#.into()),
+        ("xl/sharedStrings.xml", format!(r#"<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1"><si><t>{big}</t></si></sst>"#)),
+        ("xl/worksheets/sheet1.xml", row),
+    ];
+    for (name, data) in parts {
+        zip.start_file(name, deflated).unwrap();
+        zip.write_all(data.as_bytes()).unwrap();
+    }
+    if padding > 0 {
+        let mut state = 0x9E37_79B9u32;
+        let noise: Vec<u8> = (0..padding)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        zip.start_file("customXml/unused.bin", stored).unwrap();
+        zip.write_all(&noise).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+/// A tiny file is bounded by the floor, not by the whole limit: 3,000 cells of
+/// a 32,000-character string (a cell holds at most 32,767) would be 96 million
+/// characters, more than the floor of 64 Mi and far less than the 256 Mi limit.
+#[test]
+fn test_a_small_input_is_bounded_by_the_floor_not_the_whole_limit() {
+    let _defaults = common::default_limits();
+    let bytes = xlsx_big_string(32_000, 3_000, 0);
+    assert!(bytes.len() < 64 * 1024, "the fixture must be a small file: {}", bytes.len());
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx).unwrap();
+    let text = doc.plain_text();
+    let chars = text.matches('x').count();
+    assert!(
+        (60_000_000..=office_oxide::limits::TEXT_BUDGET_FLOOR_CHARS).contains(&chars),
+        "{chars}"
+    );
+    assert!(text.contains("set_max_text_chars"), "the cut is reported");
+}
+
+/// The same text from a file of 64 KB or more is bounded by the limit alone
+/// (96 million characters fit under 256 Mi), so nothing is cut.
+#[test]
+fn test_a_larger_input_is_bounded_by_the_limit() {
+    let _defaults = common::default_limits();
+    let bytes = xlsx_big_string(32_000, 3_000, 80 * 1024);
+    assert!(bytes.len() >= 64 * 1024);
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx).unwrap();
+    let text = doc.plain_text();
+    assert_eq!(text.matches('x').count(), 96_000_000);
+    assert!(!text.contains("set_max_text_chars"));
+}
+
+/// The format's own reader knows the size of its file too: the same small
+/// workbook read through `XlsxDocument` directly is bounded by the floor, and
+/// the larger file by the limit, as through `Document`.
+#[test]
+fn test_a_format_reader_used_directly_scales_the_budget_too() {
+    use office_oxide::xlsx::XlsxDocument;
+    let _defaults = common::default_limits();
+    let small = XlsxDocument::from_reader(Cursor::new(xlsx_big_string(32_000, 3_000, 0))).unwrap();
+    let chars = small.plain_text().matches('x').count();
+    assert!(
+        (60_000_000..=office_oxide::limits::TEXT_BUDGET_FLOOR_CHARS).contains(&chars),
+        "{chars}"
+    );
+    let large =
+        XlsxDocument::from_reader(Cursor::new(xlsx_big_string(32_000, 3_000, 80 * 1024))).unwrap();
+    assert_eq!(large.plain_text().matches('x').count(), 96_000_000);
+    // And by path.
+    let path = std::env::temp_dir().join(format!("office_oxide_scale_{}.xlsx", std::process::id()));
+    std::fs::write(&path, xlsx_big_string(32_000, 3_000, 0)).unwrap();
+    let by_path = XlsxDocument::open(&path).unwrap();
+    std::fs::remove_file(&path).ok();
+    let chars = by_path.plain_text().matches('x').count();
+    assert!(chars <= office_oxide::limits::TEXT_BUDGET_FLOOR_CHARS, "{chars}");
 }

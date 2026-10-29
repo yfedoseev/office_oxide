@@ -20,22 +20,43 @@ pub struct Worksheet {
     pub merged_cells: Vec<String>,
     /// Hyperlinks defined on this sheet.
     pub hyperlinks: Vec<HyperlinkInfo>,
+    /// Formulas left out: a shared-formula master longer than Excel allows (8,192
+    /// characters), the cells that follow it, and followers whose copies of
+    /// the master would pass the document's text budget
+    /// ([`crate::limits::set_max_text_chars`]). The cells keep their values.
+    pub formulas_dropped: usize,
+    /// Set when the worksheet's XML is malformed and only the rows before the
+    /// damage were read: what was kept, and where it stops.
+    pub damage: Option<String>,
     /// Per-sheet page geometry parsed from `<pageMargins>` + `<pageSetup>`.
     pub page_setup: Option<PageSetup>,
     /// Pictures anchored on this worksheet via `xl/drawings/drawingN.xml`.
     /// Resolved at parse time: anchor + image bytes are materialised
-    /// into this `Vec` so consumers don't need to re-walk the OPC
-    /// reader. Empty when the worksheet has no drawing rel.
-    pub images: Vec<WorksheetPicture>,
+    /// so consumers don't need to re-walk the OPC reader. Empty when the
+    /// worksheet has no drawing rel.
+    ///
+    /// Shared by every sheet that names the same drawing part: the part is
+    /// parsed once.
+    pub images: std::sync::Arc<[WorksheetPicture]>,
+    /// Pictures placed in cells (Excel's "Place in Cell" rich values),
+    /// which have no anchor in a drawing. Kept apart from [`Self::images`]
+    /// so that a drawing shared by several sheets stays shared.
+    pub cell_images: Vec<WorksheetPicture>,
     /// Cell comments from the sheet's `xl/comments*.xml` part, in document
-    /// order. Empty when the sheet has no comments.
-    pub comments: Vec<SheetComment>,
+    /// order. Empty when the sheet has no comments. Shared by every sheet
+    /// that names the same comments part.
+    pub comments: std::sync::Arc<[SheetComment]>,
+    /// `true` when the comments stopped at the document's text budget: the
+    /// threaded comments past it are missing (or show their legacy note).
+    pub comments_truncated: bool,
     /// Layout-preserving text shapes anchored on this worksheet via a
     /// DrawingML drawing part. Each entry is one `<xdr:sp>` carrying a
     /// single styled run — populated by the round-trip from
     /// `to_xlsx_bytes_layout`. Empty when the worksheet has no
     /// `<xdr:sp>` shapes (the common XLSX case).
-    pub text_shapes: Vec<WorksheetTextShape>,
+    ///
+    /// Shared by every sheet that names the same drawing part.
+    pub text_shapes: std::sync::Arc<[WorksheetTextShape]>,
     /// Conditional formatting rules from `<conditionalFormatting>`/
     /// `<cfRule>`. Empty when the worksheet defines none.
     pub conditional_formats: Vec<crate::ir::ConditionalFormat>,
@@ -53,18 +74,20 @@ pub struct Worksheet {
     /// Table definitions (`xl/tables/tableN.xml`, [ECMA-376] §18.5) the
     /// sheet's `<tableParts>` reference: each names a range of the sheet's
     /// own cells, whose values are in `rows`.
-    pub tables: Vec<SheetTable>,
+    /// Each is shared by every sheet that names the same table part.
+    pub tables: Vec<std::sync::Arc<SheetTable>>,
     /// Pivot tables anchored on this sheet ([ECMA-376] §18.10). The values
     /// a pivot table displays are ordinary cells in `rows`; this records
-    /// the pivot itself and where its data comes from.
-    pub pivot_tables: Vec<SheetPivotTable>,
+    /// the pivot itself and where its data comes from. Each is shared by
+    /// every sheet that names the same pivot table part.
+    pub pivot_tables: Vec<std::sync::Arc<SheetPivotTable>>,
     /// What the sheet is. A macro sheet's cells are in `rows` like a
     /// worksheet's; a chart sheet or dialog sheet has none.
     pub kind: crate::ir::SheetKind,
     /// A chart sheet's own chart text (titles, series, categories, in the
     /// shape of [`super::XlsxDocument::chart_text`]), reached through the
     /// chartsheet's drawing. Empty for every other kind.
-    pub chart_text: Vec<String>,
+    pub chart_text: Vec<std::sync::Arc<str>>,
 }
 
 /// A table part ([ECMA-376] §18.5.1.2 `table`).
@@ -100,7 +123,9 @@ pub struct SheetPivotTable {
     /// not in the workbook — an external or consolidation source, a sheet
     /// the workbook does not have, or a name that resolves to nothing. When
     /// the source cells exist, they already carry this data.
-    pub cache_data: Option<PivotCacheData>,
+    ///
+    /// Shared by every pivot that names the same cache part.
+    pub cache_data: Option<std::sync::Arc<PivotCacheData>>,
 }
 
 /// A pivot cache's source data as cached in the package: one column per
@@ -148,6 +173,62 @@ impl PivotCacheSource {
             (_, None, name) => name.clone(),
         }
     }
+}
+
+/// The part of a malformed worksheet that parsed before the damage: the XML up
+/// to the end of the last complete `<row>`, closed with the end tags of
+/// `<sheetData>` and the root, and how many rows that holds. `None` when the
+/// XML is not damaged (the error lies elsewhere) or no row is complete. A row
+/// the damage reaches is not kept, so no row is ever cut in two.
+pub(crate) fn salvage_prefix(data: &[u8]) -> Option<(Vec<u8>, usize)> {
+    let mut reader = xml::make_fast_reader(data);
+    let mut root: Option<Vec<u8>> = None;
+    let mut sheet_data: Option<Vec<u8>> = None;
+    let mut last_end = None;
+    let mut rows = 0usize;
+    let damaged;
+    // Elements still open: end-of-file with some open is a cut-off part.
+    let mut open = 0usize;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => {
+                open += 1;
+                let name = e.name().as_ref().as_bytes().to_vec();
+                if root.is_none() {
+                    root = Some(name);
+                } else if e.local_name().as_ref() == "sheetData" {
+                    sheet_data = Some(name);
+                }
+            },
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == "row" => {
+                open = open.saturating_sub(1);
+                rows += 1;
+                last_end = Some(reader.buffer_position() as usize);
+            },
+            Ok(Event::End(_)) => open = open.saturating_sub(1),
+            Ok(Event::Eof) => {
+                damaged = open > 0;
+                break;
+            },
+            Err(_) => {
+                damaged = true;
+                break;
+            },
+            _ => {},
+        }
+    }
+    if !damaged {
+        return None;
+    }
+    let (root, sheet_data, end) = (root?, sheet_data?, last_end?);
+    let mut out = Vec::with_capacity(end + 64);
+    out.extend_from_slice(data.get(..end)?);
+    for name in [&sheet_data, &root] {
+        out.extend_from_slice(b"</");
+        out.extend_from_slice(name);
+        out.push(b'>');
+    }
+    Some((out, rows))
 }
 
 /// Parse the source and records reference of a pivot cache definition.
@@ -533,8 +614,9 @@ impl SheetHeaderFooter {
 pub struct SheetComment {
     /// Cell reference the comment is attached to, e.g. `"B2"`.
     pub cell_ref: String,
-    /// Comment author, resolved through the part's `<authors>` list.
-    pub author: Option<String>,
+    /// Comment author, resolved through the part's `<authors>` list. Shared by
+    /// every comment of the same author: a name is stored once in the part.
+    pub author: Option<std::sync::Arc<str>>,
     /// Comment body text.
     pub text: String,
 }
@@ -547,7 +629,7 @@ pub struct SheetComment {
 pub fn parse_comments(xml_data: &[u8]) -> crate::core::Result<Vec<SheetComment>> {
     use quick_xml::events::Event;
     let mut reader = xml::make_fast_reader(xml_data);
-    let mut authors: Vec<String> = Vec::new();
+    let mut authors: Vec<std::sync::Arc<str>> = Vec::new();
     let mut out: Vec<SheetComment> = Vec::new();
     let mut in_authors = false;
 
@@ -556,7 +638,7 @@ pub fn parse_comments(xml_data: &[u8]) -> crate::core::Result<Vec<SheetComment>>
             Event::Start(ref e) => match e.local_name().as_ref() {
                 "authors" => in_authors = true,
                 "author" if in_authors => {
-                    authors.push(xml::read_text_content_fast(&mut reader)?.trim().to_string());
+                    authors.push(xml::read_text_content_fast(&mut reader)?.trim().into());
                 },
                 "comment" => {
                     let cell_ref = xml::optional_attr_str(e, "ref")?
@@ -630,7 +712,7 @@ pub(crate) fn parse_threaded_comments(
 /// Parse a `xl/persons/person.xml` part: `personId -> displayName`.
 pub(crate) fn parse_persons(
     xml_data: &[u8],
-) -> crate::core::Result<std::collections::HashMap<String, String>> {
+) -> crate::core::Result<std::collections::HashMap<String, std::sync::Arc<str>>> {
     use quick_xml::events::Event;
     let mut reader = xml::make_fast_reader(xml_data);
     let mut out = std::collections::HashMap::new();
@@ -641,7 +723,7 @@ pub(crate) fn parse_persons(
                 let id = xml::optional_attr_str(e, "id")?.map(|v| v.into_owned());
                 let name = xml::optional_attr_str(e, "displayName")?.map(|v| v.into_owned());
                 if let (Some(id), Some(name)) = (id, name) {
-                    out.insert(id, name);
+                    out.insert(id, name.into());
                 }
             },
             Event::Eof => break,
@@ -649,6 +731,40 @@ pub(crate) fn parse_persons(
         }
     }
     Ok(out)
+}
+
+/// The messages of a threaded-comments part grouped into threads, one per
+/// cell reference in reference order, each thread's root message first and
+/// its replies after it in file order.
+///
+/// Built once for a part, however many legacy comments parts it is merged
+/// with: grouping the messages is work in proportion to the whole part, and
+/// a package can pair one large part with a great many small ones.
+#[derive(Default)]
+pub(crate) struct ThreadedComments {
+    threads: Vec<Vec<RawThreadedComment>>,
+}
+
+impl ThreadedComments {
+    pub(crate) fn new(messages: Vec<RawThreadedComment>) -> Self {
+        let mut by_ref: std::collections::BTreeMap<String, Vec<RawThreadedComment>> =
+            std::collections::BTreeMap::new();
+        for tc in messages {
+            by_ref.entry(tc.cell_ref.clone()).or_default().push(tc);
+        }
+        let mut threads: Vec<Vec<RawThreadedComment>> = by_ref.into_values().collect();
+        for msgs in &mut threads {
+            // The root message (no parentId) leads; replies follow in their
+            // original file order — a stable sort on "has a parent" keeps
+            // that order within each group.
+            msgs.sort_by_key(|m| m.parent_id.is_some());
+        }
+        Self { threads }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.threads.is_empty()
+    }
 }
 
 /// Merge legacy `xl/comments*.xml` entries with modern threaded-comment
@@ -663,31 +779,40 @@ pub(crate) fn parse_persons(
 /// first, author-resolved via `persons`) instead of the legacy
 /// boilerplate; a `ref` with no threaded entry (a genuine, non-threaded
 /// legacy "Note") keeps its own legacy text unchanged.
+///
+/// The parts may be shared by several sheets, so the merge reads them and the
+/// legacy notes it keeps are copies. Everything it copies is charged to
+/// `budget` before it is copied (a thread's note, each of its messages, each
+/// legacy note kept), so the work of a merge is bounded by what the budget
+/// allows and a merge made after the budget is spent does none.
 pub(crate) fn merge_threaded_comments(
-    legacy: Vec<SheetComment>,
-    threaded: Vec<RawThreadedComment>,
-    persons: &std::collections::HashMap<String, String>,
-) -> Vec<SheetComment> {
+    legacy: &[SheetComment],
+    threaded: &ThreadedComments,
+    persons: &std::collections::HashMap<String, std::sync::Arc<str>>,
+    budget: &mut crate::limits::TextBudget,
+) -> (Vec<SheetComment>, bool) {
     if threaded.is_empty() {
-        return legacy;
+        return (legacy.to_vec(), false);
+    }
+    // Nothing more fits: the legacy notes of this sheet cannot be paid for
+    // either, and the caller says so.
+    if budget.exhausted() {
+        return (Vec::new(), true);
     }
 
-    let mut by_ref: std::collections::HashMap<String, Vec<&RawThreadedComment>> =
-        std::collections::HashMap::new();
-    for tc in &threaded {
-        by_ref.entry(tc.cell_ref.clone()).or_default().push(tc);
-    }
-
-    let mut out: Vec<SheetComment> = legacy
-        .into_iter()
-        .filter(|c| !by_ref.contains_key(&c.cell_ref))
-        .collect();
-
-    for (cell_ref, mut msgs) in by_ref {
-        // The root message (no parentId) leads; replies follow in their
-        // original file order — a stable sort on "has a parent" keeps
-        // that order within each group.
-        msgs.sort_by_key(|m| m.parent_id.is_some());
+    let mut threads: Vec<SheetComment> = Vec::new();
+    let mut resolved: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut truncated = false;
+    'threads: for msgs in &threaded.threads {
+        let Some(first) = msgs.first() else {
+            continue;
+        };
+        let cell_ref = first.cell_ref.as_str();
+        // The note that holds the thread, whatever the messages say.
+        if !budget.charge(std::mem::size_of::<crate::ir::Note>().saturating_add(cell_ref.len())) {
+            truncated = true;
+            break;
+        }
         let mut lines = Vec::with_capacity(msgs.len());
         let mut thread_author = None;
         for (i, m) in msgs.iter().enumerate() {
@@ -695,18 +820,45 @@ pub(crate) fn merge_threaded_comments(
             if i == 0 {
                 thread_author = author.clone();
             }
+            // Each message line names its author, so a long name repeated
+            // down a long thread is charged for every message. A thread
+            // that does not fit is left out whole, and so are the rest.
+            // A message is a string of its own until the thread's lines are
+            // joined, however short its text.
+            let line_chars = author.as_ref().map_or(0, |a| a.len() + 2)
+                + m.text.len()
+                + std::mem::size_of::<String>();
+            if !budget.charge(line_chars) {
+                truncated = true;
+                break 'threads;
+            }
             match author {
                 Some(a) => lines.push(format!("{a}: {}", m.text)),
                 None => lines.push(m.text.clone()),
             }
         }
-        out.push(SheetComment {
-            cell_ref,
+        resolved.insert(cell_ref);
+        threads.push(SheetComment {
+            cell_ref: cell_ref.to_string(),
             author: thread_author,
             text: lines.join("\n"),
         });
     }
-    out
+
+    // A cell whose thread was left out keeps its legacy note.
+    let mut out: Vec<SheetComment> = Vec::new();
+    for c in legacy
+        .iter()
+        .filter(|c| !resolved.contains(c.cell_ref.as_str()))
+    {
+        if !budget.charge(crate::xlsx::text::comment_chars(c)) {
+            truncated = true;
+            break;
+        }
+        out.push(c.clone());
+    }
+    out.extend(threads);
+    (out, truncated)
 }
 
 /// A text shape anchored on a worksheet via a DrawingML drawing part.
@@ -744,8 +896,8 @@ pub struct WorksheetTextShape {
 /// part contents; `format` is the lowercase file extension.
 #[derive(Debug, Clone)]
 pub struct WorksheetPicture {
-    /// Image bytes.
-    pub data: Vec<u8>,
+    /// Image bytes, shared by every picture that names the same media part.
+    pub data: std::sync::Arc<[u8]>,
     /// Lowercase file extension (`"png"`, `"jpeg"`, ...).
     pub format: String,
     /// X anchor in EMU.
@@ -811,8 +963,8 @@ pub struct HyperlinkInfo {
 /// Hyperlink target type.
 #[derive(Debug, Clone)]
 pub enum HyperlinkTarget {
-    /// External URL.
-    External(String),
+    /// External URL, shared by every link that names the same relationship.
+    External(std::sync::Arc<str>),
     /// Internal sheet/cell location.
     Internal(String),
 }
@@ -827,10 +979,14 @@ impl Worksheet {
             rows: Vec::new(),
             merged_cells: Vec::new(),
             hyperlinks: Vec::new(),
+            formulas_dropped: 0,
+            damage: None,
             page_setup: None,
-            images: Vec::new(),
-            comments: Vec::new(),
-            text_shapes: Vec::new(),
+            images: std::sync::Arc::from([]),
+            cell_images: Vec::new(),
+            comments: std::sync::Arc::from([]),
+            comments_truncated: false,
+            text_shapes: std::sync::Arc::from([]),
             conditional_formats: Vec::new(),
             data_validations: Vec::new(),
             state: super::SheetState::Visible,
@@ -848,6 +1004,22 @@ impl Worksheet {
         name: String,
         rels: &crate::core::relationships::Relationships,
     ) -> crate::core::Result<Self> {
+        let (mut ws, shared) = Self::parse_unresolved(xml_data, name, rels)?;
+        ws.formulas_dropped = shared
+            .resolve(&mut ws.rows, &mut crate::limits::TextBudget::new())
+            .dropped;
+        Ok(ws)
+    }
+
+    /// [`Self::parse`] without writing the formulas of shared-formula
+    /// followers, which the caller does with [`SharedFormulas::resolve`] once
+    /// all sheets are read so that one document-wide budget is spent in
+    /// sheet order whatever order the sheets were parsed in.
+    pub(crate) fn parse_unresolved(
+        xml_data: &[u8],
+        name: String,
+        rels: &crate::core::relationships::Relationships,
+    ) -> crate::core::Result<(Self, SharedFormulas)> {
         // Use plain Reader (not NsReader) for performance — worksheet XML is always
         // in the SML namespace, so namespace resolution is unnecessary overhead.
         // This is the hot path: worksheets can have thousands of cells.
@@ -879,6 +1051,7 @@ impl Worksheet {
                         // previous row (ECMA-376 18.3.1.73); some writers omit
                         // it throughout the sheet.
                         let implied = rows.last().map_or(1, |r: &Row| r.index + 1);
+                        shared.at_position(rows.len(), 0);
                         rows.push(parse_row_fast(&mut reader, e, implied, &mut shared)?);
                     },
                     "mergeCell" => {
@@ -941,40 +1114,30 @@ impl Worksheet {
 
         let page_setup = build_page_setup(margins_in, page_setup_raw);
 
-        // A shared group's master usually precedes its followers, but not
-        // always — calamine ships a fixture with the records reversed — so
-        // followers that arrived first are filled in now.
-        if shared.has_pending() {
-            for (at, formula) in shared.resolve_pending() {
-                if let Some(cell) = rows
-                    .iter_mut()
-                    .find(|r| r.index == at.row + 1)
-                    .and_then(|r| r.cells.iter_mut().find(|c| c.reference == at))
-                {
-                    cell.formula = Some(formula);
-                }
-            }
-        }
-
-        Ok(Worksheet {
+        let ws = Worksheet {
             kind: crate::ir::SheetKind::Worksheet,
             chart_text: Vec::new(),
             state: super::SheetState::Visible,
             header_footer,
             tables: Vec::new(),
             pivot_tables: Vec::new(),
-            comments: Vec::new(),
+            comments: std::sync::Arc::from([]),
+            comments_truncated: false,
             name,
             dimension,
             rows,
             merged_cells,
             hyperlinks,
+            formulas_dropped: 0,
+            damage: None,
             page_setup,
-            images: Vec::new(),
-            text_shapes: Vec::new(),
+            images: std::sync::Arc::from([]),
+            cell_images: Vec::new(),
+            text_shapes: std::sync::Arc::from([]),
             conditional_formats,
             data_validations,
-        })
+        };
+        Ok((ws, shared))
     }
 }
 
@@ -1374,7 +1537,11 @@ fn parse_hyperlink(
 
     let target = if let Some(rid) = r_id {
         if let Some(rel) = rels.get_by_id(&rid) {
-            HyperlinkTarget::External(rel.target.clone())
+            // Shared with the relationship, not copied: every link that
+            // names it holds the one allocation, and the IR's copies are
+            // charged to the text budget. The package layer already refuses
+            // a target past 64 KiB, the limit of every format.
+            HyperlinkTarget::External(std::sync::Arc::clone(&rel.target))
         } else {
             return Ok(None);
         }
@@ -1410,6 +1577,7 @@ fn parse_row_fast(
         match reader.read_event()? {
             Event::Start(ref e) => {
                 if e.local_name().as_ref() == "c" {
+                    shared.at_position(shared.row(), cells.len());
                     let cell = parse_cell_fast(reader, e, index, next_col, shared)?;
                     next_col = cell.reference.col.saturating_add(1);
                     cells.push(cell);
@@ -1474,19 +1642,18 @@ fn parse_empty_cell(
     implied_col: u32,
 ) -> crate::core::Result<Cell> {
     let attrs = cell_attrs(e)?;
-    Ok(Cell {
-        reference: attrs.reference.unwrap_or(CellRef {
+    let mut cell = Cell::new(
+        attrs.reference.unwrap_or(CellRef {
             col: implied_col,
             row,
         }),
-        value: CellValue::Empty,
-        style_index: attrs.style_index,
-        formula: None,
-        // A self-closing cell can still name value metadata (`vm`,
-        // [ECMA-376] §18.3.1.4) — an in-cell rich-value image.
-        vm: attrs.vm,
-        rich_runs: None,
-    })
+        CellValue::Empty,
+        attrs.style_index,
+    );
+    // A self-closing cell can still name value metadata (`vm`,
+    // [ECMA-376] §18.3.1.4) — an in-cell rich-value image.
+    cell.set_vm(attrs.vm);
+    Ok(cell)
 }
 
 /// Read the `si` group index of an `<f>` element, but only when it really
@@ -1522,7 +1689,8 @@ fn parse_cell_fast(
     let mut raw_value: Option<String> = None;
     let mut number: Option<f64> = None;
     let mut formula: Option<String> = None;
-    let mut inline_rich_runs: Option<Vec<crate::xlsx::shared_strings::RichTextRun>> = None;
+    let mut inline_rich_runs: Option<std::sync::Arc<[crate::xlsx::shared_strings::RichTextRun]>> =
+        None;
 
     loop {
         match reader.read_event()? {
@@ -1544,15 +1712,16 @@ fn parse_cell_fast(
                     let si = shared_si(e)?;
                     let text = read_text_fast(reader)?;
                     // A shared group's master carries the text once, here.
-                    if let Some(si) = si {
-                        shared.add_master(si, reference.clone(), text.clone());
-                    }
-                    formula = Some(text);
+                    // One longer than Excel allows is refused, with its group:
+                    // the cell keeps its value and has no formula.
+                    let accepted =
+                        si.is_none_or(|si| shared.add_master(si, reference.clone(), &text));
+                    formula = accepted.then_some(text);
                 },
                 "is" => {
                     let (text, runs) = parse_inline_string_fast(reader)?;
                     raw_value = Some(text);
-                    inline_rich_runs = runs;
+                    inline_rich_runs = runs.map(Into::into);
                 },
                 _ => {
                     reader.read_to_end(e.to_end().name())?;
@@ -1563,10 +1732,9 @@ fn parse_cell_fast(
                 // its own, but its formula is the group master's translated
                 // by the row/column offset. Discarding it made a formula
                 // cell indistinguishable from one with no formula.
-                formula = match shared_si(e)? {
-                    Some(si) => shared.follower(si, &reference),
-                    None => None,
-                };
+                if let Some(si) = shared_si(e)? {
+                    shared.follower(si, &reference);
+                }
             },
             Event::End(ref e) if e.local_name().as_ref() == "c" => {
                 break;
@@ -1618,14 +1786,11 @@ fn parse_cell_fast(
         },
     };
 
-    Ok(Cell {
-        reference,
-        value,
-        style_index,
-        formula,
-        vm,
-        rich_runs: inline_rich_runs,
-    })
+    let mut cell = Cell::new(reference, value, style_index);
+    cell.set_formula(formula);
+    cell.set_vm(vm);
+    cell.set_rich_runs(inline_rich_runs);
+    Ok(cell)
 }
 
 /// Read text content of the current element using fast Reader.
@@ -1750,9 +1915,9 @@ mod tests {
   </sheetData>
 </worksheet>"#;
         let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
-        assert_eq!(ws.rows[0].cells[0].formula.as_deref(), Some("A2"));
-        assert_eq!(ws.rows[1].cells[0].formula.as_deref(), Some("A3"));
-        assert_eq!(ws.rows[2].cells[0].formula.as_deref(), Some("A4"));
+        assert_eq!(ws.rows[0].cells[0].formula(), Some("A2"));
+        assert_eq!(ws.rows[1].cells[0].formula(), Some("A3"));
+        assert_eq!(ws.rows[2].cells[0].formula(), Some("A4"));
     }
 
     /// Same, with the master written after its followers — the record order
@@ -1767,8 +1932,8 @@ mod tests {
   </sheetData>
 </worksheet>"#;
         let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
-        assert_eq!(ws.rows[1].cells[0].formula.as_deref(), Some("A2*2"));
-        assert_eq!(ws.rows[0].cells[0].formula.as_deref(), Some("A3*2"));
+        assert_eq!(ws.rows[1].cells[0].formula(), Some("A2*2"));
+        assert_eq!(ws.rows[0].cells[0].formula(), Some("A3*2"));
     }
 
     /// A plain `<f/>` with no `t="shared"` still means "no formula text",
@@ -1786,8 +1951,8 @@ mod tests {
   </sheetData>
 </worksheet>"#;
         let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
-        assert_eq!(ws.rows[0].cells[0].formula, None);
-        assert_eq!(ws.rows[0].cells[1].formula, None);
+        assert_eq!(ws.rows[0].cells[0].formula(), None);
+        assert_eq!(ws.rows[0].cells[1].formula(), None);
     }
 
     /// The sheet reader trims text, and quick-xml emits every entity
@@ -1864,8 +2029,7 @@ mod tests {
         let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
         let cell = &ws.rows[0].cells[0];
         let runs = cell
-            .rich_runs
-            .as_ref()
+            .rich_runs()
             .expect("expected rich_runs to be populated");
         assert_eq!(runs.len(), 2, "got {runs:?}");
         assert_eq!(runs[0].text, "Hello ");
@@ -2092,7 +2256,7 @@ mod tests {
 </worksheet>"#;
         let ws = Worksheet::parse(xml, "Sheet1".to_string(), &empty_rels()).unwrap();
         let cell = &ws.rows[0].cells[1];
-        assert_eq!(cell.formula.as_deref(), Some("A1*2"));
+        assert_eq!(cell.formula(), Some("A1*2"));
         assert!(matches!(cell.value, CellValue::Number(n) if n == 20.0));
     }
 
@@ -2379,7 +2543,7 @@ mod tests {
   <person displayName="Pankaj Chaudhary" id="{P1}" userId="S::x" providerId="AD"/>
 </personList>"#;
         let out = parse_persons(xml).unwrap();
-        assert_eq!(out.get("{P1}").map(String::as_str), Some("Pankaj Chaudhary"));
+        assert_eq!(out.get("{P1}").map(|n| &**n), Some("Pankaj Chaudhary"));
     }
 
     /// A `ref` with a resolved threaded-comment thread must
@@ -2393,27 +2557,33 @@ mod tests {
         let legacy = vec![
             SheetComment {
                 cell_ref: "C2".to_string(),
-                author: Some("tc={ID1}".to_string()),
+                author: Some("tc={ID1}".into()),
                 text: "[Threaded comment]\n\nYour version of Excel allows you to read this \
                        threaded comment... Comment:\n    testing"
                     .to_string(),
             },
             SheetComment {
                 cell_ref: "B3".to_string(),
-                author: Some("Microsoft Office User".to_string()),
+                author: Some("Microsoft Office User".into()),
                 text: "Microsoft Office User:\nSample Notes".to_string(),
             },
         ];
-        let threaded = vec![RawThreadedComment {
+        let threaded = ThreadedComments::new(vec![RawThreadedComment {
             cell_ref: "C2".to_string(),
             parent_id: None,
             person_id: Some("{P1}".to_string()),
             text: "testing".to_string(),
-        }];
+        }]);
         let mut persons = std::collections::HashMap::new();
-        persons.insert("{P1}".to_string(), "Pankaj Chaudhary".to_string());
+        persons.insert("{P1}".to_string(), "Pankaj Chaudhary".into());
 
-        let merged = merge_threaded_comments(legacy, threaded, &persons);
+        let merged = merge_threaded_comments(
+            &legacy,
+            &threaded,
+            &persons,
+            &mut crate::limits::TextBudget::new(),
+        )
+        .0;
         assert_eq!(merged.len(), 2);
 
         let c2 = merged.iter().find(|c| c.cell_ref == "C2").unwrap();
@@ -2430,7 +2600,7 @@ mod tests {
     /// reply — the issue's own secondary, not-corpus-confirmed concern.
     #[test]
     fn test_merge_orders_reply_after_root_in_a_thread() {
-        let threaded = vec![
+        let threaded = ThreadedComments::new(vec![
             RawThreadedComment {
                 cell_ref: "A1".to_string(),
                 parent_id: Some("{ROOT}".to_string()),
@@ -2443,11 +2613,61 @@ mod tests {
                 person_id: None,
                 text: "the root message".to_string(),
             },
-        ];
-        let merged =
-            merge_threaded_comments(Vec::new(), threaded, &std::collections::HashMap::new());
+        ]);
+        let merged = merge_threaded_comments(
+            &[],
+            &threaded,
+            &std::collections::HashMap::new(),
+            &mut crate::limits::TextBudget::new(),
+        )
+        .0;
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "the root message\na reply");
+    }
+
+    /// Every message of a thread names its author, so a long name down a
+    /// long thread multiplies; the thread text is charged to the budget.
+    #[test]
+    fn test_threaded_comment_author_repeated_down_a_thread_is_budgeted() {
+        let threaded = ThreadedComments::new(
+            (0..50)
+                .map(|_| RawThreadedComment {
+                    cell_ref: "A1".to_string(),
+                    parent_id: None,
+                    person_id: Some("{P1}".to_string()),
+                    text: "x".to_string(),
+                })
+                .collect(),
+        );
+        let mut persons = std::collections::HashMap::new();
+        persons.insert("{P1}".to_string(), "n".repeat(100).into());
+        let mut budget = crate::limits::TextBudget::with_limit(1_000);
+        let (merged, truncated) = merge_threaded_comments(&[], &threaded, &persons, &mut budget);
+        assert!(truncated, "5,000 characters of thread text exceed a 1,000 budget");
+        assert!(merged.is_empty(), "a thread that does not fit is left out whole");
+    }
+
+    /// A message of one character is still a string of its own, so the
+    /// messages of a thread are charged for more than their text: many short
+    /// ones cannot be merged for a budget of their characters.
+    #[test]
+    fn test_a_short_threaded_message_is_charged_as_the_string_that_holds_it() {
+        let threaded = ThreadedComments::new(
+            (0..100)
+                .map(|_| RawThreadedComment {
+                    cell_ref: "A1".to_string(),
+                    parent_id: None,
+                    person_id: None,
+                    text: "x".to_string(),
+                })
+                .collect(),
+        );
+        // The note that holds the thread, and the messages' text, fit.
+        let note = std::mem::size_of::<crate::ir::Note>() + 2;
+        let mut budget = crate::limits::TextBudget::with_limit(note + 100 + 100);
+        let (merged, truncated) =
+            merge_threaded_comments(&[], &threaded, &std::collections::HashMap::new(), &mut budget);
+        assert!(truncated && merged.is_empty(), "100 strings cost more than 100 characters");
     }
 
     #[test]
@@ -2457,8 +2677,13 @@ mod tests {
             author: None,
             text: "plain note".to_string(),
         }];
-        let merged =
-            merge_threaded_comments(legacy.clone(), Vec::new(), &std::collections::HashMap::new());
+        let merged = merge_threaded_comments(
+            &legacy,
+            &ThreadedComments::new(Vec::new()),
+            &std::collections::HashMap::new(),
+            &mut crate::limits::TextBudget::new(),
+        )
+        .0;
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "plain note");
     }

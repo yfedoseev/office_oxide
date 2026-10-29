@@ -1,6 +1,6 @@
 # Office Oxide — The Fastest Native Office Document Library
 
-A fast, memory-safe library for text extraction from Office documents. Rust core with **first-class bindings for Python, Go, C#/.NET, Node.js (native and WASM), and a stable C FFI**. Handles DOCX, XLSX, PPTX, DOC, XLS, and PPT. Up to 100× faster than python-docx, openpyxl, python-pptx, and xlrd. Beats python-calamine on XLSX. **100% pass rate on valid Office files** — zero failures on legitimate Word/Excel/PowerPoint documents. MIT/Apache-2.0 dual-licensed.
+A fast, memory-safe library for text extraction from Office documents. Rust core with **first-class bindings for Python, Go, C#/.NET, Node.js (native and WASM), and a stable C FFI**. Handles DOCX, XLSX, PPTX, DOC, XLS, and PPT. 5–10× faster than python-docx, openpyxl, python-pptx, and xlrd; faster than python-calamine on XLSX. **Opens 97.3% of a 10,386-file test collection**; the rest are encrypted, truncated or corrupt files. MIT/Apache-2.0 dual-licensed.
 
 > **Scope of "fastest".** Benchmarks compare Office Oxide against other
 > native / embeddable libraries (no JVM runtime required): python-docx,
@@ -71,7 +71,7 @@ let ir = doc.to_ir(); // Format-agnostic intermediate representation
 
 ```toml
 [dependencies]
-office_oxide = "0.1.15"
+office_oxide = "0.1.16"
 ```
 
 ### JavaScript / WASM
@@ -132,84 +132,65 @@ Include [`include/office_oxide_c/office_oxide.h`](include/office_oxide_c/office_
 
 ## Why office_oxide?
 
-- **Fast** — 8-100× faster than python-docx, openpyxl, python-pptx, xlrd; beats calamine on XLSX
-- **Reliable** — 100% pass rate on valid Office files, tested against 6,062 real-world documents. Zero failures on legitimate Word 97+ / Excel 97+ / PowerPoint 97+ files
+- **Fast** — 5–10× faster than python-docx, openpyxl, python-pptx, xlrd; faster than python-calamine on XLSX
+- **Reliable** — opens 97.3% of a 10,386-file test collection; the files it does not open are encrypted, truncated or corrupt (the opt-in `default-password` feature opens the ones Office protects with its fixed default password)
 - **Complete** — 6 formats: DOCX, XLSX, PPTX + legacy DOC, XLS, PPT
 - **Multi-platform** — Rust, Python, Go, JavaScript/TypeScript, C#/.NET, WASM, CLI, and MCP server — one library, all platforms
 - **Permissive** — MIT / Apache-2.0, no AGPL or GPL restrictions
 
 ## Performance
 
-Benchmarked on **6,062 files** from 11 independent public test suites. Single-thread, release build with LTO, warm disk cache (steady-state), median of three runs on an idle system. Full methodology in [BENCHMARKS.md](BENCHMARKS.md).
+Benchmarked on **10,386 files** (the project's test collection: 3,519 .docx, 3,367 .xlsx, 1,123 .pptx, 780 .doc, 1,180 .xls, 417 .ppt), run on 2026-10-29. Single-thread, release build with LTO, warm disk cache. Rust figures are the median of three runs; Python and command-line figures are one run. Full methodology, pinned versions and the failure breakdown are in [BENCHMARKS.md](BENCHMARKS.md).
 
-### DOCX — 2,538 files
+### DOCX
 
-| Library | Language | Mean | p99 | Pass Rate | License |
-|---------|----------|------|-----|-----------|---------|
-| **office_oxide** | **Rust** | **0.8ms** | **3.9ms** | **98.9%** | **MIT** |
-| python-docx | Python | 11.8ms | 98ms | 95.1% | MIT |
+| Library | Language | Mean | Pass Rate | License |
+|---------|----------|------|-----------|---------|
+| **office_oxide** | **Rust** | **1.7ms** | **98.7%** | **MIT** |
+| docx-rs (crate) | Rust | 5.0ms | 98.0% | MIT |
+| python-docx | Python | 9.5ms | 95.7% | MIT |
+| markitdown | Python | 147.5ms | 98.4% | MIT |
 
-### XLSX — 1,802 files
+### XLSX
 
-| Library | Language | Mean | p99 | Pass Rate | License |
-|---------|----------|------|-----|-----------|---------|
-| **office_oxide** | **Rust** | **5.0ms** | **40ms** | **97.8%** | **MIT** |
-| python-calamine | Rust/Python | 13.9ms | 183ms | 96.6% | MIT |
-| openpyxl | Python | 94.5ms | 698ms | 96.2% | MIT |
+| Library | Language | Mean | Pass Rate | License |
+|---------|----------|------|-----------|---------|
+| calamine (crate) | Rust | 4.2ms | 98.2% | MIT |
+| **office_oxide** | **Rust** | **6.2ms** | **98.6%** | **MIT** |
+| python-calamine | Rust (Python) | 8.7ms | 97.8% | MIT |
+| openpyxl | Python | 60.7ms | 96.0% | MIT |
+| markitdown | Python | 307.5ms | 96.2% | MIT |
 
-### PPTX — 806 files
+### PPTX
 
-| Library | Language | Mean | p99 | Pass Rate | License |
-|---------|----------|------|-----|-----------|---------|
-| **office_oxide** | **Rust** | **0.7ms** | **3.9ms** | **98.4%** | **MIT** |
-| python-pptx | Python | 32.5ms | 174ms | 86.7% | MIT |
+| Library | Language | Mean | Pass Rate | License |
+|---------|----------|------|-----------|---------|
+| **office_oxide** | **Rust** | **2.6ms** | **98.1%** | **MIT** |
+| python-pptx | Python | 13.4ms | 90.0% | MIT |
+| markitdown | Python | 74.1ms | 90.2% | MIT |
 
-### Legacy Formats — 916 files
+### Legacy formats
 
-| Library | Format | Mean | p99 | Pass Rate | License |
-|---------|--------|------|-----|-----------|---------|
-| **office_oxide** | **DOC** (246) | **0.3ms** | **3.4ms** | **94.7%** | **MIT** |
-| catdoc | DOC | 4.3ms | 41ms | 90.2% | GPL-2.0 |
-| antiword | DOC | 4.5ms | 66ms | 76.8% | GPL-2.0 |
-| **office_oxide** | **XLS** (494) | **2.8ms** | 75ms | **99.2%** | **MIT** |
-| xls2csv (catdoc) | XLS | 6.9ms | **58ms** | 84.0% | GPL-2.0 |
-| python-calamine | XLS | 9.0ms | 96ms | 90.7% | MIT |
-| xlrd | XLS | 36.6ms | 503ms | 93.1% | BSD-3 |
-| **office_oxide** | **PPT** (176) | **0.7ms** | **6.6ms** | **100%** | **MIT** |
-| catppt (catdoc) | PPT | 2.8ms | 8ms | 77.8% | GPL-2.0 |
+| Library | Language | Mean | Pass Rate | License |
+|---------|----------|------|-----------|---------|
+| **office_oxide** | **Rust** | **4.1ms** | **90.0%** | **MIT** |
+| catdoc | C | 5.6ms | 95.5% | GPL-2.0 |
+| antiword | C | 5.6ms | 79.5% | GPL-2.0 |
 
-On .xls, xls2csv has a tighter p99 (58ms vs 75ms) because it emits truncated/lossy output on complex sheets. office_oxide is 2.4× faster on the mean and passes 15pp more of the corpus. No other Rust or Python library supports .doc, .xls, and .ppt text extraction without a JVM (Apache Tika) or external binaries.
+| Library | Language | Mean | Pass Rate | License |
+|---------|----------|------|-----------|---------|
+| **office_oxide** | **Rust** | **5.1ms** | **95.3%** | **MIT** |
+| calamine (crate) | Rust | 9.0ms | 93.0% | MIT |
+| xlrd | Python | 26.9ms | 92.5% | BSD-3 |
+| xls2csv (catdoc) | C | 36.5ms | 97.7% | GPL-2.0 |
+| python-calamine | Rust (Python) | 44.5ms | 92.6% | MIT |
 
-### Corpus
+| Library | Language | Mean | Pass Rate | License |
+|---------|----------|------|-----------|---------|
+| **office_oxide** | **Rust** | **6.7ms** | **92.3%** | **MIT** |
+| catppt (catdoc) | C | 80.2ms | 99.8% | GPL-2.0 |
 
-| Source | Files | License |
-|--------|------:|---------|
-| [LibreOffice Core](https://github.com/LibreOffice/core) | 2,185 | MPL-2.0 |
-| [Apache POI](https://github.com/apache/poi) | 1,298 | Apache-2.0 |
-| [Open XML SDK](https://github.com/OfficeDev/Open-XML-SDK) | 707 | MIT |
-| [ClosedXML](https://github.com/ClosedXML/ClosedXML) | 371 | MIT |
-| [Pandoc](https://github.com/jgm/pandoc) | 224 | GPL-2.0 |
-| [python-docx](https://github.com/python-openxml/python-docx) + [python-pptx](https://github.com/scanny/python-pptx) | 111 | MIT |
-| [Apache Tika](https://github.com/apache/tika) | 108 | Apache-2.0 |
-| [calamine](https://github.com/tafia/calamine) | 28 | MIT |
-| [openpreserve](https://github.com/openpreserve/format-corpus) | 20 | CC0 |
-| [oletools](https://github.com/decalage2/oletools) | 17 | BSD-2 |
-| LibreOffice (legacy) | 12 | MPL-2.0 |
-| **Total** | **6,062** | |
-
-### Pass Rate — 100% on valid files
-
-100% pass rate on all valid Office files — the 97 non-passing files in the corpus are all invalid inputs:
-
-| Category | Count | Notes |
-|----------|------:|-------|
-| Truncated / corrupted ZIP | 43 | Missing EOCD, invalid Central Directory, fuzzer-corrupted archives |
-| Encrypted / password-protected | 19 | CFBF-encrypted containers — no password supplied |
-| XML bomb / security fixture | 17 | Billion-laughs entities, CVE exploit inputs, fuzzer corpus |
-| Wrong format / mislabeled | 16 | WordPerfect, IBM DisplayWrite, pre-OLE2 Excel 3/4, ODT stored as .docx, XLSB stored as .xls |
-| Truncated binary | 2 | File ends mid-CFB-sector |
-
-**Zero failures on legitimate Word 97+ / Excel 97+ / PowerPoint 97+ files.** Zero panics, zero timeouts, zero false negatives on valid documents. Full breakdown in [BENCHMARKS.md](BENCHMARKS.md).
+"Pass" means the library opened the file and returned without an error. The command-line tools exit 0 on many files they cannot read and print little or nothing, so their rate overstates what they extracted. The collection also holds deliberately damaged and password-protected files, which is where most of office_oxide's failures are. The earlier April 2026 run (a different 6,062-file collection) is kept in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Supported Formats
 
@@ -322,7 +303,7 @@ Wheels available for Linux, macOS, and Windows. Python 3.10–3.14.
 
 ```toml
 [dependencies]
-office_oxide = "0.1.15"
+office_oxide = "0.1.16"
 ```
 
 ### JavaScript/WASM
@@ -361,6 +342,13 @@ cargo binstall office_oxide_cli      # Pre-built binary
 cargo install office_oxide_mcp
 ```
 
+### Per-document options
+
+Limits, hidden/deleted text and "refuse an incomplete result" can be set per document instead of process-wide:
+`ParseOptions` with `Document::open_with` (Rust), `ParseOptions(strict=True)` (Python), `new ParseOptions({ strict: true })`
+(Node), `NewStrictParseOptions` (Go), `new ParseOptions(strict: true)` (C#), `WasmParseOptions` (WASM), `--strict` and
+`--limit NAME=VALUE` (CLI), `"strict": true` (MCP). `Document::damage()` (`.damage()`) lists what is missing.
+
 ## CLI
 
 `office-oxide` provides fast Office document processing from your terminal:
@@ -374,6 +362,9 @@ office-oxide ir document.docx                    # Dump IR as JSON
 office-oxide info report.docx                    # Show format and metadata
 office-oxide replace report.docx OLD NEW         # Find/replace text (DOCX/PPTX), in place
 office-oxide replace report.docx OLD NEW --output edited.docx   # …written to a new file
+office-oxide text report.docx --include-hidden --include-deleted  # also hidden text and tracked deletions
+office-oxide text upload.docx --strict           # untrusted input: tighter limits, error if anything is missing
+office-oxide text big.xlsx --limit text_chars=50000000   # set a limit by name (`max` for none)
 ```
 
 All six formats are supported for reading (docx, xlsx, pptx, doc, xls, ppt); `replace` writes
@@ -430,7 +421,7 @@ cargo build --release --lib
 - **Document processing at scale** — Parse thousands of documents in seconds
 - **Data extraction** — Pull structured data from spreadsheets, tables, and presentations
 - **Format conversion** — Convert between formats via the intermediate representation
-- **python-docx / openpyxl alternative** — Up to 100× faster, supports all 6 formats in one library
+- **python-docx / openpyxl alternative** — 5–10× faster, supports all 6 formats in one library
 
 ## Why I built this
 
@@ -469,4 +460,4 @@ cargo build && cargo test && cargo fmt && cargo clippy -- -D warnings
 
 ---
 
-**Rust** + **Python** + **Go** + **JS/TS** + **C#** + **WASM** + **CLI** + **MCP** | MIT/Apache-2.0 | 100% pass rate on valid Office files (6,062-file corpus) | Up to 100× faster than alternatives | 6 formats
+**Rust** + **Python** + **Go** + **JS/TS** + **C#** + **WASM** + **CLI** + **MCP** | MIT/Apache-2.0 | Opens 97.3% of a 10,386-file test collection | 5–10× faster than the common Python libraries | 6 formats

@@ -24,6 +24,14 @@ pub const RT_DATEMODE: u16 = 0x0022;
 pub const RT_CODEPAGE: u16 = 0x0042;
 pub const RT_FILEPASS: u16 = 0x002F;
 pub const RT_STRING: u16 = 0x0207;
+/// The array formula a cell belongs to; it follows that cell's `FORMULA`
+/// and precedes its `STRING` (MS-XLS, the `Array` record and the `CELL`
+/// rule of the worksheet substream: `Formula [Array | ShrFmla | Table] [String]`).
+pub const RT_ARRAY: u16 = 0x0221;
+/// The shared formula a cell belongs to (MS-XLS, the `ShrFmla` record).
+pub const RT_SHRFMLA: u16 = 0x04BC;
+/// The data table a cell belongs to (MS-XLS, the `Table` record).
+pub const RT_TABLE: u16 = 0x0236;
 /// Merged cell ranges for the current worksheet ([MS-XLS] §2.4.180).
 pub const RT_MERGEDCELLS: u16 = 0x00E5;
 pub const RT_NAME: u16 = 0x0018;

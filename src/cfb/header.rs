@@ -25,6 +25,10 @@ pub struct CfbHeader {
     pub major_version: u16,
     /// Minor version (typically 0x003E).
     pub minor_version: u16,
+    /// The header's byte-order field, `0xFFFE` in a conforming file. Any other
+    /// value was found in a file whose other fields were intact and is read
+    /// as little-endian (see [`CfbHeader::parse`]).
+    pub byte_order: u16,
     /// Sector size in bytes (512 for v3, 4096 for v4).
     pub sector_size: usize,
     /// Mini-sector size in bytes (always 64).
@@ -83,13 +87,14 @@ impl CfbHeader {
             )));
         }
 
-        // Byte order must be little-endian (0xFFFE).
+        // [MS-CFB] §2.2: the byte-order field MUST be 0xFFFE, a mark that every
+        // integer field is little-endian. That is a requirement on writers; the
+        // specification gives a reader no rule for another value, and files with
+        // only this field damaged exist (a writer that swapped it, a fuzzed
+        // header) and are read by other implementations. The field is kept and
+        // reported, not refused: the checks below still reject a header that is
+        // really big-endian, because its sector shifts would not validate.
         let byte_order = u16::from_le_bytes([buf[0x1C], buf[0x1D]]);
-        if byte_order != 0xFFFE {
-            return Err(CfbError::InvalidHeader(format!(
-                "unsupported byte order: 0x{byte_order:04X}"
-            )));
-        }
 
         // `1 << shift` overflows — and panics in a debug build, or wraps to
         // a nonsense size in release — for any shift a malformed file cares
@@ -151,6 +156,7 @@ impl CfbHeader {
         Ok(Self {
             major_version,
             minor_version,
+            byte_order,
             sector_size,
             mini_sector_size,
             fat_sector_count,
@@ -241,11 +247,46 @@ mod tests {
         assert!(CfbHeader::parse(&buf).is_err());
     }
 
+    /// [MS-CFB] §2.2 says the byte-order field MUST be 0xFFFE and that it marks
+    /// every integer field as little-endian; it gives a reader no rule for any
+    /// other value. A header whose other fields validate is read as
+    /// little-endian, and the field's value is kept so the reader can say so.
     #[test]
-    fn test_bad_byte_order_rejected() {
+    fn test_a_wrong_byte_order_is_accepted_when_the_rest_of_the_header_validates() {
+        for byte_order in [0xFEFFu16, 0xFF20, 0xFFFF, 0x0000] {
+            let mut buf = build_v3_header();
+            buf[0x1C..0x1E].copy_from_slice(&byte_order.to_le_bytes());
+            let header = CfbHeader::parse(&buf).expect("the other fields are intact");
+            assert_eq!(header.byte_order, byte_order);
+            assert_eq!(header.sector_size, 512);
+        }
+        assert_eq!(CfbHeader::parse(&build_v3_header()).unwrap().byte_order, 0xFFFE);
+    }
+
+    /// A header written big-endian throughout fails on its other fields, so the
+    /// tolerance above does not make such a file readable by accident.
+    #[test]
+    fn test_a_big_endian_header_is_still_refused() {
         let mut buf = build_v3_header();
-        buf[0x1C..0x1E].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        buf[0x1C..0x1E].copy_from_slice(&0xFEFFu16.to_le_bytes());
+        buf[0x1A..0x1C].copy_from_slice(&3u16.to_be_bytes());
+        buf[0x1E..0x20].copy_from_slice(&9u16.to_be_bytes());
+        buf[0x20..0x22].copy_from_slice(&6u16.to_be_bytes());
         assert!(CfbHeader::parse(&buf).is_err());
+    }
+
+    /// The tolerance is for the byte-order field alone: every other check
+    /// still holds with a wrong marker.
+    #[test]
+    fn test_a_wrong_byte_order_does_not_excuse_other_damage() {
+        let mut bad_shift = build_v3_header();
+        bad_shift[0x1C..0x1E].copy_from_slice(&0xFEFFu16.to_le_bytes());
+        bad_shift[0x1E..0x20].copy_from_slice(&13u16.to_le_bytes());
+        assert!(CfbHeader::parse(&bad_shift).is_err());
+        let mut bad_signature = build_v3_header();
+        bad_signature[0x1C..0x1E].copy_from_slice(&0xFEFFu16.to_le_bytes());
+        bad_signature[0] = 0;
+        assert!(CfbHeader::parse(&bad_signature).is_err());
     }
 
     #[test]

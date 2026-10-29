@@ -21,6 +21,58 @@ use std::io::Cursor;
 
 pub mod ppt;
 
+/// Serialises the tests of one binary that change a process-wide limit
+/// (`office_oxide::limits::set_max_*`) against each other and against the
+/// tests that need the defaults, and puts every limit back when the test
+/// ends, however it ends.
+static LIMITS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// A test that sets limits holds one of these: the exclusive lock on the
+/// limits for as long as it lives, and every limit it set restored, last set
+/// first, when it is dropped.
+#[allow(dead_code)]
+#[must_use = "the limits are restored as soon as the scope is dropped; bind it for the length of the test"]
+pub struct LimitScope {
+    restore: Vec<Box<dyn FnOnce()>>,
+    _lock: std::sync::RwLockWriteGuard<'static, ()>,
+}
+
+#[allow(dead_code)]
+impl LimitScope {
+    /// Take the exclusive lock on the limits.
+    pub fn new() -> Self {
+        Self {
+            restore: Vec::new(),
+            // A test that failed while holding the lock poisoned it; its
+            // guard has already restored the limits.
+            _lock: LIMITS.write().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+
+    /// Set a limit for the rest of the scope: `get` and `set` are the
+    /// limit's accessor and setter in `office_oxide::limits`.
+    pub fn set<T: Copy + 'static>(&mut self, get: fn() -> T, set: fn(T), value: T) {
+        let before = get();
+        set(value);
+        self.restore.push(Box::new(move || set(before)));
+    }
+}
+
+impl Drop for LimitScope {
+    fn drop(&mut self) {
+        while let Some(restore) = self.restore.pop() {
+            restore();
+        }
+    }
+}
+
+/// A test that relies on the default limits holds one of these, so a sibling
+/// test that lowers a limit cannot do so while it runs.
+#[allow(dead_code)]
+pub fn default_limits() -> std::sync::RwLockReadGuard<'static, ()> {
+    LIMITS.read().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Sentinel directory id: no sibling / child.
 const NO_ENTRY: u32 = 0xFFFF_FFFF;
 
@@ -213,6 +265,35 @@ pub fn build_doc_streams(
     tweaks: FibTweaks,
 ) -> (Vec<u8>, Vec<u8>) {
     build_streams(paras, subdocs, tweaks, &[], &[])
+}
+
+/// Append a `PlcfandTxt` ([MS-DOC] "PlcfandTxt", the comment-body boundary
+/// CPs `aCP`: `n + 2` entries for `n` comments) and a `PlcfandRef` of `n`
+/// 30-byte `ATRDPre10` entries to a built document's Table stream and point
+/// the FIB's `fcPlcfandRef`/`fcPlcfandTxt` (0x00BA/0x00C2) at them, so the
+/// reader sees `and_txt_cps.len() - 2` comments.
+#[allow(dead_code)]
+pub fn with_comment_plcs(word_doc: &mut [u8], table: &mut Vec<u8>, and_txt_cps: &[u32]) {
+    let n = and_txt_cps.len().saturating_sub(2);
+    let fc_ref = table.len() as u32;
+    for i in 0..=n {
+        table.extend_from_slice(&(i as u32).to_le_bytes());
+    }
+    table.extend(std::iter::repeat_n(0u8, 30 * n));
+    let lcb_ref = table.len() as u32 - fc_ref;
+    let fc_txt = table.len() as u32;
+    for cp in and_txt_cps {
+        table.extend_from_slice(&cp.to_le_bytes());
+    }
+    let lcb_txt = table.len() as u32 - fc_txt;
+    for (off, v) in [
+        (0x00BA, fc_ref),
+        (0x00BE, lcb_ref),
+        (0x00C2, fc_txt),
+        (0x00C6, lcb_txt),
+    ] {
+        word_doc[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
 }
 
 /// Build a synthetic `.doc` whose paragraphs carry the given PAPX `istd` values
@@ -446,6 +527,9 @@ pub struct Style<'a> {
     /// `StdfBase.stk` ([MS-DOC] §2.9.253): 1 paragraph, 2 character, 3 table,
     /// 4 numbering.
     pub kind: u16,
+    /// The `sprmCRgFtc2` operand in the style's own `UpxChpx`: the font-table
+    /// index of the font the style gives characters outside U+0020..U+007F.
+    pub ftc: Option<u16>,
 }
 
 #[allow(dead_code)]
@@ -458,6 +542,7 @@ impl<'a> Style<'a> {
             base: None,
             outline: None,
             kind: 1,
+            ftc: None,
         }
     }
     /// A user-defined style based on `base`.
@@ -468,7 +553,14 @@ impl<'a> Style<'a> {
             base: Some(base),
             outline: None,
             kind: 1,
+            ftc: None,
         }
+    }
+    /// The same style, giving characters outside U+0020..U+007F the font at
+    /// index `ftc` of the font table.
+    pub fn font(mut self, ftc: u16) -> Self {
+        self.ftc = Some(ftc);
+        self
     }
     /// The same style with a different style kind (`stk`).
     pub fn kind(mut self, stk: u16) -> Self {
@@ -493,20 +585,38 @@ fn lpstd(style: &Style) -> Vec<u8> {
     std[0..2].copy_from_slice(&style.sti.to_le_bytes());
     let istd_base = style.base.unwrap_or(0x0FFF);
     std[2..4].copy_from_slice(&(style.kind | (istd_base << 4)).to_le_bytes());
-    std[4..6].copy_from_slice(&u16::from(style.outline.is_some()).to_le_bytes());
+    // A paragraph style holds a `UpxPapx` and then a `UpxChpx`; a character
+    // style holds a `UpxChpx` only. Each is present when it has something to say
+    // (a paragraph style's `UpxPapx` is then empty but for its `istd`).
+    let has_papx = style.kind == 1 && (style.outline.is_some() || style.ftc.is_some());
+    let has_chpx = matches!(style.kind, 1 | 2) && style.ftc.is_some();
+    let cupx = u16::from(has_papx) + u16::from(has_chpx);
+    std[4..6].copy_from_slice(&cupx.to_le_bytes());
     let units: Vec<u16> = style.name.encode_utf16().collect();
     std.extend_from_slice(&(units.len() as u16).to_le_bytes());
     for u in &units {
         std.extend_from_slice(&u.to_le_bytes());
     }
     std.extend_from_slice(&0u16.to_le_bytes());
-    if let Some(operand) = style.outline {
+    if has_papx {
         if std.len() % 2 == 1 {
             std.push(0);
         }
-        std.extend_from_slice(&5u16.to_le_bytes()); // cbUpx: istd(2) + grpprl(3)
+        let grpprl: Vec<u8> = style
+            .outline
+            .map(|operand| vec![0x40, 0x26, operand]) // sprmPOutLvl
+            .unwrap_or_default();
+        std.extend_from_slice(&((2 + grpprl.len()) as u16).to_le_bytes()); // cbUpx
         std.extend_from_slice(&0u16.to_le_bytes()); // UpxPapx.istd
-        std.extend_from_slice(&[0x40, 0x26, operand]); // sprmPOutLvl
+        std.extend_from_slice(&grpprl);
+    }
+    if let (true, Some(ftc)) = (has_chpx, style.ftc) {
+        if std.len() % 2 == 1 {
+            std.push(0);
+        }
+        let ftc = ftc.to_le_bytes();
+        std.extend_from_slice(&4u16.to_le_bytes()); // cbUpx
+        std.extend_from_slice(&[0x51, 0x4A, ftc[0], ftc[1]]); // sprmCRgFtc2
     }
     let mut out = (std.len() as u16).to_le_bytes().to_vec();
     out.extend_from_slice(&std);
@@ -514,6 +624,20 @@ fn lpstd(style: &Style) -> Vec<u8> {
         out.push(0);
     }
     out
+}
+
+/// The `WordDocument` and `1Table` streams of a document of `paras`, paragraph
+/// `i` in the style `istds[i]`, whose Table stream ends with `stsh`; for a test
+/// that adds to the streams before building the file ([`build_doc_with_styles`]
+/// builds it straight away).
+#[allow(dead_code)]
+pub fn build_streams_with_styles(
+    paras: &[Para],
+    istds: &[u16],
+    stsh: &[u8],
+    tweaks: FibTweaks,
+) -> (Vec<u8>, Vec<u8>) {
+    build_streams(paras, &Subdocs::default(), tweaks, istds, stsh)
 }
 
 /// A spec-conformant STSH ([MS-DOC] §2.7.1 / §2.9.274) holding `styles` in
@@ -544,6 +668,7 @@ pub fn heading_style_sheet() -> Vec<u8> {
             base: Some(0),
             outline: None,
             kind: 1,
+            ftc: None,
         });
     }
     let mut d = style_sheet(&styles);
@@ -576,6 +701,13 @@ pub fn build_word6_doc(wident: u16, text: &[u8]) -> Vec<u8> {
 /// pictures.
 #[allow(dead_code)]
 pub fn build_word6_doc_with_tail(wident: u16, text: &[u8], tail: &[u8]) -> Vec<u8> {
+    build_cfb(&word6_stream(wident, text, tail), &[0u8; 512])
+}
+
+/// The `WordDocument` stream of [`build_word6_doc_with_tail`] on its own, for a
+/// test that embeds it in a compound file of its own making.
+#[allow(dead_code)]
+pub fn word6_stream(wident: u16, text: &[u8], tail: &[u8]) -> Vec<u8> {
     let fc_min = 0x300u32;
     let mut wd = vec![0u8; fc_min as usize];
     wd[0..2].copy_from_slice(&wident.to_le_bytes());
@@ -588,7 +720,7 @@ pub fn build_word6_doc_with_tail(wident: u16, text: &[u8], tail: &[u8]) -> Vec<u
     wd.extend_from_slice(tail);
     let pad = (512 - wd.len() % 512) % 512;
     wd.extend(std::iter::repeat_n(0u8, pad));
-    build_cfb(&wd, &[0u8; 512])
+    wd
 }
 
 /// Word 6.0/95 `sprmPFInTable` (sprm 24): the paragraph is in a table.
@@ -997,6 +1129,13 @@ fn build_fkp_page(fc0: u32, fc1: u32, grpprl: &[u8], istd: u16) -> [u8; 512] {
 }
 
 /// Assemble the CFB container around the `WordDocument` and `0Table` streams.
+/// The container of [`build_doc_full`] around `WordDocument` and `0Table`
+/// streams a test has rewritten.
+#[allow(dead_code)]
+pub fn build_doc_from_streams(word_doc: &[u8], table: &[u8]) -> Vec<u8> {
+    build_cfb(word_doc, table)
+}
+
 fn build_cfb(word_doc: &[u8], table: &[u8]) -> Vec<u8> {
     let wd_sectors = word_doc.len() / 512;
     let zero_table_sectors = table.len().div_ceil(512);
@@ -1351,6 +1490,201 @@ pub fn cfb_with_streams(streams: &[(&str, &[u8])]) -> Vec<u8> {
     for (i, v) in fat.iter().enumerate() {
         let off = 512 + dir_sectors * 512 + i * 4;
         file[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    file
+}
+
+/// A BIFF8 `.xls` ([MS-XLS]) of one `NUMBER` cell per `(row, col)` pair in
+/// each sheet, for the paths that pad sparse rows: sheet `i` is named `S{i}`.
+#[allow(dead_code)]
+pub fn sparse_xls(sheets: &[Vec<(u16, u16)>]) -> Vec<u8> {
+    let bof = |dt: u16| {
+        // BOF ([MS-XLS] 2.4.21): vers 0x0600, dt, then build/year/flags.
+        let mut b = 0x0600u16.to_le_bytes().to_vec();
+        b.extend_from_slice(&dt.to_le_bytes());
+        b.extend_from_slice(&[0u8; 12]);
+        biff(0x0809, &b)
+    };
+    let mut s = bof(0x0005);
+    for i in 0..sheets.len() {
+        // BoundSheet8 ([MS-XLS] 2.4.28): lbPlyPos, hsState, dt, name.
+        let name = format!("S{i}");
+        let mut b = 0u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&[0, 0, name.len() as u8, 0]);
+        b.extend_from_slice(name.as_bytes());
+        s.extend(biff(0x0085, &b));
+    }
+    s.extend(biff(0x000A, &[]));
+    for cells in sheets {
+        s.extend(bof(0x0010));
+        for &(row, col) in cells {
+            // Number ([MS-XLS] 2.4.180): rw, col, ixfe, num.
+            let mut d = row.to_le_bytes().to_vec();
+            d.extend_from_slice(&col.to_le_bytes());
+            d.extend_from_slice(&0u16.to_le_bytes());
+            d.extend_from_slice(&1.0f64.to_le_bytes());
+            s.extend(biff(0x0203, &d));
+        }
+        s.extend(biff(0x000A, &[]));
+    }
+    cfb_with_stream("Workbook", &s)
+}
+
+// ── A compound file with nested storages ──
+
+/// One node of a synthetic compound file's directory.
+#[allow(dead_code)]
+pub enum CfbNode {
+    /// A stream and its bytes.
+    Stream(String, Vec<u8>),
+    /// A storage and the nodes directly under it.
+    Storage(String, Vec<CfbNode>),
+}
+
+/// A CFB v3 container with the given nodes under the root storage. Every
+/// stream is stored in regular sectors (the mini-stream cutoff is 1), and the
+/// siblings of a storage are chained through their right links, which is all
+/// the reader's tree walk needs.
+#[allow(dead_code)]
+pub fn cfb_tree(root: Vec<CfbNode>) -> Vec<u8> {
+    struct Flat {
+        name: String,
+        kind: u8,
+        child: u32,
+        right: u32,
+        data: Vec<u8>,
+    }
+    fn add(nodes: Vec<CfbNode>, flat: &mut Vec<Flat>, parent: usize) {
+        let first = flat.len();
+        let mut pending = Vec::new();
+        for node in nodes {
+            let at = flat.len();
+            match node {
+                CfbNode::Stream(name, data) => flat.push(Flat {
+                    name,
+                    kind: 2,
+                    child: NO_ENTRY,
+                    right: NO_ENTRY,
+                    data,
+                }),
+                CfbNode::Storage(name, children) => {
+                    flat.push(Flat {
+                        name,
+                        kind: 1,
+                        child: NO_ENTRY,
+                        right: NO_ENTRY,
+                        data: Vec::new(),
+                    });
+                    pending.push((at, children));
+                },
+            }
+        }
+        let count = flat.len() - first;
+        if count > 0 {
+            flat[parent].child = first as u32;
+            for k in first..first + count - 1 {
+                flat[k].right = (k + 1) as u32;
+            }
+        }
+        for (at, children) in pending {
+            add(children, flat, at);
+        }
+    }
+    let mut flat = vec![Flat {
+        name: "Root Entry".into(),
+        kind: 5,
+        child: NO_ENTRY,
+        right: NO_ENTRY,
+        data: Vec::new(),
+    }];
+    add(root, &mut flat, 0);
+
+    let dir_sectors = flat.len().div_ceil(4);
+    let data_sectors: Vec<usize> = flat
+        .iter()
+        .map(|f| {
+            if f.kind == 2 {
+                f.data.len().div_ceil(512)
+            } else {
+                0
+            }
+        })
+        .collect();
+    let data_total: usize = data_sectors.iter().sum();
+    let mut fat_sectors = 1;
+    while (dir_sectors + fat_sectors + data_total).div_ceil(128) > fat_sectors {
+        fat_sectors += 1;
+    }
+    let total = dir_sectors + fat_sectors + data_total;
+    let mut file = vec![0u8; 512 * (1 + total)];
+
+    file[0..8].copy_from_slice(&CFB_SIGNATURE);
+    file[0x18..0x1A].copy_from_slice(&0x003Eu16.to_le_bytes());
+    file[0x1A..0x1C].copy_from_slice(&3u16.to_le_bytes());
+    file[0x1C..0x1E].copy_from_slice(&0xFFFEu16.to_le_bytes());
+    file[0x1E..0x20].copy_from_slice(&9u16.to_le_bytes());
+    file[0x20..0x22].copy_from_slice(&6u16.to_le_bytes());
+    file[0x2C..0x30].copy_from_slice(&(fat_sectors as u32).to_le_bytes());
+    file[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());
+    file[0x38..0x3C].copy_from_slice(&1u32.to_le_bytes()); // mini-stream cutoff
+    file[0x3C..0x40].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+    file[0x44..0x48].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+    for i in 0..109 {
+        let v = if i < fat_sectors {
+            (dir_sectors + i) as u32
+        } else {
+            FREE_SECT
+        };
+        file[0x4C + i * 4..0x50 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    // FAT: the directory chain, the FAT sectors, each stream's chain.
+    let mut fat = vec![FREE_SECT; fat_sectors * 128];
+    for s in 0..dir_sectors {
+        fat[s] = if s + 1 < dir_sectors {
+            (s + 1) as u32
+        } else {
+            END_OF_CHAIN
+        };
+    }
+    for s in 0..fat_sectors {
+        fat[dir_sectors + s] = FAT_SECT;
+    }
+    let mut next = dir_sectors + fat_sectors;
+    let mut starts = vec![END_OF_CHAIN; flat.len()];
+    for (i, n) in data_sectors.iter().enumerate() {
+        if *n == 0 {
+            continue;
+        }
+        starts[i] = next as u32;
+        for k in 0..*n {
+            fat[next + k] = if k + 1 < *n {
+                (next + k + 1) as u32
+            } else {
+                END_OF_CHAIN
+            };
+            let off = 512 * (1 + next + k);
+            let chunk = &flat[i].data[k * 512..((k + 1) * 512).min(flat[i].data.len())];
+            file[off..off + chunk.len()].copy_from_slice(chunk);
+        }
+        next += n;
+    }
+    for (i, v) in fat.iter().enumerate() {
+        let off = 512 * (1 + dir_sectors) + i * 4;
+        file[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    for (i, f) in flat.iter().enumerate() {
+        let off = 512 + i * 128;
+        write_dir_entry_with_sibling(
+            &mut file[off..off + 128],
+            &f.name,
+            f.kind,
+            f.child,
+            f.right,
+            if f.kind == 5 { END_OF_CHAIN } else { starts[i] },
+            if f.kind == 2 { f.data.len() as u32 } else { 0 },
+        );
     }
     file
 }

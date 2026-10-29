@@ -6,9 +6,10 @@
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// Encode `data` with padding and no line breaks.
-pub(crate) fn encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+/// Encode `data` (whole 3-byte groups, then the tail) into `out`, which holds
+/// `data.len().div_ceil(3) * 4` bytes; returns the number written.
+fn encode_chunk(data: &[u8], out: &mut [u8]) -> usize {
+    let mut at = 0;
     for chunk in data.chunks(3) {
         let b = [
             chunk[0],
@@ -16,20 +17,46 @@ pub(crate) fn encode(data: &[u8]) -> String {
             *chunk.get(2).unwrap_or(&0),
         ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6) as usize & 63] as char
+        out[at] = ALPHABET[(n >> 18) as usize & 63];
+        out[at + 1] = ALPHABET[(n >> 12) as usize & 63];
+        out[at + 2] = if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63]
         } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[n as usize & 63] as char
+            b'='
+        };
+        out[at + 3] = if chunk.len() > 2 {
+            ALPHABET[n as usize & 63]
         } else {
-            '='
-        });
+            b'='
+        };
+        at += 4;
     }
-    out
+    at
+}
+
+/// Encode `data` with padding and no line breaks (tests; the renderers write
+/// through [`Display`]).
+#[cfg(test)]
+pub(crate) fn encode(data: &[u8]) -> String {
+    format!("{}", Display(data))
+}
+
+/// `data` as base64 text, produced as it is written: formatting it into a
+/// string, a file or a JSON serializer needs no intermediate copy of the
+/// whole encoding (for a 30 MiB picture, 40 MiB).
+pub(crate) struct Display<'a>(pub &'a [u8]);
+
+impl std::fmt::Display for Display<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 768 input bytes make 1,024 output bytes and end on a group boundary.
+        let mut buf = [0u8; 1024];
+        for part in self.0.chunks(768) {
+            let n = encode_chunk(part, &mut buf);
+            // The alphabet and `=` are ASCII.
+            f.write_str(std::str::from_utf8(&buf[..n]).map_err(|_| std::fmt::Error)?)?;
+        }
+        Ok(())
+    }
 }
 
 /// Decode standard base64. Padding is optional, ASCII whitespace is
@@ -81,6 +108,29 @@ pub(crate) fn decode(text: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The streaming encoder agrees with the reference vectors of RFC 4648 §10
+    /// for every length around a group and across the 768-byte chunk edge.
+    #[test]
+    fn test_display_matches_rfc_vectors_and_the_chunk_edges() {
+        for (plain, coded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(encode(plain.as_bytes()), coded);
+        }
+        for len in [766usize, 767, 768, 769, 770, 1535, 1536, 1537, 5000] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+            let text = encode(&data);
+            assert_eq!(text.len(), len.div_ceil(3) * 4, "length {len}");
+            assert_eq!(decode(&text).unwrap(), data, "length {len}");
+        }
+    }
 
     #[test]
     fn test_round_trips_every_padding_length() {

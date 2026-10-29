@@ -201,7 +201,7 @@ mod block_default {
                 // image's position in the flow.
                 if super::MARKDOWN_OPTIONS.with(|o| o.get().image_embed) == ImageEmbed::Base64 {
                     if let Some(ref data) = img.data {
-                        return format!("[image-base64:{}]", crate::core::base64::encode(data));
+                        return format!("[image-base64:{}]", crate::core::base64::Display(data));
                     }
                 }
                 // A linked image has a real, addressable source.
@@ -256,7 +256,7 @@ mod block_default {
                         let _ = write!(
                             out,
                             "<img src=\"data:{mime};base64,{}\" alt=\"{}\" />",
-                            crate::core::base64::encode(data),
+                            crate::core::base64::Display(data),
                             super::escape_html(alt)
                         );
                         return out;
@@ -323,15 +323,7 @@ impl DocumentIR {
     /// self-contained preview — the mirror of `to_markdown_with`'s existing
     /// image-embedding option.
     pub fn to_html_with(&self, options: HtmlOptions) -> String {
-        HTML_OPTIONS.with(|o| o.set(options));
-        let section_texts: Vec<String> = self
-            .sections
-            .iter()
-            .map(render_section_html)
-            .filter(|s| !s.is_empty())
-            .collect();
-        HTML_OPTIONS.with(|o| o.set(HtmlOptions::default()));
-        section_texts.join("\n<hr />\n")
+        html_from_sections(&self.sections, options)
     }
 
     /// Render the IR as markdown.
@@ -341,16 +333,106 @@ impl DocumentIR {
 
     /// Render the IR as markdown with explicit options.
     pub fn to_markdown_with(&self, options: MarkdownOptions) -> String {
-        MARKDOWN_OPTIONS.with(|o| o.set(options));
-        let section_texts: Vec<String> = self
-            .sections
-            .iter()
-            .map(render_section_markdown)
-            .filter(|s| !s.is_empty())
-            .collect();
-        MARKDOWN_OPTIONS.with(|o| o.set(MarkdownOptions::default()));
-        section_texts.join("\n\n---\n\n")
+        markdown_from_sections(&self.sections, options)
     }
+}
+
+/// Separates the HTML of two sections.
+const HTML_SECTION_SEPARATOR: &str = "\n<hr />\n";
+
+/// Separates the Markdown of two sections.
+const MARKDOWN_SECTION_SEPARATOR: &str = "\n\n---\n\n";
+
+/// Puts the thread's HTML options back to their defaults when dropped.
+struct HtmlOptionsReset;
+
+impl Drop for HtmlOptionsReset {
+    fn drop(&mut self) {
+        HTML_OPTIONS.with(|o| o.set(HtmlOptions::default()));
+    }
+}
+
+/// Puts the thread's Markdown options back to their defaults when dropped.
+struct MarkdownOptionsReset;
+
+impl Drop for MarkdownOptionsReset {
+    fn drop(&mut self) {
+        MARKDOWN_OPTIONS.with(|o| o.set(MarkdownOptions::default()));
+    }
+}
+
+/// Write sections as an HTML fragment, each as soon as it is handed over and
+/// dropped once written: the output of `DocumentIR::to_html_with`, without
+/// the sections having to exist together or the result in memory.
+pub(crate) fn write_html_sections<S: std::borrow::Borrow<Section>, W: std::fmt::Write + ?Sized>(
+    sections: impl IntoIterator<Item = S>,
+    options: HtmlOptions,
+    out: &mut W,
+) -> std::fmt::Result {
+    let _reset = HtmlOptionsReset;
+    HTML_OPTIONS.with(|o| o.set(options));
+    let mut first = true;
+    for section in sections {
+        let html = render_section_html(section.borrow());
+        drop(section);
+        if html.is_empty() {
+            continue;
+        }
+        if !std::mem::take(&mut first) {
+            out.write_str(HTML_SECTION_SEPARATOR)?;
+        }
+        out.write_str(&html)?;
+    }
+    Ok(())
+}
+
+/// Write sections as Markdown, each as soon as it is handed over and dropped
+/// once written; see [`write_html_sections`].
+pub(crate) fn write_markdown_sections<
+    S: std::borrow::Borrow<Section>,
+    W: std::fmt::Write + ?Sized,
+>(
+    sections: impl IntoIterator<Item = S>,
+    options: MarkdownOptions,
+    out: &mut W,
+) -> std::fmt::Result {
+    let _reset = MarkdownOptionsReset;
+    MARKDOWN_OPTIONS.with(|o| o.set(options));
+    let mut first = true;
+    for section in sections {
+        let md = render_section_markdown(section.borrow());
+        drop(section);
+        if md.is_empty() {
+            continue;
+        }
+        if !std::mem::take(&mut first) {
+            out.write_str(MARKDOWN_SECTION_SEPARATOR)?;
+        }
+        out.write_str(&md)?;
+    }
+    Ok(())
+}
+
+/// [`write_html_sections`] into a `String`.
+pub(crate) fn html_from_sections<S: std::borrow::Borrow<Section>>(
+    sections: impl IntoIterator<Item = S>,
+    options: HtmlOptions,
+) -> String {
+    let mut out = String::new();
+    // Writing to a `String` cannot fail.
+    let _ = write_html_sections(sections, options, &mut out);
+    out
+}
+
+/// [`write_markdown_sections`] into a `String`.
+pub(crate) fn markdown_from_sections<S: std::borrow::Borrow<Section>>(
+    sections: impl IntoIterator<Item = S>,
+    options: MarkdownOptions,
+) -> String {
+    let mut out = String::new();
+    // Writing to a `String` cannot fail.
+    let _ = write_markdown_sections(sections, options, &mut out);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -884,11 +966,41 @@ fn render_table_markdown(table: &Table) -> String {
         return String::new();
     }
 
+    // A GFM table cannot span columns, so a cell that covers several grid
+    // columns is followed by empty ones. A grid column in which no row starts
+    // a cell only continues spans: it holds no text and no cell's own
+    // position, and writing it just widens the table (a Word 6/95 table whose
+    // rows each have their own boundaries came out 28 columns wide for 14
+    // cells). Only those columns are left out. A table past the layout bound
+    // comes back ragged, with each row holding only its own cells; it is
+    // written as before, so the work stays linear in the cells it holds.
+    let laid_out = grid.iter().all(|row| row.len() == col_count);
+    let keep: Vec<usize> = if laid_out {
+        let mut starts = vec![false; col_count];
+        for row in &grid {
+            for (c, slot) in row.iter().enumerate() {
+                starts[c] |= slot.is_some();
+            }
+        }
+        (0..col_count).filter(|&c| starts[c]).collect()
+    } else {
+        Vec::new()
+    };
+    let col_count = if laid_out { keep.len() } else { col_count };
+    if col_count == 0 {
+        return String::new();
+    }
+
     let mut result = String::new();
 
     let write_row = |cells: &[Option<&TableCell>], out: &mut String| {
         out.push('|');
-        for slot in cells.iter().take(col_count) {
+        let slots: Box<dyn Iterator<Item = Option<&TableCell>>> = if laid_out {
+            Box::new(keep.iter().map(|&c| cells[c]))
+        } else {
+            Box::new(cells.iter().take(col_count).copied())
+        };
+        for slot in slots {
             out.push(' ');
             out.push_str(&slot.map(render_cell_markdown).unwrap_or_default());
             out.push_str(" |");
@@ -1629,6 +1741,76 @@ mod tests {
         assert!(md.contains("| H1 | H2 |"));
         assert!(md.contains("| --- | --- |"));
         assert!(md.contains("| A | B |"));
+    }
+
+    fn spanning(text: &str, col_span: u32) -> TableCell {
+        TableCell {
+            col_span,
+            ..cell(text)
+        }
+    }
+
+    fn table_of(rows: Vec<Vec<TableCell>>) -> DocumentIR {
+        simple_ir(vec![Element::Table(Table {
+            rows: rows
+                .into_iter()
+                .map(|cells| TableRow {
+                    cells,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })])
+    }
+
+    /// A grid column that no cell starts in, in any row, only continues
+    /// spans: writing it adds empty columns and no text.
+    #[test]
+    fn test_markdown_table_drops_grid_columns_that_only_continue_spans() {
+        let md = table_of(vec![
+            vec![spanning("X", 2), spanning("Y", 2)],
+            vec![spanning("P", 2), spanning("Q", 2)],
+        ])
+        .to_markdown();
+        assert_eq!(md, "| X | Y |\n| --- | --- |\n| P | Q |");
+    }
+
+    #[test]
+    fn test_markdown_table_keeps_a_column_some_row_starts_a_cell_in() {
+        let md = table_of(vec![
+            vec![spanning("X", 2), cell("Y")],
+            vec![cell("P"), cell("Q"), cell("R")],
+        ])
+        .to_markdown();
+        assert_eq!(md, "| X |  | Y |\n| --- | --- | --- |\n| P | Q | R |");
+    }
+
+    #[test]
+    fn test_markdown_table_with_misaligned_rows_loses_no_cell() {
+        // Word 6/95 style: every row has its own boundaries.
+        let md = table_of(vec![
+            vec![spanning("a", 2), spanning("b", 2), cell("c")],
+            vec![cell("d"), spanning("e", 3), cell("f")],
+        ])
+        .to_markdown();
+        for t in ["a", "b", "c", "d", "e", "f"] {
+            assert!(md.contains(&format!("| {t} ")), "{t} missing from {md}");
+        }
+        let widths: Vec<_> = md.lines().map(|l| l.matches('|').count()).collect();
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "ragged: {md}");
+    }
+
+    /// A table past the layout bound is written row by row from its own
+    /// cells: the work and the output stay linear in the cells it holds, not
+    /// rows times the widest row.
+    #[test]
+    fn test_markdown_table_past_the_layout_bound_is_not_padded_per_row() {
+        let wide: Vec<TableCell> = (0..60_000).map(|_| cell("w")).collect();
+        let mut rows = vec![wide];
+        rows.extend((0..3_000).map(|_| vec![cell("n")]));
+        let md = table_of(rows).to_markdown();
+        assert!(md.len() < 2_000_000, "{} bytes", md.len());
+        assert_eq!(md.lines().filter(|l| *l == "| n |").count(), 3_000);
     }
 
     #[test]

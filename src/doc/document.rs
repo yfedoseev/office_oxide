@@ -1,21 +1,28 @@
 //! High-level DOC document API.
 
 use std::io::{Read, Seek};
+use std::sync::Arc;
 
 use crate::cfb::{CfbReader, SummaryProperties};
 
-use super::chpx::{parse_chpx_runs, resolve_excluded_cp_ranges_from_runs};
+use super::chpx::{
+    FkpRun, parse_chpx_runs, resolve_chp_cp_runs, resolve_excluded_cp_ranges_from_runs,
+};
 use super::error::{DocError, Result};
 use super::fib::Fib;
-use super::images::{DocImage, extract_images};
+use super::fonts::{SymbolRuns, parse_symbol_fonts};
+use super::images::{DocImage, extract_images_diagnosed};
 use super::list_format::ListFormatting;
 use super::papx::{
-    DocParagraph, build_paragraphs, parse_papx_paragraphs, resolve_huge_papx, runs_work_too_large,
+    DocParagraph, build_paragraphs_symbols, paragraph_style_ranges, parse_papx_paragraphs,
+    resolve_huge_papx, runs_work_too_large,
 };
 use super::piece_table::{
-    covers_declared_length, extract_text_range_excluding, parse_clx, sanitize_text,
+    ParsedPieces, Piece, covers_declared_length, extract_text_range_excluding_symbols,
+    extract_text_range_symbols, parse_clx_diagnosed, sanitize_text,
 };
 use super::styles::parse_style_sheet;
+use crate::cfb::blip::BlipDiagnostics;
 
 /// A parsed legacy Word document.
 #[derive(Debug)]
@@ -27,7 +34,7 @@ pub struct DocDocument {
     /// image payload; decoding it eagerly made `plain_text()` on a
     /// picture-heavy file pay for pictures it never emits.
     data_stream: Vec<u8>,
-    images: std::sync::OnceLock<Vec<DocImage>>,
+    images: std::sync::OnceLock<(Vec<DocImage>, BlipDiagnostics)>,
     /// Structured main-text paragraphs with PAP (paragraph property) flags.
     /// Populated only when the FIB advertises a PlcfBtePapx (PAPX FKP index);
     /// empty for very old or minimal files, in which case `doc_to_ir` falls
@@ -67,6 +74,12 @@ pub struct DocDocument {
     /// entry per section (`PlcfSed`), with an empty story inheriting the
     /// previous section's. Empty when the document has no `PlcfHdd`.
     header_footers: Vec<HeaderFooterStories>,
+    /// What is left of the document's text budget after the piece table and
+    /// the header/footer stories were read; the IR conversion spends the
+    /// same budget on the repeated per-section copies it makes of those
+    /// stories (the first copy of each is covered by the piece table's
+    /// charge).
+    text_budget: crate::limits::TextBudget,
     /// Individual comments, split from the merged Comments substory using
     /// `PlcfandTxt`'s CP boundaries and attributed via `PlcfandRef`'s
     /// `ATRDPre10.ibst` index into `comment_authors`. Empty when either
@@ -182,23 +195,24 @@ pub struct ParsedComment {
 }
 
 /// One document section's header/footer content, split out of the
-/// merged header-document blob using `PlcfHdd`'s story boundaries.
+/// merged header-document blob using `PlcfHdd`'s story boundaries. A story a
+/// section inherits is shared with the section it comes from, not copied.
 #[derive(Debug, Clone, Default)]
 pub struct HeaderFooterStories {
     /// Even-page header (story 0 of a section's group).
-    pub even_header: Option<String>,
+    pub even_header: Option<Arc<str>>,
     /// Odd-page header — used on every page when even/odd headers
     /// aren't separately enabled (story 1).
-    pub odd_header: Option<String>,
+    pub odd_header: Option<Arc<str>>,
     /// Even-page footer (story 2).
-    pub even_footer: Option<String>,
+    pub even_footer: Option<Arc<str>>,
     /// Odd-page footer — used on every page when even/odd footers
     /// aren't separately enabled (story 3).
-    pub odd_footer: Option<String>,
+    pub odd_footer: Option<Arc<str>>,
     /// First-page header (story 4).
-    pub first_header: Option<String>,
+    pub first_header: Option<Arc<str>>,
     /// First-page footer (story 5).
-    pub first_footer: Option<String>,
+    pub first_footer: Option<Arc<str>>,
 }
 
 impl HeaderFooterStories {
@@ -233,6 +247,7 @@ pub enum SubDocumentKind {
 impl DocDocument {
     /// Open a DOC file from a reader.
     pub fn from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
+        let _scale = crate::limits::InputSizeScope::new(crate::limits::stream_len(&mut reader));
         // Word for Windows 1.x/2.0 wrote flat files, the FIB first; they
         // have no compound container to open.
         let mut magic = [0u8; 2];
@@ -261,7 +276,7 @@ impl DocDocument {
         // Propagate FIB errors. Swallowing them into an empty document with
         // `Ok` is what made an encrypted file look like a document that
         // simply had no text.
-        let fib = Fib::parse(&word_doc)?;
+        let mut fib = Fib::parse(&word_doc)?;
 
         // Open the appropriate table stream; try preferred first, then fallback.
         let table_stream = if fib.use_table1 {
@@ -277,6 +292,10 @@ impl DocDocument {
         let table_stream = table_stream.map_err(|_| {
             DocError::MissingStream("neither 0Table nor 1Table stream is present".into())
         })?;
+
+        // A header with a destroyed version has lost its language; the font
+        // table still declares the character sets of the fonts used.
+        let language_from_fonts = take_language_from_fonts(&mut fib, &table_stream);
 
         // Extract CLX from the table stream.
         let clx_start = fib.clx_offset as usize;
@@ -294,7 +313,23 @@ impl DocDocument {
 
         let clx_end = clx_end.min(table_stream.len());
         let clx_data = &table_stream[clx_start..clx_end];
-        let pieces = parse_clx(clx_data)?;
+        let ParsedPieces {
+            mut pieces,
+            irregular: cps_out_of_order,
+        } = parse_clx_diagnosed(clx_data)?;
+        // Refuse pieces that read far more than the stream holds, and cut the
+        // table where the text budget runs out, before any text is decoded.
+        let mut text_budget = crate::limits::TextBudget::new();
+        let mut work_warnings: Vec<String> = Vec::new();
+        if cps_out_of_order {
+            work_warnings.push(PIECE_TABLE_OUT_OF_ORDER.into());
+        }
+        if !super::fib::is_word_version(fib.n_fib) {
+            work_warnings.push(super::fib::damaged_version_warning(fib.n_fib, language_from_fonts));
+        }
+        if super::piece_table::bound_piece_reads(&mut pieces, word_doc.len(), &mut text_budget)? {
+            work_warnings.push(text_budget.notice());
+        }
         let text_complete = covers_declared_length(&pieces, fib.text_len);
 
         // The CHPX FKP is parsed once here (rather than separately by each
@@ -310,7 +345,6 @@ impl DocDocument {
         // file whose pieces are piled on the same bytes. Such a file keeps its
         // text, without character formatting or the deleted/hidden-text
         // exclusion, and says so.
-        let mut work_warnings: Vec<String> = Vec::new();
         if runs_work_too_large(&pieces, chpx_runs.iter().map(|r| (r.fc_start, r.fc_end))) {
             chpx_runs.clear();
             work_warnings.push(
@@ -328,13 +362,15 @@ impl DocDocument {
         // applies the same exclusion to the structured paragraphs.
         let deleted_ranges =
             resolve_excluded_cp_ranges_from_runs(&chpx_runs, &pieces, fib.text_len);
-        let raw_text = extract_text_range_excluding(
+        let symbols = symbol_runs(&word_doc, &table_stream, &fib, &chpx_runs, &pieces);
+        let raw_text = extract_text_range_excluding_symbols(
             &word_doc,
             &pieces,
             0,
             fib.text_len,
             fib.lid,
             &deleted_ranges,
+            &symbols,
         );
         let text = sanitize_text(&raw_text);
 
@@ -351,6 +387,8 @@ impl DocDocument {
         // table's character space, each delimited by its own `ccp*` length.
         let mut subdocuments = Vec::new();
         let mut header_footers = Vec::new();
+        // Set when the text budget ran out while header/footer stories were read.
+        let mut hdd_cut = false;
         let section_ends = parse_plcf_sed_ends(&table_stream, fib.fc_plcf_sed, fib.lcb_plcf_sed);
         let mut comments = Vec::new();
         let mut cp = fib.text_len;
@@ -366,7 +404,7 @@ impl DocDocument {
                 continue;
             }
             let end = cp.saturating_add(len);
-            let raw = super::piece_table::extract_text_range(&word_doc, &pieces, cp, end, fib.lid);
+            let raw = extract_text_range_symbols(&word_doc, &pieces, cp, end, fib.lid, &symbols);
             // The header document opens with six fixed stories — the
             // footnote/endnote separators and "continued" notices Word
             // shows only when a note spans pages ([MS-DOC] "Headers").
@@ -374,13 +412,19 @@ impl DocDocument {
             // the way the split below already keeps them out of the IR.
             let mut text_start = 0;
             if kind == SubDocumentKind::HeadersFooters {
-                header_footers = parse_plcf_hdd_stories(
+                let (stories, cut) = parse_plcf_hdd_stories(
                     &table_stream,
                     &raw,
                     fib.fc_plcf_hdd,
                     fib.lcb_plcf_hdd,
                     section_ends.len().max(1),
+                    &mut text_budget,
                 );
+                header_footers = stories;
+                if cut {
+                    work_warnings.push(text_budget.notice());
+                    hdd_cut = true;
+                }
                 text_start =
                     plcf_hdd_first_section_cp(&table_stream, fib.fc_plcf_hdd, fib.lcb_plcf_hdd)
                         .unwrap_or(0);
@@ -394,6 +438,7 @@ impl DocDocument {
                     fib.fc_plcf_and_ref,
                     fib.lcb_plcf_and_ref,
                     &comment_authors,
+                    &mut work_warnings,
                 );
             }
             // Text boxes: each box's story is delimited by its PLC.
@@ -482,7 +527,7 @@ impl DocDocument {
                 let sheet = parse_style_sheet(&table_stream, &fib);
                 style_warnings.extend(sheet.warnings);
                 let styles = sheet.styles;
-                build_paragraphs(
+                build_paragraphs_symbols(
                     &word_doc,
                     &pieces,
                     &fkp,
@@ -491,6 +536,7 @@ impl DocDocument {
                     &chpx_runs,
                     &section_ends,
                     &styles,
+                    &symbols,
                 )
             }
         } else {
@@ -510,12 +556,15 @@ impl DocDocument {
         // surface its identity — before this, `ObjectPool` was never
         // traversed at all, so an embedded Excel workbook, Equation
         // Editor object, etc. left no trace anywhere.
-        let ole_objects = super::ole_objects::extract_ole_objects(&cfb);
+        let mut embedded_warnings = Vec::new();
+        let found_objects = super::ole_objects::extract_ole_objects_with_storage(&cfb);
+        let ole_objects = read_embedded_word_texts(&mut cfb, found_objects, &mut embedded_warnings);
         let summary_properties = crate::cfb::read_document_properties(&mut cfb);
         // A container stream that came back shorter than its declared size
         // lost content just as surely as a piece-table gap.
-        let text_complete = text_complete && cfb.truncated_streams().is_empty();
+        let text_complete = text_complete && !hdd_cut && cfb.truncated_streams().is_empty();
         let mut warnings = container_warnings(&cfb);
+        warnings.extend(embedded_warnings);
         warnings.extend(style_warnings);
         warnings.extend(work_warnings);
 
@@ -531,6 +580,7 @@ impl DocDocument {
             list_formatting,
             comment_authors,
             header_footers,
+            text_budget,
             comments,
             ole_objects,
             warnings,
@@ -545,7 +595,10 @@ impl DocDocument {
     /// file without one.
     fn from_word6<R: Read + Seek>(cfb: &mut CfbReader<R>, word_doc: &[u8]) -> Result<Self> {
         let fib = super::word6::parse_fib(word_doc)?;
-        let pieces = super::word6::pieces(word_doc, &fib)?;
+        let mut pieces = super::word6::pieces(word_doc, &fib)?;
+        let mut text_budget = crate::limits::TextBudget::new();
+        let budget_cut =
+            super::piece_table::bound_piece_reads(&mut pieces, word_doc.len(), &mut text_budget)?;
         let text_complete = covers_declared_length(&pieces, fib.ccp[0]);
         let (text, subs) = super::word6::stories(word_doc, &fib, &pieces);
         let subdocuments = subs
@@ -569,7 +622,7 @@ impl DocDocument {
         // sit in the WordDocument stream itself. Scanned now, since the
         // stream is not kept.
         let images = std::sync::OnceLock::new();
-        let _ = images.set(extract_images(word_doc));
+        let _ = images.set(extract_images_diagnosed(word_doc));
         let summary_properties = crate::cfb::read_document_properties(cfb);
         let text_complete = text_complete && cfb.truncated_streams().is_empty();
         // The paragraph properties, for the tables they describe. A file with no
@@ -583,19 +636,26 @@ impl DocDocument {
             Vec::new()
         } else {
             let section_ends = parse_plcf_sed_ends(word_doc, fib.fc_plcf_sed, fib.lcb_plcf_sed);
-            build_paragraphs(
+            build_paragraphs_symbols(
                 word_doc,
                 &pieces,
                 &papx.runs,
                 fib.ccp[0],
-                fib.lid,
+                fib.text_lid(),
                 &[],
                 &section_ends,
                 &[],
+                &SymbolRuns::none(),
             )
         };
         let mut warnings = container_warnings(cfb);
         warnings.extend(papx.warnings);
+        if !super::fib::is_word_version(fib.n_fib) {
+            warnings.push(super::fib::damaged_version_warning(fib.n_fib, None));
+        }
+        if budget_cut {
+            warnings.push(text_budget.notice());
+        }
         if overlapping {
             warnings.push(
                 "the pieces of this Word 6/95 file are laid out so that reading its paragraphs \
@@ -615,6 +675,7 @@ impl DocDocument {
             list_formatting: ListFormatting::default(),
             comment_authors: Vec::new(),
             header_footers: Vec::new(),
+            text_budget,
             comments: Vec::new(),
             ole_objects: super::ole_objects::extract_ole_objects(cfb),
             warnings,
@@ -666,6 +727,7 @@ impl DocDocument {
             list_formatting: ListFormatting::default(),
             comment_authors: Vec::new(),
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
             warnings: Vec::new(),
@@ -686,14 +748,37 @@ impl DocDocument {
 
     /// Get all extracted images.
     pub fn images(&self) -> &[DocImage] {
+        &self.decoded_images().0
+    }
+
+    /// Warnings about pictures left out because of a limit, if any; see
+    /// `Metadata::warnings`. Pictures are decoded on first use, so this
+    /// decodes them if nothing has yet.
+    pub(crate) fn image_warnings(&self) -> Vec<String> {
+        self.decoded_images().1.warnings()
+    }
+
+    /// `true` when a picture was left out because of a limit; see
+    /// `Metadata::text_truncated`.
+    pub(crate) fn images_left_out(&self) -> bool {
+        self.decoded_images().1.limit_hit()
+    }
+
+    fn decoded_images(&self) -> &(Vec<DocImage>, BlipDiagnostics) {
         self.images
-            .get_or_init(|| extract_images(&self.data_stream))
+            .get_or_init(|| extract_images_diagnosed(&self.data_stream))
     }
 
     /// Footnotes, headers, comments, endnotes and text boxes, in the order
     /// the file stores them.
     pub fn subdocuments(&self) -> &[SubDocument] {
         &self.subdocuments
+    }
+
+    /// What is left of the document's text budget once the text is decoded
+    /// (see the field).
+    pub(crate) fn text_budget(&self) -> crate::limits::TextBudget {
+        self.text_budget
     }
 
     /// Comment author names declared by `GrpXstAtnOwners`, in file order.
@@ -784,6 +869,10 @@ impl DocDocument {
             out.push('[');
             out.push_str(&obj.description);
             out.push_str("]\n");
+            if let Some(text) = &obj.text {
+                out.push_str(text);
+                out.push('\n');
+            }
         }
         out
     }
@@ -818,6 +907,316 @@ impl DocDocument {
 /// Whether the file carries a VBA project: Word keeps it in a root
 /// `Macros` storage holding the `VBA` storage ([MS-OVBA] §2.2.1 project
 /// storage; Excel's equivalent root storage is `_VBA_PROJECT_CUR`).
+/// The runs of the document set in a symbol font (see [`super::fonts`]):
+/// nothing is computed for a document whose font table names none.
+fn symbol_runs(
+    word_doc: &[u8],
+    table: &[u8],
+    fib: &Fib,
+    chpx_runs: &[FkpRun],
+    pieces: &[Piece],
+) -> SymbolRuns {
+    let fonts = parse_symbol_fonts(table, fib.fc_sttbf_ffn, fib.lcb_sttbf_ffn);
+    if fonts.iter().all(Option::is_none) {
+        return SymbolRuns::none();
+    }
+    let styles = parse_style_sheet(table, fib).styles;
+    // A paragraph style can put its paragraphs in a symbol font; only then
+    // are the paragraphs' styles needed.
+    let style_names_symbol_font = styles.iter().any(|s| {
+        s.own_ftc_other
+            .is_some_and(|i| fonts.get(usize::from(i)).copied().flatten().is_some())
+    });
+    let paragraphs =
+        if style_names_symbol_font && fib.fc_plcf_bte_papx != 0 && fib.lcb_plcf_bte_papx != 0 {
+            let fkp =
+                parse_papx_paragraphs(word_doc, table, fib.fc_plcf_bte_papx, fib.lcb_plcf_bte_papx);
+            if runs_work_too_large(pieces, fkp.iter().map(|r| (r.fc_start, r.fc_end))) {
+                Vec::new()
+            } else {
+                paragraph_style_ranges(&fkp, pieces)
+            }
+        } else {
+            Vec::new()
+        };
+    SymbolRuns::from_runs(&resolve_chp_cp_runs(chpx_runs, pieces), &fonts, &styles, &paragraphs)
+}
+
+/// When the header's version is not a Word version its language is lost: take
+/// the language of the 8-bit text from the character sets the font table
+/// declares, set it as the document's, and return the character set used.
+fn take_language_from_fonts(fib: &mut Fib, table: &[u8]) -> Option<u8> {
+    if super::fib::is_word_version(fib.n_fib) {
+        return None;
+    }
+    let (chs, lid) =
+        super::fonts::language_from_font_charsets(table, fib.fc_sttbf_ffn, fib.lcb_sttbf_ffn)?;
+    fib.lid = lid;
+    Some(chs)
+}
+
+/// The warning for a piece table whose character positions are not ascending.
+const PIECE_TABLE_OUT_OF_ORDER: &str = "the piece table's character positions are not in ascending \
+     order ([MS-DOC] PlcPcd); its pieces were resolved by the lookup rule of the text retrieval \
+     algorithm (the largest index whose position is not past the character), and some text may be \
+     misplaced";
+
+/// Read the main text of each embedded Word document, within the document's
+/// embedded-package account: the object is admitted by the size of its
+/// streams (a count, a byte allowance, a depth), its text is charged to the
+/// text budget, a document embedded under several names is read from its
+/// content once, and an object that is not read keeps its placeholder and is
+/// reported. The objects inside an embedded document follow it, under the
+/// same account.
+fn read_embedded_word_texts<R: Read + Seek>(
+    cfb: &mut CfbReader<R>,
+    found: Vec<(super::ole_objects::EmbeddedOleObject, usize)>,
+    warnings: &mut Vec<String>,
+) -> Vec<super::ole_objects::EmbeddedOleObject> {
+    use crate::core::embedded;
+    let mut session = embedded::Session::begin();
+    let mut out = Vec::with_capacity(found.len());
+    let mut walk = super::ole_objects::ObjectWalk::new(&found);
+    read_embedded_objects(cfb, found, &session, &mut walk, "ObjectPool/", warnings, &mut out);
+    let refused = std::cell::RefCell::new(Vec::new());
+    session.report(&|name, why| {
+        refused
+            .borrow_mut()
+            .push(format!("embedded object {name} was not read: {why}"));
+    });
+    warnings.extend(refused.into_inner());
+    out
+}
+
+/// One level of [`read_embedded_word_texts`]: the objects `found`, each
+/// followed by the objects inside it. The depth of the account bounds the
+/// recursion.
+fn read_embedded_objects<R: Read + Seek>(
+    cfb: &mut CfbReader<R>,
+    found: Vec<(super::ole_objects::EmbeddedOleObject, usize)>,
+    session: &crate::core::embedded::Session,
+    walk: &mut super::ole_objects::ObjectWalk,
+    prefix: &str,
+    warnings: &mut Vec<String>,
+    out: &mut Vec<super::ole_objects::EmbeddedOleObject>,
+) {
+    for (mut object, storage) in found {
+        if object.description != super::ole_objects::EMBEDDED_WORD {
+            out.push(object);
+            continue;
+        }
+        let name = format!("{prefix}{}", cfb.entries()[storage].name);
+        let (text, admission) = embedded_word_text(cfb, storage, session, &name, warnings);
+        object.text = text;
+        out.push(object);
+        // The level stays open while the objects inside are read.
+        if admission.is_some() {
+            let nested = walk.under(cfb.entries(), storage);
+            if !nested.is_empty() {
+                read_embedded_objects(
+                    cfb,
+                    nested,
+                    session,
+                    walk,
+                    &format!("{name}/"),
+                    warnings,
+                    out,
+                );
+            }
+        }
+    }
+}
+
+/// The main text of the Word document in the object storage `storage`, and the
+/// admission that keeps its level of the account open (`None` when the object
+/// was not admitted). The text is `None` when it is not read, the reason
+/// recorded in `warnings` or the session.
+fn embedded_word_text<R: Read + Seek>(
+    cfb: &mut CfbReader<R>,
+    storage: usize,
+    session: &crate::core::embedded::Session,
+    name: &str,
+    warnings: &mut Vec<String>,
+) -> (Option<String>, Option<crate::core::embedded::Admission>) {
+    use super::ole_objects::find_direct_child;
+    use crate::cfb::EntryType;
+    use crate::core::embedded;
+    let found = {
+        let entries = cfb.entries();
+        entries.get(storage).and_then(|holder| {
+            let child = holder.child;
+            let stream = |n: &str| {
+                find_direct_child(entries, child, n)
+                    .filter(|&i| entries[i].entry_type == EntryType::Stream)
+            };
+            let word_idx = stream("WordDocument")?;
+            let (t0, t1) = (stream("0Table"), stream("1Table"));
+            let size = |i: Option<usize>| i.map_or(0, |i| entries[i].stream_size);
+            let declared = entries[word_idx]
+                .stream_size
+                .saturating_add(size(t0).max(size(t1)));
+            Some((word_idx, (t0, t1), declared))
+        })
+    };
+    let Some((word_idx, table_idxs, declared)) = found else {
+        return (None, None);
+    };
+    let admission = match embedded::admit(session, declared) {
+        Ok(admission) => admission,
+        Err(refusal) => {
+            embedded::refuse(session, name, refusal);
+            return (None, None);
+        },
+    };
+    let read = embedded_word_main_text(cfb, word_idx, table_idxs);
+    let EmbeddedRead { text, notes } = match read {
+        Ok(read) => read,
+        Err(why) => {
+            warnings.push(format!("embedded object {name} was not read: {why}"));
+            return (None, Some(admission));
+        },
+    };
+    for note in notes {
+        warnings.push(format!("embedded object {name}: {note}"));
+    }
+    // Two embedded documents are the same when their text is: the
+    // `WordDocument` stream alone does not say (the piece table, fonts and
+    // formatting live in the table stream), so it cannot decide this.
+    let fingerprint = embedded::Fingerprint::of(text.as_bytes());
+    let text = if let Some(cached) = embedded::cached::<String>(session, fingerprint) {
+        // Found again under another name: its text is where it first appears.
+        // A document with no text has nothing to point to.
+        let repeat = (!cached.is_empty()).then(|| embedded::REPEATED_NOTICE.to_string());
+        repeat.and_then(|notice| charge_embedded_text(session, name, notice))
+    } else {
+        // Remembered only once it has been given: a copy the budget refused is
+        // not "where it first appears".
+        let charged = charge_embedded_text(session, name, text.clone());
+        if charged.is_some() {
+            embedded::remember(session, fingerprint, text);
+        }
+        charged
+    };
+    (text, Some(admission))
+}
+
+/// Charge an embedded document's text to the text budget; the text, or
+/// `None` when the budget is spent or the document has no text.
+fn charge_embedded_text(
+    session: &crate::core::embedded::Session,
+    name: &str,
+    text: String,
+) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    if let Err(refusal) = crate::core::embedded::charge_text(session, text.chars().count()) {
+        crate::core::embedded::refuse(session, name, refusal);
+        return None;
+    }
+    Some(text)
+}
+
+/// The main story of the Word 97+ document whose `WordDocument` and table
+/// streams are the directory entries given, read as the top-level document's
+/// own is (the deleted and hidden text excluded).
+fn embedded_word_main_text<R: Read + Seek>(
+    cfb: &mut CfbReader<R>,
+    word_idx: usize,
+    (t0, t1): (Option<usize>, Option<usize>),
+) -> std::result::Result<EmbeddedRead, String> {
+    let word_doc = cfb
+        .read_stream_by_index(word_idx)
+        .map_err(|e| e.to_string())?;
+    if word_doc.len() >= 2
+        && super::word6::is_word6_magic(u16::from_le_bytes([word_doc[0], word_doc[1]]))
+    {
+        // Word 6.0/95 keeps no table stream: its text and pieces are in the
+        // main stream.
+        let fib = super::word6::parse_fib(&word_doc).map_err(|e| e.to_string())?;
+        let mut pieces = super::word6::pieces(&word_doc, &fib).map_err(|e| e.to_string())?;
+        let mut notes = Vec::new();
+        if !super::fib::is_word_version(fib.n_fib) {
+            notes.push(super::fib::damaged_version_warning(fib.n_fib, None));
+        }
+        let mut budget = crate::limits::TextBudget::new();
+        if super::piece_table::bound_piece_reads(&mut pieces, word_doc.len(), &mut budget)
+            .map_err(|e| e.to_string())?
+        {
+            notes.push(budget.notice());
+        }
+        let (main, _) = super::word6::stories(&word_doc, &fib, &pieces);
+        return Ok(EmbeddedRead {
+            text: main.trim().to_string(),
+            notes,
+        });
+    }
+    let mut fib = Fib::parse(&word_doc).map_err(|e| e.to_string())?;
+    let table_idx = if fib.use_table1 { t1.or(t0) } else { t0.or(t1) }
+        .ok_or_else(|| "neither 0Table nor 1Table stream is present".to_string())?;
+    let table_stream = cfb
+        .read_stream_by_index(table_idx)
+        .map_err(|e| e.to_string())?;
+    let language_from_fonts = take_language_from_fonts(&mut fib, &table_stream);
+    let clx_start = fib.clx_offset as usize;
+    if clx_start >= table_stream.len()
+        || clx_size_zero_or_oob(fib.clx_size, clx_start, table_stream.len())
+    {
+        return Err("the piece table lies outside the table stream".into());
+    }
+    let clx_end = (clx_start + fib.clx_size as usize).min(table_stream.len());
+    let ParsedPieces {
+        mut pieces,
+        irregular,
+    } = parse_clx_diagnosed(&table_stream[clx_start..clx_end]).map_err(|e| e.to_string())?;
+    let mut budget = crate::limits::TextBudget::new();
+    let mut notes = Vec::new();
+    if !super::fib::is_word_version(fib.n_fib) {
+        notes.push(super::fib::damaged_version_warning(fib.n_fib, language_from_fonts));
+    }
+    if irregular {
+        notes.push(PIECE_TABLE_OUT_OF_ORDER.to_string());
+    }
+    if super::piece_table::bound_piece_reads(&mut pieces, word_doc.len(), &mut budget)
+        .map_err(|e| e.to_string())?
+    {
+        notes.push(budget.notice());
+    }
+    let mut chpx_runs = if fib.fc_plcf_bte_chpx != 0 && fib.lcb_plcf_bte_chpx != 0 {
+        parse_chpx_runs(&word_doc, &table_stream, fib.fc_plcf_bte_chpx, fib.lcb_plcf_bte_chpx)
+    } else {
+        Vec::new()
+    };
+    if runs_work_too_large(&pieces, chpx_runs.iter().map(|r| (r.fc_start, r.fc_end))) {
+        chpx_runs.clear();
+    }
+    let excluded = resolve_excluded_cp_ranges_from_runs(&chpx_runs, &pieces, fib.text_len);
+    let symbols = symbol_runs(&word_doc, &table_stream, &fib, &chpx_runs, &pieces);
+    let raw = extract_text_range_excluding_symbols(
+        &word_doc,
+        &pieces,
+        0,
+        fib.text_len,
+        fib.lid,
+        &excluded,
+        &symbols,
+    );
+    Ok(EmbeddedRead {
+        text: sanitize_text(&raw).trim().to_string(),
+        notes,
+    })
+}
+
+/// What reading an embedded Word document's main story yielded.
+struct EmbeddedRead {
+    text: String,
+    /// Fingerprint of its `WordDocument` stream.
+    /// What to tell the reader about this document's text: the text-budget
+    /// notice when the budget cut the story short, and the piece-table notice
+    /// when its positions were out of order.
+    notes: Vec<String>,
+}
+
 fn has_vba_project<R: Read + Seek>(cfb: &CfbReader<R>) -> bool {
     cfb.find_entry_by_path("Macros/VBA").is_some()
 }
@@ -900,22 +1299,44 @@ fn parse_plcf_hdd_stories(
     fc: u32,
     lcb: u32,
     sections: usize,
-) -> Vec<HeaderFooterStories> {
+    budget: &mut crate::limits::TextBudget,
+) -> (Vec<HeaderFooterStories>, bool) {
     let Some(cps) = plcf_hdd_cps(table_stream, fc, lcb) else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
 
-    let char_range = |lo: usize, hi: usize| -> Option<String> {
-        if hi <= lo {
+    // Byte offset of every character, built once: slicing a story out by
+    // skipping characters from the start made each of the six stories of
+    // every section a scan of the whole header document.
+    let mut starts: Vec<usize> = raw_header_text.char_indices().map(|(i, _)| i).collect();
+    starts.push(raw_header_text.len());
+    let chars = starts.len() - 1;
+
+    // The header document's own text was charged to the budget when the
+    // piece table was read, so the first `chars` characters copied out of it
+    // are already paid for; only what the stories copy beyond that (ranges
+    // that overlap, in a PLC whose CPs run backwards) is charged here, before
+    // it is copied.
+    let cut = std::cell::Cell::new(false);
+    let mut copied = 0usize;
+    let mut char_range = |lo: usize, hi: usize| -> Option<Arc<str>> {
+        if hi <= lo || lo >= chars || cut.get() {
             return None;
         }
-        let text: String = raw_header_text.chars().skip(lo).take(hi - lo).collect();
-        let sanitized = sanitize_text(&text);
+        let hi = hi.min(chars);
+        let before = copied;
+        copied = copied.saturating_add(hi - lo);
+        let extra = copied.saturating_sub(chars) - before.saturating_sub(chars);
+        if !budget.charge(extra) {
+            cut.set(true);
+            return None;
+        }
+        let sanitized = sanitize_text(&raw_header_text[starts[lo]..starts[hi]]);
         let trimmed = sanitized.trim();
         if trimmed.is_empty() {
             None
         } else {
-            Some(trimmed.to_string())
+            Some(Arc::from(trimmed))
         }
     };
 
@@ -942,6 +1363,10 @@ fn parse_plcf_hdd_stories(
             first_header: char_range(cps[base + 4], cps[base + 5]),
             first_footer: char_range(cps[base + 5], cps[base + 6]),
         };
+        if cut.get() {
+            // The stories after the one that did not fit are left out.
+            break;
+        }
         let merged = HeaderFooterStories {
             even_header: own.even_header.or_else(|| prev.even_header.clone()),
             odd_header: own.odd_header.or_else(|| prev.odd_header.clone()),
@@ -953,7 +1378,7 @@ fn parse_plcf_hdd_stories(
         out.push(merged.clone());
         prev = merged;
     }
-    out
+    (out, cut.get())
 }
 
 /// The story boundary CPs (`aCP`) of `PlcftxbxTxt`/`PlcfHdrtxbxTxt`
@@ -1149,7 +1574,11 @@ fn plcf_hdd_first_section_cp(table_stream: &[u8], fc: u32, lcb: u32) -> Option<u
 /// `Vec` (meaning "fall back to the merged substory") whenever either
 /// PLC is absent/malformed, or the two disagree on comment count — that
 /// mismatch means the file doesn't match the fixed-size assumptions
-/// here closely enough to trust a per-comment split.
+/// here closely enough to trust a per-comment split. A `PlcfandTxt` whose
+/// boundaries run backwards is refused the same way, and reported in
+/// `warnings`: its ranges would overlap, and copying each one would copy the
+/// story again and again.
+#[allow(clippy::too_many_arguments)]
 fn parse_comments(
     table_stream: &[u8],
     raw_comment_text: &str,
@@ -1158,10 +1587,18 @@ fn parse_comments(
     fc_ref: u32,
     lcb_ref: u32,
     authors: &[String],
+    warnings: &mut Vec<String>,
 ) -> Vec<ParsedComment> {
-    let Some(bodies) = parse_plcf_and_txt_ranges(table_stream, raw_comment_text, fc_txt, lcb_txt)
-    else {
-        return Vec::new();
+    let bodies = match parse_plcf_and_txt_ranges(table_stream, raw_comment_text, fc_txt, lcb_txt) {
+        Ok(Some(bodies)) => bodies,
+        Ok(None) => return Vec::new(),
+        Err(()) => {
+            warnings.push(
+                "comments are not split: the comment text boundaries (PlcfandTxt) run backwards,                  so the comments are shown as one block"
+                    .to_string(),
+            );
+            return Vec::new();
+        },
     };
     let ibsts = parse_plcf_and_ref_ibsts(table_stream, fc_ref, lcb_ref);
     if bodies.len() != ibsts.len() {
@@ -1188,27 +1625,34 @@ fn parse_comments(
 /// usual PLC boundary CPs, and the final entry is undefined/ignored, per
 /// [MS-DOC] "PlcfandTxt". Each range's leading `0x0005` reference-mark
 /// character is stripped before returning.
+///
+/// `Ok(None)` when the PLC is absent or malformed; `Err(())` when its CPs
+/// decrease (a PLC's CPs are non-decreasing, [MS-DOC] "PLC"). With
+/// non-decreasing CPs the ranges are disjoint and in order, so one forward
+/// pass over the text cuts them all: nothing is copied twice, and the copies
+/// total at most the story, which the text budget was charged when the piece
+/// table was read.
 fn parse_plcf_and_txt_ranges(
     table_stream: &[u8],
     raw_comment_text: &str,
     fc: u32,
     lcb: u32,
-) -> Option<Vec<String>> {
+) -> std::result::Result<Option<Vec<String>>, ()> {
     if lcb == 0 {
-        return None;
+        return Ok(None);
     }
     let start = fc as usize;
     let end = start.saturating_add(lcb as usize).min(table_stream.len());
     if start >= end || !(end - start).is_multiple_of(4) {
-        return None;
+        return Ok(None);
     }
     let total_cps = (end - start) / 4;
     if total_cps < 2 {
-        return None;
+        return Ok(None);
     }
     let n = total_cps - 2;
     if n == 0 {
-        return None;
+        return Ok(None);
     }
 
     let cps: Vec<usize> = (0..=n)
@@ -1221,20 +1665,38 @@ fn parse_plcf_and_txt_ranges(
             ]) as usize
         })
         .collect();
+    if cps.windows(2).any(|w| w[1] < w[0]) {
+        return Err(());
+    }
 
-    Some(
+    // The byte offset of the character at each CP, found by advancing one
+    // cursor through the text; CPs past the end of the text are its end.
+    let mut at_char = 0usize;
+    let mut at_byte = 0usize;
+    let mut byte_of = |cp: usize| -> usize {
+        for c in raw_comment_text[at_byte..].chars() {
+            if at_char >= cp {
+                break;
+            }
+            at_char += 1;
+            at_byte += c.len_utf8();
+        }
+        at_byte
+    };
+    let bounds: Vec<usize> = cps.iter().map(|&cp| byte_of(cp)).collect();
+    Ok(Some(
         (0..n)
             .map(|i| {
-                let (lo, hi) = (cps[i], cps[i + 1]);
+                let (lo, hi) = (bounds[i], bounds[i + 1]);
                 if hi <= lo {
                     return String::new();
                 }
-                let text: String = raw_comment_text.chars().skip(lo).take(hi - lo).collect();
-                let text = text.strip_prefix('\u{5}').unwrap_or(&text);
+                let text = &raw_comment_text[lo..hi];
+                let text = text.strip_prefix('\u{5}').unwrap_or(text);
                 sanitize_text(text).trim().to_string()
             })
             .collect(),
-    )
+    ))
 }
 
 /// `PlcfandRef`'s data elements are `ATRDPre10` structures (30 bytes
@@ -1300,6 +1762,7 @@ mod tests {
             ole_objects: Vec::new(),
             warnings: Vec::new(),
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "First paragraph\nSecond paragraph\n\nAfter gap".into(),
@@ -1315,6 +1778,45 @@ mod tests {
         assert!(md.trim_end().ends_with("After gap"));
     }
 
+    /// Pictures decode after the document is open, so a picture left out for
+    /// a limit has to reach `Metadata::warnings` and `text_truncated` through
+    /// the conversion that asks for the pictures.
+    #[test]
+    fn test_picture_left_out_for_a_limit_is_reported_in_metadata() {
+        use crate::cfb::blip::tests::make_metafile_blip;
+        let raw = vec![0u8; 1 << 20];
+        let mut data = make_metafile_blip(0xF01A, 0x3D4, &raw, true);
+        // cbSize claims 64 MiB over a stream that cannot hold it.
+        data[8 + 16..8 + 20].copy_from_slice(&(64u32 << 20).to_le_bytes());
+        let doc = DocDocument {
+            subdocuments: Vec::new(),
+            has_macros: false,
+            text_complete: true,
+            summary_properties: None,
+            list_formatting: crate::doc::list_format::ListFormatting::default(),
+            comment_authors: Vec::new(),
+            comments: Vec::new(),
+            ole_objects: Vec::new(),
+            header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
+            data_stream: data,
+            images: std::sync::OnceLock::new(),
+            text: "Body".into(),
+            paragraphs: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        assert!(ir.metadata.text_truncated);
+        assert!(
+            ir.metadata
+                .warnings
+                .iter()
+                .any(|w| w.contains("compressed picture(s) left out")),
+            "{:?}",
+            ir.metadata.warnings
+        );
+    }
+
     /// An embedded object is named on the direct surfaces as on the IR
     /// ones; `plain_text()` alone said nothing about it.
     #[test]
@@ -1328,9 +1830,11 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: vec![crate::doc::ole_objects::EmbeddedOleObject {
+                text: None,
                 description: "Embedded Equation Editor/MathType Object".into(),
             }],
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "Body".into(),
@@ -1365,6 +1869,7 @@ mod tests {
             ole_objects: Vec::new(),
             warnings: Vec::new(),
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "Price list follows.".into(),
@@ -1389,6 +1894,7 @@ mod tests {
             ole_objects: Vec::new(),
             warnings: Vec::new(),
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "Hello World".into(),
@@ -1419,6 +1925,7 @@ mod tests {
             ole_objects: Vec::new(),
             warnings: Vec::new(),
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "Main body text".into(),
@@ -1449,6 +1956,7 @@ mod tests {
             ole_objects: Vec::new(),
             warnings: Vec::new(),
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "Body".into(),
@@ -1475,6 +1983,7 @@ mod tests {
             ole_objects: Vec::new(),
             warnings: Vec::new(),
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "only the recovered fragment".into(),
@@ -1509,6 +2018,7 @@ mod tests {
             ole_objects: Vec::new(),
             warnings: Vec::new(),
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: text.to_string(),
@@ -1531,6 +2041,7 @@ mod tests {
             ole_objects: Vec::new(),
             warnings: Vec::new(),
             header_footers: Vec::new(),
+            text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: String::new(),
@@ -1986,8 +2497,16 @@ mod tests {
             table_stream.extend_from_slice(&cp.to_le_bytes());
         }
 
-        let stories =
-            &parse_plcf_hdd_stories(&table_stream, raw, 0, table_stream.len() as u32, 1)[0];
+        let (stories, cut) = parse_plcf_hdd_stories(
+            &table_stream,
+            raw,
+            0,
+            table_stream.len() as u32,
+            1,
+            &mut crate::limits::TextBudget::new(),
+        );
+        assert!(!cut);
+        let stories = &stories[0];
         assert_eq!(stories.even_header.as_deref(), Some("EVEN HEADER"));
         assert_eq!(stories.odd_header.as_deref(), Some("ODD HEADER"));
         assert_eq!(stories.even_footer.as_deref(), Some("EVEN FOOTER"));
@@ -2016,7 +2535,8 @@ mod tests {
 
     #[test]
     fn test_plcf_hdd_zero_length_yields_no_stories() {
-        let stories = parse_plcf_hdd_stories(&[0u8; 8], "", 0, 0, 1);
+        let (stories, _) =
+            parse_plcf_hdd_stories(&[0u8; 8], "", 0, 0, 1, &mut crate::limits::TextBudget::new());
         assert!(stories.is_empty());
     }
 
@@ -2025,7 +2545,14 @@ mod tests {
         // Only the 6 fixed separators (n=6, needs n+2=8 CPs) — no
         // section's worth of header/footer stories at all.
         let table_stream = vec![0u8; 8 * 4];
-        let stories = parse_plcf_hdd_stories(&table_stream, "", 0, table_stream.len() as u32, 1);
+        let (stories, _) = parse_plcf_hdd_stories(
+            &table_stream,
+            "",
+            0,
+            table_stream.len() as u32,
+            1,
+            &mut crate::limits::TextBudget::new(),
+        );
         assert!(stories.is_empty());
     }
 
@@ -2042,8 +2569,8 @@ mod tests {
             "irrelevant merged blob",
         )];
         doc.header_footers = vec![HeaderFooterStories {
-            odd_header: Some("The Odd Header".to_string()),
-            first_footer: Some("The First Footer".to_string()),
+            odd_header: Some("The Odd Header".into()),
+            first_footer: Some("The First Footer".into()),
             ..Default::default()
         }];
 
@@ -2063,6 +2590,126 @@ mod tests {
             "must not also dump the merged blob as a generic TextBox once structured: {:?}",
             section.elements
         );
+    }
+
+    /// One header inherited by thousands of sections is copied into every
+    /// section's IR; those copies are charged to the document's text budget,
+    /// and the sections past it are left without one and the file reported
+    /// truncated, instead of the header multiplying by the section count.
+    #[test]
+    fn test_inherited_headers_copied_per_section_are_charged_to_the_budget() {
+        let mut paras: Vec<DocParagraph> = Vec::new();
+        for _ in 0..100 {
+            let mut p = pap("x", crate::doc::sprm::PapProps::default());
+            p.terminator = '\u{C}';
+            paras.push(p);
+        }
+        let mut doc = make_doc_with_paragraphs(paras);
+        doc.header_footers = vec![HeaderFooterStories {
+            odd_header: Some("h".repeat(1000).into()),
+            ..Default::default()
+        }];
+        doc.text_budget = crate::limits::TextBudget::with_limit(5500);
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        assert_eq!(ir.sections.len(), 100);
+        let with_header = ir.sections.iter().filter(|s| s.header.is_some()).count();
+        // The first copy is the text the piece table already paid for; the
+        // budget covers five further copies of 1,000 bytes.
+        assert_eq!(with_header, 6);
+        assert!(ir.metadata.text_truncated);
+        assert!(
+            ir.metadata
+                .warnings
+                .iter()
+                .any(|w| w.contains("character budget"))
+        );
+    }
+
+    /// The header document's text was charged when the piece table was read,
+    /// so slicing it into stories charges nothing more: a budget that was
+    /// spent exactly by the pieces still yields every header and footer.
+    #[test]
+    fn test_header_stories_are_not_charged_again_for_text_already_counted() {
+        // Six separators, then one section whose six stories split 1,000
+        // characters between them.
+        let mut cps: Vec<u32> = vec![0; 6];
+        cps.extend_from_slice(&[0, 200, 400, 600, 800, 900]);
+        cps.extend_from_slice(&[1000, 1000]);
+        let mut table_stream = Vec::new();
+        for cp in &cps {
+            table_stream.extend_from_slice(&cp.to_le_bytes());
+        }
+        let raw = "y".repeat(1000);
+        let mut budget = crate::limits::TextBudget::with_limit(0);
+        let (stories, cut) = parse_plcf_hdd_stories(
+            &table_stream,
+            &raw,
+            0,
+            table_stream.len() as u32,
+            1,
+            &mut budget,
+        );
+        assert!(!cut, "disjoint stories add nothing to what the pieces cost");
+        assert_eq!(stories.len(), 1);
+        assert_eq!(stories[0].first_header.as_deref().map(str::len), Some(100));
+        assert!(!budget.exhausted());
+    }
+
+    /// Distinct headers of distinct sections are each the text the piece table
+    /// already paid for: none is charged again when the IR makes its copy, even
+    /// with nothing left of the budget.
+    #[test]
+    fn test_distinct_section_headers_are_not_charged_again_in_the_ir() {
+        let mut paras: Vec<DocParagraph> = Vec::new();
+        for _ in 0..3 {
+            let mut p = pap("x", crate::doc::sprm::PapProps::default());
+            p.terminator = '\u{C}';
+            paras.push(p);
+        }
+        let mut doc = make_doc_with_paragraphs(paras);
+        doc.header_footers = ["a", "b", "c"]
+            .iter()
+            .map(|t| HeaderFooterStories {
+                odd_header: Some(t.repeat(1000).into()),
+                ..Default::default()
+            })
+            .collect();
+        doc.text_budget = crate::limits::TextBudget::with_limit(0);
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        assert_eq!(ir.sections.len(), 3);
+        assert!(ir.sections.iter().all(|s| s.header.is_some()));
+        assert!(!ir.metadata.text_truncated);
+    }
+
+    /// Stories whose ranges overlap are charged each time they are copied
+    /// out, and reading stops at the story that does not fit.
+    #[test]
+    fn test_overlapping_header_stories_are_charged_before_they_are_copied() {
+        // Six separators, then ten sections each claiming the whole 1,000
+        // characters for every story (a PLC whose CPs run backwards between
+        // groups): without a charge that is 60 copies of the text.
+        let mut cps: Vec<u32> = vec![0; 6];
+        for _ in 0..10 {
+            cps.extend_from_slice(&[0, 1000, 1000, 1000, 1000, 1000]);
+        }
+        cps.extend_from_slice(&[1000, 1000]);
+        let mut table_stream = Vec::new();
+        for cp in &cps {
+            table_stream.extend_from_slice(&cp.to_le_bytes());
+        }
+        let raw = "y".repeat(1000);
+        let mut budget = crate::limits::TextBudget::with_limit(2500);
+        let (stories, cut) = parse_plcf_hdd_stories(
+            &table_stream,
+            &raw,
+            0,
+            table_stream.len() as u32,
+            10,
+            &mut budget,
+        );
+        assert!(cut);
+        assert!(stories.len() < 10);
+        assert!(budget.exhausted());
     }
 
     #[test]
@@ -2137,6 +2784,7 @@ mod tests {
             and_ref_fc,
             and_ref.len() as u32,
             &authors,
+            &mut Vec::new(),
         );
 
         assert_eq!(comments.len(), 2, "expected 2 split comments: {comments:?}");
@@ -2172,6 +2820,7 @@ mod tests {
             and_txt.len() as u32,
             and_ref.len() as u32,
             &[],
+            &mut Vec::new(),
         );
         assert!(comments.is_empty(), "count mismatch must fall back to empty: {comments:?}");
     }

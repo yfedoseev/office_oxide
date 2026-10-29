@@ -42,6 +42,12 @@ impl<R: Read + Seek> CfbReader<R> {
         let header = CfbHeader::parse(&header_buf)?;
 
         let mut warnings = Vec::new();
+        if header.byte_order != 0xFFFE {
+            warnings.push(format!(
+                "header byte-order field is 0x{:04X}, not 0xFFFE; the file was read as little-endian",
+                header.byte_order
+            ));
+        }
 
         // Build the FAT.
         let (fat, difat_sectors_walked) = Self::read_fat(&mut reader, &header)?;

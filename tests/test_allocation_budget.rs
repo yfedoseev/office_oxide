@@ -19,6 +19,19 @@ struct Counting;
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
+/// Bytes requested by every thread. Opening a `.docx` parses on a thread of
+/// its own, which the per-thread count cannot see.
+static PROCESS_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Bytes live now and the most that were live at once, across threads.
+static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+fn grow_live(by: usize) {
+    let now = LIVE_BYTES.fetch_add(by, Ordering::Relaxed) + by;
+    PEAK_BYTES.fetch_max(now, Ordering::Relaxed);
+}
+
 thread_local! {
     /// Bytes requested by this thread, so a byte budget is not disturbed
     /// by tests running in parallel.
@@ -35,16 +48,22 @@ fn count_bytes(n: usize) {
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        PROCESS_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        grow_live(layout.size());
         count_bytes(layout.size());
         // SAFETY: same layout contract as the caller's.
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
         // SAFETY: `ptr` came from `System.alloc` with this layout.
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        PROCESS_BYTES.fetch_add(new_size, Ordering::Relaxed);
+        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+        grow_live(new_size);
         count_bytes(new_size);
         // SAFETY: forwarded unchanged.
         unsafe { System.realloc(ptr, layout, new_size) }
@@ -56,18 +75,34 @@ static GLOBAL: Counting = Counting;
 
 /// The counter is process-wide, so a test allocating on another thread
 /// during a measurement is charged to it. Every test holds this for its
-/// whole body.
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// whole body. It is also the exclusive lock on the process-wide limits, so a
+/// limit a test sets through it is back at its default when the test ends,
+/// however it ends.
+fn serial() -> common::LimitScope {
+    common::LimitScope::new()
 }
 
 fn allocations_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let before = ALLOCATIONS.load(Ordering::SeqCst);
     let out = f();
     (out, ALLOCATIONS.load(Ordering::SeqCst) - before)
+}
+
+/// Bytes any thread requested from the allocator while running `f`. Only
+/// meaningful while holding [`serial`].
+fn process_bytes_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let before = PROCESS_BYTES.load(Ordering::SeqCst);
+    let out = f();
+    (out, PROCESS_BYTES.load(Ordering::SeqCst) - before)
+}
+
+/// The most bytes that were live at once, above those live when `f` began,
+/// while running `f`. Only meaningful while holding [`serial`].
+fn peak_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let start = LIVE_BYTES.load(Ordering::SeqCst);
+    PEAK_BYTES.store(start, Ordering::SeqCst);
+    let out = f();
+    (out, PEAK_BYTES.load(Ordering::SeqCst).saturating_sub(start))
 }
 
 /// Bytes this thread requested from the allocator while running `f`.
@@ -672,4 +707,198 @@ fn test_docx_to_ir_does_not_copy_a_huge_style_name_per_paragraph() {
         bytes < 8 << 20,
         "{bytes} bytes requested converting {PARAS} paragraphs that share a 1 MiB style name"
     );
+}
+
+/// A `.docx` whose paragraph style `S` carries `style_inner` (a `w:pPr` or
+/// `w:rPr`), used by `paragraphs` paragraphs that each hold one bold run.
+fn docx_with_style_inner(style_inner: &str, paragraphs: usize) -> Vec<u8> {
+    let body = r#"<w:p><w:pPr><w:pStyle w:val="S"/></w:pPr><w:r><w:rPr><w:b/></w:rPr><w:t>x</w:t></w:r></w:p>"#
+        .repeat(paragraphs);
+    let styles = format!(
+        r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="S"><w:name w:val="S"/>{style_inner}</w:style></w:styles>"#
+    );
+    let doc = format!(
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}</w:body></w:document>"#
+    );
+    zip_of(&[
+        (
+            "[Content_Types].xml",
+            br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/></Types>"#,
+        ),
+        (
+            "_rels/.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+        ),
+        (
+            "word/_rels/document.xml.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#,
+        ),
+        ("word/document.xml", doc.as_bytes()),
+        ("word/styles.xml", styles.as_bytes()),
+    ])
+}
+
+/// A style's 1 MiB face name, folded into the effective formatting of each
+/// run to find its bold flag, used to be copied once per run: runs x 1 MiB
+/// requested.
+#[test]
+fn test_docx_markdown_does_not_copy_a_huge_style_face_name_per_run() {
+    let _serial = serial();
+    const PARAS: usize = 200;
+    let name = "F".repeat(1 << 20);
+    let style = format!(r#"<w:rPr><w:rFonts w:ascii="{name}" w:hAnsi="{name}"/></w:rPr>"#);
+    let doc = office_oxide::Document::from_reader(
+        Cursor::new(docx_with_style_inner(&style, PARAS)),
+        office_oxide::DocumentFormat::Docx,
+    )
+    .unwrap();
+    let (md, bytes) = bytes_during(|| doc.to_markdown());
+    assert!(md.contains("**x**"));
+    assert!(
+        bytes < 8 << 20,
+        "{bytes} bytes requested rendering {PARAS} runs under a style with a 1 MiB face name"
+    );
+}
+
+/// A style's tab stops, folded into the effective formatting of each
+/// paragraph to find its numbering, used to be copied once per paragraph.
+#[test]
+fn test_docx_markdown_does_not_copy_a_styles_tab_stops_per_paragraph() {
+    let _serial = serial();
+    const PARAS: usize = 200;
+    let mut style = String::from("<w:pPr><w:tabs>");
+    for i in 0..20_000 {
+        style.push_str(&format!(r#"<w:tab w:val="left" w:pos="{}"/>"#, i + 1));
+    }
+    style.push_str("</w:tabs></w:pPr>");
+    let doc = office_oxide::Document::from_reader(
+        Cursor::new(docx_with_style_inner(&style, PARAS)),
+        office_oxide::DocumentFormat::Docx,
+    )
+    .unwrap();
+    let (md, bytes) = bytes_during(|| doc.to_markdown());
+    assert!(md.contains("**x**"));
+    // One copy of 20,000 tab stops is about 1 MiB; the old fold made one per
+    // paragraph (200 MiB).
+    assert!(
+        bytes < 8 << 20,
+        "{bytes} bytes requested rendering {PARAS} paragraphs under a style with 20,000 tab stops"
+    );
+}
+
+/// A chart part's 1 MiB of text, named by 100 drawings, used to be copied
+/// into every drawing at open: drawings x 1 MiB requested.
+#[test]
+fn test_docx_open_does_not_copy_a_charts_text_per_drawing() {
+    let _serial = serial();
+    const DRAWINGS: usize = 100;
+    let drawing = r#"<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><wp:extent cx="100" cy="100"/><wp:docPr id="1" name="c"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rId9"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#;
+    let doc = format!(
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>{}</w:body></w:document>"#,
+        drawing.repeat(DRAWINGS)
+    );
+    let chart = format!(
+        r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>{}</a:t></a:r></a:p></c:rich></c:tx></c:title></c:chart></c:chartSpace>"#,
+        "c".repeat(1 << 20)
+    );
+    let bytes = zip_of(&[
+        (
+            "[Content_Types].xml",
+            br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/></Types>"#,
+        ),
+        (
+            "_rels/.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+        ),
+        (
+            "word/_rels/document.xml.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="charts/chart1.xml"/></Relationships>"#,
+        ),
+        ("word/document.xml", doc.as_bytes()),
+        ("word/charts/chart1.xml", chart.as_bytes()),
+    ]);
+    let (opened, bytes_requested) = process_bytes_during(|| {
+        office_oxide::Document::from_reader(Cursor::new(bytes), office_oxide::DocumentFormat::Docx)
+    });
+    let opened = opened.unwrap();
+    assert!(opened.plain_text().len() >= 1 << 20, "the chart text was read");
+    // Far under one copy of the text per drawing (100 MiB before).
+    assert!(
+        bytes_requested < 16 << 20,
+        "{bytes_requested} bytes requested opening {DRAWINGS} drawings of one 1 MiB chart"
+    );
+}
+
+/// A table style's 1 MiB face name is folded into the formatting of every
+/// table that uses the style; the fold of each table is kept for the whole
+/// conversion. Under the default text budget (256 Mi characters) 300 tables
+/// of 1 MiB each used to be kept in full, 300 MiB, plus the copies made to
+/// build them. The charge makes the first few fit and leaves the rest out.
+#[test]
+fn test_docx_to_ir_does_not_keep_a_table_styles_face_name_per_table() {
+    let mut serial = serial();
+    const TABLES: usize = 300;
+    let name = "F".repeat(1 << 20);
+    let styles = format!(
+        r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="table" w:styleId="T"><w:name w:val="T"/><w:rPr><w:rFonts w:ascii="{name}" w:hAnsi="{name}"/></w:rPr></w:style></w:styles>"#
+    );
+    let table = r#"<w:tbl><w:tblPr><w:tblStyle w:val="T"/></w:tblPr><w:tblGrid><w:gridCol w:w="1000"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>x</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p/>"#;
+    let body = table.repeat(TABLES);
+    let doc = format!(
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}</w:body></w:document>"#
+    );
+    let bytes = zip_of(&[
+        (
+            "[Content_Types].xml",
+            br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/></Types>"#,
+        ),
+        (
+            "_rels/.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+        ),
+        (
+            "word/_rels/document.xml.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#,
+        ),
+        ("word/document.xml", doc.as_bytes()),
+        ("word/styles.xml", styles.as_bytes()),
+    ]);
+    let doc =
+        office_oxide::Document::from_reader(Cursor::new(bytes), office_oxide::DocumentFormat::Docx)
+            .unwrap();
+    // A small text budget stands in for the default one.
+    serial.set(
+        office_oxide::limits::max_text_chars,
+        office_oxide::limits::set_max_text_chars,
+        8 << 20,
+    );
+    let (ir, peak) = peak_during(|| doc.to_ir());
+    assert!(ir.metadata.text_truncated);
+    // The budget (8 Mi) holds a handful of copies; one kept per table would
+    // be 300 MiB.
+    assert!(
+        peak < 64 << 20,
+        "{peak} bytes live at once converting {TABLES} tables under a 1 MiB table-style face name"
+    );
+}
+
+/// A header cell costs no more than a body cell: one row of as many columns
+/// as the default cell limit allows, parsed from Markdown, stays within the
+/// memory the limit was sized for (about 1.2 KB a cell; asserted at 2 KB of
+/// requested bytes, which also counts what was freed on the way).
+#[test]
+fn test_a_markdown_header_row_at_the_cell_limit_stays_within_its_memory_bound() {
+    let _serial = serial();
+    // The fixed table-cell limit of the Markdown reader.
+    let cells = 150_000;
+    let md = format!("|{}\n|{}\n", "h|".repeat(cells), "-|".repeat(cells));
+    let (ir, bytes) = bytes_during(|| {
+        office_oxide::DocumentIR::from_markdown(&md, office_oxide::DocumentFormat::Docx)
+    });
+    assert!(!ir.metadata.text_truncated, "the row at the limit is kept whole");
+    assert!(bytes < cells * 2_048, "{} bytes requested for {cells} header cells", bytes);
+    // One column more than the limit is cut, loudly.
+    let md = format!("|{}\n", "h|".repeat(cells + 1));
+    let ir = office_oxide::DocumentIR::from_markdown(&md, office_oxide::DocumentFormat::Docx);
+    assert!(ir.metadata.text_truncated);
 }

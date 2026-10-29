@@ -5,8 +5,9 @@ use std::io::{Read, Seek};
 use crate::cfb::{CfbReader, SummaryProperties};
 
 use super::error::{PptError, Result};
-use super::images::{PptImage, extract_images};
+use super::images::{PptImage, extract_blip_images_diagnosed};
 use super::text::{SlideText, TextRun, TextType, extract_deck_text};
+use crate::cfb::blip::BlipDiagnostics;
 
 /// A parsed legacy PowerPoint document.
 #[derive(Debug)]
@@ -25,7 +26,7 @@ pub struct PptDocument {
     /// The `Pictures` stream, decoded into `images` on first request —
     /// see `DocDocument::data_stream` for why.
     pictures_stream: Vec<u8>,
-    images: std::sync::OnceLock<Vec<PptImage>>,
+    images: std::sync::OnceLock<(Vec<PptImage>, BlipDiagnostics)>,
     has_macros: bool,
     /// Title/author/subject/keywords/comments/dates from the
     /// `\x05SummaryInformation` OLE property-set stream every real `.ppt`
@@ -43,7 +44,8 @@ pub struct PptDocument {
 
 impl PptDocument {
     /// Open a PPT file from a reader.
-    pub fn from_reader<R: Read + Seek>(reader: R) -> Result<Self> {
+    pub fn from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
+        let _scale = crate::limits::InputSizeScope::new(crate::limits::stream_len(&mut reader));
         let mut cfb = CfbReader::new(reader)?;
         let summary_properties = crate::cfb::read_document_properties(&mut cfb);
 
@@ -91,7 +93,10 @@ impl PptDocument {
         let text_complete = !truncated.iter().any(|n| {
             n.eq_ignore_ascii_case("PowerPoint Document") || n.eq_ignore_ascii_case("Current User")
         });
+        // Slides or text the deck reader left out to stay within its bounds.
+        let text_complete = text_complete && deck.notices.is_empty();
         let mut warnings = cfb.warnings().to_vec();
+        warnings.extend(deck.notices);
         warnings.extend(
             truncated
                 .iter()
@@ -144,8 +149,25 @@ impl PptDocument {
 
     /// Get all extracted images.
     pub fn images(&self) -> &[PptImage] {
+        &self.decoded_images().0
+    }
+
+    /// Warnings about pictures left out because of a limit, if any; see
+    /// `Metadata::warnings`. Pictures are decoded on first use, so this
+    /// decodes them if nothing has yet.
+    pub(crate) fn image_warnings(&self) -> Vec<String> {
+        self.decoded_images().1.warnings()
+    }
+
+    /// `true` when a picture was left out because of a limit; see
+    /// `Metadata::text_truncated`.
+    pub(crate) fn images_left_out(&self) -> bool {
+        self.decoded_images().1.limit_hit()
+    }
+
+    fn decoded_images(&self) -> &(Vec<PptImage>, BlipDiagnostics) {
         self.images
-            .get_or_init(|| extract_images(&self.pictures_stream))
+            .get_or_init(|| extract_blip_images_diagnosed(&self.pictures_stream))
     }
 
     /// Extract plain text.
@@ -540,6 +562,40 @@ mod tests {
         let err = PptDocument::from_reader(std::io::Cursor::new(bytes))
             .expect_err("a .ppt without its main stream must not open");
         assert!(matches!(err, PptError::MissingStream(_)), "expected MissingStream, got {err:?}");
+    }
+
+    /// Pictures decode after the document is open, so a picture left out for
+    /// a limit has to reach `Metadata::warnings` and `text_truncated` through
+    /// the conversion that asks for the pictures.
+    #[test]
+    fn test_picture_left_out_for_a_limit_is_reported_in_metadata() {
+        use crate::cfb::blip::tests::{make_metafile_blip, zlib};
+        let raw = vec![0u8; 1 << 20];
+        let mut pictures = make_metafile_blip(0xF01A, 0x3D4, &raw, true);
+        let stored = zlib(&raw).len();
+        assert!(stored < 4096);
+        // cbSize claims 64 MiB over a stream that cannot hold it.
+        pictures[8 + 16..8 + 20].copy_from_slice(&(64u32 << 20).to_le_bytes());
+        let doc = PptDocument {
+            pictures_stream: pictures,
+            images: std::sync::OnceLock::new(),
+            has_macros: false,
+            summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
+            master_text: Vec::new(),
+            slides: Vec::new(),
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        assert!(ir.metadata.text_truncated);
+        assert!(
+            ir.metadata
+                .warnings
+                .iter()
+                .any(|w| w.contains("compressed picture(s) left out")),
+            "{:?}",
+            ir.metadata.warnings
+        );
     }
 
     #[test]
@@ -1477,18 +1533,21 @@ mod tests {
 
         let doc = PptDocument {
             pictures_stream: Vec::new(),
-            images: std::sync::OnceLock::from(vec![
-                BlipImage {
-                    format: BlipFormat::Png,
-                    data: b"PNG0".to_vec(),
-                    index: 0,
-                },
-                BlipImage {
-                    format: BlipFormat::Jpeg,
-                    data: b"JPEG1".to_vec(),
-                    index: 1,
-                },
-            ]),
+            images: std::sync::OnceLock::from((
+                vec![
+                    BlipImage {
+                        format: BlipFormat::Png,
+                        data: b"PNG0".to_vec(),
+                        index: 0,
+                    },
+                    BlipImage {
+                        format: BlipFormat::Jpeg,
+                        data: b"JPEG1".to_vec(),
+                        index: 1,
+                    },
+                ],
+                BlipDiagnostics::default(),
+            )),
             has_macros: false,
             summary_properties: None,
             warnings: Vec::new(),
@@ -1535,11 +1594,14 @@ mod tests {
 
         let doc = PptDocument {
             pictures_stream: Vec::new(),
-            images: std::sync::OnceLock::from(vec![BlipImage {
-                format: BlipFormat::Png,
-                data: b"ORPHAN".to_vec(),
-                index: 0,
-            }]),
+            images: std::sync::OnceLock::from((
+                vec![BlipImage {
+                    format: BlipFormat::Png,
+                    data: b"ORPHAN".to_vec(),
+                    index: 0,
+                }],
+                BlipDiagnostics::default(),
+            )),
             has_macros: false,
             summary_properties: None,
             warnings: Vec::new(),

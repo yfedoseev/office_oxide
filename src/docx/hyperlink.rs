@@ -21,7 +21,8 @@ pub struct Hyperlink {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HyperlinkTarget {
     /// External URL, resolved from relationship with TargetMode=External.
-    External(String),
+    /// Links that name the same relationship share one allocation.
+    External(std::sync::Arc<str>),
     /// Internal bookmark name (from `w:anchor` attribute).
     Internal(String),
 }

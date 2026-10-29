@@ -256,6 +256,9 @@ pub struct OpcReader<R: Read + Seek> {
     entries: ZipEntryIndex,
     content_types: ContentTypes,
     package_rels: Relationships,
+    /// Why `_rels/.rels` was taken for empty although the package has it, when
+    /// it could not be read (see [`Self::package_rels_problem`]).
+    package_rels_problem: Option<String>,
 }
 
 impl OpcReader<File> {
@@ -292,7 +295,21 @@ impl<R: Read + Seek> OpcReader<R> {
         let content_types = ContentTypes::parse(&ct_data)?;
 
         // Eagerly parse _rels/.rels
-        let rels_data = read_zip_entry(&mut archive, &entries, "_rels/.rels").unwrap_or_default();
+        // Absent is an empty set (the main part is then found through
+        // `[Content_Types].xml`); present and unreadable is an error.
+        // A `_rels/.rels` the package has but the zip cannot decode is no
+        // reason to refuse the document: the main part is found through
+        // `[Content_Types].xml` all the same, as it always was. The loss is
+        // kept for the reader to report (`package_rels_problem`).
+        let mut package_rels_problem = None;
+        let rels_data = match read_zip_entry(&mut archive, &entries, "_rels/.rels") {
+            Ok(data) => data,
+            Err(Error::MissingPart(_)) => Vec::new(),
+            Err(e) => {
+                package_rels_problem = Some(e.to_string());
+                Vec::new()
+            },
+        };
         let package_rels = if rels_data.is_empty() {
             Relationships::empty()
         } else {
@@ -304,7 +321,16 @@ impl<R: Read + Seek> OpcReader<R> {
             entries,
             content_types,
             package_rels,
+            package_rels_problem,
         })
+    }
+
+    /// Why the package's `_rels/.rels` could not be read, when the package
+    /// has one that the zip cannot decode: the relationships are then empty
+    /// and the main part is found through `[Content_Types].xml`. A reader
+    /// that opens anyway reports it, so that the loss is not silent.
+    pub(crate) fn package_rels_problem(&self) -> Option<&str> {
+        self.package_rels_problem.as_deref()
     }
 
     /// Return the parsed `[Content_Types].xml` table.
@@ -377,10 +403,9 @@ impl<R: Read + Seek> OpcReader<R> {
                 trace!("read_rels_for '{}' ({} bytes)", part, data.len());
                 Relationships::parse(&data)
             },
-            Err(Error::Zip(zip::result::ZipError::FileNotFound)) => {
-                trace!("read_rels_for '{}': no rels file", part);
-                Ok(Relationships::empty())
-            },
+            // Only a part the package does not have is an empty set; one
+            // that is there and cannot be read is the caller's error to
+            // report.
             Err(Error::MissingPart(_)) => {
                 trace!("read_rels_for '{}': no rels file", part);
                 Ok(Relationships::empty())
@@ -396,7 +421,7 @@ impl<R: Read + Seek> OpcReader<R> {
         // Primary: use the officeDocument relationship from _rels/.rels
         if let Some(rel) = self.package_rels.first_by_type(rel_types::OFFICE_DOCUMENT) {
             let target = if rel.target.starts_with('/') {
-                rel.target.clone()
+                rel.target.to_string()
             } else {
                 format!("/{}", rel.target)
             };
@@ -475,16 +500,45 @@ impl<R: Read + Seek> OpcReader<R> {
 /// [`crate::limits::max_package_bytes`], so a package of many parts each
 /// just under [`MAX_PART_SIZE`] — or many entries pointing at the same
 /// compressed data — cannot add up to an unbounded allocation.
+///
+/// Reading an entry again allocates nothing that outlives the read, so it is
+/// not charged to that account, but it is as much work as the first read. The
+/// bytes inflated by reads past the first (and by reads that failed, which
+/// are never committed) are therefore totalled separately and held to the
+/// same limit: no entry can be inflated unboundedly often, however many parts
+/// name it and whether or not a caller remembers its result.
 pub(crate) struct ZipEntryIndex {
     by_normalized: HashMap<String, usize>,
     /// Entries already charged against the byte budget, by index.
     charged: Vec<std::cell::Cell<bool>>,
     /// Decompressed bytes charged so far.
     consumed: std::cell::Cell<u64>,
+    /// Bytes inflated by reads of an entry already read in full.
+    reinflated: std::cell::Cell<u64>,
+    /// Bytes inflated by reads that failed, which commit nothing.
+    failed: std::cell::Cell<u64>,
     /// The package-wide byte budget, fixed when the index is built.
     byte_limit: u64,
     /// Entries whose bytes failed their recorded CRC-32, in read order.
     crc_mismatched: std::cell::RefCell<Vec<String>>,
+    /// Where each entry's local header starts (by index), the same sorted,
+    /// and where the central directory starts: built on first use, to bound
+    /// what an entry can physically store (see [`Self::stored_span`]).
+    header_starts: std::cell::OnceCell<(Vec<Option<u64>>, Vec<u64>, u64)>,
+}
+
+impl Drop for ZipEntryIndex {
+    /// The bytes a package embedded in a document inflated count against
+    /// that document's allowance for its embedded packages; for any other
+    /// package this does nothing.
+    fn drop(&mut self) {
+        let inflated = self
+            .consumed
+            .get()
+            .saturating_add(self.reinflated.get())
+            .saturating_add(self.failed.get());
+        super::embedded::charge_inflated(inflated);
+    }
 }
 
 impl ZipEntryIndex {
@@ -530,26 +584,92 @@ impl ZipEntryIndex {
                 .map(|_| std::cell::Cell::new(false))
                 .collect(),
             consumed: std::cell::Cell::new(0),
+            reinflated: std::cell::Cell::new(0),
+            failed: std::cell::Cell::new(0),
             byte_limit,
             crc_mismatched: std::cell::RefCell::new(Vec::new()),
+            header_starts: std::cell::OnceCell::new(),
         }
     }
 
-    /// Charge `bytes` decompressed from entry `index` against the package
-    /// budget. An entry already charged is free: re-reading a shared image
-    /// allocates nothing that outlives the previous read.
-    fn charge(&self, index: usize, bytes: u64, name: &str) -> Result<()> {
-        if self.charged.get(index).is_some_and(|c| c.get()) {
-            return Ok(());
+    /// The most compressed bytes entry `index` can physically hold: the bytes
+    /// between its local header and the next one (or the central directory).
+    /// The compressed size a header *declares* is the file's to choose, and a
+    /// part's inflate ratio computed from a lying one would let a bomb through;
+    /// this is what the file's layout allows. `None` when the layout cannot
+    /// be read.
+    fn stored_span<R: Read + Seek>(
+        &self,
+        archive: &mut ZipArchive<R>,
+        index: usize,
+    ) -> Option<u64> {
+        if self.header_starts.get().is_none() {
+            // An entry whose header cannot be read is left out, not a reason to
+            // give up on the rest; it has no span of its own (`None`).
+            let by_index: Vec<Option<u64>> = (0..archive.len())
+                .map(|i| archive.by_index_raw(i).ok().map(|f| f.header_start()))
+                .collect();
+            let mut sorted: Vec<u64> = by_index.iter().flatten().copied().collect();
+            sorted.sort_unstable();
+            let _ = self
+                .header_starts
+                .set((by_index, sorted, archive.central_directory_start()));
         }
+        let (by_index, sorted, directory) = self.header_starts.get()?;
+        let mine = (*by_index.get(index)?)?;
+        let next = sorted
+            .get(sorted.partition_point(|&s| s <= mine))
+            .copied()
+            .unwrap_or(*directory);
+        // A local file header is 30 bytes before its name and extra field.
+        Some(next.saturating_sub(mine).saturating_sub(30))
+    }
+
+    /// Charge `bytes` decompressed from entry `index` against the package
+    /// budget. An entry already charged costs the package account nothing
+    /// (re-reading a shared image allocates nothing that outlives the previous
+    /// read) but its bytes count towards the re-inflated total, so that the
+    /// work of reading it again is bounded too. `counted` is the part of
+    /// `bytes` an earlier call for this read has already put to that total.
+    fn charge(&self, index: usize, bytes: u64, name: &str, counted: u64) -> Result<()> {
+        if self.charged.get(index).is_some_and(|c| c.get()) {
+            return self.charge_reinflated(bytes.saturating_sub(counted), name);
+        }
+        // Reads that failed after inflating are never committed; once their
+        // total is past the limit no entry is inflated again.
         let total = self.consumed.get().saturating_add(bytes);
-        if total > self.byte_limit {
+        if total > self.byte_limit || self.failed.get() > self.byte_limit {
             return Err(Error::PackageLimit(format!(
                 "reading '{name}' brings the package's decompressed size past {} bytes",
                 self.byte_limit
             )));
         }
         Ok(())
+    }
+
+    /// Add `bytes` to the re-inflated total; an error once it is past the
+    /// package limit.
+    fn charge_reinflated(&self, bytes: u64, name: &str) -> Result<()> {
+        let total = self.reinflated.get().saturating_add(bytes);
+        self.reinflated.set(total);
+        if total > self.byte_limit {
+            return Err(Error::PackageLimit(format!(
+                "reading '{name}' again brings the bytes the package re-inflates past {} bytes",
+                self.byte_limit
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record that a read of entry `index` inflated `bytes` and then failed.
+    /// Nothing is committed for it, so each retry would be free; the bytes
+    /// are totalled instead (unless the entry was already counted as
+    /// re-inflated), and once the total is past the limit no entry that was
+    /// not read in full is inflated again.
+    fn note_failed_read(&self, index: usize, bytes: u64) {
+        if !self.charged.get(index).is_some_and(|c| c.get()) {
+            self.failed.set(self.failed.get().saturating_add(bytes));
+        }
     }
 
     /// Record that entry `index` was read in full, `bytes` long.
@@ -764,7 +884,41 @@ fn open_zip_checked<R: Read + Seek>(mut reader: R, max_entries: usize) -> Result
 /// the difference between a failed parse and an out-of-memory kill of the
 /// host process — and every binding (Python, Go, C#, WASM) inherits that
 /// difference.
-pub const MAX_PART_SIZE: u64 = 512 * 1024 * 1024;
+pub const MAX_PART_SIZE: u64 = crate::limits::DEFAULT_MAX_PART_BYTES;
+
+/// Decode a deflated entry whose stream is complete but whose length is not
+/// the one its header declares. `Err` carries the bytes inflated by an
+/// attempt that gave up (so the caller can charge them) when the entry is
+/// not deflated, the stream is damaged or incomplete, or it inflates more
+/// than a quarter (and 64 KiB) past the declared size: a header that is
+/// wrong by a little is a damaged header, one that is wrong by a lot is a
+/// decompression bomb.
+fn inflate_despite_declared_size<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    index: usize,
+    declared: u64,
+    cap: u64,
+) -> std::result::Result<Vec<u8>, u64> {
+    let Ok(raw) = archive.by_index_raw(index) else {
+        return Err(0);
+    };
+    if raw.compression() != zip::CompressionMethod::Deflated {
+        return Err(0);
+    }
+    let bound = declared
+        .saturating_add(declared / 4)
+        .saturating_add(64 * 1024)
+        .min(cap);
+    let mut decoder = flate2::read::DeflateDecoder::new(raw);
+    let mut out = Vec::with_capacity((declared as usize).min(1 << 20));
+    match (&mut decoder)
+        .take(bound.saturating_add(1))
+        .read_to_end(&mut out)
+    {
+        Ok(_) if out.len() as u64 <= bound => Ok(out),
+        _ => Err(out.len() as u64),
+    }
+}
 
 pub(crate) fn read_zip_entry<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
@@ -778,9 +932,34 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
         .index_for_name(name)
         .or_else(|| entries.lookup(name))
         .ok_or_else(|| Error::MissingPart(name.to_string()))?;
-    let mut file = archive
-        .by_index(index)
-        .map_err(|_| Error::MissingPart(name.to_string()))?;
+    // The name is in the index, so a failure here is not an absent part: the
+    // entry exists and cannot be decoded (a compression method this reader
+    // does not implement, an encrypted entry, a bad header; APPNOTE 4.4.4
+    // and 4.4.5). It is a typed error, so that no caller can mistake a
+    // damaged part for one the package does not have.
+    // The compressed size in the header is the file's to declare; bound it
+    // by what the file's layout can hold when it would raise the cap.
+    let claimed = archive
+        .by_index_raw(index)
+        .map(|f| f.compressed_size())
+        .unwrap_or(0);
+    let ratio = crate::limits::max_inflate_ratio();
+    let compressed = if ratio != u64::MAX
+        && claimed.saturating_mul(ratio) > crate::limits::inflate_ratio_floor()
+    {
+        // A layout that cannot be read is not believed either: the claim is
+        // cut to what would not raise the cap past the floor.
+        let believed = entries
+            .stored_span(archive, index)
+            .unwrap_or(crate::limits::inflate_ratio_floor() / ratio.max(1));
+        claimed.min(believed)
+    } else {
+        claimed
+    };
+    let mut file = archive.by_index(index).map_err(|e| match e {
+        zip::result::ZipError::FileNotFound => Error::MissingPart(name.to_string()),
+        e => Error::Zip(e),
+    })?;
 
     // Reject decompression bombs before allocating for them. A ZIP entry
     // declares its uncompressed size in the central directory; a 2 MB
@@ -789,18 +968,24 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
     // CVE-2014-3574). The declared size is attacker-controlled, so it is
     // used only to refuse early — the read below is separately capped so a
     // lying header cannot get past it either.
-    if file.size() > MAX_PART_SIZE {
+    // The size limit, and past the floor the ratio limit, of this part
+    // (`limits::part_inflate_cap`).
+    let cap = crate::limits::part_inflate_cap(compressed);
+    if file.size() > cap {
         return Err(Error::DecompressionLimit {
             part: name.to_string(),
-            limit: MAX_PART_SIZE,
+            limit: cap,
         });
     }
     // The package-wide account, checked against the declared size before
     // reading and against the actual size after.
-    entries.charge(index, file.size(), name)?;
-    let mut buf = Vec::with_capacity((file.size() as usize).min(1 << 20));
-    let mut capped = (&mut file).take(MAX_PART_SIZE + 1);
-    match capped.read_to_end(&mut buf) {
+    entries.charge(index, file.size(), name, 0)?;
+    let declared = file.size();
+    let mut buf = Vec::with_capacity((declared as usize).min(1 << 20));
+    let mut capped = (&mut file).take(cap.saturating_add(1));
+    let read = capped.read_to_end(&mut buf);
+    drop(file);
+    match read {
         Ok(_) => {},
         // A CRC-32 mismatch means the bytes may not be the ones the
         // producer wrote. Refusing the part cost real documents their
@@ -812,21 +997,52 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
         Err(e)
             if e.kind() == std::io::ErrorKind::InvalidData
                 && e.to_string().contains("checksum")
-                && buf.len() as u64 == file.size() =>
+                && buf.len() as u64 == declared =>
         {
             log::warn!("opc: part '{name}' failed its CRC-32 check; read as stored");
             entries.record_crc_mismatch(name);
         },
-        Err(e) => return Err(e.into()),
+        // A deflate stream that is complete but decodes to a different
+        // length than the header declares (an edit that rewrote line
+        // endings does this) is rejected by the zip layer. The stream itself
+        // is sound, so it is decoded directly, within a bound derived from
+        // the declared size, and reported like a checksum mismatch.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            match inflate_despite_declared_size(archive, index, declared, cap) {
+                Ok(bytes) => {
+                    log::warn!("opc: part '{name}' differs from its declared size; read as stored");
+                    entries.record_crc_mismatch(name);
+                    buf = bytes;
+                },
+                Err(inflated) => {
+                    entries.note_failed_read(index, (buf.len() as u64).saturating_add(inflated));
+                    return Err(e.into());
+                },
+            }
+        },
+        Err(e) => {
+            entries.note_failed_read(index, buf.len() as u64);
+            return Err(e.into());
+        },
     }
-    if buf.len() as u64 > MAX_PART_SIZE {
+    // A stream that ended short of the declared size read without error; it
+    // is as much a damaged entry as one that ran long.
+    if (buf.len() as u64) < declared {
+        log::warn!("opc: part '{name}' is shorter than its declared size");
+        entries.record_crc_mismatch(name);
+    }
+    if buf.len() as u64 > cap {
+        entries.note_failed_read(index, buf.len() as u64);
         return Err(Error::DecompressionLimit {
             part: name.to_string(),
-            limit: MAX_PART_SIZE,
+            limit: cap,
         });
     }
     // A lying declared size is caught here, before the bytes are kept.
-    entries.charge(index, buf.len() as u64, name)?;
+    if let Err(e) = entries.charge(index, buf.len() as u64, name, declared) {
+        entries.note_failed_read(index, buf.len() as u64);
+        return Err(e);
+    }
     entries.commit(index, buf.len() as u64);
     Ok(buf)
 }
@@ -1270,7 +1486,7 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(err, Error::DecompressionLimit { ref part, limit }
-                if part == "word/a.xml" && limit == MAX_PART_SIZE),
+                if part == "word/a.xml" && limit == crate::limits::part_inflate_cap(4)),
             "{err:?}"
         );
     }
@@ -1332,6 +1548,86 @@ mod tests {
         assert!(matches!(err, Error::PackageLimit(_)), "{err:?}");
         // Already-charged parts stay readable.
         assert!(read_zip_entry(&mut archive, &entries, "b.bin").is_ok());
+    }
+
+    /// Reading one entry again is free of the package account but not of the
+    /// work: the bytes inflated by reads past the first are totalled and held
+    /// to the same limit, so no entry can be inflated unboundedly often.
+    #[test]
+    fn test_package_byte_budget_bounds_the_bytes_re_inflated() {
+        let bytes = raw_zip(&[("a.bin", &[1u8; 8])], Eocd::Count(1), &[]);
+        let mut archive = ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let entries = ZipEntryIndex::with_byte_limit(&archive, 16);
+        // The first read is charged to the package account (8 of 16), the
+        // next two to the re-inflated total (16 of 16).
+        for _ in 0..3 {
+            assert_eq!(
+                read_zip_entry(&mut archive, &entries, "a.bin")
+                    .unwrap()
+                    .len(),
+                8
+            );
+        }
+        let err = read_zip_entry(&mut archive, &entries, "a.bin").unwrap_err();
+        assert!(matches!(err, Error::PackageLimit(_)), "{err:?}");
+        // The refusal is sticky: the limit is spent for every entry.
+        assert!(read_zip_entry(&mut archive, &entries, "a.bin").is_err());
+    }
+
+    /// A part that fails after inflating is not committed, so it would be
+    /// free to try again; the bytes of each failed attempt count, and once
+    /// they are past the limit the part is no longer inflated.
+    #[test]
+    fn test_package_byte_budget_stops_inflating_a_part_that_keeps_failing() {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts: zip::write::FileOptions<'_, '_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("a.bin", opts).unwrap();
+        zip.write_all(&vec![0u8; 1 << 20]).unwrap();
+        let good = zip.finish().unwrap().into_inner();
+        // Damage the compressed stream where a read inflates the most before
+        // it fails (a checksum mismatch alone keeps the bytes, and so does a
+        // stream that is complete but of another length: only a stream that
+        // breaks, such as one cut short, fails after inflating).
+        let limit = 2 << 20;
+        let mut found: Option<(u64, Vec<u8>)> = None;
+        for at in 40..good.len() {
+            let mut bytes = good.clone();
+            bytes[at] ^= 0x5A;
+            let Ok(mut archive) = ZipArchive::new(std::io::Cursor::new(bytes.clone())) else {
+                continue;
+            };
+            let entries = ZipEntryIndex::with_byte_limit(&archive, limit);
+            if read_zip_entry(&mut archive, &entries, "a.bin").is_err()
+                && entries.failed.get() > found.as_ref().map_or(0, |f| f.0)
+            {
+                found = Some((entries.failed.get(), bytes));
+            }
+        }
+        let (_, bytes) = found.expect("a damaged stream that fails after inflating");
+        let mut archive = ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let entries = ZipEntryIndex::with_byte_limit(&archive, limit);
+        let mut inflating = 0u64;
+        let mut refused = false;
+        for _ in 0..10_000 {
+            match read_zip_entry(&mut archive, &entries, "a.bin") {
+                Err(Error::PackageLimit(_)) => {
+                    refused = true;
+                    break;
+                },
+                Err(_) => inflating += 1,
+                Ok(_) => panic!("a damaged stream was accepted"),
+            }
+        }
+        assert!(refused, "{inflating} attempts were inflated and none refused");
+        let each = entries.failed.get() / inflating.max(1);
+        assert!(
+            each > 0 && inflating <= limit / each + 2,
+            "{inflating} attempts of {each} bytes"
+        );
+        assert!(read_zip_entry(&mut archive, &entries, "a.bin").is_err());
+        assert!(entries.failed.get() <= limit + each, "{}", entries.failed.get());
     }
 
     /// A declared size that understates the data does not dodge the package

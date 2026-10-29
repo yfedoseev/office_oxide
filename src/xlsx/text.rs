@@ -5,6 +5,8 @@ use super::numfmt;
 use super::worksheet::Row;
 use crate::ir::SheetKind;
 use crate::limits::TextBudget;
+use crate::stream::Prefixed;
+use std::fmt::{self, Write};
 
 /// The heading every renderer gives a pivot's cached source data.
 pub(crate) fn pivot_cache_title(pivot_name: &str) -> String {
@@ -24,8 +26,27 @@ impl XlsxDocument {
         self.worksheets
             .iter()
             .flat_map(|ws| &ws.pivot_tables)
-            .filter_map(|p| Some((p.name.as_str(), p.cache_data.as_ref()?)))
+            .filter_map(|p| Some((p.name.as_str(), p.cache_data.as_deref()?)))
     }
+}
+
+/// What an unused column of a Markdown table row costs: `" | "`.
+pub(crate) const MARKDOWN_PAD_CHARS: usize = 3;
+
+/// The line every renderer gives a sheet whose threaded comments stopped at
+/// the document's text budget.
+pub(crate) const COMMENTS_TRUNCATED_NOTICE: &str = "[comments truncated: the threaded comments exceed the character budget (office_oxide::limits::set_max_text_chars) — later threads are missing]";
+
+/// What a comment adds to a rendering: its cell reference, author and text,
+/// and the note that holds them in the IR. The author is stored once and
+/// named by every comment, and a comments part may be named by every sheet,
+/// so this is what the renderers charge to the budget for each: a comment of
+/// one character is still a note.
+pub(crate) fn comment_chars(c: &super::worksheet::SheetComment) -> usize {
+    std::mem::size_of::<crate::ir::Note>()
+        .saturating_add(c.cell_ref.len())
+        .saturating_add(c.author.as_ref().map_or(0, |a| a.len()))
+        .saturating_add(c.text.len())
 }
 
 /// `B2 (Author)` — the same marker `to_ir()` puts on a comment's endnote.
@@ -36,52 +57,138 @@ pub(crate) fn comment_marker(cell_ref: &str, author: Option<&str>) -> String {
     }
 }
 
-/// Per-render cell formatting state: the date styles found once
-/// (`date_style_indices`) and each custom `<numFmt>` compiled once, rather
-/// than a date re-check of the format code and a re-parse of it for every
-/// cell. Every direct renderer and `to_ir()` format through this.
+/// The workbook-level tables every cell render needs: which cell styles are
+/// dates, and the custom `<numFmt>` codes behind the others, each compiled the
+/// first time a cell needs it. They depend on the stylesheet alone, so they
+/// are built once per document and shared by every sheet's render (building
+/// them per sheet made a workbook of many sheets and many cell formats cost
+/// their product).
+#[derive(Debug, Clone)]
+pub(crate) struct FormatTables {
+    /// The stylesheet shape these were built from, to notice a stylesheet
+    /// changed through the public field since.
+    shape: (usize, usize),
+    date_indices: std::collections::HashSet<u32>,
+    /// Per number-format id, the first style that uses it (its code is looked
+    /// up through that style) and the code compiled on first use.
+    compiled:
+        std::collections::HashMap<u32, (u32, std::sync::OnceLock<Option<numfmt::CompiledFormat>>)>,
+}
+
+thread_local! {
+    /// How many times [`FormatTables`] were built on this thread.
+    #[cfg(test)]
+    pub(crate) static FORMAT_TABLE_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl FormatTables {
+    fn shape_of(doc: &XlsxDocument) -> (usize, usize) {
+        doc.styles
+            .as_ref()
+            .map_or((0, 0), |s| (s.cell_formats.len(), s.number_formats.len()))
+    }
+
+    fn build(doc: &XlsxDocument) -> Self {
+        #[cfg(test)]
+        FORMAT_TABLE_BUILDS.with(|n| n.set(n.get() + 1));
+        let mut compiled = std::collections::HashMap::new();
+        if let Some(styles) = doc.styles.as_ref() {
+            for idx in 0..styles.cell_formats.len() as u32 {
+                if let (Some(fmt_id), Some(_)) =
+                    (styles.number_format_id_for(idx), styles.number_format_override_for(idx))
+                {
+                    compiled
+                        .entry(fmt_id)
+                        .or_insert_with(|| (idx, std::sync::OnceLock::new()));
+                }
+            }
+        }
+        Self {
+            shape: Self::shape_of(doc),
+            date_indices: doc.date_style_indices(),
+            compiled,
+        }
+    }
+}
+
+/// What a document keeps between renders: the [`FormatTables`] and the
+/// theme parsed from its raw part.
+#[derive(Debug, Default)]
+pub(crate) struct RenderCache {
+    tables: std::sync::OnceLock<FormatTables>,
+    theme: std::sync::OnceLock<Option<crate::core::theme::Theme>>,
+}
+
+/// A copy of a document starts with an empty cache: its tables are derived
+/// again from the copy's own `styles` and theme, so editing a copy cannot
+/// leave it with the tables of the original.
+impl Clone for RenderCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl RenderCache {
+    pub(crate) fn theme(&self, raw: Option<&[u8]>) -> Option<&crate::core::theme::Theme> {
+        self.theme
+            .get_or_init(|| raw.and_then(|d| crate::core::theme::Theme::parse(d).ok()))
+            .as_ref()
+    }
+}
+
+/// Per-render cell formatting state over the document's [`FormatTables`]
+/// rather than a date re-check of the format code and a re-parse of it for
+/// every cell. Every direct renderer and `to_ir()` format through this.
 pub(crate) struct CellFormatter<'a> {
     doc: &'a XlsxDocument,
-    date_indices: std::collections::HashSet<u32>,
-    compiled: std::collections::HashMap<u32, Option<numfmt::CompiledFormat>>,
+    tables: std::borrow::Cow<'a, FormatTables>,
 }
 
 impl<'a> CellFormatter<'a> {
     pub(crate) fn new(doc: &'a XlsxDocument) -> Self {
-        Self {
-            doc,
-            date_indices: doc.date_style_indices(),
-            compiled: std::collections::HashMap::new(),
-        }
+        let cached = doc
+            .render_cache
+            .tables
+            .get_or_init(|| FormatTables::build(doc));
+        // `styles` is a public field: tables built for a stylesheet that has
+        // since changed shape are not used.
+        let tables = if cached.shape == FormatTables::shape_of(doc) {
+            std::borrow::Cow::Borrowed(cached)
+        } else {
+            std::borrow::Cow::Owned(FormatTables::build(doc))
+        };
+        Self { doc, tables }
     }
 
     pub(crate) fn date_indices(&self) -> &std::collections::HashSet<u32> {
-        &self.date_indices
+        &self.tables.date_indices
     }
 
     /// Append `cell`'s display text to `buf`.
-    pub(crate) fn write(&mut self, cell: &Cell, buf: &mut String) {
+    pub(crate) fn write(&self, cell: &Cell, buf: &mut String) {
         let doc = self.doc;
-        let date_indices = &self.date_indices;
-        let compiled = &mut self.compiled;
+        let tables = &*self.tables;
         doc.write_value_with(
             cell,
             buf,
-            |idx| date_indices.contains(&idx),
-            |n, idx, fmt_id| {
-                let styles = doc.styles.as_ref();
-                let code = compiled.entry(fmt_id).or_insert_with(|| {
-                    styles
-                        .and_then(|s| s.number_format_override_for(idx))
-                        .and_then(numfmt::compile_custom)
+            |idx| tables.date_indices.contains(&idx),
+            |n, _idx, fmt_id| {
+                let code = tables.compiled.get(&fmt_id).and_then(|(first, once)| {
+                    once.get_or_init(|| {
+                        doc.styles
+                            .as_ref()
+                            .and_then(|s| s.number_format_override_for(*first))
+                            .and_then(numfmt::compile_custom)
+                    })
+                    .as_ref()
                 });
-                numfmt::apply_format_compiled(n, fmt_id, code.as_ref())
+                numfmt::apply_format_compiled(n, fmt_id, code)
             },
         );
     }
 
     /// `cell`'s display text.
-    pub(crate) fn text(&mut self, cell: &Cell) -> String {
+    pub(crate) fn text(&self, cell: &Cell) -> String {
         let mut buf = String::new();
         self.write(cell, &mut buf);
         buf
@@ -96,92 +203,160 @@ impl XlsxDocument {
     /// `to_markdown()` and every other spreadsheet reader (POI, openpyxl,
     /// xlrd, calamine) do — the same workbook used to name its sheets in
     /// one format and not the other.
+    ///
+    /// The text is produced sheet by sheet straight into the result, with
+    /// nothing held but the row being laid out; [`Self::write_plain_text`]
+    /// writes it to a stream instead.
     pub fn plain_text(&self) -> String {
-        let mut parts = Vec::new();
+        let mut out = String::new();
+        // Writing to a `String` cannot fail.
+        let _ = self.render_plain_text(&mut out);
+        out
+    }
+
+    /// Write [`Self::plain_text`] to `out` as it is produced, without
+    /// building it in memory.
+    pub fn write_plain_text<W: std::io::Write + ?Sized>(&self, out: &mut W) -> std::io::Result<()> {
+        crate::stream::render_to_io(out, |sink| self.render_plain_text(sink))
+    }
+
+    pub(crate) fn render_plain_text<W: Write + ?Sized>(&self, out: &mut W) -> fmt::Result {
         // One text budget for the whole document: a shared string
         // referenced from every cell is rendered once per cell, and
         // nothing else bounds that product (see `crate::limits`).
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
         let mut budget = TextBudget::new();
+        // The parts of the text are separated by a blank line; the
+        // separator goes in front of each part but the first.
+        let mut first = true;
+        let mut begin = |out: &mut W| -> fmt::Result {
+            if !std::mem::take(&mut first) {
+                out.write_str("\n\n")?;
+            }
+            Ok(())
+        };
         for (i, ws) in self.worksheets.iter().enumerate() {
-            let mut sheet = ws.name.clone();
+            begin(out)?;
+            out.write_str(&ws.name)?;
             // Page headers above the cells and footers below, as the IR
             // renderers place a section's headers and footers.
             let [fh, oh, eh, ff, of, ef] = ws.header_footer.active(&ws.name);
             for h in [fh, oh, eh].into_iter().flatten() {
-                sheet.push('\n');
-                sheet.push_str(&h);
+                out.write_char('\n')?;
+                out.write_str(&h)?;
             }
             // A chart sheet's content is its chart's text.
             for text in &ws.chart_text {
-                sheet.push('\n');
-                sheet.push_str(text.trim());
-            }
-            if let Some(text) = self.sheet_plain_text_within(i, &mut budget) {
-                if !text.is_empty() {
-                    sheet.push('\n');
-                    sheet.push_str(&text);
+                if !budget.charge(text.trim().len()) {
+                    break;
                 }
+                out.write_char('\n')?;
+                out.write_str(text.trim())?;
             }
+            // The cells follow on a line of their own, when there are any.
+            self.render_sheet_plain_within(i, &mut budget, &mut Prefixed::new(out, "\n"))?;
             for f in [ff, of, ef].into_iter().flatten() {
-                sheet.push('\n');
-                sheet.push_str(&f);
+                out.write_char('\n')?;
+                out.write_str(&f)?;
             }
             if budget.exhausted() {
-                sheet.push('\n');
-                sheet.push_str(&budget.notice());
-                parts.push(sheet);
+                out.write_char('\n')?;
+                out.write_str(&budget.notice())?;
                 break;
             }
             // Cell comments are document content; `to_ir()` carries them
             // as endnotes, and this direct renderer dropped them.
-            for c in &ws.comments {
-                sheet.push('\n');
-                sheet.push_str(&format!(
-                    "{}: {}",
-                    comment_marker(&c.cell_ref, c.author.as_deref()),
-                    c.text
-                ));
+            for c in ws.comments.iter() {
+                // The author's name is repeated by every comment of theirs.
+                if !budget.charge(comment_chars(c)) {
+                    break;
+                }
+                out.write_char('\n')?;
+                write!(out, "{}: {}", comment_marker(&c.cell_ref, c.author.as_deref()), c.text)?;
+            }
+            if ws.comments_truncated {
+                out.write_char('\n')?;
+                out.write_str(COMMENTS_TRUNCATED_NOTICE)?;
+            }
+            if let Some(damage) = &ws.damage {
+                out.write_char('\n')?;
+                out.write_str(&damaged_notice(&ws.name, damage))?;
+            }
+            if budget.exhausted() {
+                out.write_char('\n')?;
+                out.write_str(&budget.notice())?;
+                break;
             }
             // Text boxes and WordArt drawn on the sheet reached `to_ir()`
             // as text boxes and this renderer not at all — a sheet whose
             // content is a drawn note came back as its name alone.
-            for ts in &ws.text_shapes {
+            for ts in ws.text_shapes.iter() {
                 if !ts.text.trim().is_empty() {
-                    sheet.push('\n');
-                    sheet.push_str(ts.text.trim());
+                    // Shared by every sheet that names the drawing, written
+                    // once for each: paid for like any other text.
+                    if !budget.charge(ts.text.trim().len()) {
+                        break;
+                    }
+                    out.write_char('\n')?;
+                    out.write_str(ts.text.trim())?;
                 }
             }
-            parts.push(sheet);
+            if budget.exhausted() {
+                out.write_char('\n')?;
+                out.write_str(&budget.notice())?;
+                break;
+            }
         }
         // `to_markdown()` already surfaces chart text (axis titles, series
         // names); `plain_text()` silently dropped it entirely.
         for text in &self.chart_text {
             if !text.trim().is_empty() {
-                parts.push(text.trim().to_string());
+                begin(out)?;
+                out.write_str(text.trim())?;
             }
         }
+        // Pivots that name one cache each render it, so the output is
+        // charged to the budget however many of them share the data.
+        let mut pivots_spent = false;
         for (name, data) in self.pivot_caches() {
-            let mut block = pivot_cache_title(name);
+            if budget.exhausted() {
+                break;
+            }
+            begin(out)?;
+            out.write_str(&pivot_cache_title(name))?;
             for row in std::iter::once(&data.fields).chain(&data.records) {
-                block.push('\n');
-                block.push_str(&row.join("\t"));
+                let line = row.join("\t");
+                if !budget.charge(line.len() + 1) {
+                    pivots_spent = true;
+                    break;
+                }
+                out.write_char('\n')?;
+                out.write_str(&line)?;
             }
             if data.truncated {
-                block.push('\n');
-                block.push_str(PIVOT_CACHE_TRUNCATED_NOTICE);
+                out.write_char('\n')?;
+                out.write_str(PIVOT_CACHE_TRUNCATED_NOTICE)?;
             }
-            parts.push(block);
         }
-        for (name, err) in &self.unreadable_sheets {
-            parts.push(unreadable_notice(name, err));
+        if pivots_spent {
+            begin(out)?;
+            out.write_str(&budget.notice())?;
         }
-        parts.join("\n\n")
+        write_report_notices(out, &mut budget, &mut begin, &self.report_notices(), false)
     }
 
     /// Extract a single sheet as plain text.
     pub fn sheet_plain_text(&self, sheet_index: usize) -> Option<String> {
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
         let mut budget = TextBudget::new();
-        let mut text = self.sheet_plain_text_within(sheet_index, &mut budget)?;
+        let mut text = String::new();
+        // Writing to a `String` cannot fail.
+        if !self
+            .render_sheet_plain_within(sheet_index, &mut budget, &mut text)
+            .ok()?
+        {
+            return None;
+        }
         if budget.exhausted() {
             text.push('\n');
             text.push_str(&budget.notice());
@@ -189,17 +364,23 @@ impl XlsxDocument {
         Some(text)
     }
 
-    fn sheet_plain_text_within(
+    /// Write the rows of sheet `sheet_index` to `out`, each cell charged to
+    /// `budget` before it is written. `Ok(false)` when there is no such sheet.
+    fn render_sheet_plain_within<W: Write + ?Sized>(
         &self,
         sheet_index: usize,
         budget: &mut TextBudget,
-    ) -> Option<String> {
-        let ws = self.worksheets.get(sheet_index)?;
-        let mut fmt = CellFormatter::new(self);
-        let mut buf = String::with_capacity(ws.rows.len() * 64);
+        out: &mut W,
+    ) -> Result<bool, fmt::Error> {
+        let Some(ws) = self.worksheets.get(sheet_index) else {
+            return Ok(false);
+        };
+        let fmt = CellFormatter::new(self);
+        // The tabs in front of a cell and the cell, the largest piece held.
+        let mut piece = String::new();
         for (row_idx, row) in ws.rows.iter().enumerate() {
             if row_idx > 0 {
-                buf.push('\n');
+                out.write_char('\n')?;
             }
             // A cell sits in its own column: XLSX stores only non-empty
             // cells (§18.3.1.4), so the columns a row skips are tabs, not
@@ -210,17 +391,53 @@ impl XlsxDocument {
                 let col = cell.reference.col;
                 let gap = col.saturating_sub(next_col) as usize;
                 let tabs = if i == 0 { gap } else { gap + 1 };
-                let before = buf.len();
-                buf.extend(std::iter::repeat_n('\t', tabs));
-                fmt.write(cell, &mut buf);
-                if !budget.charge(buf.len() - before) {
-                    buf.truncate(before);
-                    return Some(buf);
+                piece.clear();
+                piece.extend(std::iter::repeat_n('\t', tabs));
+                fmt.write(cell, &mut piece);
+                if !budget.charge(piece.len()) {
+                    return Ok(true);
                 }
+                out.write_str(&piece)?;
                 next_col = next_col.max(col.saturating_add(1));
             }
         }
-        Some(buf)
+        Ok(true)
+    }
+
+    /// Convert the workbook to IR one section at a time, in the order of
+    /// [`Document::to_ir`](crate::Document::to_ir)`().sections`: each worksheet,
+    /// then the chart text, the pivot caches and the sheets that could not
+    /// be read.
+    ///
+    /// Nothing is converted until the iterator is advanced, and nothing it
+    /// has handed out is kept, so a caller that uses and drops each
+    /// [`SheetIr`](super::SheetIr) before asking for the next holds about
+    /// one sheet's IR whatever the workbook's size. This is how a browser
+    /// holds a page, and how a streaming reader holds a worksheet.
+    ///
+    /// The allowances that bound the IR's memory are therefore a sheet's,
+    /// fresh for each: the empty cells that pad its rows
+    /// (`max_sheet_ir_padding_bytes`)
+    /// and the picture bytes it copies
+    /// (`max_image_bytes`). What
+    /// bounds the run as a whole stays document-wide: the text budget
+    /// ([`limits::max_text_chars`](crate::limits::max_text_chars)), which the
+    /// padding is charged to as well, and the total of picture bytes copied
+    /// (`max_total_image_bytes`).
+    /// A sheet that does not fit its own allowance is cut, with a notice in
+    /// the section, a [`SheetIr::warnings`](super::SheetIr::warnings) entry
+    /// and [`SheetIr::text_truncated`](super::SheetIr::text_truncated), and
+    /// the next sheet is converted whole; a document-wide limit ends the
+    /// iteration the same way. [`Document::to_ir`](crate::Document::to_ir)
+    /// holds every sheet at once, so it keeps document-wide allowances.
+    pub fn sheets_ir(&self) -> super::SheetIrs<'_> {
+        super::SheetIrs::new(self)
+    }
+
+    /// Convert worksheet `sheet_index` alone, with a sheet's own allowances
+    /// (see [`Self::sheets_ir`]); `None` when there is no such worksheet.
+    pub fn sheet_ir(&self, sheet_index: usize) -> Option<super::SheetIr> {
+        crate::convert_xlsx::sheet_to_ir(self, sheet_index)
     }
 
     /// Convert to CSV string (default: first sheet).
@@ -233,8 +450,9 @@ impl XlsxDocument {
         let ws = self.worksheets.get(sheet_index)?;
         let col_count = compute_column_count(&ws.rows);
         let mut lines = Vec::new();
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
         let mut budget = TextBudget::new();
-        let mut fmt = CellFormatter::new(self);
+        let fmt = CellFormatter::new(self);
 
         // Rows the sheet does not store are empty lines, so every value
         // keeps its row number (§18.3.1.73 `r`); the padding is charged to
@@ -272,47 +490,106 @@ impl XlsxDocument {
     }
 
     /// Convert to markdown (pipe-delimited tables).
+    ///
+    /// The text is produced sheet by sheet straight into the result, with
+    /// nothing held but the row being laid out; [`Self::write_markdown`]
+    /// writes it to a stream instead.
     pub fn to_markdown(&self) -> String {
-        let mut parts = Vec::new();
+        let mut out = String::new();
+        // Writing to a `String` cannot fail.
+        let _ = self.render_markdown(&mut out);
+        out
+    }
+
+    /// Write [`Self::to_markdown`] to `out` as it is produced, without
+    /// building it in memory.
+    pub fn write_markdown<W: std::io::Write + ?Sized>(&self, out: &mut W) -> std::io::Result<()> {
+        crate::stream::render_to_io(out, |sink| self.render_markdown(sink))
+    }
+
+    pub(crate) fn render_markdown<W: Write + ?Sized>(&self, out: &mut W) -> fmt::Result {
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
         let mut budget = TextBudget::new();
+        // The parts of the Markdown are separated by a blank line; the
+        // separator goes in front of each part but the first.
+        let mut first = true;
+        let mut begin = |out: &mut W| -> fmt::Result {
+            if !std::mem::take(&mut first) {
+                out.write_str("\n\n")?;
+            }
+            Ok(())
+        };
         for (i, ws) in self.worksheets.iter().enumerate() {
             let [fh, oh, eh, ff, of, ef] = ws.header_footer.active(&ws.name);
-            if let Some(md) = self.sheet_to_markdown_within(i, &mut budget) {
-                if !md.is_empty() {
-                    parts.push(md);
-                } else if !ws.comments.is_empty()
-                    || ws.text_shapes.iter().any(|t| !t.text.trim().is_empty())
-                    || !ws.header_footer.is_empty()
-                    || !matches!(ws.kind, SheetKind::Worksheet | SheetKind::Macro)
-                {
-                    // No cells, but comments, drawn text or page
-                    // headers: they still belong under the sheet's heading.
-                    // A chart sheet or dialog sheet has no cells at all;
-                    // its tab is still a sheet of the workbook.
-                    parts.push(format!("## {}", ws.name));
-                }
+            if markdown_column_count(ws) > 0 {
+                begin(out)?;
+                self.render_sheet_markdown_within(i, &mut budget, out)?;
+            } else if !ws.comments.is_empty()
+                || ws.text_shapes.iter().any(|t| !t.text.trim().is_empty())
+                || !ws.header_footer.is_empty()
+                || !matches!(ws.kind, SheetKind::Worksheet | SheetKind::Macro)
+            {
+                // No cells, but comments, drawn text or page
+                // headers: they still belong under the sheet's heading.
+                // A chart sheet or dialog sheet has no cells at all;
+                // its tab is still a sheet of the workbook.
+                begin(out)?;
+                write!(out, "## {}", ws.name)?;
             }
             for text in &ws.chart_text {
-                parts.push(text.trim().to_string());
+                if !budget.charge(text.trim().len()) {
+                    break;
+                }
+                begin(out)?;
+                out.write_str(text.trim())?;
             }
             for hf in [fh, oh, eh, ff, of, ef].into_iter().flatten() {
-                parts.push(crate::core::markdown::escape_text(&hf));
+                begin(out)?;
+                out.write_str(&crate::core::markdown::escape_text(&hf))?;
             }
             if budget.exhausted() {
-                parts.push(budget.notice());
+                begin(out)?;
+                out.write_str(&budget.notice())?;
                 break;
             }
-            for c in &ws.comments {
-                parts.push(format!(
+            for c in ws.comments.iter() {
+                if !budget.charge(comment_chars(c)) {
+                    break;
+                }
+                begin(out)?;
+                write!(
+                    out,
                     "> **{}:** {}",
                     comment_marker(&c.cell_ref, c.author.as_deref()),
                     c.text.trim()
-                ));
+                )?;
             }
-            for ts in &ws.text_shapes {
+            if ws.comments_truncated {
+                begin(out)?;
+                out.write_str(COMMENTS_TRUNCATED_NOTICE)?;
+            }
+            if let Some(damage) = &ws.damage {
+                begin(out)?;
+                out.write_str(&damaged_notice(&ws.name, damage))?;
+            }
+            if budget.exhausted() {
+                begin(out)?;
+                out.write_str(&budget.notice())?;
+                break;
+            }
+            for ts in ws.text_shapes.iter() {
                 if !ts.text.trim().is_empty() {
-                    parts.push(ts.text.trim().to_string());
+                    if !budget.charge(ts.text.trim().len()) {
+                        break;
+                    }
+                    begin(out)?;
+                    out.write_str(ts.text.trim())?;
                 }
+            }
+            if budget.exhausted() {
+                begin(out)?;
+                out.write_str(&budget.notice())?;
+                break;
             }
         }
         // Charts: emit each chart's extracted text under a "## Chart N" heading
@@ -320,10 +597,17 @@ impl XlsxDocument {
         // graphical chart renderer.
         for (i, text) in self.chart_text.iter().enumerate() {
             if !text.trim().is_empty() {
-                parts.push(format!("## Chart {}\n\n{}", i + 1, text));
+                begin(out)?;
+                write!(out, "## Chart {}\n\n{}", i + 1, text)?;
             }
         }
+        // Pivots that name one cache each render it, so the output is
+        // charged to the budget however many of them share the data.
+        let mut pivots_spent = false;
         for (name, data) in self.pivot_caches() {
+            if budget.exhausted() {
+                break;
+            }
             let cols = data.fields.len().max(1);
             let md_row = |row: &[String]| {
                 let mut line = String::from("|");
@@ -335,31 +619,54 @@ impl XlsxDocument {
                 }
                 line
             };
-            let mut block = format!("## {}\n\n", pivot_cache_title(name));
-            block.push_str(&md_row(&data.fields));
-            block.push('\n');
-            block.push('|');
-            block.push_str(&" --- |".repeat(cols));
+            // The heading, the header row and the separator are paid for
+            // before they are written; a pivot whose header does not fit is
+            // not written, and no later one is.
+            let heading = format!("## {}\n\n", pivot_cache_title(name));
+            let header = md_row(&data.fields);
+            let separator = format!("|{}", " --- |".repeat(cols));
+            if !budget.charge(heading.len() + header.len() + separator.len() + 2) {
+                pivots_spent = true;
+                break;
+            }
+            begin(out)?;
+            out.write_str(&heading)?;
+            out.write_str(&header)?;
+            out.write_char('\n')?;
+            out.write_str(&separator)?;
             for rec in &data.records {
-                block.push('\n');
-                block.push_str(&md_row(rec));
+                let line = md_row(rec);
+                if !budget.charge(line.len() + 1) {
+                    pivots_spent = true;
+                    break;
+                }
+                out.write_char('\n')?;
+                out.write_str(&line)?;
             }
             if data.truncated {
-                block.push_str("\n\n");
-                block.push_str(PIVOT_CACHE_TRUNCATED_NOTICE);
+                out.write_str("\n\n")?;
+                out.write_str(PIVOT_CACHE_TRUNCATED_NOTICE)?;
             }
-            parts.push(block);
         }
-        for (name, err) in &self.unreadable_sheets {
-            parts.push(format!("## {name}\n\n{}", unreadable_notice(name, err)));
+        if pivots_spent {
+            begin(out)?;
+            out.write_str(&budget.notice())?;
         }
-        parts.join("\n\n")
+        write_report_notices(out, &mut budget, &mut begin, &self.report_notices(), true)
     }
 
     /// Convert specific sheet to markdown.
     pub fn sheet_to_markdown(&self, sheet_index: usize) -> Option<String> {
+        let _scale = crate::limits::InputSizeScope::new(self.input_bytes);
         let mut budget = TextBudget::new();
-        let mut md = self.sheet_to_markdown_within(sheet_index, &mut budget)?;
+        let mut md = String::new();
+        // Writing to a `String` cannot fail.
+        if !self
+            .render_sheet_markdown_within(sheet_index, &mut budget, &mut md)
+            .ok()?
+        {
+            return None;
+        }
         if budget.exhausted() {
             md.push_str("\n\n");
             md.push_str(&budget.notice());
@@ -367,23 +674,25 @@ impl XlsxDocument {
         Some(md)
     }
 
-    fn sheet_to_markdown_within(
+    /// Write sheet `sheet_index` as Markdown to `out`, each cell charged to
+    /// `budget` before it is written; nothing for a sheet without cells.
+    /// `Ok(false)` when there is no such sheet.
+    fn render_sheet_markdown_within<W: Write + ?Sized>(
         &self,
         sheet_index: usize,
         budget: &mut TextBudget,
-    ) -> Option<String> {
-        let ws = self.worksheets.get(sheet_index)?;
-        if ws.rows.is_empty() {
-            return Some(String::new());
+        out: &mut W,
+    ) -> Result<bool, fmt::Error> {
+        let Some(ws) = self.worksheets.get(sheet_index) else {
+            return Ok(false);
+        };
+        let col_count = markdown_column_count(ws);
+        if col_count == 0 {
+            return Ok(true);
         }
         // Every cell text passes through here; a spent budget ends the
         // sheet at the cell that spent it.
-        let mut fmt = CellFormatter::new(self);
-
-        let col_count = compute_column_count(&ws.rows);
-        if col_count == 0 {
-            return Some(String::new());
-        }
+        let fmt = CellFormatter::new(self);
 
         // A "document style" sheet (see `rows_read_as_prose`) is emitted a
         // paragraph per row instead of a tall, narrow GFM table that reads
@@ -396,20 +705,23 @@ impl XlsxDocument {
                 .filter(|&n| n > 0)
                 .collect::<Vec<_>>()
         }));
-        let mut cell_text = |cell: &Cell| -> Option<String> {
+        let cell_text = |cell: &Cell, budget: &mut TextBudget| -> Option<String> {
             let text = fmt.text(cell);
             budget
                 .charge(text.len())
                 .then(|| crate::core::markdown::escape_cell(&text))
         };
         if prose {
-            let mut out = String::new();
-            out.push_str(&format!("## {}\n\n", ws.name));
+            // The paragraphs, each followed by a blank line, but for the
+            // last: the line written is held back until the next one comes.
+            let heading = format!("## {}\n\n", ws.name);
+            let mut heading_written = false;
+            let mut held: Option<String> = None;
             'rows: for row in &ws.rows {
                 // Every non-empty cell of the row, tab-separated.
                 let mut line = String::new();
                 for cell in &row.cells {
-                    let Some(text) = cell_text(cell) else {
+                    let Some(text) = cell_text(cell, budget) else {
                         break 'rows;
                     };
                     if text.trim().is_empty() {
@@ -423,28 +735,52 @@ impl XlsxDocument {
                     line.push_str(&text.replace("<br>", "\n"));
                 }
                 if !line.is_empty() {
-                    out.push_str(&line);
-                    out.push_str("\n\n");
+                    if !heading_written {
+                        out.write_str(&heading)?;
+                        heading_written = true;
+                    }
+                    if let Some(previous) = held.replace(line) {
+                        out.write_str(&previous)?;
+                        out.write_str("\n\n")?;
+                    }
                 }
             }
-            return Some(out.trim_end().to_string());
+            match held {
+                Some(last) => out.write_str(last.trim_end())?,
+                None => out.write_str(heading.trim_end())?,
+            }
+            return Ok(true);
         }
 
-        let mut lines = Vec::new();
+        // The lines of the table are separated by a line break.
+        let mut first_line = true;
+        let mut line_out = |out: &mut W, line: &str| -> fmt::Result {
+            if !std::mem::take(&mut first_line) {
+                out.write_char('\n')?;
+            }
+            out.write_str(line)
+        };
 
         // Sheet name as heading
-        lines.push(format!("## {}", ws.name));
-        lines.push(String::new());
+        line_out(out, &format!("## {}", ws.name))?;
+        line_out(out, "")?;
 
         // First row as header
         // A row keeps the cells that fit the budget (the rest empty) and
         // reports that the budget is spent, so the table ends after it.
         // Each cell goes under its own column's header (§18.3.1.4 `r`).
-        let mut row_line = |row: &Row| -> (String, bool) {
+        // Every row is laid out the sheet's full width, so the columns a
+        // row does not use are output too: " | " for each one. They are
+        // charged like text, which bounds a sheet whose cells sit at A1
+        // and XFD1 however many rows it stores, as `to_csv` does.
+        let row_line = |row: &Row, budget: &mut TextBudget| -> (Option<String>, bool) {
             let mut cells: Vec<String> = vec![String::new(); col_count];
+            if !budget.charge(col_count.saturating_mul(MARKDOWN_PAD_CHARS)) {
+                return (None, true);
+            }
             let mut spent = false;
             for c in &row.cells {
-                match cell_text(c) {
+                match cell_text(c, budget) {
                     Some(t) => place(&mut cells, c.reference.col, t),
                     None => {
                         spent = true;
@@ -452,27 +788,36 @@ impl XlsxDocument {
                     },
                 }
             }
-            (format!("| {} |", cells.join(" | ")), spent)
+            (Some(format!("| {} |", cells.join(" | "))), spent)
         };
-        let (header, spent) = row_line(&ws.rows[0]);
-        lines.push(header);
+        let (header, spent) = row_line(&ws.rows[0], budget);
+        let Some(header) = header else {
+            // Not even the header fits: the sheet is its heading alone.
+            return Ok(true);
+        };
+        line_out(out, &header)?;
 
-        // Separator row
+        // Separator row, as wide as the table.
+        if !budget.charge(col_count.saturating_mul(MARKDOWN_PAD_CHARS + 2)) {
+            return Ok(true);
+        }
         let sep: Vec<&str> = vec!["---"; col_count];
-        lines.push(format!("| {} |", sep.join(" | ")));
+        line_out(out, &format!("| {} |", sep.join(" | ")))?;
 
         // Data rows
         if !spent {
             for row in ws.rows.iter().skip(1) {
-                let (line, spent) = row_line(row);
-                lines.push(line);
+                let (line, spent) = row_line(row, budget);
+                if let Some(line) = line {
+                    line_out(out, &line)?;
+                }
                 if spent {
                     break;
                 }
             }
         }
 
-        Some(lines.join("\n"))
+        Ok(true)
     }
 
     /// Format a cell value to a display string, applying date detection.
@@ -520,7 +865,7 @@ impl XlsxDocument {
             // indistinguishable from a genuinely empty one, and the formula
             // text never reached any consumer at all.
             CellValue::Empty => {
-                if let Some(f) = &cell.formula {
+                if let Some(f) = cell.formula() {
                     buf.push('=');
                     buf.push_str(f);
                 }
@@ -622,6 +967,16 @@ fn write_number(n: f64, buf: &mut String) {
 
 /// The sheet's width: one past the rightmost column any cell references
 /// (not the longest row's cell count — a sparse row is short but wide).
+/// How many columns a sheet's Markdown table has; zero when the sheet
+/// renders as nothing at all (no stored rows, or no cells in them).
+fn markdown_column_count(ws: &super::worksheet::Worksheet) -> usize {
+    if ws.rows.is_empty() {
+        0
+    } else {
+        compute_column_count(&ws.rows)
+    }
+}
+
 fn compute_column_count(rows: &[Row]) -> usize {
     rows.iter()
         .flat_map(|r| &r.cells)
@@ -651,10 +1006,133 @@ fn csv_escape(field: &str) -> String {
     }
 }
 
+/// The line every renderer emits for a sheet whose XML was malformed part-way
+/// and which was read only up to the damage.
+pub(crate) fn damaged_notice(name: &str, damage: &str) -> String {
+    inert(&format!("[sheet {name:?} cut short: {damage}]"))
+}
+
 /// The line every renderer emits for a sheet that could not be read, so
 /// a workbook missing a sheet never passes for a complete one.
 pub(crate) fn unreadable_notice(name: &str, err: &str) -> String {
-    format!("[unreadable sheet {name:?}: {err}]")
+    inert(&format!("[unreadable sheet {name:?}: {err}]"))
+}
+
+/// `s` as one line: every control character, and the Unicode line and
+/// paragraph separators, become a space. A notice echoes names and reasons
+/// the file controls, and one that could end its line could start another
+/// (a heading, a list item) in any rendering.
+pub(crate) fn inert(s: &str) -> String {
+    crate::core::unreadable::one_line(s)
+}
+
+/// What could not be read, as every renderer reports it: one entry for each
+/// unreadable sheet listed, one for the sheets left unlisted and one for the
+/// parts (relationship, drawing, comments, table, pivot, chart and picture
+/// parts). They are bounded (see [`XlsxDocument::unreadable_sheets`]), cut and
+/// charged to the text budget by every renderer before it writes them.
+pub(crate) struct ReportNotice {
+    /// The heading of the entry's section: a fixed label, never text from the
+    /// file.
+    pub(crate) title: String,
+    /// The in-band lines, each a bracketed notice.
+    pub(crate) lines: Vec<String>,
+    /// The `Metadata::warnings` entries for the same.
+    pub(crate) warnings: Vec<String>,
+}
+
+impl ReportNotice {
+    /// What the entry costs to write, in characters like the rest of the
+    /// text budget: its heading and lines. (Each is cut at 256 characters
+    /// and there are at most 201 of them, so counting is bounded.)
+    pub(crate) fn chars(&self) -> usize {
+        self.lines.iter().fold(self.title.chars().count(), |n, l| {
+            n.saturating_add(l.chars().count()).saturating_add(4)
+        })
+    }
+}
+
+impl XlsxDocument {
+    /// The entries reporting what could not be read, in the order every
+    /// renderer writes them: the unreadable sheets, then the parts.
+    pub(crate) fn report_notices(&self) -> Vec<ReportNotice> {
+        let mut out: Vec<ReportNotice> = self
+            .unreadable_sheets
+            .iter()
+            .map(|(name, err)| ReportNotice {
+                // The name is in the line, where every rendering writes it as
+                // text; a heading would write it as markup.
+                title: "Unreadable sheet".to_string(),
+                lines: vec![unreadable_notice(name, err)],
+                warnings: vec![format!("skipped unreadable sheet {name:?}: {err}")],
+            })
+            .collect();
+        if self.unreadable_sheets_omitted > 0 {
+            let more =
+                format!("and {} more unreadable sheets not listed", self.unreadable_sheets_omitted);
+            out.push(ReportNotice {
+                title: "Unreadable sheets".to_string(),
+                lines: vec![format!("[{more}]")],
+                warnings: vec![more],
+            });
+        }
+        if !self.unreadable_parts.is_empty() || self.unreadable_parts_omitted > 0 {
+            let mut warnings: Vec<String> = self
+                .unreadable_parts
+                .iter()
+                .map(|(part, err)| format!("skipped unreadable part {part}: {err}"))
+                .collect();
+            if self.unreadable_parts_omitted > 0 {
+                warnings.push(format!(
+                    "and {} more unreadable parts not listed",
+                    self.unreadable_parts_omitted
+                ));
+            }
+            out.push(ReportNotice {
+                title: "Unreadable parts".to_string(),
+                lines: warnings.iter().map(|w| inert(&format!("[{w}]"))).collect(),
+                warnings,
+            });
+        }
+        out
+    }
+}
+
+/// Write the entries of `notices` that the budget pays for, each by `write`,
+/// and the budget's own notice (unless something already wrote it) where it
+/// runs out. `begin` starts each part of the output.
+fn write_report_notices<W: Write + ?Sized>(
+    out: &mut W,
+    budget: &mut TextBudget,
+    begin: &mut dyn FnMut(&mut W) -> fmt::Result,
+    notices: &[ReportNotice],
+    markdown: bool,
+) -> fmt::Result {
+    for n in notices {
+        let was_spent = budget.exhausted();
+        if !budget.charge(n.chars()) {
+            if !was_spent {
+                begin(out)?;
+                out.write_str(&budget.notice())?;
+            }
+            break;
+        }
+        if markdown {
+            begin(out)?;
+            let lines: Vec<String> = n
+                .lines
+                .iter()
+                .map(|l| crate::core::markdown::escape_text(l))
+                .collect();
+            write!(out, "## {}\n\n{}", n.title, lines.join("\n\n"))?;
+        } else {
+            for line in &n.lines {
+                begin(out)?;
+                out.write_str(line)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether a sheet reads as prose — flowing text laid out one paragraph
@@ -754,6 +1232,7 @@ mod tests {
 </styleSheet>"#;
         let ss = super::super::styles::StyleSheet::parse(styles).expect("styles parse");
         let doc = XlsxDocument {
+            input_bytes: 0,
             workbook: super::super::WorkbookInfo {
                 sheets: Vec::new(),
                 defined_names: Vec::new(),
@@ -770,8 +1249,13 @@ mod tests {
             package_properties: Default::default(),
             has_macros: false,
             unreadable_sheets: Vec::new(),
+            unreadable_sheets_omitted: 0,
+            unreadable_parts: Vec::new(),
+            unreadable_parts_omitted: 0,
+            cosmetic_parts: Vec::new(),
             styles_data: None,
             theme_data: None,
+            render_cache: Default::default(),
         };
         let idx = doc.date_style_indices();
         assert!(!idx.contains(&0), "id 50 overridden to a numeric code is not a date");
@@ -791,9 +1275,13 @@ mod tests {
             rows: Vec::new(),
             merged_cells: Vec::new(),
             hyperlinks: Vec::new(),
+            formulas_dropped: 0,
+            damage: None,
             page_setup: None,
-            images: Vec::new(),
-            comments: Vec::new(),
+            images: std::sync::Arc::from([]),
+            cell_images: Vec::new(),
+            comments: std::sync::Arc::from([]),
+            comments_truncated: false,
             text_shapes: vec![super::super::worksheet::WorksheetTextShape {
                 text: "Lorem ipsum drawn in a text box".to_string(),
                 font_name: None,
@@ -805,7 +1293,8 @@ mod tests {
                 y_emu: 0,
                 cx_emu: 100,
                 cy_emu: 100,
-            }],
+            }]
+            .into(),
             conditional_formats: Vec::new(),
             data_validations: Vec::new(),
             state: super::super::SheetState::Visible,
@@ -816,6 +1305,7 @@ mod tests {
             chart_text: Vec::new(),
         };
         let doc = XlsxDocument {
+            input_bytes: 0,
             workbook: super::super::WorkbookInfo {
                 sheets: Vec::new(),
                 defined_names: Vec::new(),
@@ -832,8 +1322,13 @@ mod tests {
             package_properties: Default::default(),
             has_macros: false,
             unreadable_sheets: Vec::new(),
+            unreadable_sheets_omitted: 0,
+            unreadable_parts: Vec::new(),
+            unreadable_parts_omitted: 0,
+            cosmetic_parts: Vec::new(),
             styles_data: None,
             theme_data: None,
+            render_cache: Default::default(),
         };
         let text = doc.plain_text();
         assert!(text.starts_with("Notes\nLorem ipsum drawn"), "{text:?}");
@@ -856,21 +1351,22 @@ mod tests {
             dimension: None,
             rows: vec![Row {
                 index: 1,
-                cells: vec![Cell {
-                    reference: super::super::CellRef { col: 0, row: 0 },
-                    value: CellValue::String(text.to_string()),
-                    style_index: None,
-                    formula: None,
-                    rich_runs: None,
-                    vm: None,
-                }],
+                cells: vec![Cell::new(
+                    super::super::CellRef { col: 0, row: 0 },
+                    CellValue::String(text.to_string()),
+                    None,
+                )],
             }],
             merged_cells: Vec::new(),
             hyperlinks: Vec::new(),
+            formulas_dropped: 0,
+            damage: None,
             page_setup: None,
-            images: Vec::new(),
-            comments: Vec::new(),
-            text_shapes: Vec::new(),
+            images: std::sync::Arc::from([]),
+            cell_images: Vec::new(),
+            comments: std::sync::Arc::from([]),
+            comments_truncated: false,
+            text_shapes: std::sync::Arc::from([]),
             conditional_formats: Vec::new(),
             data_validations: Vec::new(),
             state: super::super::SheetState::Visible,
@@ -881,6 +1377,7 @@ mod tests {
             chart_text: Vec::new(),
         };
         let doc = XlsxDocument {
+            input_bytes: 0,
             workbook: super::super::WorkbookInfo {
                 sheets: Vec::new(),
                 defined_names: Vec::new(),
@@ -897,8 +1394,13 @@ mod tests {
             package_properties: Default::default(),
             has_macros: false,
             unreadable_sheets: Vec::new(),
+            unreadable_sheets_omitted: 0,
+            unreadable_parts: Vec::new(),
+            unreadable_parts_omitted: 0,
+            cosmetic_parts: Vec::new(),
             styles_data: None,
             theme_data: None,
+            render_cache: Default::default(),
         };
         let text = doc.plain_text();
         assert!(text.starts_with("Revenue\nnorth"), "{text:?}");
@@ -914,6 +1416,7 @@ mod tests {
     #[test]
     fn test_plain_text_includes_chart_text() {
         let doc = XlsxDocument {
+            input_bytes: 0,
             workbook: super::super::WorkbookInfo {
                 sheets: Vec::new(),
                 defined_names: Vec::new(),
@@ -930,8 +1433,13 @@ mod tests {
             package_properties: Default::default(),
             has_macros: false,
             unreadable_sheets: Vec::new(),
+            unreadable_sheets_omitted: 0,
+            unreadable_parts: Vec::new(),
+            unreadable_parts_omitted: 0,
+            cosmetic_parts: Vec::new(),
             styles_data: None,
             theme_data: None,
+            render_cache: Default::default(),
         };
         assert!(
             doc.plain_text().contains("Rotated Title"),
@@ -971,5 +1479,85 @@ mod tests {
         ] {
             assert!(n <= 2, "{name} scanned date formats {n} times for 100 cells");
         }
+    }
+
+    /// A workbook of many sheets over a stylesheet of many cell formats: the
+    /// date styles and compiled number formats are workbook-level, so every
+    /// rendering builds them once, not once per sheet.
+    #[test]
+    fn test_workbook_level_format_tables_are_built_once_for_all_sheets() {
+        use crate::xlsx::test_support::{open_bytes, zip_parts};
+        const SHEETS: usize = 40;
+        const FORMATS: usize = 60;
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let mut workbook = format!(r#"<workbook xmlns="{ns}" xmlns:r="{rel}"><sheets>"#);
+        let mut rels = String::from(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        );
+        let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 1..=SHEETS {
+            workbook.push_str(&format!(r#"<sheet name="S{i}" sheetId="{i}" r:id="rId{i}"/>"#));
+            rels.push_str(&format!(
+                r#"<Relationship Id="rId{i}" Type="{rel}/worksheet" Target="worksheets/sheet{i}.xml"/>"#
+            ));
+            parts.push((
+                format!("xl/worksheets/sheet{i}.xml"),
+                format!(
+                    r#"<worksheet xmlns="{ns}"><sheetData><row r="1"><c r="A1" s="{}"><v>{}</v></c></row></sheetData></worksheet>"#,
+                    i % FORMATS + 1,
+                    38000 + i
+                )
+                .into_bytes(),
+            ));
+        }
+        workbook.push_str("</sheets></workbook>");
+        rels.push_str(&format!(
+            r#"<Relationship Id="rIdS" Type="{rel}/styles" Target="styles.xml"/></Relationships>"#
+        ));
+        let mut styles = format!(r#"<styleSheet xmlns="{ns}"><numFmts count="{FORMATS}">"#);
+        for i in 0..FORMATS {
+            styles.push_str(&format!(
+                r#"<numFmt numFmtId="{}" formatCode="yyyy-mm-dd;@;0.0{i}"/>"#,
+                164 + i
+            ));
+        }
+        styles
+            .push_str(&format!(r#"</numFmts><cellXfs count="{}"><xf numFmtId="0"/>"#, FORMATS + 1));
+        for i in 0..FORMATS {
+            styles.push_str(&format!(r#"<xf numFmtId="{}" applyNumberFormat="1"/>"#, 164 + i));
+        }
+        styles.push_str("</cellXfs></styleSheet>");
+        parts.push(("xl/workbook.xml".into(), workbook.into_bytes()));
+        parts.push(("xl/_rels/workbook.xml.rels".into(), rels.into_bytes()));
+        parts.push(("xl/styles.xml".into(), styles.into_bytes()));
+        let refs: Vec<(&str, &[u8])> = parts
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.as_slice()))
+            .collect();
+        let doc = open_bytes(zip_parts(&refs));
+
+        FORMAT_TABLE_BUILDS.with(|n| n.set(0));
+        let plain = doc.plain_text();
+        assert!(plain.contains("2004-01-"), "{plain}");
+        let _ = doc.to_markdown();
+        let _ = doc.to_csv();
+        let _ = crate::convert_xlsx::xlsx_to_ir(&doc);
+        for i in 0..SHEETS {
+            assert!(doc.sheet_ir(i).is_some());
+            assert!(doc.sheet_plain_text(i).is_some());
+            assert!(doc.sheet_to_markdown(i).is_some());
+            assert!(doc.sheet_to_csv(i).is_some());
+        }
+        assert_eq!(doc.sheets_ir().count(), SHEETS);
+        let builds = FORMAT_TABLE_BUILDS.with(|n| n.get());
+        assert_eq!(builds, 1, "format tables built {builds} times for {SHEETS} sheets");
+
+        // A stylesheet changed through the public field is not served from
+        // the tables built for the old one.
+        let mut changed = doc.clone();
+        changed.styles.as_mut().unwrap().cell_formats.truncate(1);
+        assert!(changed.plain_text().contains("38001"), "{}", changed.plain_text());
+        assert!(!changed.plain_text().contains("2004-01-"));
     }
 }

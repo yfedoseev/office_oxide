@@ -76,8 +76,12 @@ pub struct DefinedName {
 impl XlsDocument {
     /// A workbook of exactly one sheet and nothing else — what a BIFF2–4
     /// file is.
-    pub(super) fn from_one_sheet(sheet: Sheet) -> Self {
-        Self::from_sheets_inner(vec![sheet])
+    /// Flagged truncated when `notices` is not empty.
+    pub(super) fn from_one_sheet(sheet: Sheet, notices: Vec<String>) -> Self {
+        let mut doc = Self::from_sheets_inner(vec![sheet]);
+        doc.truncated = !notices.is_empty();
+        doc.notices = notices;
+        doc
     }
 
     fn from_sheets_inner(sheets: Vec<Sheet>) -> Self {
@@ -207,6 +211,7 @@ fn bof_dt(data: &[u8]) -> Option<u16> {
 impl XlsDocument {
     /// Open an XLS file from a reader (any `Read + Seek`).
     pub fn from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
+        let _scale = crate::limits::InputSizeScope::new(crate::limits::stream_len(&mut reader));
         // A pre-OLE2 Excel file (BIFF2/3/4 — Excel 2.x through 4.x) has no
         // compound-file container at all: it is a raw record stream that
         // starts with its own `BOF`, holding one worksheet. It used to be
@@ -250,7 +255,39 @@ impl XlsDocument {
         // Drop CFB early to free file handle and memory.
         drop(cfb);
 
+        // A workbook Excel encrypted with its default password opens with it.
+        #[cfg(feature = "default-password")]
+        let (stream_data, default_password, decrypt_failure) = {
+            let mut stream_data = stream_data;
+            let decrypted = crate::core::offcrypto::decrypt_workbook(&mut stream_data);
+            (stream_data, decrypted == Ok(true), decrypted.err())
+        };
+        #[cfg(feature = "default-password")]
+        let mut doc = match Self::parse_workbook_stream(&stream_data) {
+            // Say why it could not be opened, not only that it is encrypted.
+            Err(XlsError::Encrypted) => {
+                use crate::core::offcrypto::Failure;
+                return Err(match decrypt_failure {
+                    Some(Failure::Unsupported(what)) => {
+                        XlsError::EncryptionNotSupported(what.to_string())
+                    },
+                    Some(Failure::Malformed(what)) => {
+                        XlsError::Corrupted(format!("the encryption header is damaged ({what})"))
+                    },
+                    _ => XlsError::Encrypted,
+                });
+            },
+            other => other?,
+        };
+        #[cfg(not(feature = "default-password"))]
         let mut doc = Self::parse_workbook_stream(&stream_data)?;
+        #[cfg(feature = "default-password")]
+        if default_password {
+            warnings.push(
+                "the workbook is encrypted with the default password and was decrypted with it"
+                    .to_string(),
+            );
+        }
         doc.has_macros = has_macros;
         doc.summary_properties = summary_properties;
         doc.warnings = warnings;
@@ -279,6 +316,20 @@ impl XlsDocument {
     /// as an explicit parameter so tests can exercise the
     /// exhausted-budget path without a multi-million-record fixture.
     fn parse_workbook_stream_with_budget(data: &[u8], record_budget: u32) -> Result<Self> {
+        Self::parse_workbook_stream_with_limits(
+            data,
+            record_budget,
+            crate::limits::GridBudget::new(),
+        )
+    }
+
+    /// As `parse_workbook_stream_with_budget`, with the allowance of empty
+    /// slots padding sparse rows as an explicit parameter too.
+    fn parse_workbook_stream_with_limits(
+        data: &[u8],
+        record_budget: u32,
+        grid_budget: crate::limits::GridBudget,
+    ) -> Result<Self> {
         let mut sheet_infos: Vec<SheetInfo> = Vec::new();
         let mut sst: Vec<String> = Vec::new();
         let mut sheets = Vec::new();
@@ -382,6 +433,8 @@ impl XlsDocument {
         // remaining string cells are skipped and the workbook is flagged
         // truncated, as when the record budget runs out.
         let mut text_budget = crate::limits::TextBudget::new();
+        // Empty slots padding sparse rows, across every sheet.
+        let mut grid_budget = grid_budget;
         let mut number_formats: Option<std::sync::Arc<NumberFormats>> = None;
         // OfficeArt payloads, kept for the lazy picture decode.
         let mut drawing_bytes: Vec<u8> = Vec::new();
@@ -612,7 +665,8 @@ impl XlsDocument {
                             &mut xf_numfmt,
                             date1904,
                         );
-                        let (rows, xf) = build_grid(&mut cells);
+                        grid_budget.begin_sheet(&name);
+                        let (rows, xf) = build_grid(&mut cells, &mut grid_budget);
                         sheets.push(Sheet {
                             name,
                             rows,
@@ -745,6 +799,11 @@ impl XlsDocument {
                         let _ =
                             parse_cell_record(&rec, &sst, codepage, &mut cells, &mut text_budget);
                     },
+                    // The formula's expression record sits between its
+                    // `FORMULA` and the `STRING` that holds a text result
+                    // (MS-XLS `Formula [Array | ShrFmla | Table] [String]`): it is not a cell, and the
+                    // result it precedes still belongs to the formula.
+                    RT_ARRAY | RT_SHRFMLA | RT_TABLE => {},
                     _ => {
                         pending_formula_string = None;
                         // Skip LABEL/RSTRING parsing for non-BIFF8 (avoids slow unicode fallback).
@@ -808,6 +867,7 @@ impl XlsDocument {
         if text_budget.exhausted() {
             notices.push(text_budget.notice());
         }
+        notices.extend(grid_budget.notices());
         if missing_sst_refs > 0 {
             let table = if sst_malformed {
                 "the shared string table is malformed".to_string()
@@ -1473,7 +1533,10 @@ impl Sheet {
     }
 }
 
-pub(super) fn build_grid(cells: &mut [Cell]) -> (Vec<Vec<CellValue>>, Vec<Vec<u16>>) {
+pub(super) fn build_grid(
+    cells: &mut [Cell],
+    budget: &mut crate::limits::GridBudget,
+) -> (Vec<Vec<CellValue>>, Vec<Vec<u16>>) {
     // Jagged, like every other spreadsheet
     // reader's storage (POI keeps a sparse map of rows, each holding cells
     // up to its last used column): a row is only as long as its last
@@ -1487,19 +1550,38 @@ pub(super) fn build_grid(cells: &mut [Cell]) -> (Vec<Vec<CellValue>>, Vec<Vec<u1
     // 2.5x slower than allocating the rows up front.
     let in_grid = |cell: &Cell| cell.col <= 255 && !matches!(cell.value, CellValue::Empty);
     let mut width: Vec<u16> = Vec::new();
+    let mut filled: Vec<u16> = Vec::new();
     for cell in cells.iter().filter(|c| in_grid(c)) {
         let r = cell.row as usize;
         if width.len() <= r {
             width.resize(r + 1, 0);
+            filled.resize(r + 1, 0);
         }
         width[r] = width[r].max(cell.col + 1);
+        filled[r] = filled[r].saturating_add(1);
     }
+    // The empty slots that pad a row out to its last cell are what a sparse
+    // sheet multiplies (one cell in column 255 of every row is 255 empty
+    // slots per record), so they are charged against the document's
+    // allowance, row by row. The row that does not fit, and every row after
+    // it, is left out and the caller reports the workbook truncated.
+    for (r, (&w, &f)) in width.iter().zip(&filled).enumerate() {
+        // A record can repeat a cell, so `f` may exceed `w`.
+        if !budget.charge((w as usize).saturating_sub(f as usize)) {
+            width.truncate(r);
+            break;
+        }
+    }
+    let rows_kept = width.len();
     let mut grid: Vec<Vec<CellValue>> = width
         .iter()
         .map(|&w| vec![CellValue::Empty; w as usize])
         .collect();
     let mut xf: Vec<Vec<u16>> = width.iter().map(|&w| vec![0u16; w as usize]).collect();
-    for cell in cells.iter_mut().filter(|c| in_grid(c)) {
+    for cell in cells
+        .iter_mut()
+        .filter(|c| in_grid(c) && (c.row as usize) < rows_kept)
+    {
         let (r, c) = (cell.row as usize, cell.col as usize);
         grid[r][c] = std::mem::take(&mut cell.value);
         xf[r][c] = cell.xf_index;
@@ -1652,6 +1734,50 @@ mod tests {
             v
         } else {
             biff_rec(RT_MSODRAWINGGROUP, &blip)
+        }
+    }
+
+    #[cfg(feature = "default-password")]
+    #[test]
+    fn test_an_encrypted_xls_opens_with_the_default_password() {
+        let plain = workbook_stream_with_globals(&[], &[("Sheet1", 0, label(0, 0, "cell marker"))]);
+        let stream =
+            crate::core::offcrypto::tests::encrypt_whole_workbook(&plain, "VelvetSweatshop");
+        let doc = XlsDocument::from_reader(std::io::Cursor::new(
+            crate::core::offcrypto::tests::cfb_with_streams(&[("Workbook", &stream)]),
+        ))
+        .unwrap();
+        assert!(doc.plain_text().contains("cell marker"), "{}", doc.plain_text());
+        // Under another password it is refused, as before.
+        let stream = crate::core::offcrypto::tests::encrypt_whole_workbook(&plain, "hunter2");
+        let refused = XlsDocument::from_reader(std::io::Cursor::new(
+            crate::core::offcrypto::tests::cfb_with_streams(&[("Workbook", &stream)]),
+        ));
+        assert!(matches!(refused, Err(XlsError::Encrypted)));
+    }
+
+    /// A workbook the reader cannot decrypt says why: the scheme it does not
+    /// implement, or a damaged header, not only that the file is encrypted.
+    #[cfg(feature = "default-password")]
+    #[test]
+    fn test_an_undecryptable_xls_says_why() {
+        use crate::core::offcrypto::tests::{cfb_with_streams, record as biff_record};
+        let open = |filepass: &[u8]| {
+            let mut stream = biff_record(0x0809, &[0u8; 16]);
+            stream.extend(biff_record(0x002F, filepass));
+            XlsDocument::from_reader(std::io::Cursor::new(cfb_with_streams(&[(
+                "Workbook", &stream,
+            )])))
+        };
+        // XOR obfuscation: a scheme this reader does not implement.
+        match open(&[0, 0, 0x12, 0x34, 0x56, 0x78]) {
+            Err(XlsError::EncryptionNotSupported(what)) => assert!(what.contains("XOR"), "{what}"),
+            other => panic!("expected a named scheme, got {:?}", other.err()),
+        }
+        // A FILEPASS cut short: a damaged header.
+        match open(&[1, 0]) {
+            Err(XlsError::Corrupted(why)) => assert!(why.contains("damaged"), "{why}"),
+            other => panic!("expected a damaged header, got {:?}", other.err()),
         }
     }
 
@@ -2245,7 +2371,7 @@ mod tests {
                 value: CellValue::String("A2".into()),
             },
         ];
-        let (grid, _) = build_grid(&mut cells);
+        let (grid, _) = build_grid(&mut cells, &mut crate::limits::GridBudget::new());
         assert_eq!(grid.len(), 2);
         assert_eq!(grid[0].len(), 2);
         assert_eq!(grid[0][0], CellValue::String("A1".into()));
@@ -2270,7 +2396,7 @@ mod tests {
             mk(65535, 0, "BL"),
             mk(65535, 255, "BR"),
         ];
-        let (grid, _) = build_grid(&mut cells);
+        let (grid, _) = build_grid(&mut cells, &mut crate::limits::GridBudget::new());
         assert_eq!(grid.len(), 65536);
         assert_eq!(grid[0].len(), 256);
         assert_eq!(grid[65535].len(), 256);
@@ -2279,9 +2405,187 @@ mod tests {
         assert_eq!(grid[65535][255], CellValue::String("BR".into()));
     }
 
+    /// A sparse sheet (one cell in the last column of each row) is capped by
+    /// the allowance of empty padding slots: the rows that fit are kept and
+    /// the workbook is flagged truncated, loudly. Memory follows the
+    /// allowance, not the 255 slots per record a hostile file asks for.
+    #[test]
+    fn test_sparse_rows_are_capped_by_the_padding_allowance() {
+        let mut body = Vec::new();
+        for r in 0..10u16 {
+            body.extend(number(r, 255, 0, 1.0));
+        }
+        let stream = workbook_stream(&[("Sheet1", 0, body.clone()), ("Sheet2", 0, body)]);
+        // Room for three rows of 255 empty slots.
+        let doc = XlsDocument::parse_workbook_stream_with_limits(
+            &stream,
+            20_000_000,
+            crate::limits::GridBudget::with_limit(255 * 3),
+        )
+        .expect("parses");
+        assert_eq!(doc.sheets[0].rows.len(), 3, "rows past the allowance are left out");
+        assert!(doc.sheets[1].rows.is_empty(), "the allowance is per document, not per sheet");
+        assert!(doc.truncated());
+        let ir = crate::convert_xls::xls_to_ir(&doc);
+        assert!(ir.metadata.text_truncated);
+        assert!(doc.plain_text().contains("empty cells of padding"));
+
+        // The same file under the default allowance is complete.
+        let whole = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+        assert_eq!(whole.sheets[0].rows.len(), 10);
+        assert!(!whole.truncated());
+    }
+
+    /// One sparse sheet cannot spend the whole document's allowance: it is cut
+    /// at its own, and the sheets after it keep theirs.
+    #[test]
+    fn test_a_sparse_sheet_leaves_later_sheets_their_own_allowance() {
+        let mut sparse = Vec::new();
+        for r in 0..10u16 {
+            sparse.extend(number(r, 255, 0, 1.0));
+        }
+        let mut second = Vec::new();
+        for r in 0..3u16 {
+            second.extend(number(r, 255, 0, 1.0));
+        }
+        let stream = workbook_stream(&[("Sparse", 0, sparse), ("Second", 0, second)]);
+        let doc = XlsDocument::parse_workbook_stream_with_limits(
+            &stream,
+            20_000_000,
+            crate::limits::GridBudget::with_limits(255 * 10, 255 * 3),
+        )
+        .expect("parses");
+        assert_eq!(doc.sheets[0].rows.len(), 3, "the sparse sheet is cut at its own allowance");
+        assert_eq!(doc.sheets[1].rows.len(), 3, "the next sheet is not starved by it");
+        assert!(doc.truncated());
+        let text = doc.plain_text();
+        assert!(text.contains("'Sparse'"), "the cut sheet is named: {text}");
+        assert!(!text.contains("'Second'"), "{text}");
+    }
+
+    /// The document's total still bounds the sheets together, and the notice
+    /// names the sheet it ran out on.
+    #[test]
+    fn test_the_document_total_still_bounds_the_sheets_together() {
+        let mut body = Vec::new();
+        for r in 0..3u16 {
+            body.extend(number(r, 255, 0, 1.0));
+        }
+        let stream = workbook_stream(&[("First", 0, body.clone()), ("Second", 0, body)]);
+        let doc = XlsDocument::parse_workbook_stream_with_limits(
+            &stream,
+            20_000_000,
+            crate::limits::GridBudget::with_limits(255 * 4, 255 * 3),
+        )
+        .expect("parses");
+        assert_eq!(doc.sheets[0].rows.len(), 3);
+        assert_eq!(doc.sheets[1].rows.len(), 1, "only what is left of the total");
+        let text = doc.plain_text();
+        assert!(text.contains("sheet 'Second'"), "{text}");
+        assert!(text.contains("set_max_memory_bytes"), "{text}");
+    }
+
+    /// Once the allowance is spent by a sparse sheet, a later sheet whose
+    /// rows need no padding (dense, or a single column) keeps every row; only
+    /// a row that needs padding is refused.
+    #[test]
+    fn test_spent_allowance_still_admits_rows_that_need_no_padding() {
+        let mut sparse = Vec::new();
+        for r in 0..10u16 {
+            sparse.extend(number(r, 255, 0, 1.0));
+        }
+        let mut dense = Vec::new();
+        for r in 0..4u16 {
+            for c in 0..8u16 {
+                dense.extend(number(r, c, 0, 1.0));
+            }
+        }
+        let mut tiny = Vec::new();
+        for r in 0..5u16 {
+            tiny.extend(number(r, 0, 0, 1.0));
+        }
+        let mut padded = Vec::new();
+        padded.extend(number(0, 1, 0, 1.0));
+        let stream = workbook_stream(&[
+            ("Sparse", 0, sparse),
+            ("Dense", 0, dense),
+            ("Tiny", 0, tiny),
+            ("Padded", 0, padded),
+        ]);
+        let doc = XlsDocument::parse_workbook_stream_with_limits(
+            &stream,
+            20_000_000,
+            crate::limits::GridBudget::with_limit(255 * 3),
+        )
+        .expect("parses");
+        assert_eq!(doc.sheets[0].rows.len(), 3);
+        assert_eq!(doc.sheets[1].rows.len(), 4, "a dense sheet needs no padding");
+        assert_eq!(doc.sheets[2].rows.len(), 5, "a one-column sheet needs no padding");
+        assert!(doc.sheets[3].rows.is_empty(), "a row that needs padding is still refused");
+        assert!(doc.truncated());
+        assert!(doc.plain_text().contains("empty cells of padding"));
+    }
+
+    /// The default allowance keeps the sparse worst case small: six sheets of
+    /// one number in the last column of 65,535 rows (a 7 MB file) reached
+    /// 0.9 GB on open under the earlier 32 Mi allowance. Memory is the slots
+    /// kept times what a slot costs, and the allowance is what bounds the
+    /// slots, whatever the number of sheets. Driving the real reader: six
+    /// such sheets at the default allowance keep fewer slots than the
+    /// allowance and are flagged truncated.
+    #[test]
+    fn test_default_padding_allowance_bounds_the_sparse_worst_case() {
+        let slot = std::mem::size_of::<CellValue>() + std::mem::size_of::<u16>();
+        let worst = crate::limits::max_grid_padding_cells() * slot;
+        assert!(worst <= 640 << 20, "{} MiB of padding at the default allowance", worst >> 20);
+        let mut body = Vec::new();
+        for r in 0..=u16::MAX - 1 {
+            body.extend(number(r, 255, 0, 1.0));
+        }
+        let sheets: Vec<(&str, u8, Vec<u8>)> = ["A", "B", "C"]
+            .iter()
+            .map(|n| (*n, 0u8, body.clone()))
+            .collect();
+        let stream = workbook_stream(&sheets);
+        let doc = XlsDocument::parse_workbook_stream_with_limits(
+            &stream,
+            200_000_000,
+            crate::limits::GridBudget::new(),
+        )
+        .expect("parses");
+        let kept: usize = doc.sheets.iter().map(|s| s.rows.len()).sum();
+        assert!(
+            kept * 255 <= crate::limits::max_grid_padding_cells() + 255 * doc.sheets.len(),
+            "{kept} sparse rows kept"
+        );
+        assert!(kept < 3 * 65_535, "the allowance cut the sparse sheets");
+        assert!(doc.truncated());
+    }
+
+    /// Control, not a regression test: padding is charged for empty slots
+    /// only, so a dense row costs nothing even with no allowance at all.
+    #[test]
+    fn test_control_dense_rows_cost_no_padding() {
+        let mut body = Vec::new();
+        for r in 0..4u16 {
+            for c in 0..256u16 {
+                body.extend(number(r, c, 0, 1.0));
+            }
+        }
+        let stream = workbook_stream(&[("Sheet1", 0, body)]);
+        let doc = XlsDocument::parse_workbook_stream_with_limits(
+            &stream,
+            20_000_000,
+            crate::limits::GridBudget::with_limit(0),
+        )
+        .expect("parses");
+        assert_eq!(doc.sheets[0].rows.len(), 4);
+        assert!(!doc.truncated());
+    }
+
     #[test]
     fn test_build_grid_empty() {
-        let (grid, _) = build_grid(&mut Vec::new());
+        let (grid, _) = build_grid(&mut Vec::new(), &mut crate::limits::GridBudget::new());
         assert!(grid.is_empty());
     }
 
@@ -3170,6 +3474,41 @@ mod tests {
         let doc = XlsDocument::parse_workbook_stream(&workbook_stream(&[("S", 0, body)]))
             .expect("parses");
         assert_eq!(doc.sheets[0].xf[0][0], 7);
+    }
+
+    /// MS-XLS: a formula cell is `FORMULA`, then optionally the
+    /// `ARRAY`, `SHRFMLA` or `TABLE` record that holds its expression, then
+    /// optionally `STRING` with its text result. The text came after such a
+    /// record and was dropped, because any record in between cleared the
+    /// pending result.
+    #[test]
+    fn test_formula_string_result_after_an_array_shared_or_table_record_is_kept() {
+        for (name, record) in [("ARRAY", 0x0221u16), ("SHRFMLA", 0x04BC), ("TABLE", 0x0236)] {
+            let mut st = 4u16.to_le_bytes().to_vec();
+            st.push(0);
+            st.extend_from_slice(b"text");
+            let mut body = string_formula(0, 0, 0);
+            body.extend(biff_rec(record, &[0u8; 14]));
+            body.extend(biff_rec(RT_STRING, &st));
+            let doc = XlsDocument::parse_workbook_stream(&workbook_stream(&[("S", 0, body)]))
+                .expect("parses");
+            assert_eq!(doc.sheets[0].display_text(0, 0).as_deref(), Some("text"), "{name}");
+        }
+    }
+
+    /// An unrelated record between `FORMULA` and `STRING` still ends the
+    /// pending result: the text must not be attached to another cell.
+    #[test]
+    fn test_formula_string_result_is_not_carried_across_an_unrelated_record() {
+        let mut st = 4u16.to_le_bytes().to_vec();
+        st.push(0);
+        st.extend_from_slice(b"text");
+        let mut body = string_formula(0, 0, 0);
+        body.extend(biff_rec(0x0203, &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])); // NUMBER
+        body.extend(biff_rec(RT_STRING, &st));
+        let doc = XlsDocument::parse_workbook_stream(&workbook_stream(&[("S", 0, body)]))
+            .expect("parses");
+        assert_ne!(doc.sheets[0].display_text(0, 0).as_deref(), Some("text"));
     }
 
     /// A `LABELSST` cell in column A referencing shared string `idx`.

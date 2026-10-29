@@ -98,14 +98,103 @@ fn handle_line(request: serde_json::Value) -> Option<serde_json::Value> {
     }
 }
 
+/// Longest request line the server reads, in bytes: 16 MiB.
+///
+/// A request is a tool name and a few paths or short strings (a
+/// `replace_text` pattern is the largest), so this is far above any real
+/// one. A longer line is rejected with a JSON-RPC error and skipped to its
+/// end, without ever being held in memory.
+const MAX_REQUEST_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// One line read from the client.
+#[derive(Debug, PartialEq, Eq)]
+enum RequestLine {
+    /// The line's bytes, without the line terminator.
+    Line(Vec<u8>),
+    /// The line exceeded the limit; the rest of it was discarded.
+    TooLong,
+}
+
+/// Read the next line from `reader`, holding at most `limit` bytes of it.
+/// `Ok(None)` at end of input.
+fn read_request_line<R: BufRead>(reader: &mut R, limit: usize) -> io::Result<Option<RequestLine>> {
+    let mut line: Vec<u8> = Vec::new();
+    let mut too_long = false;
+    let mut seen_any = false;
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            // End of input ends a final line that has no terminator.
+            if !seen_any {
+                return Ok(None);
+            }
+            return Ok(Some(if too_long {
+                RequestLine::TooLong
+            } else {
+                RequestLine::Line(line)
+            }));
+        }
+        seen_any = true;
+        let (used, done) = match chunk.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (chunk.len(), false),
+        };
+        if !too_long {
+            let body = &chunk[..if done { used - 1 } else { used }];
+            if line.len().saturating_add(body.len()) > limit {
+                too_long = true;
+                line = Vec::new();
+            } else {
+                line.extend_from_slice(body);
+            }
+        }
+        reader.consume(used);
+        if done {
+            return Ok(Some(if too_long {
+                RequestLine::TooLong
+            } else {
+                RequestLine::Line(line)
+            }));
+        }
+    }
+}
+
 fn main() {
     let stdin = io::stdin();
+    let mut stdin = stdin.lock();
     let mut stdout = io::stdout();
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
+    loop {
+        let line = match read_request_line(&mut stdin, MAX_REQUEST_LINE_BYTES) {
+            Ok(Some(RequestLine::Line(bytes))) => match String::from_utf8(bytes) {
+                Ok(l) => l,
+                Err(e) => {
+                    let err = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": null,
+                        "error": { "code": -32700, "message": format!("parse error: {e}") }
+                    });
+                    let _ = writeln!(stdout, "{err}");
+                    let _ = stdout.flush();
+                    continue;
+                },
+            },
+            Ok(Some(RequestLine::TooLong)) => {
+                let err = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": {
+                        "code": -32600,
+                        "message": format!(
+                            "Invalid Request: the request line exceeds {MAX_REQUEST_LINE_BYTES} bytes"
+                        )
+                    }
+                });
+                let _ = writeln!(stdout, "{err}");
+                let _ = stdout.flush();
+                continue;
+            },
+            Ok(None) | Err(_) => break,
         };
 
         if line.trim().is_empty() {
@@ -137,6 +226,33 @@ fn main() {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A line longer than the limit is reported, skipped to its end and not
+    /// held; lines before and after it are read as usual, including a final
+    /// one without a terminator.
+    #[test]
+    fn test_over_long_request_lines_are_rejected_and_skipped() {
+        let mut input: &[u8] = b"ok\n0123456789\n\nlast";
+        let mut next = || read_request_line(&mut input, 8).unwrap();
+        assert_eq!(next(), Some(RequestLine::Line(b"ok".to_vec())));
+        assert_eq!(next(), Some(RequestLine::TooLong));
+        assert_eq!(next(), Some(RequestLine::Line(Vec::new())));
+        assert_eq!(next(), Some(RequestLine::Line(b"last".to_vec())));
+        assert_eq!(next(), None);
+
+        // A long line with no terminator at all, over many small reads.
+        let data = vec![b'a'; 100_000];
+        let mut reader = io::BufReader::with_capacity(16, &data[..]);
+        assert_eq!(read_request_line(&mut reader, 1_000).unwrap(), Some(RequestLine::TooLong));
+        assert_eq!(read_request_line(&mut reader, 1_000).unwrap(), None);
+
+        // Exactly at the limit is accepted.
+        let mut input: &[u8] = b"12345678\n";
+        assert_eq!(
+            read_request_line(&mut input, 8).unwrap(),
+            Some(RequestLine::Line(b"12345678".to_vec()))
+        );
+    }
 
     #[test]
     fn test_batch_of_two_valid_requests_returns_an_array_of_two_responses() {

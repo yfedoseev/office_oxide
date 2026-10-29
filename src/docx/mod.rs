@@ -67,6 +67,7 @@ pub use table::{
 
 use std::io::{Read, Seek};
 use std::path::Path;
+use std::sync::Arc;
 
 use log::debug;
 use quick_xml::events::Event;
@@ -97,6 +98,9 @@ fn make_content_reader(xml_data: &[u8]) -> quick_xml::Reader<&[u8]> {
 /// A parsed DOCX document.
 #[derive(Debug, Clone)]
 pub struct DocxDocument {
+    /// The size of the file this document was read from (0 when unknown): small
+    /// inputs get a text budget scaled to them (see [`crate::limits`]).
+    pub(crate) input_bytes: u64,
     /// The document body.
     pub body: Body,
     /// Parsed stylesheet from `word/styles.xml`.
@@ -108,12 +112,29 @@ pub struct DocxDocument {
     /// Section properties (from the last `w:sectPr` in the body).
     pub sections: Vec<SectionProperties>,
     /// Parsed headers and footers.
+    ///
+    /// One entry per distinct part, type and role: sections that share a
+    /// header or footer share its entry. (Each section's references are
+    /// recovered by the converters through `hf_by_ref`.)
     pub headers_footers: Vec<HeaderFooter>,
+    /// For each section, the `headers_footers` entry each of its header
+    /// references and then each of its footer references resolved to
+    /// (`None` when the part is missing or unreadable).
+    pub(crate) hf_by_ref: Vec<Vec<Option<usize>>>,
     /// Header, footer and note parts that exist but could not be read or
     /// parsed (a corrupt entry, malformed XML), one line each naming the
     /// part and the error. They are skipped so the body still opens —
     /// the policy Tika/POI follow — and reported here instead of vanishing.
     pub unreadable_parts: Vec<String>,
+    /// How many unreadable parts beyond the first 100 in [`Self::unreadable_parts`]
+    /// were left out of the list.
+    pub unreadable_parts_omitted: usize,
+    /// Unreadable parts that hold no text (the theme): in the metadata
+    /// warnings only; they change neither the text nor `text_truncated`.
+    pub(crate) cosmetic_parts: Vec<String>,
+    /// Set when hyperlink target text copied while reading exceeded the text
+    /// budget and some link lost its fragment or its target.
+    pub(crate) link_notice: Option<String>,
     /// Font programs found under `word/fonts/`. Each entry is
     /// `(font_name, ttf_or_otf_bytes)`. PDF→DOCX→PDF round-trips use these
     /// to preserve typeface fidelity (e.g. CJK / math fonts beyond
@@ -124,7 +145,7 @@ pub struct DocxDocument {
     /// IR converter populate `Image::data` so downstream renderers
     /// (the positional PDF reader, plain-text export with alt-text,
     /// etc.) can place actual bitmap content.
-    pub images: std::collections::HashMap<String, (Vec<u8>, Option<String>)>,
+    pub images: std::collections::HashMap<String, (std::sync::Arc<[u8]>, Option<String>)>,
     /// Parsed `docProps/core.xml`. `None` when the package carries no
     /// core-properties part.
     pub core_properties: Option<crate::core::properties::CoreProperties>,
@@ -163,6 +184,14 @@ pub struct NoteBody {
 impl DocxDocument {
     /// Open a DOCX file from a file path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let bytes = std::fs::metadata(path.as_ref()).map_or(0, |m| m.len());
+        let _scale = crate::limits::InputSizeScope::new(bytes);
+        let mut doc = Self::open_unscaled(path)?;
+        doc.input_bytes = bytes;
+        Ok(doc)
+    }
+
+    fn open_unscaled(path: impl AsRef<Path>) -> Result<Self> {
         let reader = OpcReader::open(path)?;
         Self::from_opc(reader)
     }
@@ -170,12 +199,29 @@ impl DocxDocument {
     /// Open a DOCX file using memory-mapped I/O for better performance on large files.
     #[cfg(feature = "mmap")]
     pub fn open_mmap(path: impl AsRef<Path>) -> Result<Self> {
+        let bytes = std::fs::metadata(path.as_ref()).map_or(0, |m| m.len());
+        let _scale = crate::limits::InputSizeScope::new(bytes);
+        let mut doc = Self::open_mmap_unscaled(path)?;
+        doc.input_bytes = bytes;
+        Ok(doc)
+    }
+
+    #[cfg(feature = "mmap")]
+    fn open_mmap_unscaled(path: impl AsRef<Path>) -> Result<Self> {
         let reader = OpcReader::open_mmap(path)?;
         Self::from_opc(reader)
     }
 
     /// Open a DOCX document from any `Read + Seek` source.
     pub fn from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
+        let bytes = crate::limits::stream_len(&mut reader);
+        let _scale = crate::limits::InputSizeScope::new(bytes);
+        let mut doc = Self::from_reader_unscaled(reader)?;
+        doc.input_bytes = bytes;
+        Ok(doc)
+    }
+
+    fn from_reader_unscaled<R: Read + Seek>(mut reader: R) -> Result<Self> {
         // A password-protected DOCX is a CFB container, not a zip at all.
         // Without this check, opening one here (rather than through the
         // unified `Document::from_reader`, which already has it) failed
@@ -211,7 +257,32 @@ impl DocxDocument {
         let app_properties = crate::core::properties::read_app_properties(&mut opc);
         let mut package_properties = crate::core::properties::read_package_properties(&mut opc);
         let main_part = opc.main_document_part()?;
-        let doc_rels = opc.read_rels_for(&main_part)?;
+
+        // Parts the reader skips are recorded here: each once, at most 100
+        // kept, the rest counted (see `core::unreadable`).
+        let unreadable_parts =
+            std::cell::RefCell::new(crate::core::unreadable::UnreadableParts::new("docx"));
+        let skip_unreadable = |part: &str, e: &dyn std::fmt::Display| {
+            unreadable_parts.borrow_mut().record(part, e);
+        };
+        // A part reached through a relationship that holds no text (the
+        // theme): reported as a warning, never as lost text.
+        let skip_cosmetic = |part: &str, e: &dyn std::fmt::Display| {
+            unreadable_parts.borrow_mut().record_cosmetic(part, e);
+        };
+        // A package or main-part relationships part the zip cannot decode
+        // does not refuse the document: it reads as it did when such a part
+        // was taken for absent (no relationships), with the loss reported.
+        if let Some(why) = opc.package_rels_problem() {
+            skip_unreadable("/_rels/.rels", &why);
+        }
+        let doc_rels = match opc.read_rels_for(&main_part) {
+            Ok(rels) => rels,
+            Err(e) => {
+                skip_unreadable(&main_part.rels_path(), &e);
+                crate::core::relationships::Relationships::empty()
+            },
+        };
         let has_macros = doc_rels.has_vba_project();
 
         // Parse theme
@@ -222,13 +293,25 @@ impl DocxDocument {
         // the inconsistency that gave it away.
         let theme = doc_rels
             .first_by_type(rel_types::THEME)
-            .and_then(|rel| main_part.resolve_relative(&rel.target).ok())
+            .and_then(|rel| match main_part.resolve_relative(&rel.target) {
+                Ok(pn) => Some(pn),
+                Err(e) => {
+                    skip_cosmetic(&rel.target, &e);
+                    None
+                },
+            })
             .filter(|pn| opc.has_part(pn))
-            .and_then(|pn| opc.read_part(&pn).ok())
-            .and_then(|data| match Theme::parse(&data) {
+            .and_then(|pn| match opc.read_part(&pn) {
+                Ok(data) => Some((pn, data)),
+                Err(e) => {
+                    skip_cosmetic(pn.as_str(), &e);
+                    None
+                },
+            })
+            .and_then(|(pn, data)| match Theme::parse(&data) {
                 Ok(t) => Some(t),
                 Err(e) => {
-                    debug!("DocxDocument: ignoring unreadable theme part: {e}");
+                    skip_cosmetic(pn.as_str(), &e);
                     None
                 },
             });
@@ -243,23 +326,56 @@ impl DocxDocument {
         };
 
         // Parse numbering (optional — some files reference it but don't include it)
-        let numbering = if let Some(rel) = doc_rels.first_by_type(rel_types::NUMBERING) {
+        let numbering = if let Some(rel) = doc_rels.first_by_type(rel_types::NUMBERING)
+            // A relationship to a place outside the package is not a part.
+            .filter(|rel| rel.target_mode == TargetMode::Internal)
+        {
             let part_name = main_part.resolve_relative(&rel.target)?;
-            match opc.read_part(&part_name) {
-                Ok(data) => Some(NumberingDefinitions::parse(&data)?),
-                Err(_) => None,
+            // A relationship to a part the package does not hold is the
+            // feature absent, as for the theme, charts and pictures.
+            if !opc.has_part(&part_name) {
+                None
+            } else {
+                match opc.read_part(&part_name) {
+                    Ok(data) => Some(NumberingDefinitions::parse(&data)?),
+                    // Numbering is optional, so the document opens without it;
+                    // the list markers lost are reported.
+                    Err(e) => {
+                        skip_unreadable(part_name.as_str(), &e);
+                        None
+                    },
+                }
             }
         } else {
             None
         };
 
         // Parse main document
+        let links = LinkBudget::new();
         let doc_data = opc.read_part(&main_part)?;
         // A part cut off mid-element parses to whatever was read before the
         // cut and reports success; check the root actually closed.
-        xml::check_root_closed(&doc_data, main_part.as_str(), "document")?;
-        let (mut body, sections, alt_chunk_rids, alt_chunk_positions) =
-            parse_document(&doc_data, &doc_rels)?;
+        let whole = xml::check_root_closed(&doc_data, main_part.as_str(), "document")
+            .and_then(|()| parse_document(&doc_data, &doc_rels, &links));
+        let (mut body, sections, alt_chunk_rids, alt_chunk_positions) = match whole {
+            Ok(parsed) => parsed,
+            // A body that is malformed part-way (or cut off) keeps the blocks
+            // before the damage, and the loss is reported.
+            Err(error) => match xml::salvage_prefix(&doc_data, 2, Some("body"), &[]) {
+                Some((prefix, blocks)) => {
+                    let parsed = parse_document(&prefix, &doc_rels, &links).map_err(|_| error)?;
+                    skip_unreadable(
+                        main_part.as_str(),
+                        &format!(
+                            "the XML is malformed after {blocks} body blocks; the rest of the \
+                             document was not read"
+                        ),
+                    );
+                    parsed
+                },
+                None => return Err(error.into()),
+            },
+        };
 
         // Resolve each `<w:altChunk>` and splice its text in at the point
         // the document references it. HTML and plain-text chunks are read;
@@ -279,8 +395,12 @@ impl DocxDocument {
                 if !opc.has_part(&part) {
                     continue;
                 }
-                let Ok(data) = opc.read_part(&part) else {
-                    continue;
+                let data = match opc.read_part(&part) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        skip_unreadable(part.as_str(), &e);
+                        continue;
+                    },
                 };
                 let paras = parse_alt_chunk(&data, part.as_str());
                 if !paras.is_empty() {
@@ -301,44 +421,101 @@ impl DocxDocument {
         // cached data values all live in the separate part that id resolves
         // to (`word/charts/chartN.xml`), which was never opened, so none of
         // that text reached any consumer.
-        let mut chart_text_by_rid: std::collections::HashMap<String, Vec<String>> =
+        let mut chart_text_by_rid: std::collections::HashMap<String, std::sync::Arc<[String]>> =
             std::collections::HashMap::new();
+        // Several relationships can name one part: it is read and parsed
+        // once, whether or not it could be.
+        let mut chart_text_by_part: std::collections::HashMap<
+            crate::core::opc::PartName,
+            std::sync::Arc<[String]>,
+        > = std::collections::HashMap::new();
         for rel in doc_rels.all() {
             if rel.rel_type != rel_types::CHART || rel.target_mode != TargetMode::Internal {
                 continue;
             }
-            let Ok(part) = main_part.resolve_relative(&rel.target) else {
-                continue;
+            let part = match main_part.resolve_relative(&rel.target) {
+                Ok(part) => part,
+                Err(e) => {
+                    skip_unreadable(&rel.target, &e);
+                    continue;
+                },
             };
             if !opc.has_part(&part) {
                 continue;
             }
-            let Ok(data) = opc.read_part(&part) else {
-                continue;
+            let lines = match chart_text_by_part.get(&part) {
+                Some(lines) => lines.clone(),
+                None => {
+                    let lines: std::sync::Arc<[String]> = match opc.read_part(&part) {
+                        Ok(data) => {
+                            let (lines, damage) =
+                                crate::core::chart::chart_text_lines_checked(&data);
+                            if let Some(damage) = damage {
+                                skip_unreadable(
+                                    part.as_str(),
+                                    &format!("{damage}; the rest of its text is missing"),
+                                );
+                            }
+                            lines.into()
+                        },
+                        Err(e) => {
+                            skip_unreadable(part.as_str(), &e);
+                            std::sync::Arc::from(Vec::new())
+                        },
+                    };
+                    chart_text_by_part.insert(part, lines.clone());
+                    lines
+                },
             };
-            let lines = crate::core::chart::chart_text_lines(&data);
             if !lines.is_empty() {
                 chart_text_by_rid.insert(rel.id.clone(), lines);
             }
         }
         // Resolve every SmartArt diagram the body references, the same
         // way charts are resolved just above.
-        let mut dgm_text_by_rid: std::collections::HashMap<String, Vec<String>> =
+        let mut dgm_text_by_rid: std::collections::HashMap<String, std::sync::Arc<[String]>> =
             std::collections::HashMap::new();
+        let mut dgm_text_by_part: std::collections::HashMap<
+            crate::core::opc::PartName,
+            std::sync::Arc<[String]>,
+        > = std::collections::HashMap::new();
         for rel in doc_rels.all() {
             if rel.rel_type != rel_types::DIAGRAM_DATA || rel.target_mode != TargetMode::Internal {
                 continue;
             }
-            let Ok(part) = main_part.resolve_relative(&rel.target) else {
-                continue;
+            let part = match main_part.resolve_relative(&rel.target) {
+                Ok(part) => part,
+                Err(e) => {
+                    skip_unreadable(&rel.target, &e);
+                    continue;
+                },
             };
             if !opc.has_part(&part) {
                 continue;
             }
-            let Ok(data) = opc.read_part(&part) else {
-                continue;
+            let lines = match dgm_text_by_part.get(&part) {
+                Some(lines) => lines.clone(),
+                None => {
+                    let lines: std::sync::Arc<[String]> = match opc.read_part(&part) {
+                        Ok(data) => {
+                            let (lines, damage) = diagram_text_lines(&data);
+                            if let Some(damage) = damage {
+                                skip_unreadable(
+                                    part.as_str(),
+                                    &format!("{damage}; the rest of its text is missing"),
+                                );
+                            }
+                            lines.into()
+                        },
+                        Err(e) => {
+                            skip_unreadable(part.as_str(), &e);
+                            std::sync::Arc::from(Vec::new())
+                        },
+                    };
+                    dgm_text_by_part.insert(part, lines.clone());
+                    lines
+                },
             };
-            let lines = diagram_text_lines(&data);
             if !lines.is_empty() {
                 dgm_text_by_rid.insert(rel.id.clone(), lines);
             }
@@ -350,7 +527,17 @@ impl DocxDocument {
         // Resolve every embedded native OOXML package object
         // (`<o:OLEObject Type="Embed">`) by opening its bytes
         // with the appropriate format reader and folding in its text.
-        resolve_deferred_parts(&mut body.elements, &mut opc, &main_part, &doc_rels);
+        let mut deferred = DeferredParts::new();
+        resolve_deferred_parts(
+            &mut body.elements,
+            &mut opc,
+            &main_part,
+            &doc_rels,
+            &mut deferred,
+            &skip_unreadable,
+        );
+        // Packages not opened, at whatever depth, are this document's loss.
+        deferred.session.report(&skip_unreadable);
 
         // Parse headers and footers. Walk header refs and footer refs
         // separately so each parsed `HeaderFooter` can record its own
@@ -360,59 +547,101 @@ impl DocxDocument {
         // Images referenced from a part other than the main document
         // (a header's logo, a picture in a footnote), keyed as
         // `<part>:<rId>` — see `qualify_part_images`.
-        let mut part_images: std::collections::HashMap<String, (Vec<u8>, Option<String>)> =
+        let mut part_images: std::collections::HashMap<
+            String,
+            (std::sync::Arc<[u8]>, Option<String>),
+        > = std::collections::HashMap::new();
+        let mut headers_footers: Vec<HeaderFooter> = Vec::new();
+        // A header or footer part is parsed and stored once per (part,
+        // type, role), however many sections reference it: sections that
+        // share one header all point at the same part (ECMA-376 §17.10.5),
+        // and re-parsing it per reference multiplied its size by the
+        // section count. `hf_by_ref` records which stored entry each
+        // reference resolved to.
+        let mut hf_cache: std::collections::HashMap<(crate::core::opc::PartName, u8, bool), usize> =
             std::collections::HashMap::new();
-        let mut headers_footers = Vec::new();
-        let unreadable_parts = std::cell::RefCell::new(Vec::<String>::new());
-        let skip_unreadable = |part: &str, e: &dyn std::fmt::Display| {
-            log::warn!("docx: skipping unreadable {part}: {e}");
-            unreadable_parts.borrow_mut().push(format!("{part}: {e}"));
-        };
-        let mut parse_hf =
-            |hf_ref: &HeaderFooterRef, is_header: bool, title_page: bool| -> CoreResult<()> {
-                if let Some(rel) = doc_rels.get_by_id(&hf_ref.relationship_id) {
-                    if rel.target_mode == TargetMode::Internal {
-                        let part_name = main_part.resolve_relative(&rel.target)?;
-                        if opc.has_part(&part_name) {
-                            // A header or footer part that cannot be read
-                            // (a corrupt zip entry) or does not parse is not
-                            // the document: skip and report it rather than
-                            // fail the file, as Tika/POI do.
-                            let data = match opc.read_part(&part_name) {
-                                Ok(d) => d,
-                                Err(e) => {
-                                    skip_unreadable(part_name.as_str(), &e);
-                                    return Ok(());
-                                },
-                            };
-                            let mut content = match parse_body_elements(&data) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    skip_unreadable(part_name.as_str(), &e);
-                                    return Ok(());
-                                },
-                            };
-                            if let Ok(hf_rels) = opc.read_rels_for(&part_name) {
-                                resolve_hyperlinks(&mut content, &hf_rels);
+        let mut hf_by_ref: Vec<Vec<Option<usize>>> = Vec::new();
+        // Image parts already read, by part name, `None` when a part could not
+        // be: shared by the main document, headers, footers and notes, so
+        // that a picture many parts name is read once and a failure is not
+        // tried again by each.
+        let mut image_by_part: ImageParts = std::collections::HashMap::new();
+        // Header and footer parts that could not be read or parsed.
+        let mut hf_failed: std::collections::HashSet<crate::core::opc::PartName> =
+            std::collections::HashSet::new();
+        let mut parse_hf = |hf_ref: &HeaderFooterRef,
+                            is_header: bool,
+                            title_page: bool|
+         -> CoreResult<Option<usize>> {
+            if let Some(rel) = doc_rels.get_by_id(&hf_ref.relationship_id) {
+                if rel.target_mode == TargetMode::Internal {
+                    let part_name = main_part.resolve_relative(&rel.target)?;
+                    if opc.has_part(&part_name) {
+                        // Failed once, failed for every reference: it is not
+                        // read again, nor reported again.
+                        if hf_failed.contains(&part_name) {
+                            return Ok(None);
+                        }
+                        let active = title_page || hf_ref.hf_type != HeaderFooterType::First;
+                        let key = (part_name.clone(), hf_ref.hf_type as u8, is_header);
+                        if let Some(&idx) = hf_cache.get(&key) {
+                            // Shown wherever any reference to it is.
+                            headers_footers[idx].active |= active;
+                            return Ok(Some(idx));
+                        }
+                        // A header or footer part that cannot be read
+                        // (a corrupt zip entry) or does not parse is not
+                        // the document: skip and report it rather than
+                        // fail the file.
+                        let data = match opc.read_part(&part_name) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                skip_unreadable(part_name.as_str(), &e);
+                                hf_failed.insert(part_name.clone());
+                                return Ok(None);
+                            },
+                        };
+                        let Some(mut content) = parse_salvaging(
+                            &data,
+                            part_name.as_str(),
+                            1,
+                            parse_body_elements,
+                            &skip_unreadable,
+                        ) else {
+                            hf_failed.insert(part_name.clone());
+                            return Ok(None);
+                        };
+                        // A relationships part that cannot be read leaves the
+                        // part without its links and images; the part is
+                        // kept, and the loss is reported.
+                        match opc.read_rels_for(&part_name) {
+                            Ok(hf_rels) => {
+                                resolve_hyperlinks(&mut content, &hf_rels, &links);
                                 qualify_part_images(
                                     &mut content,
                                     &part_name,
                                     &hf_rels,
                                     &mut opc,
                                     &mut part_images,
+                                    &mut image_by_part,
+                                    &skip_unreadable,
                                 );
-                            }
-                            headers_footers.push(HeaderFooter {
-                                hf_type: hf_ref.hf_type,
-                                content,
-                                is_header,
-                                active: title_page || hf_ref.hf_type != HeaderFooterType::First,
-                            });
+                            },
+                            Err(e) => skip_unreadable(&part_name.rels_path(), &e),
                         }
+                        headers_footers.push(HeaderFooter {
+                            hf_type: hf_ref.hf_type,
+                            content,
+                            is_header,
+                            active,
+                        });
+                        hf_cache.insert(key, headers_footers.len() - 1);
+                        return Ok(Some(headers_footers.len() - 1));
                     }
                 }
-                Ok(())
-            };
+            }
+            Ok(None)
+        };
         // A first-page part is shown when any section that *uses* it has
         // `w:titlePg`. A section that declares no reference of a type
         // inherits the previous section's (ECMA-376 §17.10.5), and
@@ -435,12 +664,15 @@ impl DocxDocument {
             }
         }
         for section in &sections {
+            let mut slots =
+                Vec::with_capacity(section.header_refs.len() + section.footer_refs.len());
             for (is_header, refs) in [(true, &section.header_refs), (false, &section.footer_refs)] {
                 for hf_ref in refs {
                     let shown = shown_first.contains(&(is_header, hf_ref.relationship_id.clone()));
-                    parse_hf(hf_ref, is_header, shown)?;
+                    slots.push(parse_hf(hf_ref, is_header, shown)?);
                 }
             }
+            hf_by_ref.push(slots);
         }
 
         // Footnotes, endnotes and comments are separate parts referenced
@@ -450,8 +682,12 @@ impl DocxDocument {
             let Some(rel) = doc_rels.first_by_type(rel_type) else {
                 return Vec::new();
             };
-            let Ok(part) = main_part.resolve_relative(&rel.target) else {
-                return Vec::new();
+            let part = match main_part.resolve_relative(&rel.target) {
+                Ok(part) => part,
+                Err(e) => {
+                    skip_unreadable(&rel.target, &e);
+                    return Vec::new();
+                },
             };
             if !opc.has_part(&part) {
                 return Vec::new();
@@ -467,35 +703,46 @@ impl DocxDocument {
                     return Vec::new();
                 },
             };
-            let mut notes = match parse_notes_part(&data, end) {
-                Ok(notes) => notes,
-                Err(e) => {
-                    skip_unreadable(part.as_str(), &e);
-                    return Vec::new();
-                },
+            let Some(mut notes) = parse_salvaging(
+                &data,
+                part.as_str(),
+                // A note's paragraphs: a damaged note keeps the paragraphs
+                // before the damage (the loss is reported).
+                2,
+                |d| parse_notes_part(d, end),
+                &skip_unreadable,
+            ) else {
+                return Vec::new();
             };
             // `r:id` is scoped per OPC part: a hyperlink inside a
             // footnote/endnote/comment resolves against *that* part's
             // `_rels`, not `document.xml.rels`. Resolving against the
             // document's relationships left the raw `rIdN` string as the
             // "URL" for every note hyperlink.
-            if let Ok(note_rels) = opc.read_rels_for(&part) {
-                for n in &mut notes {
-                    resolve_hyperlinks(&mut n.content, &note_rels);
-                    qualify_part_images(
-                        &mut n.content,
-                        &part,
-                        &note_rels,
-                        &mut opc,
-                        &mut part_images,
-                    );
-                }
+            match opc.read_rels_for(&part) {
+                Ok(note_rels) => {
+                    for n in &mut notes {
+                        resolve_hyperlinks(&mut n.content, &note_rels, &links);
+                        qualify_part_images(
+                            &mut n.content,
+                            &part,
+                            &note_rels,
+                            &mut opc,
+                            &mut part_images,
+                            &mut image_by_part,
+                            &skip_unreadable,
+                        );
+                    }
+                },
+                // The notes are kept without their links and images; the
+                // loss is reported.
+                Err(e) => skip_unreadable(&part.rels_path(), &e),
             }
             notes
         };
-        let footnotes = read_notes(rel_types::FOOTNOTES, "footnote");
-        let endnotes = read_notes(rel_types::ENDNOTES, "endnote");
-        let comments = read_notes(rel_types::COMMENTS, "comment");
+        let mut footnotes = read_notes(rel_types::FOOTNOTES, "footnote");
+        let mut endnotes = read_notes(rel_types::ENDNOTES, "endnote");
+        let mut comments = read_notes(rel_types::COMMENTS, "comment");
 
         // Scan `word/fonts/` for embedded font programs. Files there are
         // typically `font_<n>_<name>.ttf` (written by our own `DocxWriter`)
@@ -510,7 +757,14 @@ impl DocxDocument {
             if !(lower.ends_with(".ttf") || lower.ends_with(".otf")) {
                 continue;
             }
-            if let Ok(data) = opc.read_part(&name) {
+            let data = match opc.read_part(&name) {
+                Ok(data) => Some(data),
+                Err(e) => {
+                    skip_unreadable(&s, &e);
+                    None
+                },
+            };
+            if let Some(data) = data {
                 // Extract a usable face name from the OPC part. Writers
                 // ship fonts as `font_<n>_<face_name>.<ext>` (the
                 // `embedded_fonts` writer convention used by all three
@@ -535,7 +789,7 @@ impl DocxDocument {
         // relationships. We capture the raw bytes plus the lower-cased
         // file extension so downstream code can decide on the format
         // without re-sniffing magic bytes.
-        let mut images: std::collections::HashMap<String, (Vec<u8>, Option<String>)> =
+        let mut images: std::collections::HashMap<String, (std::sync::Arc<[u8]>, Option<String>)> =
             std::collections::HashMap::new();
         for rel in doc_rels.get_by_type(rel_types::IMAGE) {
             if rel.target_mode != TargetMode::Internal {
@@ -543,14 +797,19 @@ impl DocxDocument {
             }
             let part_name = match main_part.resolve_relative(&rel.target) {
                 Ok(p) => p,
-                Err(_) => continue,
+                Err(e) => {
+                    skip_unreadable(&rel.target, &e);
+                    continue;
+                },
             };
             if !opc.has_part(&part_name) {
                 continue;
             }
-            let data = match opc.read_part(&part_name) {
-                Ok(d) => d,
-                Err(_) => continue,
+            // Relationships that name one image part share its bytes.
+            let Some(data) =
+                read_image_part(&part_name, &mut opc, &mut image_by_part, &skip_unreadable)
+            else {
+                continue;
             };
             let ext = part_name
                 .as_str()
@@ -569,14 +828,39 @@ impl DocxDocument {
             images.len()
         );
         package_properties.crc_mismatched_parts = opc.crc_mismatched_parts();
+        // Private-use text in a symbol-font run, now that the styles are known.
+        map_symbol_fonts(&mut body.elements, styles.as_ref());
+        for part in &mut headers_footers {
+            map_symbol_fonts(&mut part.content, styles.as_ref());
+        }
+        for note in footnotes
+            .iter_mut()
+            .chain(endnotes.iter_mut())
+            .chain(comments.iter_mut())
+        {
+            map_symbol_fonts(&mut note.content, styles.as_ref());
+        }
+        let (unreadable_parts, unreadable_parts_omitted, cosmetic_parts) =
+            unreadable_parts.into_inner().finish_with_cosmetic();
         Ok(DocxDocument {
+            input_bytes: 0,
             body,
             styles,
             numbering,
             theme,
             sections,
             headers_footers,
-            unreadable_parts: unreadable_parts.into_inner(),
+            hf_by_ref,
+            unreadable_parts: unreadable_parts
+                .into_iter()
+                .map(|(part, reason)| format!("{part}: {reason}"))
+                .collect(),
+            unreadable_parts_omitted,
+            cosmetic_parts: cosmetic_parts
+                .into_iter()
+                .map(|(part, reason)| format!("{part}: {reason}"))
+                .collect(),
+            link_notice: links.notice(),
             embedded_fonts,
             images,
             core_properties,
@@ -726,6 +1010,40 @@ fn strip_html_tags(html: &str) -> String {
 /// `comment`). Word emits two pseudo-notes at ids 0 and -1 (the separator
 /// and continuation marks) with `w:type` set; those are not document
 /// content and are filtered out.
+/// Parse an ancillary part with `parse`, whose blocks worth keeping sit
+/// `depth` levels below the root. A part
+/// malformed part-way keeps the blocks before the damage and the
+/// loss is reported through `skip`; damage before the first block, or a
+/// salvaged prefix that does not parse either, reports the original error
+/// and gives `None`.
+fn parse_salvaging<T>(
+    data: &[u8],
+    part: &str,
+    depth: usize,
+    parse: impl Fn(&[u8]) -> CoreResult<T>,
+    skip: &dyn Fn(&str, &dyn std::fmt::Display),
+) -> Option<T> {
+    match parse(data) {
+        Ok(parsed) => Some(parsed),
+        Err(error) => {
+            if let Some((prefix, blocks)) = xml::salvage_prefix(data, depth, None, &[]) {
+                if let Ok(parsed) = parse(&prefix) {
+                    skip(
+                        part,
+                        &format!(
+                            "the XML is malformed after {blocks} blocks; the rest of the part \
+                             was not read"
+                        ),
+                    );
+                    return Some(parsed);
+                }
+            }
+            skip(part, &error);
+            None
+        },
+    }
+}
+
 fn parse_notes_part(xml_data: &[u8], end: &str) -> CoreResult<Vec<NoteBody>> {
     let mut reader = make_content_reader(xml_data);
     let mut notes = Vec::new();
@@ -888,9 +1206,9 @@ impl VmlContent {
                 anchor_position: None,
                 shape: None,
                 chart_rel_id: None,
-                chart_text: Vec::new(),
+                chart_text: std::sync::Arc::default(),
                 dgm_data_rel_id: None,
-                dgm_text: Vec::new(),
+                dgm_text: std::sync::Arc::default(),
             })));
         }
         for b in self.boxes {
@@ -1049,18 +1367,34 @@ fn parse_alternate_content(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<
     Ok(if chosen.is_empty() { fallback } else { chosen })
 }
 
-/// Decode `<w:sym w:font="Wingdings" w:char="F0B7"/>` into a character.
+/// Decode `<w:sym w:font="Symbol" w:char="F0B7"/>` into a character.
 ///
 /// The code point is hex. Values in `F000..F0FF` are the Windows
-/// symbol-font private-use encoding of a single byte; map them down to the
-/// bullet-ish equivalent rather than emitting an unrenderable PUA code
-/// point, and pass everything else through unchanged.
+/// symbol-font private-use encoding of a single byte, and what that byte
+/// means is the font's own encoding, so the font decides:
+///
+/// * `Symbol`, `Wingdings`, `Wingdings 2`, `Wingdings 3` and `Webdings` have
+///   tables ([`crate::core::symbol_font`]). A code the font has no character
+///   for is the replacement character, never a Latin letter.
+/// * Any other font (or none) has no table, so the byte is mapped to the
+///   bullet-ish equivalent for the two codes Word's galleries use and passed
+///   down as before otherwise; everything outside the private-use range
+///   passes through unchanged.
 fn parse_sym_char(e: &quick_xml::events::BytesStart) -> Option<char> {
     let raw = xml::optional_attr_str(e, "w:char").ok().flatten()?;
     let code = u32::from_str_radix(raw.trim(), 16).ok()?;
+    let font = xml::optional_attr_str(e, "w:font").ok().flatten();
+    if let (Some(font), 0xF000..=0xF0FF) = (font.as_deref(), code) {
+        if let Some(font) = crate::core::symbol_font::symbol_font(font) {
+            return Some(
+                crate::core::symbol_font::char_for(font, (code - 0xF000) as u8)
+                    .unwrap_or('\u{FFFD}'),
+            );
+        }
+    }
     let mapped = match code {
-        0xF0B7 | 0xF0A7 => 0x2022, // Wingdings/Symbol bullet
-        0xF0D8 => 0x25BA,          // Wingdings arrowhead
+        0xF0B7 | 0xF0A7 => 0x2022, // a symbol-font bullet
+        0xF0D8 => 0x25BA,          // an arrowhead
         c @ 0xF000..=0xF0FF => c - 0xF000,
         c => c,
     };
@@ -1073,6 +1407,7 @@ type ParsedDocument = (Body, Vec<SectionProperties>, Vec<String>, Vec<usize>);
 fn parse_document(
     xml_data: &[u8],
     rels: &crate::core::relationships::Relationships,
+    links: &LinkBudget,
 ) -> CoreResult<ParsedDocument> {
     let mut reader = make_content_reader(xml_data);
     let mut elements = Vec::new();
@@ -1149,7 +1484,7 @@ fn parse_document(
     }
 
     // Resolve hyperlink targets using relationships
-    resolve_hyperlinks(&mut elements, rels);
+    resolve_hyperlinks(&mut elements, rels, links);
 
     // Detect mid-document section breaks: paragraphs whose <w:pPr>
     // carries a <w:sectPr>. Each such paragraph terminates a section,
@@ -1180,10 +1515,74 @@ fn parse_document(
     Ok((body, all_sections, alt_chunk_rids, alt_chunk_positions))
 }
 
+/// The characters of hyperlink target text one document may materialise while
+/// it is read, shared by every part: a relationship's target is stored once and
+/// shared by the links that name it, but a link that adds a fragment, or names
+/// an internal target, owns a copy of the text.
+struct LinkBudget {
+    spent: std::cell::RefCell<crate::limits::TextBudget>,
+}
+
+impl LinkBudget {
+    fn new() -> Self {
+        Self {
+            spent: std::cell::RefCell::new(crate::limits::TextBudget::new()),
+        }
+    }
+
+    /// Charge `chars` before they are copied; `false` when the budget is spent.
+    fn charge(&self, chars: usize) -> bool {
+        self.spent.borrow_mut().charge(chars)
+    }
+
+    /// The notice to report when some link text was left out.
+    fn notice(&self) -> Option<String> {
+        let b = self.spent.borrow();
+        b.exhausted().then(|| {
+            format!(
+                "some hyperlink targets were shortened or left out: their text exceeds the {} \
+                 character budget (office_oxide::limits::set_max_text_chars)",
+                b.limit()
+            )
+        })
+    }
+}
+
+/// A hyperlink's target from the relationship it names (ECMA-376 §17.16.22):
+/// the relationship's own text, shared, plus any `w:anchor` as a URI fragment.
+/// Text that would have to be copied is charged first; when the budget is
+/// spent the link keeps the shared external target without its fragment, or
+/// loses an internal target.
+fn resolve_link_target(
+    rel: &crate::core::relationships::Relationship,
+    fragment: Option<&str>,
+    links: &LinkBudget,
+) -> HyperlinkTarget {
+    if rel.target_mode != TargetMode::External {
+        return if links.charge(rel.target.len() + fragment.map_or(0, |f| f.len() + 1)) {
+            let mut t = rel.target.to_string();
+            if let Some(frag) = fragment {
+                t.push('#');
+                t.push_str(frag);
+            }
+            HyperlinkTarget::Internal(t)
+        } else {
+            HyperlinkTarget::Internal(String::new())
+        };
+    }
+    match fragment {
+        Some(frag) if links.charge(rel.target.len() + 1 + frag.len()) => {
+            HyperlinkTarget::External(format!("{}#{frag}", rel.target).into())
+        },
+        _ => HyperlinkTarget::External(Arc::clone(&rel.target)),
+    }
+}
+
 /// Walk the element tree and resolve hyperlink rIds to actual URLs.
 fn resolve_hyperlinks(
     elements: &mut [BlockElement],
     rels: &crate::core::relationships::Relationships,
+    links: &LinkBudget,
 ) {
     for elem in elements.iter_mut() {
         match elem {
@@ -1194,20 +1593,11 @@ fn resolve_hyperlinks(
                             if let HyperlinkTarget::External(ref r_id) = hl.target {
                                 match rels.get_by_id(r_id) {
                                     Some(rel) => {
-                                        // A `w:anchor` alongside `r:id` is a URI
-                                        // fragment of the resolved target.
-                                        let mut t = rel.target.clone();
-                                        if let Some(frag) =
-                                            hl.fragment.as_deref().filter(|f| !f.is_empty())
-                                        {
-                                            t.push('#');
-                                            t.push_str(frag);
-                                        }
-                                        hl.target = if rel.target_mode == TargetMode::External {
-                                            HyperlinkTarget::External(t)
-                                        } else {
-                                            HyperlinkTarget::Internal(t)
-                                        };
+                                        hl.target = resolve_link_target(
+                                            rel,
+                                            hl.fragment.as_deref().filter(|f| !f.is_empty()),
+                                            links,
+                                        );
                                     },
                                     // Unresolvable relationship: a bare
                                     // relationship id is not a URL. Fall back
@@ -1223,11 +1613,11 @@ fn resolve_hyperlinks(
                                 }
                             }
                             for run in &mut hl.runs {
-                                resolve_hyperlinks_in_run(run, rels);
+                                resolve_hyperlinks_in_run(run, rels, links);
                             }
                         },
                         ParagraphContent::Run(run) => {
-                            resolve_hyperlinks_in_run(run, rels);
+                            resolve_hyperlinks_in_run(run, rels, links);
                         },
                     }
                 }
@@ -1235,7 +1625,7 @@ fn resolve_hyperlinks(
             BlockElement::Table(t) => {
                 for row in &mut t.rows {
                     for cell in &mut row.cells {
-                        resolve_hyperlinks(&mut cell.content, rels);
+                        resolve_hyperlinks(&mut cell.content, rels, links);
                     }
                 }
             },
@@ -1247,13 +1637,17 @@ fn resolve_hyperlinks(
 /// prose is ordinary content and carries ordinary links), and a linked
 /// picture's relationship id to its target — like a hyperlink's, `r:link`
 /// is scoped to the part it appears in.
-fn resolve_hyperlinks_in_run(run: &mut Run, rels: &crate::core::relationships::Relationships) {
+fn resolve_hyperlinks_in_run(
+    run: &mut Run,
+    rels: &crate::core::relationships::Relationships,
+    links: &LinkBudget,
+) {
     for rc in &mut run.content {
         match rc {
-            RunContent::TextBox(blocks) => resolve_hyperlinks(blocks, rels),
+            RunContent::TextBox(blocks) => resolve_hyperlinks(blocks, rels, links),
             RunContent::Drawing(d) => {
                 if let Some(rid) = d.linked_image_rid.as_deref() {
-                    d.linked_image = rels.get_by_id(rid).map(|rel| rel.target.clone());
+                    d.linked_image = rels.get_by_id(rid).map(|rel| Arc::clone(&rel.target));
                     if d.linked_image.is_none() {
                         log::warn!("docx: linked picture {rid} has no relationship");
                     }
@@ -1282,20 +1676,21 @@ fn resolve_hyperlinks_in_run(run: &mut Run, rels: &crate::core::relationships::R
 /// `w:rubyBase` text, not in the line, and inlining it doubled every
 /// annotated word (東京 read as とうきょう東京).
 fn is_transparent_paragraph_wrapper(local: &str) -> bool {
-    matches!(
-        local,
-        "ins"
-            | "moveTo"
-            | "fldSimple"
-            | "smartTag"
-            | "sdt"
-            | "sdtContent"
-            | "ruby"
-            | "rubyBase"
-            | "bdo"
-            | "dir"
-            | "customXml"
-    )
+    (local == "del" && crate::read_options::include_deleted_text())
+        || matches!(
+            local,
+            "ins"
+                | "moveTo"
+                | "fldSimple"
+                | "smartTag"
+                | "sdt"
+                | "sdtContent"
+                | "ruby"
+                | "rubyBase"
+                | "bdo"
+                | "dir"
+                | "customXml"
+        )
 }
 
 /// Record a `w:commentRangeStart` (ECMA-376 §17.13.4) in paragraph
@@ -1380,7 +1775,13 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
                         }));
                     }
                 },
-                "del" | "moveFrom" => {
+                // With deletions included, `w:del` is a transparent wrapper
+                // (below) and its runs keep their text in `w:delText`.
+                "moveFrom" => {
+                    // Tracked deletions are not document content.
+                    xml::skip_element_fast(reader)?;
+                },
+                "del" if !crate::read_options::include_deleted_text() => {
                     // Tracked deletions are not document content.
                     xml::skip_element_fast(reader)?;
                 },
@@ -1666,6 +2067,12 @@ fn parse_run(
                 "softHyphen" => {
                     xml::skip_element_fast(reader)?;
                 },
+                "delText" if crate::read_options::include_deleted_text() => {
+                    let text = xml::read_text_content_fast(reader)?;
+                    if !text.is_empty() {
+                        run.content.push(RunContent::Text(text));
+                    }
+                },
                 "delText" => {
                     // Deleted revision text is not document content.
                     xml::skip_element_fast(reader)?;
@@ -1719,6 +2126,87 @@ fn parse_run(
     }
     run.content.shrink_to_fit();
     Ok(run)
+}
+
+/// Text typed in a symbol font is stored as private-use characters
+/// (`U+F000` plus the font's byte), so `μ` in the Symbol font is `U+F06D`. In a
+/// run whose effective font is Symbol, Wingdings, Wingdings 2 or 3 or Webdings,
+/// those characters are the font's, and are replaced by them; a character the
+/// font has no mapping for stays as it is. The effective font is the run's own,
+/// else its character style's, its paragraph style's, or the document default.
+/// It is applied once, to the parsed document, so every rendering agrees.
+fn map_symbol_fonts(root: &mut [BlockElement], styles: Option<&StyleSheet>) {
+    // An explicit worklist: table cells nest, and a crafted file nests them deep.
+    let mut stack: Vec<&mut [BlockElement]> = vec![root];
+    while let Some(blocks) = stack.pop() {
+        for block in blocks {
+            match block {
+                BlockElement::Paragraph(Paragraph {
+                    properties,
+                    content,
+                }) => {
+                    let style = properties.as_ref().and_then(|p| p.style_id.as_deref());
+                    for item in content {
+                        match item {
+                            ParagraphContent::Run(run) => map_symbol_font_run(run, style, styles),
+                            ParagraphContent::Hyperlink(link) => {
+                                for run in &mut link.runs {
+                                    map_symbol_font_run(run, style, styles);
+                                }
+                            },
+                        }
+                    }
+                },
+                BlockElement::Table(table) => {
+                    for row in &mut table.rows {
+                        for cell in &mut row.cells {
+                            stack.push(&mut cell.content);
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
+fn map_symbol_font_run(run: &mut Run, paragraph_style: Option<&str>, styles: Option<&StyleSheet>) {
+    let in_range = |c: char| ('\u{F020}'..='\u{F0FF}').contains(&c);
+    // Most runs hold no such character: the style chain is not read for them.
+    if !run
+        .content
+        .iter()
+        .any(|c| matches!(c, RunContent::Text(t) if t.chars().any(in_range)))
+    {
+        return;
+    }
+    let direct = run.properties.as_ref();
+    let named = match styles {
+        Some(sheet) => sheet.effective_font_name(paragraph_style, direct),
+        None => direct.and_then(|rp| {
+            rp.script
+                .as_ref()
+                .and_then(|s| s.font_h_ansi.as_deref())
+                .or(rp.font_name.as_deref())
+        }),
+    };
+    let Some(font) = named.and_then(crate::core::symbol_font::symbol_font) else {
+        return;
+    };
+    for content in &mut run.content {
+        if let RunContent::Text(text) = content {
+            *text = text
+                .chars()
+                .map(|c| {
+                    if in_range(c) {
+                        crate::core::symbol_font::char_for(font, (c as u32 - 0xF000) as u8)
+                            .unwrap_or(c)
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+        }
+    }
 }
 
 /// Push the `RunContent` for a `w:footnoteReference` /
@@ -1928,7 +2416,7 @@ fn hyperlink_target_from_instr(instr: &str) -> Option<(HyperlinkTarget, Option<S
                 u.push('#');
                 u.push_str(&a);
             }
-            HyperlinkTarget::External(u)
+            HyperlinkTarget::External(u.into())
         },
         (None, Some(a)) => HyperlinkTarget::Internal(a),
         (None, None) => return None,
@@ -1955,7 +2443,7 @@ fn parse_hyperlink(
     let (target, fragment) = match (r_id, anchor) {
         // Will be resolved to the actual URL after parsing via
         // `resolve_hyperlinks()`.
-        (Some(r_id), anchor) => (HyperlinkTarget::External(r_id), anchor),
+        (Some(r_id), anchor) => (HyperlinkTarget::External(r_id.into()), anchor),
         (None, Some(anchor)) => (HyperlinkTarget::Internal(anchor), None),
         (None, None) => (HyperlinkTarget::Internal(String::new()), None),
     };
@@ -2034,7 +2522,9 @@ fn qualify_part_images<R: Read + Seek>(
     part: &crate::core::opc::PartName,
     rels: &crate::core::relationships::Relationships,
     opc: &mut OpcReader<R>,
-    images: &mut std::collections::HashMap<String, (Vec<u8>, Option<String>)>,
+    images: &mut std::collections::HashMap<String, (std::sync::Arc<[u8]>, Option<String>)>,
+    read: &mut ImageParts,
+    skip: &dyn Fn(&str, &dyn std::fmt::Display),
 ) {
     let prefix = format!("{}:", part.as_str().rsplit('/').next().unwrap_or(""));
     let mut any = false;
@@ -2042,13 +2532,17 @@ fn qualify_part_images<R: Read + Seek>(
         if rel.target_mode != TargetMode::Internal {
             continue;
         }
-        let Ok(image_part) = part.resolve_relative(&rel.target) else {
-            continue;
+        let image_part = match part.resolve_relative(&rel.target) {
+            Ok(image_part) => image_part,
+            Err(e) => {
+                skip(&rel.target, &e);
+                continue;
+            },
         };
         if !opc.has_part(&image_part) {
             continue;
         }
-        let Ok(data) = opc.read_part(&image_part) else {
+        let Some(data) = read_image_part(&image_part, opc, read, skip) else {
             continue;
         };
         let ext = image_part
@@ -2062,6 +2556,34 @@ fn qualify_part_images<R: Read + Seek>(
     if any {
         prefix_drawing_rids(elements, &prefix);
     }
+}
+
+/// Image parts already read, by part name (compared as a zip lookup is, without
+/// regard to case): the bytes, or `None` when the part
+/// could not be read.
+type ImageParts =
+    std::collections::HashMap<crate::core::opc::PartName, Option<std::sync::Arc<[u8]>>>;
+
+/// The bytes of the image part `part`, read once however many relationships
+/// name it. A part that cannot be read is reported once and not tried again.
+fn read_image_part<R: Read + Seek>(
+    part: &crate::core::opc::PartName,
+    opc: &mut OpcReader<R>,
+    read: &mut ImageParts,
+    skip: &dyn Fn(&str, &dyn std::fmt::Display),
+) -> Option<std::sync::Arc<[u8]>> {
+    if let Some(found) = read.get(part) {
+        return found.clone();
+    }
+    let data: Option<std::sync::Arc<[u8]>> = match opc.read_part(part) {
+        Ok(data) => Some(data.into()),
+        Err(e) => {
+            skip(part.as_str(), &e);
+            None
+        },
+    };
+    read.insert(part.clone(), data.clone());
+    data
 }
 
 fn prefix_drawing_rids(elements: &mut [BlockElement], prefix: &str) {
@@ -2102,8 +2624,8 @@ fn prefix_drawing_rids(elements: &mut [BlockElement], prefix: &str) {
 
 fn attach_chart_text(
     elements: &mut [BlockElement],
-    chart_text_by_rid: &std::collections::HashMap<String, Vec<String>>,
-    dgm_text_by_rid: &std::collections::HashMap<String, Vec<String>>,
+    chart_text_by_rid: &std::collections::HashMap<String, std::sync::Arc<[String]>>,
+    dgm_text_by_rid: &std::collections::HashMap<String, std::sync::Arc<[String]>>,
 ) {
     for elem in elements {
         match elem {
@@ -2119,12 +2641,12 @@ fn attach_chart_text(
                                 RunContent::Drawing(d) => {
                                     if let Some(rid) = d.chart_rel_id.as_deref() {
                                         if let Some(lines) = chart_text_by_rid.get(rid) {
-                                            d.chart_text = lines.clone();
+                                            d.chart_text = std::sync::Arc::clone(lines);
                                         }
                                     }
                                     if let Some(rid) = d.dgm_data_rel_id.as_deref() {
                                         if let Some(lines) = dgm_text_by_rid.get(rid) {
-                                            d.dgm_text = lines.clone();
+                                            d.dgm_text = std::sync::Arc::clone(lines);
                                         }
                                     }
                                 },
@@ -2161,6 +2683,8 @@ fn resolve_deferred_parts<R: Read + Seek>(
     opc: &mut OpcReader<R>,
     main_part: &crate::core::opc::PartName,
     doc_rels: &crate::core::relationships::Relationships,
+    done: &mut DeferredParts,
+    skip: &dyn Fn(&str, &dyn std::fmt::Display),
 ) {
     for elem in elements {
         match elem {
@@ -2174,12 +2698,14 @@ fn resolve_deferred_parts<R: Read + Seek>(
                         for rc in &mut run.content {
                             match rc {
                                 RunContent::TextBox(blocks) => {
-                                    resolve_deferred_parts(blocks, opc, main_part, doc_rels);
+                                    resolve_deferred_parts(
+                                        blocks, opc, main_part, doc_rels, done, skip,
+                                    );
                                 },
                                 RunContent::DeferredPart(rid) => {
-                                    if let Some(blocks) =
-                                        resolve_one_deferred_part(rid, opc, main_part, doc_rels)
-                                    {
+                                    if let Some(blocks) = resolve_one_deferred_part(
+                                        rid, opc, main_part, doc_rels, done, skip,
+                                    ) {
                                         *rc = RunContent::TextBox(blocks);
                                     }
                                 },
@@ -2192,7 +2718,14 @@ fn resolve_deferred_parts<R: Read + Seek>(
             BlockElement::Table(t) => {
                 for row in &mut t.rows {
                     for cell in &mut row.cells {
-                        resolve_deferred_parts(&mut cell.content, opc, main_part, doc_rels);
+                        resolve_deferred_parts(
+                            &mut cell.content,
+                            opc,
+                            main_part,
+                            doc_rels,
+                            done,
+                            skip,
+                        );
                     }
                 }
             },
@@ -2200,26 +2733,147 @@ fn resolve_deferred_parts<R: Read + Seek>(
     }
 }
 
+/// The embedded packages already opened, by part: their paragraphs, or
+/// `None` when the part could not be read or opened. Several objects can name
+/// one part; it is opened once, and a failure is remembered as a success is.
+struct DeferredParts {
+    done: std::collections::HashMap<crate::core::opc::PartName, Option<Vec<BlockElement>>>,
+    /// The document's account of the packages it embeds, joined by the
+    /// documents embedded in it.
+    session: crate::core::embedded::Session,
+}
+
+impl DeferredParts {
+    fn new() -> Self {
+        Self {
+            done: std::collections::HashMap::new(),
+            session: crate::core::embedded::Session::begin(),
+        }
+    }
+}
+
+/// What opening one embedded package yielded: its paragraphs and the
+/// characters of text they hold. Kept by the package's content, so that a
+/// blob reached through several entry names is opened once.
+#[derive(Clone)]
+struct OpenedPackage {
+    /// The package's text was kept, so a repeat has somewhere to point to.
+    has_text: bool,
+}
+
+/// What stands for an embedded package that was already read, found again
+/// under another name: one short paragraph, charged to the account, in place of
+/// a second copy of its text. `None` when even that does not fit.
+fn repeated_package_notice(
+    session: &crate::core::embedded::Session,
+    part: &str,
+) -> Option<Vec<BlockElement>> {
+    const NOTICE: &str = crate::core::embedded::REPEATED_NOTICE;
+    if let Err(refusal) = crate::core::embedded::charge_text(session, NOTICE.chars().count()) {
+        crate::core::embedded::refuse(session, part, refusal);
+        return None;
+    }
+    Some(vec![BlockElement::Paragraph(Paragraph {
+        properties: None,
+        content: vec![ParagraphContent::Run(Run {
+            properties: None,
+            content: vec![RunContent::Text(NOTICE.to_string())],
+        })],
+    })])
+}
+
 fn resolve_one_deferred_part<R: Read + Seek>(
     rid: &str,
     opc: &mut OpcReader<R>,
     main_part: &crate::core::opc::PartName,
     doc_rels: &crate::core::relationships::Relationships,
+    done: &mut DeferredParts,
+    skip: &dyn Fn(&str, &dyn std::fmt::Display),
 ) -> Option<Vec<BlockElement>> {
     let rel = doc_rels.get_by_id(rid)?;
     if rel.target_mode != TargetMode::Internal {
         return None;
     }
-    let part = main_part.resolve_relative(&rel.target).ok()?;
+    let part = match main_part.resolve_relative(&rel.target) {
+        Ok(part) => part,
+        Err(e) => {
+            skip(&rel.target, &e);
+            return None;
+        },
+    };
     if !opc.has_part(&part) {
         return None;
     }
+    if let Some(found) = done.done.get(&part) {
+        // The same part named again: its text is where it first appears.
+        return found
+            .as_ref()
+            .and_then(|_| repeated_package_notice(&done.session, part.as_str()));
+    }
+    let found = open_deferred_part(&part, opc, &done.session, skip);
+    done.done.insert(part, found.clone());
+    found
+}
+
+fn open_deferred_part<R: Read + Seek>(
+    part: &crate::core::opc::PartName,
+    opc: &mut OpcReader<R>,
+    session: &crate::core::embedded::Session,
+    skip: &dyn Fn(&str, &dyn std::fmt::Display),
+) -> Option<Vec<BlockElement>> {
+    use crate::core::embedded;
     let ext = part.as_str().rsplit('.').next()?;
     let format = crate::format::DocumentFormat::from_extension(ext)?;
-    let data = opc.read_part(&part).ok()?;
-    let text = crate::Document::from_reader(std::io::Cursor::new(data), format)
-        .ok()?
-        .plain_text();
+    let data = match opc.read_part(part) {
+        Ok(data) => data,
+        Err(e) => {
+            skip(part.as_str(), &e);
+            return None;
+        },
+    };
+    // The same package reached through another entry name costs what the
+    // first did to find, and nothing to open again; its text is not copied
+    // again either, one line points to where it is.
+    let fingerprint = embedded::Fingerprint::of(&data);
+    if let Some(OpenedPackage { has_text }) =
+        embedded::cached::<OpenedPackage>(session, fingerprint)
+    {
+        // Another name for a package already read: its text is where it first
+        // appears, and is not copied again.
+        return has_text
+            .then(|| repeated_package_notice(session, part.as_str()))
+            .flatten();
+    }
+    let admission = match embedded::admit(session, data.len() as u64) {
+        Ok(admission) => admission,
+        Err(refusal) => {
+            embedded::refuse(session, part.as_str(), refusal);
+            return None;
+        },
+    };
+    let opened = crate::Document::from_reader_nested(std::io::Cursor::new(data), format)
+        .map(|doc| (doc.plain_text(), doc.unreadable_part_pairs()));
+    // The level and the package's byte account end here, with the document.
+    drop(admission);
+    let text = match opened {
+        Ok((text, problems)) => {
+            // The embedded package's own losses are the document's too, each
+            // named by the part that holds the package and the part within.
+            for (inner, why) in problems {
+                skip(
+                    &format!("{} ({inner})", part.as_str()),
+                    &format!("an embedded package could not be read in full: {why}"),
+                );
+            }
+            text
+        },
+        Err(e) => {
+            skip(part.as_str(), &e);
+            embedded::remember(session, fingerprint, OpenedPackage { has_text: false });
+            return None;
+        },
+    };
+    let chars = text.chars().count();
     let paragraphs: Vec<BlockElement> = text
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -2233,18 +2887,34 @@ fn resolve_one_deferred_part<R: Read + Seek>(
             })
         })
         .collect();
-    if paragraphs.is_empty() {
-        None
-    } else {
-        Some(paragraphs)
+    let paragraphs = (!paragraphs.is_empty()).then_some(paragraphs);
+    if let Err(refusal) = embedded::charge_text(session, chars) {
+        embedded::refuse(session, part.as_str(), refusal);
+        embedded::remember(session, fingerprint, OpenedPackage { has_text: false });
+        return None;
     }
+    embedded::remember(
+        session,
+        fingerprint,
+        OpenedPackage {
+            has_text: paragraphs.is_some(),
+        },
+    );
+    paragraphs
 }
 
 /// Collect every `<a:t>` text node inside a SmartArt data part
 /// (`word/diagrams/dataN.xml`), in document order, one per line.
-fn diagram_text_lines(xml: &[u8]) -> Vec<String> {
-    let mut reader = xml::make_fast_reader(xml);
+///
+/// Also says why the part could not be read to its end (`None` when it
+/// could): the lines are then what came before the damage.
+fn diagram_text_lines(xml: &[u8]) -> (Vec<String>, Option<String>) {
+    let mut reader = quick_xml::Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+    reader.config_mut().check_comments = false;
     let mut lines = Vec::new();
+    let mut open = 0usize;
+    let damage;
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) if e.local_name().as_ref() == "t" => {
@@ -2255,11 +2925,20 @@ fn diagram_text_lines(xml: &[u8]) -> Vec<String> {
                     }
                 }
             },
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Start(_)) => open += 1,
+            Ok(Event::End(_)) => open = open.saturating_sub(1),
+            Ok(Event::Eof) => {
+                damage = (open > 0).then(|| "the XML ends inside an open element".to_string());
+                break;
+            },
+            Err(e) => {
+                damage = Some(format!("the XML is malformed: {e}"));
+                break;
+            },
             _ => {},
         }
     }
-    lines
+    (lines, damage)
 }
 
 // ---------------------------------------------------------------------------
@@ -2430,9 +3109,9 @@ fn parse_inline_or_anchor_body(
             anchor_position,
             shape,
             chart_rel_id,
-            chart_text: Vec::new(),
+            chart_text: std::sync::Arc::default(),
             dgm_data_rel_id,
-            dgm_text: Vec::new(),
+            dgm_text: std::sync::Arc::default(),
         }))
     } else {
         Ok(None)
@@ -3659,6 +4338,18 @@ impl crate::core::OfficeDocument for DocxDocument {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_a_damaged_diagram_part_is_reported_and_keeps_its_first_text() {
+        let head = r#"<dgm:dataModel xmlns:dgm="d" xmlns:a="a"><dgm:ptLst><dgm:pt><dgm:t><a:p><a:r><a:t>kept point</a:t></a:r></a:p></dgm:t></dgm:pt>"#;
+        let sound = format!("{head}</dgm:ptLst></dgm:dataModel>");
+        assert_eq!(diagram_text_lines(sound.as_bytes()), (vec!["kept point".to_string()], None));
+        for tail in ["<dgm:pt><dgm:t><a:p><a:r", "<dgm:pt><<", "<dgm:pt>"] {
+            let (lines, damage) = diagram_text_lines(format!("{head}{tail}").as_bytes());
+            assert_eq!(lines, vec!["kept point".to_string()], "{tail}");
+            assert!(damage.is_some(), "{tail}");
+        }
+    }
     use super::*;
 
     /// A plain one-run paragraph in a one-paragraph cell cost ~4 KB even
@@ -3685,7 +4376,7 @@ mod tests {
 <w:p><w:r><w:t>para</w:t></w:r></w:p>
 </w:body></w:document>"#;
         let rels = crate::core::relationships::Relationships::empty();
-        let parsed = parse_document(xml, &rels).unwrap();
+        let parsed = parse_document(xml, &rels, &LinkBudget::new()).unwrap();
         let BlockElement::Table(table) = &parsed.0.elements[0] else {
             panic!("first element is the table")
         };
@@ -4543,7 +5234,7 @@ mod tests {
         });
         let hl = hl.expect("hyperlink was not captured");
         match &hl.target {
-            HyperlinkTarget::External(rid) => assert_eq!(rid, "rId7"),
+            HyperlinkTarget::External(rid) => assert_eq!(&**rid, "rId7"),
             other => panic!("expected an External target carrying r:id, got {other:?}"),
         }
         assert_eq!(hl.fragment.as_deref(), Some("section1"));
@@ -4567,7 +5258,7 @@ mod tests {
         });
         let hl = hl.expect("field-code hyperlink was not resolved");
         match &hl.target {
-            HyperlinkTarget::External(url) => assert_eq!(url, "https://example.com/page"),
+            HyperlinkTarget::External(url) => assert_eq!(&**url, "https://example.com/page"),
             other => panic!("expected an External URL target, got {other:?}"),
         }
         let text: String = hl
@@ -5774,7 +6465,7 @@ mod tests {
         let hl = hl.expect("hyperlink was not captured in the footnote body");
         assert_eq!(
             hl.target,
-            HyperlinkTarget::External("https://example.com/source".to_string()),
+            HyperlinkTarget::External("https://example.com/source".into()),
             "the footnote hyperlink must resolve against footnotes.xml's own rels, not the \
              document's — got {:?}",
             hl.target

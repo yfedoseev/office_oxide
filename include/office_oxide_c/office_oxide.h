@@ -63,6 +63,7 @@ extern "C" {
 #define OFFICE_ERR_EXTRACTION       4
 #define OFFICE_ERR_INTERNAL         5
 #define OFFICE_ERR_UNSUPPORTED      6
+#define OFFICE_ERR_INCOMPLETE       7  /* read, but known to be incomplete and the options asked for an error */
 
 /* ─── Cell value types (for office_editable_set_cell) ─────────────────────── */
 
@@ -111,6 +112,54 @@ OfficeDocumentHandle* office_document_open_from_bytes(
     size_t len,
     const char* format,
     int* error_code);
+
+/* ─── Parse options (per document) ────────────────────────────────────────── */
+
+typedef struct OfficeParseOptionsHandle OfficeParseOptionsHandle;
+
+/** Options holding the process-wide settings in force now. Free with office_options_free. */
+OfficeParseOptionsHandle* office_options_new(void);
+
+/**
+ * Options for untrusted input: tighter limits, and an incomplete result is an
+ * error (OFFICE_ERR_INCOMPLETE). Free with office_options_free.
+ */
+OfficeParseOptionsHandle* office_options_strict(void);
+
+/** Free an options handle. */
+void office_options_free(OfficeParseOptionsHandle* handle);
+
+/**
+ * Set an option by name: a limit (text_chars, part_bytes, ...), or
+ * include_hidden_text / include_deleted_text (0 or 1), or on_incomplete
+ * (0 = report, 1 = error). Returns OFFICE_OK, or OFFICE_ERR_INVALID_ARG for a
+ * null handle or unknown name.
+ */
+int32_t office_options_set(OfficeParseOptionsHandle* handle, const char* name, uint64_t value);
+
+/** The names office_options_set accepts, comma-separated. Free with office_oxide_free_string. */
+char* office_options_names(void);
+
+/** Open a document from a path under `options` (NULL: the process-wide settings). */
+OfficeDocumentHandle* office_document_open_with(
+    const char* path,
+    const OfficeParseOptionsHandle* options,
+    int* error_code);
+
+/** Open a document from a buffer under `options` (NULL: the process-wide settings). */
+OfficeDocumentHandle* office_document_open_from_bytes_with(
+    const uint8_t* data,
+    size_t len,
+    const char* format,
+    const OfficeParseOptionsHandle* options,
+    int* error_code);
+
+/**
+ * What is wrong with the document, as a JSON array of {kind, part, detail}
+ * (kind: "unreadable_part", "truncated" or "recovered"); "[]" if sound.
+ * Free result with office_oxide_free_string.
+ */
+char* office_document_damage_json(const OfficeDocumentHandle* handle, int* error_code);
 
 /** Free a document handle. */
 void office_document_free(OfficeDocumentHandle* handle);
