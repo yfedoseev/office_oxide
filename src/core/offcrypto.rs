@@ -227,22 +227,18 @@ fn agile(info: &[u8], body: &[u8]) -> Result<Vec<u8>> {
             h = a.key_hash.digest_array(&next[..4 + len]).0;
         }
         let h = &h[..len];
-        let hash_input = cbc(
-            &derive(&h, &[0xfe, 0xa7, 0xd2, 0x76, 0x3b, 0x4b, 0x9e, 0x79]),
-            &a.verifier_input,
-        )
-        .ok()?;
-        let expected = cbc(
-            &derive(&h, &[0xd7, 0xaa, 0x0f, 0x6d, 0x30, 0x61, 0x34, 0x4e]),
-            &a.verifier_value,
-        )
-        .ok()?;
+        let hash_input =
+            cbc(&derive(h, &[0xfe, 0xa7, 0xd2, 0x76, 0x3b, 0x4b, 0x9e, 0x79]), &a.verifier_input)
+                .ok()?;
+        let expected =
+            cbc(&derive(h, &[0xd7, 0xaa, 0x0f, 0x6d, 0x30, 0x61, 0x34, 0x4e]), &a.verifier_value)
+                .ok()?;
         let actual = a.key_hash.digest(&hash_input);
         if expected.get(..actual.len()) != Some(&actual[..]) {
             return None;
         }
         let mut key =
-            cbc(&derive(&h, &[0x14, 0x6e, 0x0b, 0xe7, 0xab, 0xac, 0xd0, 0xd6]), &a.key_value)
+            cbc(&derive(h, &[0x14, 0x6e, 0x0b, 0xe7, 0xab, 0xac, 0xd0, 0xd6]), &a.key_value)
                 .ok()?;
         key.truncate(bytes);
         Some(key)
