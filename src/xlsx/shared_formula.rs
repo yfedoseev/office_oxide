@@ -130,7 +130,7 @@ impl SharedFormulas {
                 continue;
             }
             if let Some(cell) = rows.get_mut(f.row).and_then(|r| r.cells.get_mut(f.cell)) {
-                cell.formula = Some(text);
+                cell.set_formula(Some(text));
             }
         }
         SharedFormulaLoss { dropped }
@@ -367,14 +367,11 @@ mod tests {
             .enumerate()
             .map(|(i, a)| Row {
                 index: i as u32 + 1,
-                cells: vec![crate::xlsx::Cell {
-                    reference: r(a),
-                    value: crate::xlsx::CellValue::Number(1.0),
-                    style_index: None,
-                    formula: None,
-                    vm: None,
-                    rich_runs: None,
-                }],
+                cells: vec![crate::xlsx::Cell::new(
+                    r(a),
+                    crate::xlsx::CellValue::Number(1.0),
+                    None,
+                )],
             })
             .collect()
     }
@@ -390,7 +387,7 @@ mod tests {
         assert!(sf.add_master(0, r("B2"), "A2"));
         let loss = sf.resolve(&mut rows, &mut TextBudget::with_limit(100));
         assert_eq!(loss.dropped, 0);
-        assert_eq!(rows[0].cells[0].formula.as_deref(), Some("A3"));
+        assert_eq!(rows[0].cells[0].formula(), Some("A3"));
     }
 
     #[test]
@@ -401,7 +398,7 @@ mod tests {
         sf.follower(7, &r("B3"));
         let loss = sf.resolve(&mut rows, &mut TextBudget::with_limit(100));
         assert_eq!(loss.dropped, 0, "an orphan is not a loss of a formula that existed");
-        assert_eq!(rows[0].cells[0].formula, None);
+        assert_eq!(rows[0].cells[0].formula(), None);
     }
 
     #[test]
@@ -416,8 +413,8 @@ mod tests {
         // "A2+A2" is 5 bytes: two fit in 12, the third does not.
         let loss = sf.resolve(&mut rows, &mut TextBudget::with_limit(12));
         assert_eq!(loss.dropped, 1);
-        assert_eq!(rows[1].cells[0].formula.as_deref(), Some("A3+A3"));
-        assert_eq!(rows[2].cells[0].formula, None);
+        assert_eq!(rows[1].cells[0].formula(), Some("A3+A3"));
+        assert_eq!(rows[2].cells[0].formula(), None);
     }
 
     #[test]
@@ -429,6 +426,6 @@ mod tests {
         sf.follower(0, &r("B2"));
         let loss = sf.resolve(&mut rows, &mut TextBudget::with_limit(1_000_000));
         assert_eq!(loss.dropped, 2);
-        assert_eq!(rows[0].cells[0].formula, None);
+        assert_eq!(rows[0].cells[0].formula(), None);
     }
 }

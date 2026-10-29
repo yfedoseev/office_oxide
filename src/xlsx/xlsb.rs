@@ -416,14 +416,8 @@ fn parse_sheet(data: &[u8], name: String) -> Worksheet {
             index: row + 1,
             cells: Vec::new(),
         });
-        r.cells.push(Cell {
-            reference: CellRef { col, row },
-            value,
-            style_index: Some(style),
-            formula: None,
-            rich_runs: None,
-            vm: None,
-        });
+        r.cells
+            .push(Cell::new(CellRef { col, row }, value, Some(style)));
     };
     for rec in records(data) {
         let d = rec.data;

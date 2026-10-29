@@ -105,7 +105,7 @@ fn shared_formula_workbook(master_len: usize, followers: usize) -> Vec<u8> {
 fn formula_and_value_counts(ws: &office_oxide::xlsx::Worksheet) -> (usize, usize) {
     let cells = ws.rows.iter().flat_map(|r| &r.cells);
     (
-        cells.clone().filter(|c| c.formula.is_some()).count(),
+        cells.clone().filter(|c| c.formula().is_some()).count(),
         cells
             .filter(|c| !matches!(c.value, office_oxide::xlsx::CellValue::Empty))
             .count(),

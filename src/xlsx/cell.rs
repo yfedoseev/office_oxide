@@ -98,6 +98,12 @@ pub enum CellValue {
 }
 
 /// A raw cell as parsed from worksheet XML.
+///
+/// Most cells are a value and a style. The three attributes that few cells
+/// carry (a formula, rich-text runs, a value-metadata index) live in one boxed
+/// extension, so the common cell is 56 bytes instead of 96: a worksheet of
+/// millions of cells holds millions of these. Read them through
+/// [`Cell::formula`], [`Cell::rich_runs`] and [`Cell::vm`].
 #[derive(Debug, Clone)]
 pub struct Cell {
     /// Parsed cell reference (column, row).
@@ -106,28 +112,102 @@ pub struct Cell {
     pub value: CellValue,
     /// Style index (`s` attribute) referencing the cellXfs array.
     pub style_index: Option<u32>,
+    /// What few cells have; `None` for the rest.
+    extras: Option<Box<CellExtras>>,
+}
+
+/// The attributes of a [`Cell`] that few cells carry.
+#[derive(Debug, Clone, Default)]
+struct CellExtras {
+    formula: Option<String>,
+    rich_runs: Option<std::sync::Arc<[crate::xlsx::shared_strings::RichTextRun]>>,
+    vm: Option<u32>,
+}
+
+impl Cell {
+    /// A cell with no formula, rich runs or value metadata.
+    pub fn new(reference: CellRef, value: CellValue, style_index: Option<u32>) -> Self {
+        Self {
+            reference,
+            value,
+            style_index,
+            extras: None,
+        }
+    }
+
     /// Formula content from the `<f>` element, if present.
-    pub formula: Option<String>,
-    /// Rich-run formatting for an inline (`t="inlineStr"`) string cell —
-    /// the mirror of `SharedString.rich_text` for a cell whose text
-    /// lives directly in the `<c>` element instead of the shared string
-    /// table. The shared-string reader parses this but missed this
-    /// structurally identical path entirely, so an inline rich-text
-    /// cell's bold/italic/color/font was silently discarded.
-    pub rich_runs: Option<std::sync::Arc<[crate::xlsx::shared_strings::RichTextRun]>>,
+    pub fn formula(&self) -> Option<&str> {
+        self.extras.as_ref()?.formula.as_deref()
+    }
+
+    /// Rich-run formatting for an inline (`t="inlineStr"`) string cell: the
+    /// mirror of `SharedString.rich_text` for a cell whose text lives directly
+    /// in the `<c>` element instead of the shared string table.
+    pub fn rich_runs(&self) -> Option<&std::sync::Arc<[crate::xlsx::shared_strings::RichTextRun]>> {
+        self.extras.as_ref()?.rich_runs.as_ref()
+    }
+
     /// The cell's `vm` attribute: a 1-based index into the workbook's
     /// `xl/metadata.xml` `<valueMetadata>` array. Excel 365's in-cell
     /// rich-value images (`=IMAGE(...)`/"Place in Cell") are stored as a
-    /// `t="e"` cell with a literal `<v>#VALUE!</v>` fallback for old
-    /// readers, plus this `vm` pointer to the real rich-value chain —
-    /// without it, that fallback text was indistinguishable from a
-    /// genuine formula error.
-    pub vm: Option<u32>,
+    /// `t="e"` cell with a literal `<v>#VALUE!</v>` fallback for old readers,
+    /// plus this pointer to the real rich-value chain.
+    pub fn vm(&self) -> Option<u32> {
+        self.extras.as_ref()?.vm
+    }
+
+    /// Set or clear the formula.
+    pub fn set_formula(&mut self, formula: Option<String>) {
+        if formula.is_some() || self.extras.is_some() {
+            self.extras.get_or_insert_with(Default::default).formula = formula;
+        }
+    }
+
+    /// Set or clear the rich runs.
+    pub fn set_rich_runs(
+        &mut self,
+        runs: Option<std::sync::Arc<[crate::xlsx::shared_strings::RichTextRun]>>,
+    ) {
+        if runs.is_some() || self.extras.is_some() {
+            self.extras.get_or_insert_with(Default::default).rich_runs = runs;
+        }
+    }
+
+    /// Set or clear the value-metadata index.
+    pub fn set_vm(&mut self, vm: Option<u32>) {
+        if vm.is_some() || self.extras.is_some() {
+            self.extras.get_or_insert_with(Default::default).vm = vm;
+        }
+    }
+
+    /// Take the formula out of the cell.
+    pub fn take_formula(&mut self) -> Option<String> {
+        self.extras.as_mut()?.formula.take()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worksheet of millions of cells holds millions of these: the three
+    /// attributes few cells carry are boxed, and a regression that inlines
+    /// them again fails here.
+    #[test]
+    fn test_a_plain_cell_is_small() {
+        assert!(std::mem::size_of::<Cell>() <= 56, "{}", std::mem::size_of::<Cell>());
+        let mut cell = Cell::new(CellRef { col: 0, row: 0 }, CellValue::Number(1.0), None);
+        assert_eq!((cell.formula(), cell.vm()), (None, None));
+        assert!(cell.rich_runs().is_none());
+        // Clearing what was never set allocates nothing.
+        cell.set_formula(None);
+        assert!(cell.extras.is_none());
+        cell.set_formula(Some("A1+1".into()));
+        cell.set_vm(Some(3));
+        assert_eq!((cell.formula(), cell.vm()), (Some("A1+1"), Some(3)));
+        assert_eq!(cell.take_formula().as_deref(), Some("A1+1"));
+        assert_eq!(cell.formula(), None);
+    }
 
     #[test]
     fn test_parse_a1() {

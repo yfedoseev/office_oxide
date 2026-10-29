@@ -418,7 +418,7 @@ impl<'d> SheetConverter<'d> {
                     raw_number,
                     number_format,
                     number_format_id,
-                    formula: cell.formula.clone(),
+                    formula: cell.formula().map(str::to_string),
                     rich_runs,
                 });
             }
@@ -1487,7 +1487,7 @@ fn rich_runs_of(
             .and_then(|s| s.rich_text.clone()),
         // An inline (`t="inlineStr"`) string cell carries its own rich runs
         // directly on the raw `Cell`, not via the shared string table.
-        crate::xlsx::cell::CellValue::String(_) => cell.rich_runs.clone(),
+        crate::xlsx::cell::CellValue::String(_) => cell.rich_runs().cloned(),
         _ => None,
     }
 }

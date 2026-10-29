@@ -329,7 +329,8 @@ impl PyDocument {
     /// (nested dicts/lists).
     fn to_ir<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
         let doc_ir = self.get()?.to_ir();
-        let json_str = serde_json::to_string(&doc_ir)
+        let json_str = doc_ir
+            .to_json_string()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         let json_module = py.import("json")?;
         let result = json_module.call_method1("loads", (json_str,))?;
@@ -339,7 +340,8 @@ impl PyDocument {
     /// Convert the document to a format-agnostic intermediate representation as a JSON string.
     fn to_ir_json(&self) -> PyResult<String> {
         let doc_ir = self.get()?.to_ir();
-        serde_json::to_string(&doc_ir)
+        doc_ir
+            .to_json_string()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 

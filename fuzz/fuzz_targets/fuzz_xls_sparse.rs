@@ -16,12 +16,13 @@ use common::sparse_xls;
 use libfuzzer_sys::fuzz_target;
 use office_oxide::{Document, DocumentFormat};
 
-const DOCUMENT_SLOTS: usize = 3_000;
-const SHEET_SLOTS: usize = 1_000;
+// The padding allowances are shares of the memory budget (a 64th of it in
+// cells for the document, a 128th for a sheet): 2,000 and 1,000 cells.
+const MEMORY_BYTES: u64 = 128_000;
+const DOCUMENT_SLOTS: usize = 2_000;
 
 fuzz_target!(|data: &[u8]| {
-    office_oxide::limits::set_max_grid_padding_cells(DOCUMENT_SLOTS);
-    office_oxide::limits::set_max_sheet_grid_padding_cells(SHEET_SLOTS);
+    office_oxide::limits::set_max_memory_bytes(MEMORY_BYTES);
     let mut sheets: Vec<Vec<(u16, u16)>> = vec![Vec::new(); 4];
     for c in data.chunks_exact(4).take(2_000) {
         let sheet = usize::from(c[0] % 4);

@@ -952,6 +952,54 @@ enum DropWork {
     Items(Vec<ListItem>),
 }
 
+/// The bytes of picture data in `elements`, nested content included, counting
+/// a picture once for every place it appears. Iterative like
+/// [`for_each_image_mut`].
+pub(crate) fn image_bytes_in(elements: &[Element]) -> u64 {
+    enum Work<'a> {
+        Elems(&'a [Element]),
+        Items(&'a [ListItem]),
+    }
+    let mut total = 0u64;
+    let mut stack = vec![Work::Elems(elements)];
+    while let Some(work) = stack.pop() {
+        match work {
+            Work::Elems(els) => {
+                for e in els {
+                    match e {
+                        Element::Image(i) => {
+                            total =
+                                total.saturating_add(i.data.as_ref().map_or(0, |d| d.len() as u64));
+                        },
+                        Element::TextBox(tb) => stack.push(Work::Elems(&tb.content)),
+                        Element::Footnote(n) | Element::Endnote(n) => {
+                            stack.push(Work::Elems(&n.content));
+                        },
+                        Element::Table(t) => {
+                            for row in &t.rows {
+                                for cell in &row.cells {
+                                    stack.push(Work::Elems(&cell.content));
+                                }
+                            }
+                        },
+                        Element::List(l) => stack.push(Work::Items(&l.items)),
+                        _ => {},
+                    }
+                }
+            },
+            Work::Items(items) => {
+                for item in items {
+                    stack.push(Work::Elems(&item.content));
+                    if let Some(n) = &item.nested {
+                        stack.push(Work::Items(&n.items));
+                    }
+                }
+            },
+        }
+    }
+    total
+}
+
 /// Call `f` on every [`Image`] in `elements`, nested content included (table
 /// cells, text boxes, notes, list items). Iterative: IR trees can be deep.
 pub(crate) fn for_each_image_mut(elements: &mut [Element], mut f: impl FnMut(&mut Image)) {
@@ -1831,12 +1879,22 @@ impl ImageFormat {
 /// serde codec for [`Image::data`]: base64 out, base64 *or* the legacy
 /// number array in.
 mod image_bytes {
+    /// The base64 text of some bytes, written into the serializer as it is
+    /// produced (no `String` of the whole encoding is built first).
+    struct Base64<'a>(&'a [u8]);
+
+    impl serde::Serialize for Base64<'_> {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            s.collect_str(&crate::core::base64::Display(self.0))
+        }
+    }
+
     use serde::de::{self, Deserializer, SeqAccess, Visitor};
     use serde::ser::Serializer;
 
     pub fn serialize<S: Serializer>(data: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
         match data {
-            Some(bytes) => s.serialize_some(&crate::core::base64::encode(bytes)),
+            Some(bytes) => s.serialize_some(&Base64(bytes)),
             None => s.serialize_none(),
         }
     }
@@ -1921,8 +1979,83 @@ pub struct Image {
     pub source_url: Option<String>,
 }
 
+impl DocumentIR {
+    /// Write this IR as JSON to `out`, as [`serde_json::to_writer`] does, without
+    /// building the JSON in memory first. Pictures are written as base64
+    /// strings, so an IR with 300 MiB of pictures is written in a few buffers
+    /// instead of one 400 MiB string.
+    pub fn write_json<W: std::io::Write>(&self, out: W) -> serde_json::Result<()> {
+        serde_json::to_writer(out, self)
+    }
+
+    /// This IR as a JSON string, built in a buffer sized for the pictures it
+    /// holds, so the string is not grown by doubling and copied (which is up to
+    /// twice its size in memory at the peak).
+    pub fn to_json_string(&self) -> serde_json::Result<String> {
+        let pictures: u64 = self
+            .sections
+            .iter()
+            .map(|s| image_bytes_in(&s.elements))
+            .fold(0, u64::saturating_add);
+        // Base64 is 4 bytes for every 3; the rest of the JSON is small beside it.
+        let capacity = usize::try_from(pictures / 3 * 4)
+            .unwrap_or(usize::MAX / 2)
+            .saturating_add(64 << 10)
+            .min(usize::MAX / 2);
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(capacity).map_err(|_| {
+            <serde_json::Error as serde::ser::Error>::custom("not enough memory for the IR JSON")
+        })?;
+        serde_json::to_writer(&mut buf, self)?;
+        String::from_utf8(buf).map_err(|_| {
+            <serde_json::Error as serde::ser::Error>::custom("the IR JSON is not valid UTF-8")
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    fn ir_with_pictures(count: usize, each: usize) -> DocumentIR {
+        let image = || {
+            Element::Image(Image {
+                data: Some(vec![7u8; each]),
+                ..Default::default()
+            })
+        };
+        DocumentIR {
+            sections: vec![Section {
+                elements: (0..count).map(|_| image()).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The JSON string is the same as `serde_json::to_string`'s, and its buffer
+    /// was sized for the pictures, not grown by doubling past them.
+    #[test]
+    fn test_ir_json_string_matches_serde_and_is_not_over_allocated() {
+        let ir = ir_with_pictures(5, 300_000);
+        let json = ir.to_json_string().unwrap();
+        assert_eq!(json, serde_json::to_string(&ir).unwrap());
+        assert!(
+            json.capacity() <= json.len() + (128 << 10),
+            "{} bytes of capacity for {} of JSON",
+            json.capacity(),
+            json.len()
+        );
+        let mut written = Vec::new();
+        ir.write_json(&mut written).unwrap();
+        assert_eq!(written, json.as_bytes());
+    }
+
+    #[test]
+    fn test_image_bytes_in_counts_nested_pictures_once_per_place() {
+        let ir = ir_with_pictures(3, 1_000);
+        assert_eq!(image_bytes_in(&ir.sections[0].elements), 3_000);
+        assert_eq!(image_bytes_in(&[]), 0);
+    }
+
     use super::*;
 
     /// The compiler-generated drop

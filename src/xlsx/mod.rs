@@ -684,7 +684,7 @@ impl XlsxDocument {
             for ws in &mut worksheets {
                 for row in &mut ws.rows {
                     for cell in &mut row.cells {
-                        let Some(vm) = cell.vm else { continue };
+                        let Some(vm) = cell.vm() else { continue };
                         // Excel writes an image cell as `t="e"` with
                         // `#VALUE!`; a self-closing `vm` cell is empty.
                         if !matches!(cell.value, CellValue::Error(_) | CellValue::Empty) {

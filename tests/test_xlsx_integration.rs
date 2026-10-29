@@ -448,7 +448,7 @@ fn test_formulas_with_cached_values() {
     let doc = parse(&data);
 
     let cell_c1 = &doc.worksheets[0].rows[0].cells[2];
-    assert_eq!(cell_c1.formula.as_deref(), Some("A1+B1"));
+    assert_eq!(cell_c1.formula(), Some("A1+B1"));
     assert!(matches!(cell_c1.value, CellValue::Number(n) if n == 30.0));
 
     let text = doc.plain_text();

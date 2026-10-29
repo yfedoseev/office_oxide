@@ -5,7 +5,7 @@ fn main() {
         for ws in &doc.worksheets {
             for row in &ws.rows {
                 for c in &row.cells {
-                    if let Some(f) = &c.formula {
+                    if let Some(f) = c.formula() {
                         println!("  {} = {}", c.reference, f);
                     }
                 }

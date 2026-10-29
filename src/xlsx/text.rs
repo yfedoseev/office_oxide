@@ -865,7 +865,7 @@ impl XlsxDocument {
             // indistinguishable from a genuinely empty one, and the formula
             // text never reached any consumer at all.
             CellValue::Empty => {
-                if let Some(f) = &cell.formula {
+                if let Some(f) = cell.formula() {
                     buf.push('=');
                     buf.push_str(f);
                 }
@@ -1351,14 +1351,11 @@ mod tests {
             dimension: None,
             rows: vec![Row {
                 index: 1,
-                cells: vec![Cell {
-                    reference: super::super::CellRef { col: 0, row: 0 },
-                    value: CellValue::String(text.to_string()),
-                    style_index: None,
-                    formula: None,
-                    rich_runs: None,
-                    vm: None,
-                }],
+                cells: vec![Cell::new(
+                    super::super::CellRef { col: 0, row: 0 },
+                    CellValue::String(text.to_string()),
+                    None,
+                )],
             }],
             merged_cells: Vec::new(),
             hyperlinks: Vec::new(),

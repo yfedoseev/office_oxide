@@ -201,7 +201,7 @@ mod block_default {
                 // image's position in the flow.
                 if super::MARKDOWN_OPTIONS.with(|o| o.get().image_embed) == ImageEmbed::Base64 {
                     if let Some(ref data) = img.data {
-                        return format!("[image-base64:{}]", crate::core::base64::encode(data));
+                        return format!("[image-base64:{}]", crate::core::base64::Display(data));
                     }
                 }
                 // A linked image has a real, addressable source.
@@ -256,7 +256,7 @@ mod block_default {
                         let _ = write!(
                             out,
                             "<img src=\"data:{mime};base64,{}\" alt=\"{}\" />",
-                            crate::core::base64::encode(data),
+                            crate::core::base64::Display(data),
                             super::escape_html(alt)
                         );
                         return out;

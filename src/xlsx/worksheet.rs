@@ -1642,19 +1642,18 @@ fn parse_empty_cell(
     implied_col: u32,
 ) -> crate::core::Result<Cell> {
     let attrs = cell_attrs(e)?;
-    Ok(Cell {
-        reference: attrs.reference.unwrap_or(CellRef {
+    let mut cell = Cell::new(
+        attrs.reference.unwrap_or(CellRef {
             col: implied_col,
             row,
         }),
-        value: CellValue::Empty,
-        style_index: attrs.style_index,
-        formula: None,
-        // A self-closing cell can still name value metadata (`vm`,
-        // [ECMA-376] §18.3.1.4) — an in-cell rich-value image.
-        vm: attrs.vm,
-        rich_runs: None,
-    })
+        CellValue::Empty,
+        attrs.style_index,
+    );
+    // A self-closing cell can still name value metadata (`vm`,
+    // [ECMA-376] §18.3.1.4) — an in-cell rich-value image.
+    cell.set_vm(attrs.vm);
+    Ok(cell)
 }
 
 /// Read the `si` group index of an `<f>` element, but only when it really
@@ -1787,14 +1786,11 @@ fn parse_cell_fast(
         },
     };
 
-    Ok(Cell {
-        reference,
-        value,
-        style_index,
-        formula,
-        vm,
-        rich_runs: inline_rich_runs,
-    })
+    let mut cell = Cell::new(reference, value, style_index);
+    cell.set_formula(formula);
+    cell.set_vm(vm);
+    cell.set_rich_runs(inline_rich_runs);
+    Ok(cell)
 }
 
 /// Read text content of the current element using fast Reader.
@@ -1919,9 +1915,9 @@ mod tests {
   </sheetData>
 </worksheet>"#;
         let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
-        assert_eq!(ws.rows[0].cells[0].formula.as_deref(), Some("A2"));
-        assert_eq!(ws.rows[1].cells[0].formula.as_deref(), Some("A3"));
-        assert_eq!(ws.rows[2].cells[0].formula.as_deref(), Some("A4"));
+        assert_eq!(ws.rows[0].cells[0].formula(), Some("A2"));
+        assert_eq!(ws.rows[1].cells[0].formula(), Some("A3"));
+        assert_eq!(ws.rows[2].cells[0].formula(), Some("A4"));
     }
 
     /// Same, with the master written after its followers — the record order
@@ -1936,8 +1932,8 @@ mod tests {
   </sheetData>
 </worksheet>"#;
         let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
-        assert_eq!(ws.rows[1].cells[0].formula.as_deref(), Some("A2*2"));
-        assert_eq!(ws.rows[0].cells[0].formula.as_deref(), Some("A3*2"));
+        assert_eq!(ws.rows[1].cells[0].formula(), Some("A2*2"));
+        assert_eq!(ws.rows[0].cells[0].formula(), Some("A3*2"));
     }
 
     /// A plain `<f/>` with no `t="shared"` still means "no formula text",
@@ -1955,8 +1951,8 @@ mod tests {
   </sheetData>
 </worksheet>"#;
         let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
-        assert_eq!(ws.rows[0].cells[0].formula, None);
-        assert_eq!(ws.rows[0].cells[1].formula, None);
+        assert_eq!(ws.rows[0].cells[0].formula(), None);
+        assert_eq!(ws.rows[0].cells[1].formula(), None);
     }
 
     /// The sheet reader trims text, and quick-xml emits every entity
@@ -2033,8 +2029,7 @@ mod tests {
         let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
         let cell = &ws.rows[0].cells[0];
         let runs = cell
-            .rich_runs
-            .as_ref()
+            .rich_runs()
             .expect("expected rich_runs to be populated");
         assert_eq!(runs.len(), 2, "got {runs:?}");
         assert_eq!(runs[0].text, "Hello ");
@@ -2261,7 +2256,7 @@ mod tests {
 </worksheet>"#;
         let ws = Worksheet::parse(xml, "Sheet1".to_string(), &empty_rels()).unwrap();
         let cell = &ws.rows[0].cells[1];
-        assert_eq!(cell.formula.as_deref(), Some("A1*2"));
+        assert_eq!(cell.formula(), Some("A1*2"));
         assert!(matches!(cell.value, CellValue::Number(n) if n == 20.0));
     }
 

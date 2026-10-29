@@ -611,7 +611,7 @@ pub extern "C" fn office_document_to_ir_json(
         }
         let h = unsafe { &*handle };
         let ir = h._doc.to_ir();
-        match serde_json::to_string(&ir) {
+        match ir.to_json_string() {
             Ok(s) => {
                 set_err(error_code, OFFICE_OK);
                 to_c_string(&s)
