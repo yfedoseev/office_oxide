@@ -340,6 +340,31 @@ enum DocumentInner {
 }
 
 impl Document {
+    /// The parts of this OOXML document that could not be read, as `(part,
+    /// reason)`, for the document that embeds it to report: its text carries
+    /// the in-band notices already, but its warnings do not. Bounded as the
+    /// reports are; empty for the legacy formats.
+    pub(crate) fn unreadable_part_pairs(&self) -> Vec<(String, String)> {
+        match &self.inner {
+            DocumentInner::Docx(d) => d
+                .unreadable_parts
+                .iter()
+                .map(|line| match line.split_once(": ") {
+                    Some((part, why)) => (part.to_string(), why.to_string()),
+                    None => (line.clone(), String::new()),
+                })
+                .collect(),
+            DocumentInner::Pptx(d) => d.unreadable_parts.clone(),
+            DocumentInner::Xlsx(d) => d
+                .unreadable_parts
+                .iter()
+                .chain(&d.unreadable_sheets)
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Open a document from a file path. Format is detected from the extension.
     #[must_use = "opening a document allocates — use the returned handle or drop it"]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -894,7 +919,14 @@ fn decrypt_default_password<R: Read + Seek>(source: Option<R>) -> Option<Vec<u8>
     let info = reader.open_stream("EncryptionInfo").ok()?;
     let package = reader.open_stream("EncryptedPackage").ok()?;
     match core::offcrypto::decrypt_package(&info, &package) {
-        Ok(zip) => Some(zip),
+        // The payload must be the zip itself. Reopening it goes through the
+        // same entry point, so a payload that is another encrypted container
+        // would be decrypted again, to a depth the file chooses.
+        Ok(zip) if zip.starts_with(b"PK") => Some(zip),
+        Ok(_) => {
+            info!("default-password decryption: the decrypted payload is not a zip package");
+            None
+        },
         Err(why) => {
             info!("default-password decryption not possible: {why:?}");
             None

@@ -24,31 +24,16 @@ use super::{
 use crate::core::opc;
 use crate::core::relationships::{Relationships, rel_types};
 
-/// Most reports kept in a [`ReportList`]; the rest are counted.
-pub(super) const MAX_REPORTS: usize = 100;
-/// Longest name or reason kept in a report, in characters: both can echo
-/// values the file controls.
-const MAX_REPORT_CHARS: usize = 256;
+/// What could not be read: the relationship and other parts, and the sheets,
+/// kept in the one bounded record every reader shares
+/// ([`crate::core::unreadable`]). A part is told apart by the zip entry its
+/// path resolves to ([`part_key`]); a sheet is an item of its own.
+pub(crate) struct ReportList(crate::core::unreadable::UnreadableParts);
 
-/// What could not be read, as `(name, reason)`: each item once, at most
-/// [`MAX_REPORTS`] kept, each name and reason cut to a fixed length, and the
-/// number of the rest. One sink for the relationship and other parts that
-/// could not be read and for the sheets that could not, so that however many
-/// the file names, and however long it makes their names, what is kept (and
-/// every renderer echoes) is bounded.
-#[derive(Default)]
-pub(crate) struct ReportList {
-    pub(super) listed: Vec<(String, String)>,
-    pub(super) omitted: usize,
-    /// Parts that hold no text (a theme): reported in the metadata warnings
-    /// only, never as a notice in the text or a truncation. Bounded like
-    /// `listed`.
-    pub(super) cosmetic: Vec<(String, String)>,
-    /// The normalised key of each part recorded (see [`part_key`]), compared
-    /// exactly: a part in the package costs `#index`, so the set is bounded by
-    /// the entries of the package and the relationship targets that name
-    /// something else, and no two parts can be taken for one.
-    seen: std::collections::HashSet<String>,
+impl Default for ReportList {
+    fn default() -> Self {
+        Self(crate::core::unreadable::UnreadableParts::new("xlsx"))
+    }
 }
 
 impl ReportList {
@@ -56,10 +41,7 @@ impl ReportList {
     /// already recorded (by the zip entry its path resolves to) is not
     /// recorded again, whether or not it was kept.
     pub(super) fn record(&mut self, entries: &opc::ZipEntryIndex, path: &str, reason: &str) {
-        if !self.seen.insert(part_key(entries, path)) {
-            return;
-        }
-        self.push(path, reason);
+        self.0.record_keyed(part_key(entries, path), path, &reason);
     }
 
     /// Record that the part at `path`, reached through a relationship that
@@ -72,26 +54,24 @@ impl ReportList {
         path: &str,
         reason: &str,
     ) {
-        if !self.seen.insert(part_key(entries, path)) || self.cosmetic.len() >= MAX_REPORTS {
-            return;
-        }
-        let cut = |s: &str| s.chars().take(MAX_REPORT_CHARS).collect::<String>();
-        self.cosmetic.push((cut(path), cut(reason)));
+        self.0
+            .record_cosmetic_keyed(part_key(entries, path), path, &reason);
     }
 
     /// Record that the item `name` could not be read, for `reason`. Every
     /// call is one item: two sheets of the same name are two.
     pub(super) fn record_item(&mut self, name: &str, reason: &str) {
-        self.push(name, reason);
+        self.0.record_item(name, &reason);
     }
 
-    fn push(&mut self, name: &str, reason: &str) {
-        if self.listed.len() >= MAX_REPORTS {
-            self.omitted += 1;
-            return;
-        }
-        let cut = |s: &str| s.chars().take(MAX_REPORT_CHARS).collect::<String>();
-        self.listed.push((cut(name), cut(reason)));
+    /// The first thing recorded, if any.
+    pub(super) fn first(&self) -> Option<&(String, String)> {
+        self.0.first()
+    }
+
+    /// The items kept, the number left out, and the parts that hold no text.
+    pub(super) fn finish(self) -> (Vec<(String, String)>, usize, Vec<(String, String)>) {
+        self.0.finish_with_cosmetic()
     }
 }
 
@@ -295,7 +275,14 @@ impl SharedParts {
             .entry(part_key(entries, path))
             .or_insert_with(|| {
                 let data = read_reporting(archive, entries, path, unreadable)?;
-                let text = super::extract_chart_text(&data);
+                let (text, damage) = super::extract_chart_text_checked(&data);
+                if let Some(damage) = damage {
+                    unreadable.record(
+                        entries,
+                        path,
+                        &format!("{damage}; the rest of its text is missing"),
+                    );
+                }
                 (!text.is_empty()).then(|| Arc::from(text))
             })
             .clone()
@@ -445,6 +432,7 @@ fn read_drawing<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::unreadable::{MAX_REPORT_CHARS, MAX_UNREADABLE_PARTS as MAX_REPORTS};
 
     fn index(names: &[&str]) -> opc::ZipEntryIndex {
         let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -468,8 +456,9 @@ mod tests {
             sink.record(&entries, &format!("xl/p{i}.xml"), "bad");
             sink.record(&entries, &format!("XL/P{i}.xml"), "bad");
         }
-        assert_eq!((sink.listed.len(), sink.omitted), (MAX_REPORTS, 41));
-        assert_eq!(sink.listed[0], ("xl/a.xml".to_string(), "bad".to_string()));
+        let (listed, omitted, _) = sink.finish();
+        assert_eq!((listed.len(), omitted), (MAX_REPORTS, 41));
+        assert_eq!(listed[0], ("xl/a.xml".to_string(), "bad".to_string()));
     }
 
     #[test]
@@ -477,7 +466,8 @@ mod tests {
         let entries = index(&[]);
         let mut sink = ReportList::default();
         sink.record(&entries, &"n".repeat(1000), &"r".repeat(1000));
-        assert_eq!(sink.listed[0].0.chars().count(), MAX_REPORT_CHARS);
-        assert_eq!(sink.listed[0].1.chars().count(), MAX_REPORT_CHARS);
+        let (listed, ..) = sink.finish();
+        assert_eq!(listed[0].0.chars().count(), MAX_REPORT_CHARS);
+        assert_eq!(listed[0].1.chars().count(), MAX_REPORT_CHARS);
     }
 }

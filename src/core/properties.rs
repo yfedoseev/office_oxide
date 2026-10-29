@@ -387,6 +387,9 @@ pub fn read_app_properties<R: std::io::Read + std::io::Seek>(
 // Package-level properties: custom properties, signature, thumbnail
 // ---------------------------------------------------------------------------
 
+/// The most damaged-metadata lines kept for one package.
+const MAX_METADATA_NOTES: usize = 8;
+
 /// The package-level properties beyond `core.xml`/`app.xml`: the custom
 /// properties part, whether the package is signed, and its thumbnail.
 #[derive(Debug, Default, Clone)]
@@ -401,6 +404,12 @@ pub struct PackageProperties {
     /// recorded CRC-32. They were read as stored and may be damaged; every
     /// converter reports them through `Metadata::warnings`.
     pub crc_mismatched_parts: Vec<String>,
+    /// Property parts (core, extended, custom, thumbnail) and the package
+    /// relationships that name them which exist but could not be read or
+    /// parsed, one line each, so a damaged properties part is not mistaken
+    /// for an absent one. Every converter reports them through
+    /// `Metadata::warnings`.
+    pub unreadable_metadata: Vec<String>,
 }
 
 /// Every package-level property part, located the same way from any
@@ -421,9 +430,21 @@ pub(crate) struct PackageMetadata {
 /// opening a document.
 pub(crate) fn read_package_metadata(
     rels: &super::relationships::Relationships,
-    mut read: impl FnMut(&str) -> Option<Vec<u8>>,
+    mut read: impl FnMut(&str) -> Option<std::result::Result<Vec<u8>, String>>,
 ) -> PackageMetadata {
     use super::relationships::rel_types;
+    // What was found damaged, at most one line per part and a few parts.
+    let mut notes: Vec<String> = Vec::new();
+    let note = |notes: &mut Vec<String>, part: &str, why: &str| {
+        if notes.len() < MAX_METADATA_NOTES {
+            let cut = |s: &str| s.chars().take(256).collect::<String>();
+            notes.push(format!(
+                "document properties part '{}' could not be read ({}); its properties are missing",
+                cut(part),
+                cut(why)
+            ));
+        }
+    };
     let target_of = |rel_type: &str| -> Option<String> {
         let rel = rels.first_by_type(rel_type)?;
         if rel.target_mode == super::relationships::TargetMode::External {
@@ -433,33 +454,56 @@ pub(crate) fn read_package_metadata(
             super::opc::PartName::new(&format!("/{}", rel.target.trim_start_matches('/'))).ok()?;
         Some(part.as_str()[1..].to_string())
     };
-    let mut read_part = |rel_type: &str, fallback: Option<&str>| -> Option<(String, Vec<u8>)> {
+    let mut read_part = |notes: &mut Vec<String>,
+                         rel_type: &str,
+                         fallback: Option<&str>|
+     -> Option<(String, Vec<u8>)> {
+        let mut attempt = |notes: &mut Vec<String>, path: &str| match read(path)? {
+            Ok(data) => Some((path.to_string(), data)),
+            Err(why) => {
+                note(notes, path, &why);
+                None
+            },
+        };
         if let Some(path) = target_of(rel_type) {
-            if let Some(data) = read(&path) {
-                return Some((path, data));
+            if let Some(found) = attempt(notes, &path) {
+                return Some(found);
             }
         }
-        let path = fallback?;
-        read(path).map(|d| (path.to_string(), d))
+        attempt(notes, fallback?)
     };
 
-    let core = read_part(rel_types::CORE_PROPERTIES, Some("docProps/core.xml"))
-        .and_then(|(_, d)| CoreProperties::parse(&d).ok());
-    let app = read_part(rel_types::EXTENDED_PROPERTIES, Some("docProps/app.xml"))
-        .and_then(|(_, d)| AppProperties::parse(&d).ok());
-    let custom = read_part(rel_types::CUSTOM_PROPERTIES, None)
+    let core = read_part(&mut notes, rel_types::CORE_PROPERTIES, Some("docProps/core.xml"))
+        .and_then(|(path, d)| match CoreProperties::parse(&d) {
+            Ok(core) => Some(core),
+            Err(e) => {
+                note(&mut notes, &path, &e.to_string());
+                None
+            },
+        });
+    let app = read_part(&mut notes, rel_types::EXTENDED_PROPERTIES, Some("docProps/app.xml"))
+        .and_then(|(path, d)| match AppProperties::parse(&d) {
+            Ok(app) => Some(app),
+            Err(e) => {
+                note(&mut notes, &path, &e.to_string());
+                None
+            },
+        });
+    let custom = read_part(&mut notes, rel_types::CUSTOM_PROPERTIES, None)
         .map(|(path, d)| {
             parse_custom_properties(&d).unwrap_or_else(|e| {
                 log::warn!("custom properties part '{path}' is malformed and was skipped: {e}");
+                note(&mut notes, &path, &e.to_string());
                 Vec::new()
             })
         })
         .unwrap_or_default();
-    let thumbnail = read_part(rel_types::THUMBNAIL, None).map(|(path, data)| crate::ir::Image {
-        format: image_format_from_path(&path),
-        data: Some(data),
-        ..Default::default()
-    });
+    let thumbnail =
+        read_part(&mut notes, rel_types::THUMBNAIL, None).map(|(path, data)| crate::ir::Image {
+            format: image_format_from_path(&path),
+            data: Some(data),
+            ..Default::default()
+        });
     PackageMetadata {
         core,
         app,
@@ -470,6 +514,7 @@ pub(crate) fn read_package_metadata(
                 .is_some(),
             thumbnail,
             crc_mismatched_parts: Vec::new(),
+            unreadable_metadata: notes,
         },
     }
 }
@@ -482,7 +527,8 @@ pub fn read_package_properties<R: std::io::Read + std::io::Seek>(
     let rels = opc.package_rels().clone();
     read_package_metadata(&rels, |path| {
         let part = super::opc::PartName::new(&format!("/{path}")).ok()?;
-        opc.has_part(&part).then(|| opc.read_part(&part).ok())?
+        opc.has_part(&part)
+            .then(|| opc.read_part(&part).map_err(|e| e.to_string()))
     })
     .package
 }

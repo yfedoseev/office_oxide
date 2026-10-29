@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A damaged properties part, package-relationships part or chart is reported instead of passing as absent.** A `docProps/core.xml`, `app.xml`, custom-properties or thumbnail part that exists but cannot be read or parsed, and a workbook's `_rels/.rels` that cannot be read (so the properties could not be located), now each give a warning; the document reads as before. A chart whose XML is cut off or malformed in a `.docx`, `.pptx` or `.xlsx` keeps the text before the damage and is reported as an unreadable part. What an embedded package could not read is now listed by the document that embeds it, named by both parts.
+
+- **A comments part that several `.pptx` slides name is parsed once.** It was parsed again for every slide.
+
 - **A `.docx` body or a `.pptx` slide whose XML is malformed or cut off part-way keeps what came before the damage.** The whole document (or slide) was an error or came back as if complete. The body is now read up to the last complete top-level block (the shapes of a slide, up to the last complete shape), closed with the end tags still open there, and the loss is reported in the warnings and in the text as an unreadable part. A slide cut off mid-element used to parse to what was read and report success; its root must now have closed. Damage before the first complete block is still an error. Headers, footers, notes and other parts are not salvaged.
 
 - **A `.doc` run whose symbol font comes from a style is read by the font's table too.** The reader looked only at the run's own `sprmCRgFtc2`. The style sheet's character properties (`UpxChpx`, [MS-DOC] §2.9.258) are now read: a run takes its own font, else the font of the character style it applies (`sprmCIstd`), else its paragraph style's, following `istdBase` (bounded, cycles end the walk). The paragraph styles are read only when a style names a symbol font.

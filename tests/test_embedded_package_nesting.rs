@@ -285,3 +285,23 @@ fn test_many_documents_embedding_a_package_do_not_wait_for_each_other() {
         );
     }
 }
+
+#[test]
+fn test_what_an_embedded_package_could_not_read_is_reported_by_the_document_that_holds_it() {
+    let _limits = common::default_limits();
+    // The inner package's body is malformed after its first paragraph.
+    let inner = leaf(r#"kept inner</w:t></w:r></w:p><w:p><w:r a=""#);
+    let doc = open(docx_embedding("outer", &[(&inner, 1)]));
+    let text = doc.plain_text();
+    assert!(text.contains("kept inner"), "{text}");
+    let reported = &doc.as_docx().unwrap().unreadable_parts;
+    assert!(
+        reported
+            .iter()
+            .any(|p| p.contains("embeddings/e0.docx") && p.contains("word/document.xml")),
+        "{reported:?}"
+    );
+    // A sound inner package reports nothing.
+    let sound = open(docx_embedding("outer", &[(&leaf("fine"), 1)]));
+    assert!(sound.as_docx().unwrap().unreadable_parts.is_empty());
+}

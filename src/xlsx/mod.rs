@@ -235,13 +235,40 @@ impl XlsxDocument {
         archive: &mut ZipArchive<R>,
         entries: &opc::ZipEntryIndex,
     ) -> crate::core::properties::PackageMetadata {
-        let rels = Self::read_xml_entry(archive, entries, "_rels/.rels")
-            .ok()
-            .and_then(|d| Relationships::parse(&d).ok())
-            .unwrap_or_else(Relationships::empty);
-        crate::core::properties::read_package_metadata(&rels, |path| {
-            Self::read_xml_entry(archive, entries, path).ok()
-        })
+        // A part the zip does not hold is absent; one it holds and cannot
+        // read is damaged, and reported.
+        let read = |archive: &mut ZipArchive<R>, path: &str| match Self::read_xml_entry(
+            archive, entries, path,
+        ) {
+            Ok(data) => Some(Ok(data)),
+            Err(crate::core::Error::MissingPart(_)) => None,
+            Err(e) => Some(Err(e.to_string())),
+        };
+        let mut rels_note = None;
+        let rels = match read(archive, "_rels/.rels") {
+            Some(Ok(data)) => Relationships::parse(&data).unwrap_or_else(|e| {
+                rels_note = Some(e.to_string());
+                Relationships::empty()
+            }),
+            Some(Err(why)) => {
+                rels_note = Some(why);
+                Relationships::empty()
+            },
+            None => Relationships::empty(),
+        };
+        let mut metadata =
+            crate::core::properties::read_package_metadata(&rels, |path| read(archive, path));
+        if let Some(why) = rels_note {
+            metadata.package.unreadable_metadata.insert(
+                0,
+                format!(
+                    "the package relationships '_rels/.rels' could not be read ({}); the \
+                     document properties could not be located",
+                    why.chars().take(256).collect::<String>()
+                ),
+            );
+        }
+        metadata
     }
 
     /// Fast path: open ZIP directly and read XLSX parts by known paths,
@@ -600,7 +627,7 @@ impl XlsxDocument {
         }
         drop_pivot_caches_backed_by_tables(&mut worksheets);
         if worksheets.is_empty() {
-            if let Some((name, err)) = unreadable_sheets.listed.first() {
+            if let Some((name, err)) = unreadable_sheets.first() {
                 return Err(crate::core::Error::MalformedXml(format!(
                     "no readable sheet: {name:?}: {err}"
                 ))
@@ -654,7 +681,14 @@ impl XlsxDocument {
             if let Some(data) =
                 shared_parts::read_reporting(&mut archive, &entries, &name, &mut shared.unreadable)
             {
-                let text = extract_chart_text(&data);
+                let (text, damage) = extract_chart_text_checked(&data);
+                if let Some(damage) = damage {
+                    shared.unreadable.record(
+                        &entries,
+                        &name,
+                        &format!("{damage}; the rest of its text is missing"),
+                    );
+                }
                 if !text.is_empty() {
                     chart_text.push(text);
                 }
@@ -698,6 +732,9 @@ impl XlsxDocument {
             embedded_fonts.len()
         );
         package_properties.crc_mismatched_parts = entries.crc_mismatched_parts();
+        let (unreadable_sheets, unreadable_sheets_omitted, _) = unreadable_sheets.finish();
+        let (unreadable_parts, unreadable_parts_omitted, cosmetic_parts) =
+            shared.unreadable.finish();
         Ok(XlsxDocument {
             workbook,
             worksheets,
@@ -710,11 +747,11 @@ impl XlsxDocument {
             app_properties,
             package_properties,
             has_macros,
-            unreadable_sheets: unreadable_sheets.listed,
-            unreadable_sheets_omitted: unreadable_sheets.omitted,
-            unreadable_parts: shared.unreadable.listed,
-            unreadable_parts_omitted: shared.unreadable.omitted,
-            cosmetic_parts: shared.unreadable.cosmetic,
+            unreadable_sheets,
+            unreadable_sheets_omitted,
+            unreadable_parts,
+            unreadable_parts_omitted,
+            cosmetic_parts,
             styles_data: None,
             theme_data,
             render_cache: Default::default(),
@@ -744,7 +781,15 @@ impl XlsxDocument {
 /// This still travels through `to_markdown` and `convert_xlsx_to_ir` as
 /// plain text (not an actual table), but the structure is now meaningful
 /// for both human readers and downstream NLP / search.
+#[cfg(test)]
 fn extract_chart_text(xml: &[u8]) -> String {
+    extract_chart_text_checked(xml).0
+}
+
+/// As `extract_chart_text`, and why the part could not be read to its end
+/// (`None` when it could): the text is then what came before the damage.
+fn extract_chart_text_checked(xml: &[u8]) -> (String, Option<String>) {
+    let mut damage: Option<String> = None;
     let mut reader = quick_xml::Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -872,8 +917,16 @@ fn extract_chart_text(xml: &[u8]) -> String {
                     }
                 }
             },
-            Ok(quick_xml::events::Event::Eof) => break,
-            Err(_) => break,
+            Ok(quick_xml::events::Event::Eof) => {
+                if !stack.is_empty() {
+                    damage = Some("the XML ends inside an open element".to_string());
+                }
+                break;
+            },
+            Err(e) => {
+                damage = Some(format!("the XML is malformed: {e}"));
+                break;
+            },
             _ => {},
         }
         buf.clear();
@@ -901,7 +954,7 @@ fn extract_chart_text(xml: &[u8]) -> String {
             out.push_str(&format!("{}: {}", s.name, s.values.join(", ")));
         }
     }
-    out
+    (out, damage)
 }
 
 #[derive(Default)]
@@ -2544,6 +2597,17 @@ mod tests {
         assert_eq!(guess_image_format_from_bytes(&[0x01, 0x00, 0x00, 0x00, 0x58]), "emf");
         // Fall back to png for unknown payloads.
         assert_eq!(guess_image_format_from_bytes(&[0, 0, 0]), "png");
+    }
+
+    #[test]
+    fn test_extract_chart_text_says_when_the_part_was_cut() {
+        let head = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>Kept title</a:t></a:r></a:p></c:rich></c:tx></c:title>"#;
+        let sound = format!("{head}</c:chart></c:chartSpace>");
+        assert_eq!(extract_chart_text_checked(sound.as_bytes()).1, None);
+        let cut = format!("{head}<c:plotArea><c:barChart");
+        let (text, damage) = extract_chart_text_checked(cut.as_bytes());
+        assert_eq!(text, "Title: Kept title");
+        assert!(damage.is_some());
     }
 
     #[test]

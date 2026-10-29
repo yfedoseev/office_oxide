@@ -419,6 +419,31 @@ pub(crate) enum Hash {
 }
 
 impl Hash {
+    /// The digest in a fixed buffer, and its length: no allocation, for the
+    /// iterated hashing of a password.
+    pub(crate) fn digest_array(self, data: &[u8]) -> ([u8; 64], usize) {
+        let mut out = [0u8; 64];
+        let len = match self {
+            Self::Sha1 => {
+                out[..20].copy_from_slice(&sha1(data));
+                20
+            },
+            Self::Sha256 => {
+                out[..32].copy_from_slice(&sha256(data));
+                32
+            },
+            Self::Sha384 => {
+                out[..48].copy_from_slice(&sha384(data));
+                48
+            },
+            Self::Sha512 => {
+                out = sha512(data);
+                64
+            },
+        };
+        (out, len)
+    }
+
     pub(crate) fn digest(self, data: &[u8]) -> Vec<u8> {
         match self {
             Self::Sha1 => sha1(data).to_vec(),

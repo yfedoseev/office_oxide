@@ -24,8 +24,9 @@ use super::crypto::{Aes, Hash, Rc4, md5, sha1};
 const DEFAULT_PASSWORDS: [&str; 2] = ["VelvetSweatshop", ""];
 
 /// The most hash iterations an Agile `spinCount` may ask for. Office writes
-/// 100,000; the bound keeps a crafted file from holding the reader.
-const MAX_SPIN_COUNT: u32 = 2_000_000;
+/// 100,000; the bound keeps a crafted file from holding the reader (at most
+/// two derivations, one per default password, of this many hashes).
+const MAX_SPIN_COUNT: u32 = 500_000;
 
 /// Why a file was not decrypted.
 #[derive(Debug, PartialEq, Eq)]
@@ -218,12 +219,14 @@ fn agile(info: &[u8], body: &[u8]) -> Result<Vec<u8>> {
     let secret = DEFAULT_PASSWORDS.iter().find_map(|password| {
         let mut input = a.key_salt.clone();
         input.extend(utf16le(password));
-        let mut h = a.key_hash.digest(&input);
+        let (mut h, len) = a.key_hash.digest_array(&input);
         for i in 0..a.spin {
-            let mut next = i.to_le_bytes().to_vec();
-            next.extend_from_slice(&h);
-            h = a.key_hash.digest(&next);
+            let mut next = [0u8; 4 + 64];
+            next[..4].copy_from_slice(&i.to_le_bytes());
+            next[4..4 + len].copy_from_slice(&h[..len]);
+            h = a.key_hash.digest_array(&next[..4 + len]).0;
         }
+        let h = &h[..len];
         let hash_input = cbc(
             &derive(&h, &[0xfe, 0xa7, 0xd2, 0x76, 0x3b, 0x4b, 0x9e, 0x79]),
             &a.verifier_input,
@@ -291,14 +294,15 @@ fn standard(info: &[u8], body: &[u8]) -> Result<Vec<u8>> {
         // §2.3.4.7: iterate SHA-1 50,000 times, then derive the key.
         let mut input = salt.to_vec();
         input.extend(utf16le(password));
-        let mut h = sha1(&input).to_vec();
+        let mut h = sha1(&input);
         for i in 0..50_000u32 {
-            let mut next = i.to_le_bytes().to_vec();
-            next.extend_from_slice(&h);
-            h = sha1(&next).to_vec();
+            let mut next = [0u8; 24];
+            next[..4].copy_from_slice(&i.to_le_bytes());
+            next[4..].copy_from_slice(&h);
+            h = sha1(&next);
         }
-        let mut last = h;
-        last.extend_from_slice(&0u32.to_le_bytes());
+        let mut last = [0u8; 24];
+        last[..20].copy_from_slice(&h);
         let h_final = sha1(&last);
         let mut x = [[0u8; 64]; 2];
         for (buf, fill) in x.iter_mut().zip([0x36u8, 0x5c]) {
@@ -1025,5 +1029,31 @@ pub(crate) mod tests {
                 .err()
                 .expect("refused");
         assert!(error.to_string().contains("password-protected"), "{error}");
+    }
+
+    #[test]
+    fn test_a_decrypted_payload_that_is_another_container_is_not_decrypted_again() {
+        let inner = encrypted_file(encrypt_agile(&docx_bytes("deep"), "VelvetSweatshop"));
+        let outer = encrypted_file(encrypt_agile(&inner, "VelvetSweatshop"));
+        let error =
+            crate::Document::from_reader(std::io::Cursor::new(outer), crate::DocumentFormat::Docx)
+                .err()
+                .expect("refused");
+        assert!(error.to_string().contains("password-protected"), "{error}");
+    }
+
+    #[test]
+    fn test_a_spin_count_past_the_bound_is_refused_before_it_is_spent() {
+        let (info, package) = encrypt_agile(b"x", "VelvetSweatshop");
+        let text = String::from_utf8_lossy(&info[8..]).replace(
+            &format!("spinCount=\"{AGILE_SPIN}\""),
+            &format!("spinCount=\"{}\"", MAX_SPIN_COUNT + 1),
+        );
+        let mut hostile = info[..8].to_vec();
+        hostile.extend_from_slice(text.as_bytes());
+        assert_eq!(
+            decrypt_package(&hostile, &package),
+            Err(Failure::Unsupported("this password spin count"))
+        );
     }
 }

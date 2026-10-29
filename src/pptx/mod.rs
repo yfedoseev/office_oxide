@@ -498,6 +498,19 @@ impl PptxDocument {
         // Phase 2: parse slides (parallel when feature enabled). Each slide
         // yields its parts that could not be used, merged in order below.
         type ParsedSlide = (Slide, Vec<(String, String)>);
+        // A comments part several slides name is parsed once.
+        let mut parsed_comments: std::collections::HashMap<
+            String,
+            (Vec<slide::SlideComment>, Option<String>),
+        > = std::collections::HashMap::new();
+        for b in &bundles {
+            for (comments_part, data) in &b.comments_data {
+                parsed_comments
+                    .entry(comments_part.clone())
+                    .or_insert_with(|| slide::parse_comments(data, &comment_authors));
+            }
+        }
+        let parsed_comments = &parsed_comments;
         let parsed = crate::core::parallel::map_collect(
             bundles,
             |b| -> std::result::Result<ParsedSlide, std::convert::Infallible> {
@@ -552,11 +565,13 @@ impl PptxDocument {
                 };
                 parsed.layout_index = b.layout_index;
                 parsed.notes = b.notes.clone();
-                for (comments_part, data) in &b.comments_data {
-                    let (comments, error) = slide::parse_comments(data, &comment_authors);
-                    parsed.comments.extend(comments);
+                for (comments_part, _) in &b.comments_data {
+                    let Some((comments, error)) = parsed_comments.get(comments_part) else {
+                        continue;
+                    };
+                    parsed.comments.extend(comments.iter().cloned());
                     if let Some(error) = error {
-                        problems.push((comments_part.clone(), error));
+                        problems.push((comments_part.clone(), error.clone()));
                     }
                 }
                 let chain = b
@@ -977,7 +992,15 @@ impl PartCache {
                         #[cfg(test)]
                         self.reads.borrow_mut().push(target.as_str().to_string());
                         std::sync::Arc::from(if is_chart {
-                            crate::core::chart::chart_text_lines(&data)
+                            let (lines, damage) =
+                                crate::core::chart::chart_text_lines_checked(&data);
+                            if let Some(damage) = damage {
+                                self.unreadable.record(
+                                    target.as_str(),
+                                    &format!("{damage}; the rest of its text is missing"),
+                                );
+                            }
+                            lines
                         } else {
                             slide::diagram_data_text_lines(&data)
                         })

@@ -162,15 +162,13 @@ pub(crate) fn package_warnings(
 ) -> Vec<String> {
     package
         .map(|p| {
-            p.crc_mismatched_parts
-                .iter()
-                .map(|name| {
-                    format!(
-                        "part '{name}' failed its CRC-32 check or differs from its declared size; \
-                         its content was read as stored and may be damaged"
-                    )
-                })
-                .collect()
+            let crc = p.crc_mismatched_parts.iter().map(|name| {
+                format!(
+                    "part '{name}' failed its CRC-32 check or differs from its declared size; \
+                     its content was read as stored and may be damaged"
+                )
+            });
+            crc.chain(p.unreadable_metadata.iter().cloned()).collect()
         })
         .unwrap_or_default()
 }

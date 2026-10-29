@@ -148,6 +148,8 @@ pub(super) fn from_zip<R: Read + Seek>(
     } = XlsxDocument::read_package_metadata(archive, entries);
     package_properties.crc_mismatched_parts = entries.crc_mismatched_parts();
     let has_macros = rels.has_vba_project();
+    let (unreadable_sheets, unreadable_sheets_omitted, _) = unreadable_sheets.finish();
+    let (unreadable_parts, unreadable_parts_omitted, cosmetic_parts) = shared.unreadable.finish();
     Ok(XlsxDocument {
         workbook: WorkbookInfo {
             sheets,
@@ -164,11 +166,11 @@ pub(super) fn from_zip<R: Read + Seek>(
         app_properties,
         package_properties,
         has_macros,
-        unreadable_sheets: unreadable_sheets.listed,
-        unreadable_sheets_omitted: unreadable_sheets.omitted,
-        unreadable_parts: shared.unreadable.listed,
-        unreadable_parts_omitted: shared.unreadable.omitted,
-        cosmetic_parts: shared.unreadable.cosmetic,
+        unreadable_sheets,
+        unreadable_sheets_omitted,
+        unreadable_parts,
+        unreadable_parts_omitted,
+        cosmetic_parts,
         styles_data: None,
         theme_data: None,
         render_cache: Default::default(),

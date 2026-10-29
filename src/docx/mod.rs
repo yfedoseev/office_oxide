@@ -419,7 +419,17 @@ impl DocxDocument {
                 Some(lines) => lines.clone(),
                 None => {
                     let lines: std::sync::Arc<[String]> = match opc.read_part(&part) {
-                        Ok(data) => crate::core::chart::chart_text_lines(&data).into(),
+                        Ok(data) => {
+                            let (lines, damage) =
+                                crate::core::chart::chart_text_lines_checked(&data);
+                            if let Some(damage) = damage {
+                                skip_unreadable(
+                                    part.as_str(),
+                                    &format!("{damage}; the rest of its text is missing"),
+                                );
+                            }
+                            lines.into()
+                        },
                         Err(e) => {
                             skip_unreadable(part.as_str(), &e);
                             std::sync::Arc::from(Vec::new())
@@ -2740,11 +2750,21 @@ fn open_deferred_part<R: Read + Seek>(
         },
     };
     let opened = crate::Document::from_reader_nested(std::io::Cursor::new(data), format)
-        .map(|doc| doc.plain_text());
+        .map(|doc| (doc.plain_text(), doc.unreadable_part_pairs()));
     // The level and the package's byte account end here, with the document.
     drop(admission);
     let text = match opened {
-        Ok(text) => text,
+        Ok((text, problems)) => {
+            // The embedded package's own losses are the document's too, each
+            // named by the part that holds the package and the part within.
+            for (inner, why) in problems {
+                skip(
+                    &format!("{} ({inner})", part.as_str()),
+                    &format!("an embedded package could not be read in full: {why}"),
+                );
+            }
+            text
+        },
         Err(e) => {
             skip(part.as_str(), &e);
             embedded::remember(

@@ -65,6 +65,13 @@ impl UnreadableParts {
                 }
             })
             .collect();
+        self.record_keyed(key, part, reason);
+    }
+
+    /// As [`Self::record`], with the identity of the part given by the caller
+    /// as `key` (a reader whose package has its own notion of "the same
+    /// part"), recorded once per key.
+    pub(crate) fn record_keyed(&mut self, key: String, part: &str, reason: &dyn std::fmt::Display) {
         if self.seen.contains(&key) {
             return;
         }
@@ -72,14 +79,25 @@ impl UnreadableParts {
             self.seen_bytes += key.len();
             self.seen.insert(key);
         }
+        self.push(part, reason);
+    }
+
+    /// Record that the item `name` (a sheet, say, which is not a part and
+    /// may share its name with another) could not be read. Every call is one
+    /// item.
+    pub(crate) fn record_item(&mut self, name: &str, reason: &dyn std::fmt::Display) {
+        self.push(name, reason);
+    }
+
+    fn push(&mut self, name: &str, reason: &dyn std::fmt::Display) {
         if self.listed.len() >= MAX_UNREADABLE_PARTS {
             self.omitted += 1;
             return;
         }
         let cut = |s: &str| s.chars().take(MAX_REPORT_CHARS).collect::<String>();
-        let (part, reason) = (cut(part), cut(&reason.to_string()));
-        log::warn!("{}: skipping unreadable part {part}: {reason}", self.label);
-        self.listed.push((part, reason));
+        let (name, reason) = (cut(name), cut(&reason.to_string()));
+        log::warn!("{}: skipping unreadable part {name}: {reason}", self.label);
+        self.listed.push((name, reason));
     }
 
     /// Record a part reached through a relationship that holds no text (a
@@ -88,6 +106,24 @@ impl UnreadableParts {
     /// how the reader reached the part, never the part's name, which the file
     /// chooses.
     pub(crate) fn record_cosmetic(&mut self, part: &str, reason: &dyn std::fmt::Display) {
+        self.push_cosmetic(part, reason);
+    }
+
+    /// As [`Self::record_cosmetic`], once per `key`, sharing the keys of
+    /// [`Self::record_keyed`].
+    pub(crate) fn record_cosmetic_keyed(
+        &mut self,
+        key: String,
+        part: &str,
+        reason: &dyn std::fmt::Display,
+    ) {
+        if !self.seen.insert(key) {
+            return;
+        }
+        self.push_cosmetic(part, reason);
+    }
+
+    fn push_cosmetic(&mut self, part: &str, reason: &dyn std::fmt::Display) {
         if self.cosmetic.len() >= MAX_UNREADABLE_PARTS {
             return;
         }
@@ -95,6 +131,11 @@ impl UnreadableParts {
         let (part, reason) = (cut(part), cut(&reason.to_string()));
         log::warn!("{}: skipping unreadable part {part}: {reason}", self.label);
         self.cosmetic.push((part, reason));
+    }
+
+    /// The first part or item recorded, if any.
+    pub(crate) fn first(&self) -> Option<&(String, String)> {
+        self.listed.first()
     }
 
     /// The parts kept and the number left out (the unit tests' view; the

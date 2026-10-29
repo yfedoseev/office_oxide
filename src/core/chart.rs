@@ -46,6 +46,13 @@ struct Series {
 /// Returns an empty vector when the part carries no title, no categories and
 /// no series — i.e. when there is nothing a reader would have seen.
 pub fn chart_text_lines(xml: &[u8]) -> Vec<String> {
+    chart_text_lines_checked(xml).0
+}
+
+/// As [`chart_text_lines`], and why the part could not be read to its end
+/// (`None` when it could): the lines are then what came before the damage.
+pub fn chart_text_lines_checked(xml: &[u8]) -> (Vec<String>, Option<String>) {
+    let mut damage: Option<String> = None;
     let mut reader = quick_xml::Reader::from_reader(xml);
     reader.config_mut().check_end_names = false;
     reader.config_mut().check_comments = false;
@@ -177,8 +184,16 @@ pub fn chart_text_lines(xml: &[u8]) -> Vec<String> {
                 let s = t.to_string();
                 append_scoped(&mut stack, title_depth, &s, &mut title_buf, &mut cur_v);
             },
-            Ok(quick_xml::events::Event::Eof) => break,
-            Err(_) => break,
+            Ok(quick_xml::events::Event::Eof) => {
+                if !stack.is_empty() {
+                    damage = Some("the XML ends inside an open element".to_string());
+                }
+                break;
+            },
+            Err(e) => {
+                damage = Some(format!("the XML is malformed: {e}"));
+                break;
+            },
             _ => {},
         }
         buf.clear();
@@ -201,7 +216,7 @@ pub fn chart_text_lines(xml: &[u8]) -> Vec<String> {
             lines.push(format!("{} (bubble size): {}", s.name, s.sizes.join(", ")));
         }
     }
-    lines
+    (lines, damage)
 }
 
 /// Extract the readable text of a chart part as a single newline-separated
@@ -240,6 +255,29 @@ fn push_capped(dst: &mut String, s: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    const CHART_HEAD: &str = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>Kept title</a:t></a:r></a:p></c:rich></c:tx></c:title>"#;
+
+    #[test]
+    fn test_a_sound_chart_reports_no_damage() {
+        let xml = format!("{CHART_HEAD}</c:chart></c:chartSpace>");
+        let (lines, damage) = chart_text_lines_checked(xml.as_bytes());
+        assert_eq!(lines, vec!["Title: Kept title".to_string()]);
+        assert_eq!(damage, None);
+    }
+
+    #[test]
+    fn test_a_damaged_chart_keeps_what_came_first_and_says_it_was_cut() {
+        // Cut off inside an element, and with a syntax error.
+        for tail in ["<c:plotArea><c:barChart", "<c:plotArea><<"] {
+            let xml = format!("{CHART_HEAD}{tail}");
+            let (lines, damage) = chart_text_lines_checked(xml.as_bytes());
+            assert_eq!(lines, vec!["Title: Kept title".to_string()], "{tail}");
+            assert!(damage.is_some(), "{tail}");
+        }
+        let cut = format!("{CHART_HEAD}<c:plotArea>");
+        assert!(chart_text_lines_checked(cut.as_bytes()).1.is_some());
+    }
     use super::*;
 
     #[test]
