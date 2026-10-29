@@ -11,10 +11,15 @@ mod common;
 
 use common::{
     CfbNode, FibTweaks, LimitScope, Para, Subdocs, build_doc_streams, cfb_tree, default_limits,
+    word6_stream,
 };
 use office_oxide::ir::Element;
-use office_oxide::limits::{max_embedded_bytes, max_embedded_packages, max_text_chars};
-use office_oxide::limits::{set_max_embedded_bytes, set_max_embedded_packages, set_max_text_chars};
+use office_oxide::limits::{
+    max_embedded_bytes, max_embedded_depth, max_embedded_packages, max_text_chars,
+};
+use office_oxide::limits::{
+    set_max_embedded_bytes, set_max_embedded_depth, set_max_embedded_packages, set_max_text_chars,
+};
 use office_oxide::{Document, DocumentFormat};
 use std::io::Cursor;
 
@@ -165,25 +170,105 @@ fn test_an_embedded_document_that_cannot_be_read_keeps_its_placeholder() {
     assert!(warnings.iter().any(|w| w.contains("_1")), "{warnings:?}");
 }
 
-/// Only the objects of the document itself are read: an object inside an
-/// embedded document is not followed.
+/// An object inside an embedded document is read too, after the document that
+/// holds it, within the same account.
 #[test]
-fn test_objects_inside_an_embedded_document_are_not_followed() {
+fn test_objects_inside_an_embedded_document_are_read_after_it() {
     let _defaults = default_limits();
     let (wd, table) = streams("outer embedded text");
-    let inner = word_object("_9", "inner embedded text");
     let outer = CfbNode::Storage(
         "_1".into(),
         vec![
             CfbNode::Stream("WordDocument".into(), wd),
             CfbNode::Stream("0Table".into(), table),
-            CfbNode::Storage("ObjectPool".into(), vec![inner]),
+            CfbNode::Storage("ObjectPool".into(), vec![word_object("_9", "inner embedded text")]),
         ],
     );
-    let doc = open(host(vec![outer]));
+    let text = open(host(vec![outer])).plain_text();
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} in {text:?}"))
+    };
+    assert!(at("outer embedded text") < at("inner embedded text"), "{text:?}");
+    assert_eq!(text.matches(PLACEHOLDER).count(), 2, "{text:?}");
+}
+
+/// A chain of embedded documents is bounded by the account's depth.
+#[test]
+fn test_a_deep_chain_of_embedded_documents_stops_at_the_depth_limit() {
+    let mut scope = LimitScope::new();
+    scope.set(max_embedded_depth, set_max_embedded_depth, 2);
+    let mut node = word_object("_6", "level six");
+    for (name, text) in [
+        ("_5", "level five"),
+        ("_4", "level four"),
+        ("_3", "level three"),
+        ("_2", "level two"),
+    ] {
+        let (wd, table) = streams(Box::leak(text.to_string().into_boxed_str()));
+        node = CfbNode::Storage(
+            name.into(),
+            vec![
+                CfbNode::Stream("WordDocument".into(), wd),
+                CfbNode::Stream("0Table".into(), table),
+                CfbNode::Storage("ObjectPool".into(), vec![node]),
+            ],
+        );
+    }
+    let doc = open(host(vec![node]));
     let text = doc.plain_text();
-    assert!(text.contains("outer embedded text"), "{text:?}");
-    assert!(!text.contains("inner embedded text"), "{text:?}");
+    assert!(text.contains("level two") && text.contains("level three"), "{text:?}");
+    assert!(!text.contains("level four"), "{text:?}");
+    let warnings = doc.to_ir().metadata.warnings;
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("embedded") && w.contains("not")),
+        "{warnings:?}"
+    );
+    drop(scope);
+}
+
+/// The packages of the whole tree count against one limit.
+#[test]
+fn test_nested_objects_count_against_the_package_limit() {
+    let mut scope = LimitScope::new();
+    scope.set(max_embedded_packages, set_max_embedded_packages, 2);
+    let (wd, table) = streams("outer text");
+    let outer = CfbNode::Storage(
+        "_1".into(),
+        vec![
+            CfbNode::Stream("WordDocument".into(), wd),
+            CfbNode::Stream("0Table".into(), table),
+            CfbNode::Storage(
+                "ObjectPool".into(),
+                vec![
+                    word_object("_2", "second text"),
+                    word_object("_3", "third text"),
+                ],
+            ),
+        ],
+    );
+    let text = open(host(vec![outer])).plain_text();
+    assert!(text.contains("outer text") && text.contains("second text"), "{text:?}");
+    assert!(!text.contains("third text"), "{text:?}");
+    drop(scope);
+}
+
+/// An embedded Word 6/95 document is read, from its own stream (it has no
+/// table stream).
+#[test]
+fn test_an_embedded_word_6_document_is_read() {
+    let _defaults = default_limits();
+    let object = CfbNode::Storage(
+        "_1".into(),
+        vec![CfbNode::Stream(
+            "WordDocument".into(),
+            word6_stream(0xA5DC, b"Old format article\r", &[]),
+        )],
+    );
+    let text = open(host(vec![object])).plain_text();
+    assert!(text.contains("Old format article"), "{text:?}");
 }
 
 #[test]

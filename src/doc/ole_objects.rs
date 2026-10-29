@@ -61,10 +61,24 @@ fn classify_objects(
     entries: &[DirEntry],
     max_walk: usize,
 ) -> (Vec<(EmbeddedOleObject, usize)>, usize) {
-    if entries.is_empty() || entries[0].entry_type != EntryType::RootStorage {
+    classify_objects_under(entries, 0, max_walk)
+}
+
+/// The objects held by the `ObjectPool` of the storage `container` (the root
+/// for a document, an object's own storage for an embedded document that
+/// holds objects itself), with the entries the walks took.
+fn classify_objects_under(
+    entries: &[DirEntry],
+    container: usize,
+    max_walk: usize,
+) -> (Vec<(EmbeddedOleObject, usize)>, usize) {
+    let Some(holder) = entries.get(container) else {
+        return (Vec::new(), 0);
+    };
+    if !matches!(holder.entry_type, EntryType::Storage | EntryType::RootStorage) {
         return (Vec::new(), 0);
     }
-    let Some(pool_idx) = find_direct_child(entries, entries[0].child, "ObjectPool") else {
+    let Some(pool_idx) = find_direct_child(entries, holder.child, "ObjectPool") else {
         return (Vec::new(), 0);
     };
     let pool = &entries[pool_idx];
@@ -94,6 +108,14 @@ fn classify_objects(
         }
     }
     (out, objects.steps)
+}
+
+/// The objects inside the embedded document whose storage is `container`.
+pub(super) fn objects_under(
+    entries: &[DirEntry],
+    container: usize,
+) -> Vec<(EmbeddedOleObject, usize)> {
+    classify_objects_under(entries, container, MAX_ENTRIES_WALKED).0
 }
 
 /// Classify one embedded object's storage by the well-known stream

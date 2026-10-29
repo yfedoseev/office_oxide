@@ -657,6 +657,13 @@ pub fn build_word6_doc(wident: u16, text: &[u8]) -> Vec<u8> {
 /// pictures.
 #[allow(dead_code)]
 pub fn build_word6_doc_with_tail(wident: u16, text: &[u8], tail: &[u8]) -> Vec<u8> {
+    build_cfb(&word6_stream(wident, text, tail), &[0u8; 512])
+}
+
+/// The `WordDocument` stream of [`build_word6_doc_with_tail`] on its own, for a
+/// test that embeds it in a compound file of its own making.
+#[allow(dead_code)]
+pub fn word6_stream(wident: u16, text: &[u8], tail: &[u8]) -> Vec<u8> {
     let fc_min = 0x300u32;
     let mut wd = vec![0u8; fc_min as usize];
     wd[0..2].copy_from_slice(&wident.to_le_bytes());
@@ -669,7 +676,7 @@ pub fn build_word6_doc_with_tail(wident: u16, text: &[u8], tail: &[u8]) -> Vec<u
     wd.extend_from_slice(tail);
     let pad = (512 - wd.len() % 512) % 512;
     wd.extend(std::iter::repeat_n(0u8, pad));
-    build_cfb(&wd, &[0u8; 512])
+    wd
 }
 
 /// Word 6.0/95 `sprmPFInTable` (sprm 24): the paragraph is in a table.

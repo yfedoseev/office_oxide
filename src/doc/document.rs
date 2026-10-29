@@ -920,10 +920,11 @@ const PIECE_TABLE_OUT_OF_ORDER: &str = "the piece table's character positions ar
 
 /// Read the main text of each embedded Word document, within the document's
 /// embedded-package account: the object is admitted by the size of its
-/// streams (a count, a byte allowance, depth one), its text is charged to the
+/// streams (a count, a byte allowance, a depth), its text is charged to the
 /// text budget, a document embedded under several names is read from its
 /// content once, and an object that is not read keeps its placeholder and is
-/// reported. Objects inside an embedded document are not followed.
+/// reported. The objects inside an embedded document follow it, under the
+/// same account.
 fn read_embedded_word_texts<R: Read + Seek>(
     cfb: &mut CfbReader<R>,
     found: Vec<(super::ole_objects::EmbeddedOleObject, usize)>,
@@ -932,13 +933,7 @@ fn read_embedded_word_texts<R: Read + Seek>(
     use crate::core::embedded;
     let mut session = embedded::Session::begin();
     let mut out = Vec::with_capacity(found.len());
-    for (mut object, storage) in found {
-        if object.description == super::ole_objects::EMBEDDED_WORD {
-            let name = format!("ObjectPool/{}", cfb.entries()[storage].name);
-            object.text = embedded_word_text(cfb, storage, &session, &name, warnings);
-        }
-        out.push(object);
-    }
+    read_embedded_objects(cfb, found, &session, "ObjectPool/", warnings, &mut out);
     let refused = std::cell::RefCell::new(Vec::new());
     session.report(&|name, why| {
         refused
@@ -949,44 +944,78 @@ fn read_embedded_word_texts<R: Read + Seek>(
     out
 }
 
-/// The main text of the Word document in the object storage `storage`, or
-/// `None` (the reason recorded in `warnings` or the session) when it is not
-/// read.
+/// One level of [`read_embedded_word_texts`]: the objects `found`, each
+/// followed by the objects inside it. The depth of the account bounds the
+/// recursion.
+fn read_embedded_objects<R: Read + Seek>(
+    cfb: &mut CfbReader<R>,
+    found: Vec<(super::ole_objects::EmbeddedOleObject, usize)>,
+    session: &crate::core::embedded::Session,
+    prefix: &str,
+    warnings: &mut Vec<String>,
+    out: &mut Vec<super::ole_objects::EmbeddedOleObject>,
+) {
+    for (mut object, storage) in found {
+        if object.description != super::ole_objects::EMBEDDED_WORD {
+            out.push(object);
+            continue;
+        }
+        let name = format!("{prefix}{}", cfb.entries()[storage].name);
+        let (text, admission) = embedded_word_text(cfb, storage, session, &name, warnings);
+        object.text = text;
+        out.push(object);
+        // The level stays open while the objects inside are read.
+        if admission.is_some() {
+            let nested = super::ole_objects::objects_under(cfb.entries(), storage);
+            if !nested.is_empty() {
+                read_embedded_objects(cfb, nested, session, &format!("{name}/"), warnings, out);
+            }
+        }
+    }
+}
+
+/// The main text of the Word document in the object storage `storage`, and the
+/// admission that keeps its level of the account open (`None` when the object
+/// was not admitted). The text is `None` when it is not read, the reason
+/// recorded in `warnings` or the session.
 fn embedded_word_text<R: Read + Seek>(
     cfb: &mut CfbReader<R>,
     storage: usize,
     session: &crate::core::embedded::Session,
     name: &str,
     warnings: &mut Vec<String>,
-) -> Option<String> {
+) -> (Option<String>, Option<crate::core::embedded::Admission>) {
     use super::ole_objects::find_direct_child;
     use crate::cfb::EntryType;
     use crate::core::embedded;
-    let (word_idx, table_idxs, declared) = {
+    let found = {
         let entries = cfb.entries();
-        let child = entries.get(storage)?.child;
-        let stream = |n: &str| {
-            find_direct_child(entries, child, n)
-                .filter(|&i| entries[i].entry_type == EntryType::Stream)
-        };
-        let word_idx = stream("WordDocument")?;
-        let (t0, t1) = (stream("0Table"), stream("1Table"));
-        let size = |i: Option<usize>| i.map_or(0, |i| entries[i].stream_size);
-        let declared = entries[word_idx]
-            .stream_size
-            .saturating_add(size(t0).max(size(t1)));
-        (word_idx, (t0, t1), declared)
+        entries.get(storage).and_then(|holder| {
+            let child = holder.child;
+            let stream = |n: &str| {
+                find_direct_child(entries, child, n)
+                    .filter(|&i| entries[i].entry_type == EntryType::Stream)
+            };
+            let word_idx = stream("WordDocument")?;
+            let (t0, t1) = (stream("0Table"), stream("1Table"));
+            let size = |i: Option<usize>| i.map_or(0, |i| entries[i].stream_size);
+            let declared = entries[word_idx]
+                .stream_size
+                .saturating_add(size(t0).max(size(t1)));
+            Some((word_idx, (t0, t1), declared))
+        })
+    };
+    let Some((word_idx, table_idxs, declared)) = found else {
+        return (None, None);
     };
     let admission = match embedded::admit(session, declared) {
         Ok(admission) => admission,
         Err(refusal) => {
             embedded::refuse(session, name, refusal);
-            return None;
+            return (None, None);
         },
     };
     let read = embedded_word_main_text(cfb, word_idx, table_idxs);
-    // The level and the object's byte account end here.
-    drop(admission);
     let EmbeddedRead {
         text,
         fingerprint,
@@ -995,17 +1024,19 @@ fn embedded_word_text<R: Read + Seek>(
         Ok(read) => read,
         Err(why) => {
             warnings.push(format!("embedded object {name} was not read: {why}"));
-            return None;
+            return (None, Some(admission));
         },
     };
     for note in notes {
         warnings.push(format!("embedded object {name}: {note}"));
     }
-    if let Some(cached) = embedded::cached::<String>(session, fingerprint) {
-        return charge_embedded_text(session, name, cached);
-    }
-    embedded::remember(session, fingerprint, text.clone());
-    charge_embedded_text(session, name, text)
+    let text = if let Some(cached) = embedded::cached::<String>(session, fingerprint) {
+        charge_embedded_text(session, name, cached)
+    } else {
+        embedded::remember(session, fingerprint, text.clone());
+        charge_embedded_text(session, name, text)
+    };
+    (text, Some(admission))
 }
 
 /// Charge an embedded document's text to the text budget; the text, or
@@ -1040,7 +1071,27 @@ fn embedded_word_main_text<R: Read + Seek>(
     if word_doc.len() >= 2
         && super::word6::is_word6_magic(u16::from_le_bytes([word_doc[0], word_doc[1]]))
     {
-        return Err("a Word 6/95 document; its text is not read from inside another".into());
+        // Word 6.0/95 keeps no table stream: its text and pieces are in the
+        // main stream.
+        let fingerprint = crate::core::embedded::Fingerprint::of(&word_doc);
+        let fib = super::word6::parse_fib(&word_doc).map_err(|e| e.to_string())?;
+        let mut pieces = super::word6::pieces(&word_doc, &fib).map_err(|e| e.to_string())?;
+        let mut notes = Vec::new();
+        if !super::fib::is_word_version(fib.n_fib) {
+            notes.push(super::fib::damaged_version_warning(fib.n_fib));
+        }
+        let mut budget = crate::limits::TextBudget::new();
+        if super::piece_table::bound_piece_reads(&mut pieces, word_doc.len(), &mut budget)
+            .map_err(|e| e.to_string())?
+        {
+            notes.push(budget.notice());
+        }
+        let (main, _) = super::word6::stories(&word_doc, &fib, &pieces);
+        return Ok(EmbeddedRead {
+            text: main.trim().to_string(),
+            fingerprint,
+            notes,
+        });
     }
     let fingerprint = crate::core::embedded::Fingerprint::of(&word_doc);
     let fib = Fib::parse(&word_doc).map_err(|e| e.to_string())?;
