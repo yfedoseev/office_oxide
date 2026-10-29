@@ -146,3 +146,118 @@ fn test_a_pptx_slide_damaged_before_any_shape_is_still_unreadable() {
         assert!(!doc.to_ir().metadata.warnings.is_empty());
     }
 }
+
+/// A `.docx` whose body references one footnote and one header; `footnotes`
+/// and `header` are the parts' raw XML (which a test may damage).
+fn docx_with_ancillary(footnotes: &str, header: &str) -> Vec<u8> {
+    let mut writer = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
+    let main = PartName::new("/word/document.xml").unwrap();
+    let body = format!(
+        r#"<w:document xmlns:w="{WML}" xmlns:r="{REL}"><w:body><w:p><w:r><w:t>body text</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r></w:p><w:sectPr><w:headerReference w:type="default" r:id="rIdH"/></w:sectPr></w:body></w:document>"#
+    );
+    writer
+        .add_part(
+            &main,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+            body.as_bytes(),
+        )
+        .unwrap();
+    writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+    let notes = PartName::new("/word/footnotes.xml").unwrap();
+    writer
+        .add_part(
+            &notes,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml",
+            footnotes.as_bytes(),
+        )
+        .unwrap();
+    writer.add_part_rel(&main, rel_types::FOOTNOTES, "footnotes.xml");
+    let hdr = PartName::new("/word/header1.xml").unwrap();
+    writer
+        .add_part(
+            &hdr,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml",
+            header.as_bytes(),
+        )
+        .unwrap();
+    writer.add_part_rel(&main, rel_types::HEADER, "header1.xml");
+    writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn test_a_damaged_footnotes_or_header_part_keeps_its_first_blocks() {
+    let notes = format!(
+        r#"<w:footnotes xmlns:w="{WML}"><w:footnote w:id="1"><w:p><w:r><w:t>first note</w:t></w:r></w:p><w:p><w:r><w:t>second para</w:t></w:r></w:p><w:p><w:r a=""#
+    );
+    let header = format!(
+        r#"<w:hdr xmlns:w="{WML}"><w:p><w:r><w:t>kept header</w:t></w:r></w:p><w:p><w:r a=""#
+    );
+    // The ids are the document's own (rIdH is not in a relationship part), so
+    // the header is reached through its relationship by type.
+    let doc = open(docx_with_ancillary(&notes, &header), DocumentFormat::Docx).unwrap();
+    let warnings = doc.to_ir().metadata.warnings;
+    assert!(warnings.iter().any(|w| w.contains("word/footnotes.xml")), "{warnings:?}");
+    let text = doc.plain_text();
+    assert!(text.contains("first note") && text.contains("second para"), "{text}");
+    assert!(!text.contains('"'), "{text}");
+}
+
+#[test]
+fn test_sound_ancillary_parts_report_nothing() {
+    let notes = format!(
+        r#"<w:footnotes xmlns:w="{WML}"><w:footnote w:id="1"><w:p><w:r><w:t>note</w:t></w:r></w:p></w:footnote></w:footnotes>"#
+    );
+    let header = format!(r#"<w:hdr xmlns:w="{WML}"><w:p><w:r><w:t>head</w:t></w:r></w:p></w:hdr>"#);
+    let doc = open(docx_with_ancillary(&notes, &header), DocumentFormat::Docx).unwrap();
+    assert!(doc.to_ir().metadata.warnings.is_empty(), "{:?}", doc.to_ir().metadata.warnings);
+}
+
+fn pptx_with_notes(notes: &str) -> Vec<u8> {
+    let mut writer = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
+    let pres = PartName::new("/ppt/presentation.xml").unwrap();
+    let slide_part = PartName::new("/ppt/slides/slide1.xml").unwrap();
+    let notes_part = PartName::new("/ppt/notesSlides/notesSlide1.xml").unwrap();
+    let presentation = format!(
+        r#"<p:presentation xmlns:p="{PML}" xmlns:r="{REL}"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="9144000" cy="6858000"/></p:presentation>"#
+    );
+    let ct = "application/vnd.openxmlformats-officedocument.presentationml";
+    writer
+        .add_part(&pres, &format!("{ct}.presentation.main+xml"), presentation.as_bytes())
+        .unwrap();
+    writer
+        .add_part(
+            &slide_part,
+            &format!("{ct}.slide+xml"),
+            slide(&format!("{}</p:spTree></p:cSld></p:sld>", shape(2, "slide text"))).as_bytes(),
+        )
+        .unwrap();
+    writer
+        .add_part(&notes_part, &format!("{ct}.notesSlide+xml"), notes.as_bytes())
+        .unwrap();
+    writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "ppt/presentation.xml");
+    writer.add_part_rel(&pres, rel_types::SLIDE, "slides/slide1.xml");
+    writer.add_part_rel(&slide_part, rel_types::NOTES_SLIDE, "../notesSlides/notesSlide1.xml");
+    writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn test_pptx_notes_cut_off_mid_shape_keep_the_shapes_before_it() {
+    let head = format!(
+        r#"<p:notes xmlns:p="{PML}" xmlns:a="{DML}"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="2" name="N"/><p:cNvSpPr/><p:nvPr><p:ph type="body"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:p><a:r><a:t>speaker note</a:t></a:r></a:p></p:txBody></p:sp>"#
+    );
+    let sound = open(
+        pptx_with_notes(&format!("{head}</p:spTree></p:cSld></p:notes>")),
+        DocumentFormat::Pptx,
+    )
+    .unwrap();
+    assert!(sound.plain_text().contains("speaker note"), "{}", sound.plain_text());
+    assert!(sound.to_ir().metadata.warnings.is_empty());
+    let cut = open(
+        pptx_with_notes(&format!(r#"{head}<p:sp><p:txBody><a:p><a:r a=""#)),
+        DocumentFormat::Pptx,
+    )
+    .unwrap();
+    assert!(cut.plain_text().contains("speaker note"), "{}", cut.plain_text());
+    let warnings = cut.to_ir().metadata.warnings;
+    assert!(warnings.iter().any(|w| w.contains("notesSlide1.xml")), "{warnings:?}");
+}

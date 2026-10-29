@@ -564,13 +564,15 @@ impl DocxDocument {
                                 return Ok(None);
                             },
                         };
-                        let mut content = match parse_body_elements(&data) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                skip_unreadable(part_name.as_str(), &e);
-                                hf_failed.insert(part_name.clone());
-                                return Ok(None);
-                            },
+                        let Some(mut content) = parse_salvaging(
+                            &data,
+                            part_name.as_str(),
+                            1,
+                            parse_body_elements,
+                            &skip_unreadable,
+                        ) else {
+                            hf_failed.insert(part_name.clone());
+                            return Ok(None);
                         };
                         // A relationships part that cannot be read leaves the
                         // part without its links and images; the part is
@@ -664,12 +666,14 @@ impl DocxDocument {
                     return Vec::new();
                 },
             };
-            let mut notes = match parse_notes_part(&data, end) {
-                Ok(notes) => notes,
-                Err(e) => {
-                    skip_unreadable(part.as_str(), &e);
-                    return Vec::new();
-                },
+            let Some(mut notes) = parse_salvaging(
+                &data,
+                part.as_str(),
+                2,
+                |d| parse_notes_part(d, end),
+                &skip_unreadable,
+            ) else {
+                return Vec::new();
             };
             // `r:id` is scoped per OPC part: a hyperlink inside a
             // footnote/endnote/comment resolves against *that* part's
@@ -966,6 +970,40 @@ fn strip_html_tags(html: &str) -> String {
 /// `comment`). Word emits two pseudo-notes at ids 0 and -1 (the separator
 /// and continuation marks) with `w:type` set; those are not document
 /// content and are filtered out.
+/// Parse an ancillary part with `parse`, whose blocks worth keeping sit
+/// `depth` levels below the root. A part
+/// malformed part-way keeps the blocks before the damage and the
+/// loss is reported through `skip`; damage before the first block, or a
+/// salvaged prefix that does not parse either, reports the original error
+/// and gives `None`.
+fn parse_salvaging<T>(
+    data: &[u8],
+    part: &str,
+    depth: usize,
+    parse: impl Fn(&[u8]) -> CoreResult<T>,
+    skip: &dyn Fn(&str, &dyn std::fmt::Display),
+) -> Option<T> {
+    match parse(data) {
+        Ok(parsed) => Some(parsed),
+        Err(error) => {
+            if let Some((prefix, blocks)) = xml::salvage_prefix(data, depth) {
+                if let Ok(parsed) = parse(&prefix) {
+                    skip(
+                        part,
+                        &format!(
+                            "the XML is malformed after {blocks} blocks; the rest of the part \
+                             was not read"
+                        ),
+                    );
+                    return Some(parsed);
+                }
+            }
+            skip(part, &error);
+            None
+        },
+    }
+}
+
 fn parse_notes_part(xml_data: &[u8], end: &str) -> CoreResult<Vec<NoteBody>> {
     let mut reader = make_content_reader(xml_data);
     let mut notes = Vec::new();

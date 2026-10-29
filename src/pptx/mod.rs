@@ -412,8 +412,34 @@ impl PptxDocument {
                                     match slide::extract_notes_body(&data, &rels) {
                                         Ok(body) => body.map(std::sync::Arc::new),
                                         Err(e) => {
-                                            parts.unreadable.record(notes_part.as_str(), &e);
-                                            None
+                                            // Notes malformed part-way keep the
+                                            // shapes before the damage.
+                                            let salvaged =
+                                                crate::core::xml::salvage_prefix(&data, 3)
+                                                    .and_then(|(prefix, shapes)| {
+                                                        slide::extract_notes_body(&prefix, &rels)
+                                                            .ok()
+                                                            .map(|body| (body, shapes))
+                                                    });
+                                            match salvaged {
+                                                Some((body, shapes)) => {
+                                                    parts.unreadable.record(
+                                                        notes_part.as_str(),
+                                                        &format!(
+                                                            "the XML is malformed after {shapes} \
+                                                             shapes; the rest of the notes was \
+                                                             not read"
+                                                        ),
+                                                    );
+                                                    body.map(std::sync::Arc::new)
+                                                },
+                                                None => {
+                                                    parts
+                                                        .unreadable
+                                                        .record(notes_part.as_str(), &e);
+                                                    None
+                                                },
+                                            }
                                         },
                                     }
                                 },
