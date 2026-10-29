@@ -246,3 +246,30 @@ fn test_strict_options_read_an_ordinary_document() {
     let doc = open_with(&bytes, &ParseOptions::strict()).unwrap();
     assert!(doc.plain_text().contains("paragraph number 199"));
 }
+
+#[test]
+fn test_saving_runs_under_the_documents_own_write_limit() {
+    let _scope = LimitScope::new();
+    let cells: String = (0..50)
+        .map(|r| {
+            format!(
+                "<w:tr><w:tc><w:p><w:r><w:t>a{r}</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>b{r}</w:t></w:r></w:p></w:tc></w:tr>"
+            )
+        })
+        .collect();
+    let bytes = docx(&format!("<w:tbl>{cells}</w:tbl>"));
+    let dir = std::env::temp_dir().join(format!("oo-save-limit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("out.docx");
+
+    let mut options = ParseOptions::default();
+    options.limits.write_bytes = 1000;
+    let limited = open_with(&bytes, &options).unwrap();
+    let refused = limited.save_as(&target);
+    assert!(refused.is_err(), "100 cells cost far more than 1,000 bytes to write");
+
+    let plain = open_with(&bytes, &ParseOptions::default()).unwrap();
+    plain.save_as(&target).unwrap();
+    assert_eq!(limits::max_write_bytes(), limits::DEFAULT_MAX_WRITE_BYTES);
+    let _ = std::fs::remove_dir_all(&dir);
+}

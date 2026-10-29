@@ -81,3 +81,36 @@ fn test_a_small_part_is_never_refused_for_its_ratio() {
     scope.set(limits::max_inflate_ratio, limits::set_max_inflate_ratio, 2);
     assert!(open(bytes).is_ok());
 }
+
+/// Raise the compressed size the central directory declares for `name`
+/// (offset 20 of its header) without touching the data.
+fn forge_compressed_size(bytes: &mut [u8], name: &str, size: u32) {
+    let mut at = 0;
+    while let Some(found) = bytes[at..].windows(4).position(|w| w == b"PK\x01\x02") {
+        let header = at + found;
+        let name_at = header + 46;
+        if bytes[name_at..].starts_with(name.as_bytes()) {
+            bytes[header + 20..header + 24].copy_from_slice(&size.to_le_bytes());
+            return;
+        }
+        at = header + 4;
+    }
+    panic!("no central directory entry for {name}");
+}
+
+#[test]
+fn test_a_header_that_declares_a_larger_stored_size_does_not_raise_the_ratio_cap() {
+    // The same 70 MiB part as above, but the central directory claims it is
+    // stored in 1 MiB, which would put its ratio under the limit. The file
+    // cannot hold that many bytes between this entry and the next, so the
+    // claim is not believed.
+    let mut bytes = docx_with_body_of(70 << 20);
+    let mut scope = LimitScope::new();
+    scope.set(limits::max_inflate_ratio, limits::set_max_inflate_ratio, 100);
+    forge_compressed_size(&mut bytes, "word/document.xml", 1 << 20);
+    let err = match open(bytes) {
+        Ok(_) => panic!("a forged stored size let a bomb through the ratio check"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("word/document.xml"), "{err}");
+}

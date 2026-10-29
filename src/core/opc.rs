@@ -521,6 +521,10 @@ pub(crate) struct ZipEntryIndex {
     byte_limit: u64,
     /// Entries whose bytes failed their recorded CRC-32, in read order.
     crc_mismatched: std::cell::RefCell<Vec<String>>,
+    /// Where each entry's local header starts (by index), the same sorted,
+    /// and where the central directory starts: built on first use, to bound
+    /// what an entry can physically store (see [`Self::stored_span`]).
+    header_starts: std::cell::OnceCell<(Vec<u64>, Vec<u64>, u64)>,
 }
 
 impl Drop for ZipEntryIndex {
@@ -584,7 +588,40 @@ impl ZipEntryIndex {
             failed: std::cell::Cell::new(0),
             byte_limit,
             crc_mismatched: std::cell::RefCell::new(Vec::new()),
+            header_starts: std::cell::OnceCell::new(),
         }
+    }
+
+    /// The most compressed bytes entry `index` can physically hold: the bytes
+    /// between its local header and the next one (or the central directory).
+    /// The compressed size a header *declares* is the file's to choose, and a
+    /// part's inflate ratio computed from a lying one would let a bomb through;
+    /// this is what the file's layout allows. `None` when the layout cannot
+    /// be read.
+    fn stored_span<R: Read + Seek>(
+        &self,
+        archive: &mut ZipArchive<R>,
+        index: usize,
+    ) -> Option<u64> {
+        if self.header_starts.get().is_none() {
+            let mut by_index = Vec::with_capacity(archive.len());
+            for i in 0..archive.len() {
+                by_index.push(archive.by_index_raw(i).ok()?.header_start());
+            }
+            let mut sorted = by_index.clone();
+            sorted.sort_unstable();
+            let _ = self
+                .header_starts
+                .set((by_index, sorted, archive.central_directory_start()));
+        }
+        let (by_index, sorted, directory) = self.header_starts.get()?;
+        let mine = *by_index.get(index)?;
+        let next = sorted
+            .get(sorted.partition_point(|&s| s <= mine))
+            .copied()
+            .unwrap_or(*directory);
+        // A local file header is 30 bytes before its name and extra field.
+        Some(next.saturating_sub(mine).saturating_sub(30))
     }
 
     /// Charge `bytes` decompressed from entry `index` against the package
@@ -859,6 +896,7 @@ fn inflate_despite_declared_size<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     index: usize,
     declared: u64,
+    cap: u64,
 ) -> std::result::Result<Vec<u8>, u64> {
     let Ok(raw) = archive.by_index_raw(index) else {
         return Err(0);
@@ -869,7 +907,7 @@ fn inflate_despite_declared_size<R: Read + Seek>(
     let bound = declared
         .saturating_add(declared / 4)
         .saturating_add(64 * 1024)
-        .min(crate::limits::max_part_bytes());
+        .min(cap);
     let mut decoder = flate2::read::DeflateDecoder::new(raw);
     let mut out = Vec::with_capacity((declared as usize).min(1 << 20));
     match (&mut decoder).take(bound + 1).read_to_end(&mut out) {
@@ -895,6 +933,21 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
     // does not implement, an encrypted entry, a bad header; APPNOTE 4.4.4
     // and 4.4.5). It is a typed error, so that no caller can mistake a
     // damaged part for one the package does not have.
+    // The compressed size in the header is the file's to declare; bound it
+    // by what the file's layout can hold when it would raise the cap.
+    let claimed = archive
+        .by_index_raw(index)
+        .map(|f| f.compressed_size())
+        .unwrap_or(0);
+    let compressed = if claimed.saturating_mul(crate::limits::max_inflate_ratio())
+        > crate::limits::INFLATE_RATIO_FLOOR_BYTES
+    {
+        entries
+            .stored_span(archive, index)
+            .map_or(claimed, |span| claimed.min(span))
+    } else {
+        claimed
+    };
     let mut file = archive.by_index(index).map_err(|e| match e {
         zip::result::ZipError::FileNotFound => Error::MissingPart(name.to_string()),
         e => Error::Zip(e),
@@ -909,7 +962,7 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
     // lying header cannot get past it either.
     // The size limit, and past the floor the ratio limit, of this part
     // (`limits::part_inflate_cap`).
-    let cap = crate::limits::part_inflate_cap(file.compressed_size());
+    let cap = crate::limits::part_inflate_cap(compressed);
     if file.size() > cap {
         return Err(Error::DecompressionLimit {
             part: name.to_string(),
@@ -947,7 +1000,7 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
         // is sound, so it is decoded directly, within a bound derived from
         // the declared size, and reported like a checksum mismatch.
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-            match inflate_despite_declared_size(archive, index, declared) {
+            match inflate_despite_declared_size(archive, index, declared, cap) {
                 Ok(bytes) => {
                     log::warn!("opc: part '{name}' differs from its declared size; read as stored");
                     entries.record_crc_mismatch(name);

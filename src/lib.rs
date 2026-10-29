@@ -1059,6 +1059,8 @@ impl Document {
                     .to_string(),
             )
         })?;
+        // The write runs under this document's limits as well as the read.
+        let _scale = self.call_scope();
         let ir = self.to_ir();
         create::create_from_ir(&ir, target_format, path)?;
         Ok(())
