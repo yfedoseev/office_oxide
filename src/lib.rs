@@ -805,13 +805,13 @@ impl Document {
     ///
     /// This path converts one sheet at a time, so the allowances that bound
     /// the IR's memory are a sheet's own, fresh for each sheet:
-    /// [`limits::max_sheet_ir_padding_bytes`] for the empty cells that pad
-    /// its rows and [`limits::max_image_bytes`] for the picture bytes it
+    /// `max_sheet_ir_padding_bytes` for the empty cells that pad
+    /// its rows and `max_image_bytes` for the picture bytes it
     /// copies. The text budget ([`limits::max_text_chars`]) and the total of
-    /// picture bytes copied ([`limits::max_total_image_bytes`]) are
+    /// picture bytes copied (`max_total_image_bytes`) are
     /// document-wide. [`Self::to_ir`] holds every sheet at once and keeps
     /// document-wide allowances for the padding and the pictures
-    /// ([`limits::max_ir_padding_bytes`], [`limits::max_image_bytes`] for the
+    /// (`max_ir_padding_bytes`, `max_image_bytes` for the
     /// whole document), so a workbook that fits sheet by sheet but not as a
     /// whole is rendered whole here and cut there. What is cut is said in the
     /// content in both (a notice where the cut is); this path has no metadata
@@ -851,13 +851,13 @@ impl Document {
     ///
     /// This path converts one sheet at a time, so the allowances that bound
     /// the IR's memory are a sheet's own, fresh for each sheet:
-    /// [`limits::max_sheet_ir_padding_bytes`] for the empty cells that pad
-    /// its rows and [`limits::max_image_bytes`] for the picture bytes it
+    /// `max_sheet_ir_padding_bytes` for the empty cells that pad
+    /// its rows and `max_image_bytes` for the picture bytes it
     /// copies. The text budget ([`limits::max_text_chars`]) and the total of
-    /// picture bytes copied ([`limits::max_total_image_bytes`]) are
+    /// picture bytes copied (`max_total_image_bytes`) are
     /// document-wide. [`Self::to_ir`] holds every sheet at once and keeps
     /// document-wide allowances for the padding and the pictures
-    /// ([`limits::max_ir_padding_bytes`], [`limits::max_image_bytes`] for the
+    /// (`max_ir_padding_bytes`, `max_image_bytes` for the
     /// whole document), so a workbook that fits sheet by sheet but not as a
     /// whole is rendered whole here and cut there. What is cut is said in the
     /// content in both (a notice where the cut is); this path has no metadata
@@ -903,13 +903,13 @@ impl Document {
     ///
     /// This path converts one sheet at a time, so the allowances that bound
     /// the IR's memory are a sheet's own, fresh for each sheet:
-    /// [`limits::max_sheet_ir_padding_bytes`] for the empty cells that pad
-    /// its rows and [`limits::max_image_bytes`] for the picture bytes it
+    /// `max_sheet_ir_padding_bytes` for the empty cells that pad
+    /// its rows and `max_image_bytes` for the picture bytes it
     /// copies. The text budget ([`limits::max_text_chars`]) and the total of
-    /// picture bytes copied ([`limits::max_total_image_bytes`]) are
+    /// picture bytes copied (`max_total_image_bytes`) are
     /// document-wide. [`Self::to_ir`] holds every sheet at once and keeps
     /// document-wide allowances for the padding and the pictures
-    /// ([`limits::max_ir_padding_bytes`], [`limits::max_image_bytes`] for the
+    /// (`max_ir_padding_bytes`, `max_image_bytes` for the
     /// whole document), so a workbook that fits sheet by sheet but not as a
     /// whole is rendered whole here and cut there. What is cut is said in the
     /// content in both (a notice where the cut is); this path has no metadata
@@ -948,13 +948,13 @@ impl Document {
     ///
     /// This path converts one sheet at a time, so the allowances that bound
     /// the IR's memory are a sheet's own, fresh for each sheet:
-    /// [`limits::max_sheet_ir_padding_bytes`] for the empty cells that pad
-    /// its rows and [`limits::max_image_bytes`] for the picture bytes it
+    /// `max_sheet_ir_padding_bytes` for the empty cells that pad
+    /// its rows and `max_image_bytes` for the picture bytes it
     /// copies. The text budget ([`limits::max_text_chars`]) and the total of
-    /// picture bytes copied ([`limits::max_total_image_bytes`]) are
+    /// picture bytes copied (`max_total_image_bytes`) are
     /// document-wide. [`Self::to_ir`] holds every sheet at once and keeps
     /// document-wide allowances for the padding and the pictures
-    /// ([`limits::max_ir_padding_bytes`], [`limits::max_image_bytes`] for the
+    /// (`max_ir_padding_bytes`, `max_image_bytes` for the
     /// whole document), so a workbook that fits sheet by sheet but not as a
     /// whole is rendered whole here and cut there. What is cut is said in the
     /// content in both (a notice where the cut is); this path has no metadata
@@ -978,8 +978,8 @@ impl Document {
     /// Convert to the format-agnostic Document IR.
     ///
     /// A spreadsheet is converted whole, so its allowances are
-    /// document-wide: [`limits::max_ir_padding_bytes`] for the padding cells,
-    /// [`limits::max_image_bytes`] for all of the document's pictures and
+    /// document-wide: `max_ir_padding_bytes` for the padding cells,
+    /// `max_image_bytes` for all of the document's pictures and
     /// [`limits::max_text_chars`] for its text. The streaming methods
     /// ([`Self::to_markdown_with`], [`Self::to_html_with`] and the
     /// `write_*_with` methods) convert a sheet at a time with a sheet's own

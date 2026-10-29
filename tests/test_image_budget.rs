@@ -7,7 +7,7 @@ use std::io::{Cursor, Write};
 
 use office_oxide::ir::{Element, Section};
 use office_oxide::limits::{
-    max_image_bytes, max_text_chars, set_max_image_bytes, set_max_text_chars,
+    max_memory_bytes, max_text_chars, set_max_memory_bytes, set_max_text_chars,
 };
 use office_oxide::{Document, DocumentFormat};
 
@@ -29,7 +29,8 @@ const TEXT_BUDGET: usize = 8_000;
 
 fn limits() -> LimitScope {
     let mut scope = LimitScope::new();
-    scope.set(max_image_bytes, set_max_image_bytes, IMAGE_BUDGET);
+    // A picture's allowance is an eighth of the memory budget.
+    scope.set(max_memory_bytes, set_max_memory_bytes, 8 * IMAGE_BUDGET as u64);
     scope.set(max_text_chars, set_max_text_chars, TEXT_BUDGET);
     scope
 }
@@ -155,7 +156,7 @@ fn test_docx_picture_budget_exhaustion_is_flagged_and_noticed_in_the_document() 
         .metadata
         .warnings
         .iter()
-        .filter(|w| w.contains("set_max_image_bytes"))
+        .filter(|w| w.contains("set_max_memory_bytes"))
         .collect();
     assert_eq!(warnings.len(), 1, "{:?}", ir.metadata.warnings);
     let Some(Element::Paragraph(last)) = ir.sections.last().and_then(|s| s.elements.last()) else {
@@ -170,7 +171,7 @@ fn test_docx_picture_budget_exhaustion_is_flagged_and_noticed_in_the_document() 
         })
         .collect();
     assert!(
-        text.contains("pictures not shown") && text.contains("set_max_image_bytes"),
+        text.contains("pictures not shown") && text.contains("set_max_memory_bytes"),
         "{text:?}"
     );
     assert!(ir.to_markdown().contains("pictures not shown"));
@@ -294,7 +295,7 @@ fn test_pptx_pictures_sharing_one_image_stop_copying_at_the_budget() {
         ir.metadata
             .warnings
             .iter()
-            .any(|w| w.contains("image bytes") && w.contains("set_max_image_bytes"))
+            .any(|w| w.contains("image bytes") && w.contains("set_max_memory_bytes"))
     );
     // A cut is flagged, as the spreadsheet conversion flags it, and said in
     // the content itself, where Markdown and HTML renderings show it.
@@ -308,7 +309,7 @@ fn test_pptx_pictures_sharing_one_image_stop_copying_at_the_budget() {
                     .iter()
                     .filter(|c| {
                         matches!(c, office_oxide::ir::InlineContent::Text(t)
-                            if t.text.contains("set_max_image_bytes"))
+                            if t.text.contains("set_max_memory_bytes"))
                     })
                     .count(),
                 _ => 0,
@@ -323,7 +324,7 @@ fn test_pptx_pictures_sharing_one_image_stop_copying_at_the_budget() {
             .is_some_and(|s| notices(&s.elements) == 1),
         "the notice closes the last slide"
     );
-    assert!(ir.to_markdown().contains("set_max_image_bytes"));
+    assert!(ir.to_markdown().contains("set_max_memory_bytes"));
 }
 
 /// Notes whose size is almost all link target, not visible text: the

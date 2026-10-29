@@ -26,23 +26,28 @@
 //! constants behind the scaled text budget and the write-memory estimate are
 //! `doc(hidden)`: they may change.)
 //!
-//! The text budget is one of several, each for the thing that multiplies:
-//! pictures ([`crate::limits::max_image_bytes`], [`crate::limits::max_total_image_bytes`] and, for the
-//! compressed metafiles of the legacy formats,
-//! [`crate::limits::max_inflated_image_bytes`]); the empty slots and table cells that pad
-//! the rows of a sparse sheet ([`crate::limits::max_grid_padding_cells`] and
-//! [`crate::limits::max_sheet_grid_padding_cells`] for `.xls`, [`crate::limits::max_ir_padding_bytes`] and
-//! [`crate::limits::max_sheet_ir_padding_bytes`] for the IR); the blocks, list items and
-//! table cells of parsed Markdown ([`crate::limits::max_markdown_elements`],
-//! [`crate::limits::max_markdown_list_items`], [`crate::limits::max_markdown_table_cells`]); and the
-//! sheets and the memory a writer will use for cells ([`crate::limits::max_write_sheets`],
-//! [`crate::limits::max_write_bytes`]).
+//! **Eight settings, grouped by what they guard.** The zip layer has the four
+//! POI's `ZipSecureFile` has: a part's decompressed size
+//! ([`max_part_bytes()`](crate::limits::max_part_bytes)), a package's
+//! ([`max_package_bytes()`](crate::limits::max_package_bytes)), its entries
+//! ([`max_package_entries()`](crate::limits::max_package_entries)) and a
+//! part's inflate ratio ([`max_inflate_ratio()`](crate::limits::max_inflate_ratio)).
+//! The output has the text budget (below). Embedded packages have a depth and
+//! a count ([`max_embedded_depth()`](crate::limits::max_embedded_depth),
+//! [`max_embedded_packages()`](crate::limits::max_embedded_packages)). And one
+//! memory budget ([`max_memory_bytes()`](crate::limits::max_memory_bytes), as
+//! `image::Limits::max_alloc` is) bounds everything a small file can multiply
+//! in memory: pictures copied or inflated, the empty cells that pad a sparse
+//! sheet, and what a writer builds. Each of those bounds is a fixed share of
+//! it, so lowering the one number lowers them together. A bound finer than
+//! that (Markdown blocks, list items and table cells, Excel's 32,767 sheets,
+//! formula and style-name lengths) is a constant, not a setting.
 //!
 //! A package embedded in a `.docx` is opened to read its text, and may embed
 //! packages of its own. What they cost is charged to the one document that
-//! holds them: how deep they nest ([`crate::limits::max_embedded_depth`]), how many are
-//! opened ([`crate::limits::max_embedded_packages`]) and the bytes they take
-//! ([`crate::limits::max_embedded_bytes`]), with their text counted against the text budget.
+//! holds them: how deep they nest, how many are opened, and the bytes they take
+//! (a quarter of the package budget), with their text counted against the text
+//! budget.
 //!
 //! The default keeps every genuine workbook this crate has been tested
 //! against (the largest, 181 MB of cell text, with room to spare) and
@@ -96,7 +101,7 @@ pub fn set_max_package_entries(entries: usize) {
 /// by a small multiple of it.
 ///
 /// For a package embedded in a document this is what the document's
-/// [embedded-package allowance](max_embedded_bytes) has left, if that is
+/// embedded-package allowance (a quarter of this limit) has left, if that is
 /// less.
 pub fn max_package_bytes() -> u64 {
     let configured =
@@ -184,14 +189,8 @@ pub const DEFAULT_MAX_EMBEDDED_DEPTH: usize = 3;
 /// at every depth together.
 pub const DEFAULT_MAX_EMBEDDED_PACKAGES: usize = 256;
 
-/// The default total size of the embedded packages opened for one document,
-/// and of what opening them inflates: 512 MiB.
-pub const DEFAULT_MAX_EMBEDDED_BYTES: u64 = 512 << 20;
-
 static MAX_EMBEDDED_DEPTH: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_EMBEDDED_DEPTH);
 static MAX_EMBEDDED_PACKAGES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_EMBEDDED_PACKAGES);
-static MAX_EMBEDDED_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_EMBEDDED_BYTES);
-
 /// How many levels deep an embedded package is opened (the document itself is
 /// level 0, a package it embeds level 1).
 pub fn max_embedded_depth() -> usize {
@@ -217,14 +216,8 @@ pub fn set_max_embedded_packages(packages: usize) {
 
 /// The total bytes the embedded packages of one document may take, counting
 /// their sizes and what reading them inflates.
-pub fn max_embedded_bytes() -> u64 {
-    scoped(|l| l.embedded_bytes).unwrap_or_else(|| MAX_EMBEDDED_BYTES.load(Ordering::Relaxed))
-}
-
-/// Set the embedded-package byte allowance for every document read
-/// afterwards. `u64::MAX` disables the bound.
-pub fn set_max_embedded_bytes(bytes: u64) {
-    MAX_EMBEDDED_BYTES.store(bytes, Ordering::Relaxed);
+pub(crate) fn max_embedded_bytes() -> u64 {
+    configured_package_bytes() / 4
 }
 
 /// The default per-document text budget: 256 Mi characters.
@@ -300,6 +293,37 @@ fn text_limit_for_input(limit: usize, input: Option<u64>) -> usize {
     limit.min(scaled.max(TEXT_BUDGET_FLOOR_CHARS))
 }
 
+/// The default memory budget for what a small file can multiply: 1 GiB.
+///
+/// The one knob behind every bound on copies and padding, in the manner of
+/// `image::Limits::max_alloc`. Each internal bound is a fixed fraction of it
+/// (pictures copied: an eighth; their total: four times; a compressed metafile
+/// inflated: a quarter; the empty cells padding a sparse sheet: a 64th in cells
+/// of 64 bytes; the IR's padding: half, a whole sheet's: all; what a writer
+/// builds: half), so that the defaults are the values this crate was
+/// tested with and lowering the one number lowers them together.
+pub const DEFAULT_MAX_MEMORY_BYTES: u64 = 1 << 30;
+
+static MAX_MEMORY_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_MEMORY_BYTES);
+
+/// The memory budget for what a small file can multiply (see
+/// [`DEFAULT_MAX_MEMORY_BYTES`]).
+pub fn max_memory_bytes() -> u64 {
+    scoped(|l| l.memory_bytes).unwrap_or_else(|| MAX_MEMORY_BYTES.load(Ordering::Relaxed))
+}
+
+/// Set the memory budget for every document read or written afterwards.
+/// `u64::MAX` disables the bounds derived from it.
+pub fn set_max_memory_bytes(bytes: u64) {
+    MAX_MEMORY_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// The package-wide byte limit as configured, before an embedded package's
+/// share of its document's allowance lowers it.
+fn configured_package_bytes() -> u64 {
+    scoped(|l| l.package_bytes).unwrap_or_else(|| MAX_PACKAGE_BYTES.load(Ordering::Relaxed))
+}
+
 static MAX_TEXT_CHARS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_TEXT_CHARS);
 
 /// The per-document text budget in characters, the amount of cell text a
@@ -324,92 +348,20 @@ pub fn set_max_text_chars(chars: usize) {
     MAX_TEXT_CHARS.store(chars, Ordering::Relaxed);
 }
 
-/// The default per-document allowance of empty grid slots: 16 Mi.
-///
-/// A legacy `.xls` sheet is stored as rows that run to their last used
-/// column, so one number in column 255 of each of 65,535 rows costs 256
-/// slots per row: 16.7M slots from 65,535 records, and six such sheets
-/// made a 7 MB file allocate 2.6 GB. Each slot is a `CellValue` and an
-/// `XF` index in the sheet, and converting the sheet to the IR adds a table
-/// cell for it, about 70 bytes in all: a 32 Mi allowance let that file
-/// reach 0.9 GB on open and 2.1 GB in `to_ir`; 16 Mi bounds both near half of
-/// that. Only the *empty* slots that pad a row out to its last cell are
-/// charged, never the cells themselves, so a dense 65,536 x 256 sheet (which
-/// carries 16.7M cells and a file to match) costs nothing, and a sheet whose
-/// rows reach their last column with up to about 64,000 rows of nothing in
-/// between still fits.
-///
-/// The document's allowance is shared by its sheets, but no sheet may spend
-/// more than [`DEFAULT_MAX_SHEET_GRID_PADDING_CELLS`] of it, so one sparse
-/// sheet cannot leave the later sheets of a workbook without rows. A
-/// workbook that needs more is cut at the row that does not fit, loudly, and
-/// the notice names the sheet; processes that read such workbooks raise the
-/// allowance with [the setter](crate::limits::set_max_grid_padding_cells).
-pub const DEFAULT_MAX_GRID_PADDING_CELLS: usize = 16 << 20;
-
-static MAX_GRID_PADDING_CELLS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_GRID_PADDING_CELLS);
-
 /// The per-document allowance of empty slots padding spreadsheet rows.
-pub fn max_grid_padding_cells() -> usize {
-    scoped(|l| l.grid_padding_cells)
-        .unwrap_or_else(|| MAX_GRID_PADDING_CELLS.load(Ordering::Relaxed))
+pub(crate) fn max_grid_padding_cells() -> usize {
+    usize::try_from(max_memory_bytes() / 64).unwrap_or(usize::MAX)
 }
-
-/// Set the per-document empty-slot allowance for every document read
-/// afterwards. `usize::MAX` disables the bound.
-pub fn set_max_grid_padding_cells(cells: usize) {
-    MAX_GRID_PADDING_CELLS.store(cells, Ordering::Relaxed);
-}
-
-/// The default allowance of empty grid slots for one `.xls` sheet: 8 Mi.
-///
-/// This is what the whole document was allowed before sheets had their own:
-/// a sheet that fitted then fits now. A realistic wide sheet (65,000 rows of
-/// 60 columns, 60% filled) pads about 2.4M slots, so a workbook of several
-/// such sheets fits within the document's
-/// [`DEFAULT_MAX_GRID_PADDING_CELLS`], while a hostile sparse sheet is cut at
-/// this and leaves the rest of the document its allowance.
-pub const DEFAULT_MAX_SHEET_GRID_PADDING_CELLS: usize = 8 << 20;
-
-static MAX_SHEET_GRID_PADDING_CELLS: AtomicUsize =
-    AtomicUsize::new(DEFAULT_MAX_SHEET_GRID_PADDING_CELLS);
 
 /// The per-sheet allowance of empty slots padding spreadsheet rows.
-pub fn max_sheet_grid_padding_cells() -> usize {
-    scoped(|l| l.sheet_grid_padding_cells)
-        .unwrap_or_else(|| MAX_SHEET_GRID_PADDING_CELLS.load(Ordering::Relaxed))
+pub(crate) fn max_sheet_grid_padding_cells() -> usize {
+    usize::try_from(max_memory_bytes() / 128).unwrap_or(usize::MAX)
 }
-
-/// Set the per-sheet empty-slot allowance for every document read
-/// afterwards. `usize::MAX` disables the bound.
-pub fn set_max_sheet_grid_padding_cells(cells: usize) {
-    MAX_SHEET_GRID_PADDING_CELLS.store(cells, Ordering::Relaxed);
-}
-
-/// The default per-document allowance of inflated image bytes: 256 Mi.
-///
-/// A compressed metafile picture (EMF/WMF/PICT) declares its uncompressed
-/// size and is stored as a zlib stream, which can shrink a run of zeros a
-/// thousandfold: four such pictures in a 1 MB `.ppt` inflated to 3.3 GB.
-/// Every compressed picture of a document is charged its declared size
-/// against this allowance before it is inflated; one that does not fit is
-/// left out. Pictures stored uncompressed are bounded by the file itself and
-/// cost nothing.
-pub const DEFAULT_MAX_INFLATED_IMAGE_BYTES: u64 = 256 << 20;
-
-static MAX_INFLATED_IMAGE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_INFLATED_IMAGE_BYTES);
 
 /// The per-document allowance of bytes a legacy file's compressed metafile
 /// pictures may inflate to.
-pub fn max_inflated_image_bytes() -> u64 {
-    scoped(|l| l.inflated_image_bytes)
-        .unwrap_or_else(|| MAX_INFLATED_IMAGE_BYTES.load(Ordering::Relaxed))
-}
-
-/// Set the per-document inflated-image allowance for every document read
-/// afterwards. `u64::MAX` disables the bound.
-pub fn set_max_inflated_image_bytes(bytes: u64) {
-    MAX_INFLATED_IMAGE_BYTES.store(bytes, Ordering::Relaxed);
+pub(crate) fn max_inflated_image_bytes() -> u64 {
+    max_memory_bytes() / 4
 }
 
 /// A document's remaining allowance of inflated image bytes.
@@ -603,7 +555,7 @@ impl GridBudget {
         if !by_sheet.is_empty() {
             out.push(format!(
                 "[sheet truncated: the sparse rows of {} need more than {} empty cells of padding \
-                 (office_oxide::limits::set_max_sheet_grid_padding_cells) — later rows of \
+                 (office_oxide::limits::set_max_memory_bytes) — later rows of \
                  {} are missing]",
                 Self::name_list(&by_sheet),
                 self.sheet.total(),
@@ -617,7 +569,7 @@ impl GridBudget {
         if let Some((name, _)) = self.cuts.iter().find(|(_, by_document)| *by_document) {
             out.push(format!(
                 "[workbook truncated: its sparse rows need more than {} empty cells of padding \
-                 (office_oxide::limits::set_max_grid_padding_cells) — rows from sheet '{name}' \
+                 (office_oxide::limits::set_max_memory_bytes) — rows from sheet '{name}' \
                  on are missing]",
                 self.document.total()
             ));
@@ -639,64 +591,16 @@ impl GridBudget {
     }
 }
 
-/// The default allowance of memory for the empty table cells that pad the
-/// rows of an `.xlsx` sheet in the IR: 512 MiB.
-///
-/// A spreadsheet's IR table is as wide as the sheet, so a row with cells at
-/// `A` and `CV` is laid out with 98 empty table cells between them, each a
-/// `TableCell` and its paragraph element, about 600 bytes. They are charged
-/// at that size, apart from the text budget (which is also charged 3
-/// characters a cell, as Markdown charges an absent column): at the default a
-/// sheet may hold about 900,000 of them, enough for a multi-sheet export of
-/// a hundred sparse columns and several thousand rows.
-///
-/// This is the allowance of a conversion that holds the whole workbook at once
-/// (`Document::to_ir`, which every sheet shares). A conversion that holds one
-/// sheet at a time has each sheet's own,
-/// [`DEFAULT_MAX_SHEET_IR_PADDING_BYTES`].
-pub const DEFAULT_MAX_IR_PADDING_BYTES: usize = 512 << 20;
-
-static MAX_IR_PADDING_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_IR_PADDING_BYTES);
-
 /// The per-document allowance of bytes for the empty cells padding the rows
 /// of a spreadsheet's IR.
-pub fn max_ir_padding_bytes() -> usize {
-    scoped(|l| l.ir_padding_bytes).unwrap_or_else(|| MAX_IR_PADDING_BYTES.load(Ordering::Relaxed))
+pub(crate) fn max_ir_padding_bytes() -> usize {
+    usize::try_from(max_memory_bytes() / 2).unwrap_or(usize::MAX)
 }
-
-/// Set the empty-cell padding allowance for every document converted
-/// afterwards. `usize::MAX` disables the bound.
-pub fn set_max_ir_padding_bytes(bytes: usize) {
-    MAX_IR_PADDING_BYTES.store(bytes, Ordering::Relaxed);
-}
-
-/// The default allowance of memory for the empty table cells that pad the
-/// rows of one `.xlsx` sheet while the sheet is held in the IR: 1 GiB.
-///
-/// When a workbook is converted a sheet at a time (the sheet-by-sheet IR of
-/// [`XlsxDocument::sheets_ir`](crate::xlsx::XlsxDocument::sheets_ir), and
-/// `to_html`, `to_markdown_with` over a spreadsheet) only one sheet's cells
-/// exist at once, so the allowance is the sheet's, not the document's, and it
-/// is given back when the sheet is released. At about 600 bytes a cell the
-/// default holds about 1.8 million of them in one sheet: 18,000 rows of a
-/// hundred sparse columns. The characters the padding adds to the output are
-/// still charged, for the whole run, to the text budget's limit.
-pub const DEFAULT_MAX_SHEET_IR_PADDING_BYTES: usize = 1 << 30;
-
-static MAX_SHEET_IR_PADDING_BYTES: AtomicUsize =
-    AtomicUsize::new(DEFAULT_MAX_SHEET_IR_PADDING_BYTES);
 
 /// The per-sheet allowance of bytes for the empty cells padding the rows of
 /// a spreadsheet sheet in the IR, when sheets are converted one at a time.
-pub fn max_sheet_ir_padding_bytes() -> usize {
-    scoped(|l| l.sheet_ir_padding_bytes)
-        .unwrap_or_else(|| MAX_SHEET_IR_PADDING_BYTES.load(Ordering::Relaxed))
-}
-
-/// Set the per-sheet empty-cell padding allowance for every sheet converted
-/// afterwards. `usize::MAX` disables the bound.
-pub fn set_max_sheet_ir_padding_bytes(bytes: usize) {
-    MAX_SHEET_IR_PADDING_BYTES.store(bytes, Ordering::Relaxed);
+pub(crate) fn max_sheet_ir_padding_bytes() -> usize {
+    usize::try_from(max_memory_bytes()).unwrap_or(usize::MAX)
 }
 
 /// A remaining allowance of bytes for IR padding cells: the document's, or
@@ -761,66 +665,30 @@ impl IrPaddingBudget {
         if self.per_sheet {
             return format!(
                 "[sheet truncated: its rows are padded to the sheet's width with more than {total} \
-                 bytes of empty table cells (office_oxide::limits::set_max_sheet_ir_padding_bytes) \
+                 bytes of empty table cells (office_oxide::limits::set_max_memory_bytes) \
                  — later rows of this sheet are missing]"
             );
         }
         format!(
             "[workbook truncated: its rows are padded to the sheet's width with more than {total} \
-             bytes of empty table cells (office_oxide::limits::set_max_ir_padding_bytes) — \
+             bytes of empty table cells (office_oxide::limits::set_max_memory_bytes) — \
              this sheet's later rows, and the rows of each later sheet that needs padding, are \
              missing]"
         )
     }
 }
 
-/// The default budget for picture bytes in the IR: 128 MiB.
-///
-/// The IR gives every picture its own copy of the bytes, and its JSON form
-/// writes them again as base64 (a third larger): at the earlier 1 GiB a 5 KB
-/// `.docx` drawing one 1 MB image 1,100 times converted to 1 GB of IR and 1.4 GB
-/// of JSON. Genuine documents are far smaller: a photo-heavy report or a deck of
-/// a hundred full-resolution photographs is tens of megabytes of distinct
-/// pictures, each used once. A picture past the budget keeps its place without
-/// its bytes, and the conversion says so; processes that convert larger
-/// documents raise it with [the setter](crate::limits::set_max_image_bytes).
-pub const DEFAULT_MAX_IMAGE_BYTES: usize = 128 << 20;
-
-static MAX_IMAGE_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_IMAGE_BYTES);
-
 /// The bytes of picture data a spreadsheet's IR may hold, counting a picture
 /// once for every anchor that draws it: the workbook stores a media part once,
 /// and the IR gives each image its own copy.
-pub fn max_image_bytes() -> usize {
-    scoped(|l| l.image_bytes).unwrap_or_else(|| MAX_IMAGE_BYTES.load(Ordering::Relaxed))
+pub(crate) fn max_image_bytes() -> usize {
+    usize::try_from(max_memory_bytes() / 8).unwrap_or(usize::MAX)
 }
-
-/// Set the picture-byte budget for every document converted afterwards.
-/// `usize::MAX` disables the bound.
-pub fn set_max_image_bytes(bytes: usize) {
-    MAX_IMAGE_BYTES.store(bytes, Ordering::Relaxed);
-}
-
-/// The default total of picture bytes a run may copy into the IR when a
-/// workbook is converted a sheet at a time: 4 GiB, four times a sheet's.
-///
-/// A sheet's own allowance ([`max_image_bytes`]) is given back with the sheet,
-/// so without a total, a workbook of many sheets each drawing the same picture
-/// would copy it once per sheet without bound.
-pub const DEFAULT_MAX_TOTAL_IMAGE_BYTES: u64 = 4 << 30;
-
-static MAX_TOTAL_IMAGE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_TOTAL_IMAGE_BYTES);
 
 /// The most picture bytes all the sheets of one workbook may copy into the IR
 /// in a sheet-by-sheet conversion.
-pub fn max_total_image_bytes() -> u64 {
-    scoped(|l| l.total_image_bytes).unwrap_or_else(|| MAX_TOTAL_IMAGE_BYTES.load(Ordering::Relaxed))
-}
-
-/// Set the total picture-byte limit for every sheet-by-sheet conversion
-/// afterwards. `u64::MAX` disables the bound.
-pub fn set_max_total_image_bytes(bytes: u64) {
-    MAX_TOTAL_IMAGE_BYTES.store(bytes, Ordering::Relaxed);
+pub(crate) fn max_total_image_bytes() -> u64 {
+    max_memory_bytes().saturating_mul(4)
 }
 
 thread_local! {
@@ -938,7 +806,7 @@ pub(crate) fn image_budget_warning() -> Option<String> {
         .then(|| {
             format!(
                 "some image bytes were left out: the document's images exceed the {} byte \
-                 budget (office_oxide::limits::set_max_image_bytes)",
+                 budget (office_oxide::limits::set_max_memory_bytes)",
                 max_image_bytes()
             )
         })
@@ -953,25 +821,11 @@ pub(crate) fn image_budget_notice() -> Option<String> {
         .then(|| {
             format!(
                 "[some pictures not shown: together they exceed the {} byte picture budget \
-             (office_oxide::limits::set_max_image_bytes)]",
+             (office_oxide::limits::set_max_memory_bytes)]",
                 max_image_bytes()
             )
         })
 }
-
-/// The default most memory the writers may be estimated to need for the cells
-/// of one IR: 512 MiB.
-///
-/// The writers build every cell in memory, and what a cell costs differs by
-/// format, so the limit is in bytes and each cell is charged what its format's
-/// writer takes: [`WRITE_BYTES_PER_DOCX_CELL`], [`WRITE_BYTES_PER_PPTX_CELL`]
-/// and [`WRITE_BYTES_PER_XLSX_CELL`] (measured at 100,000 cells: 1,832, 632 and
-/// 161 bytes, charged rounded up). At the default that is about 280,000
-/// `.docx` cells, 825,000 `.pptx` cells or 3.1 million worksheet cells. A
-/// million-cell `.docx` table took 2.2 GB to write; genuine tables in these
-/// formats stay far below the default. A process that writes larger ones raises
-/// it with [the setter](set_max_write_bytes).
-pub const DEFAULT_MAX_WRITE_BYTES: u64 = 512 << 20;
 
 /// What a table cell costs the `.docx` writer, in bytes (measured 1,832).
 #[doc(hidden)]
@@ -985,19 +839,11 @@ pub const WRITE_BYTES_PER_PPTX_CELL: u64 = 650;
 #[doc(hidden)]
 pub const WRITE_BYTES_PER_XLSX_CELL: u64 = 170;
 
-static MAX_WRITE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_WRITE_BYTES);
-
 /// The most memory, in bytes, the cells (nested tables included, each table
 /// padded to its widest row) of an IR written to `.docx`, `.pptx` or `.xlsx`
 /// may be estimated to need before the write is refused.
-pub fn max_write_bytes() -> u64 {
-    scoped(|l| l.write_bytes).unwrap_or_else(|| MAX_WRITE_BYTES.load(Ordering::Relaxed))
-}
-
-/// Set the write-memory limit for every write afterwards. `u64::MAX` disables
-/// the bound.
-pub fn set_max_write_bytes(bytes: u64) {
-    MAX_WRITE_BYTES.store(bytes, Ordering::Relaxed);
+pub(crate) fn max_write_bytes() -> u64 {
+    max_memory_bytes() / 2
 }
 
 /// The default most worksheets an IR written to `.xlsx` may hold: 32,767.
@@ -1007,88 +853,31 @@ pub fn set_max_write_bytes(bytes: u64) {
 /// extensions can hold. Excel itself has no fixed sheet limit (memory
 /// decides), but a genuine workbook has tens or hundreds of sheets, not tens
 /// of thousands.
-pub const DEFAULT_MAX_WRITE_SHEETS: usize = 32_767;
-
-static MAX_WRITE_SHEETS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_WRITE_SHEETS);
+pub(crate) const DEFAULT_MAX_WRITE_SHEETS: usize = 32_767;
 
 /// The most sections (worksheets) an IR written to `.xlsx` may hold before
 /// the write is refused.
-pub fn max_write_sheets() -> usize {
-    scoped(|l| l.write_sheets).unwrap_or_else(|| MAX_WRITE_SHEETS.load(Ordering::Relaxed))
+pub(crate) fn max_write_sheets() -> usize {
+    DEFAULT_MAX_WRITE_SHEETS
 }
-
-/// Set the worksheet limit for every write afterwards. `usize::MAX`
-/// disables the bound.
-pub fn set_max_write_sheets(sheets: usize) {
-    MAX_WRITE_SHEETS.store(sheets, Ordering::Relaxed);
-}
-
-/// The default most list items one Markdown document may parse into:
-/// 100,000. Each item becomes about 250 bytes of IR.
-pub const DEFAULT_MAX_MARKDOWN_LIST_ITEMS: usize = 100_000;
-
-static MAX_MARKDOWN_LIST_ITEMS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_MARKDOWN_LIST_ITEMS);
 
 /// The most list items (nested ones included) `DocumentIR::from_markdown`
 /// keeps; the rest are dropped with a notice.
-pub fn max_markdown_list_items() -> usize {
-    scoped(|l| l.markdown_list_items)
-        .unwrap_or_else(|| MAX_MARKDOWN_LIST_ITEMS.load(Ordering::Relaxed))
+pub(crate) fn max_markdown_list_items() -> usize {
+    100_000
 }
-
-/// Set the Markdown list-item limit for every parse afterwards.
-/// `usize::MAX` disables the bound.
-pub fn set_max_markdown_list_items(items: usize) {
-    MAX_MARKDOWN_LIST_ITEMS.store(items, Ordering::Relaxed);
-}
-
-/// The default most blocks one Markdown document may parse into: 100,000.
-///
-/// A block costs a section, a paragraph, a heading, a code block, a break,
-/// a list or a table as 1. Each is 0.5-1.4 KB of IR from a few bytes of
-/// Markdown: 100,000 sections were 214 MB and 200,000 paragraphs 285 MB.
-/// List items and table cells have limits of their own,
-/// [`max_markdown_list_items`] and [`max_markdown_table_cells`].
-pub const DEFAULT_MAX_MARKDOWN_ELEMENTS: usize = 100_000;
-
-/// The default most table cells one Markdown document may parse into: 150,000.
-///
-/// A cell is about 1.2 KB of IR whether it is in a header row or a body row
-/// (measured: peak memory of 118 MB for a 100,000-column header row, 292 MB
-/// for 250,000), so the default keeps the cells of one document near 180 MB;
-/// with the block limit's own bound the IR of a parse stays under about
-/// 350 MB. A table of 1,000 rows by 25 columns is a sixth of it. Past it the rows that do not fit are dropped, with a
-/// notice, and the rest of the document is read.
-pub const DEFAULT_MAX_MARKDOWN_TABLE_CELLS: usize = 150_000;
-
-static MAX_MARKDOWN_TABLE_CELLS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_MARKDOWN_TABLE_CELLS);
 
 /// The most table cells `DocumentIR::from_markdown` keeps, over all of a
 /// document's tables.
-pub fn max_markdown_table_cells() -> usize {
-    scoped(|l| l.markdown_table_cells)
-        .unwrap_or_else(|| MAX_MARKDOWN_TABLE_CELLS.load(Ordering::Relaxed))
+pub(crate) fn max_markdown_table_cells() -> usize {
+    150_000
 }
-
-/// Set the Markdown table-cell limit for every parse afterwards.
-/// `usize::MAX` disables the bound.
-pub fn set_max_markdown_table_cells(cells: usize) {
-    MAX_MARKDOWN_TABLE_CELLS.store(cells, Ordering::Relaxed);
-}
-
-static MAX_MARKDOWN_ELEMENTS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_MARKDOWN_ELEMENTS);
 
 /// The most blocks (sections, paragraphs, headings, code blocks, breaks,
 /// lists and tables) `DocumentIR::from_markdown`
 /// keeps; the rest of the document is dropped with a notice.
-pub fn max_markdown_elements() -> usize {
-    scoped(|l| l.markdown_elements).unwrap_or_else(|| MAX_MARKDOWN_ELEMENTS.load(Ordering::Relaxed))
-}
-
-/// Set the Markdown block limit for every parse afterwards. `usize::MAX`
-/// disables the bound.
-pub fn set_max_markdown_elements(elements: usize) {
-    MAX_MARKDOWN_ELEMENTS.store(elements, Ordering::Relaxed);
+pub(crate) fn max_markdown_elements() -> usize {
+    100_000
 }
 
 /// A document's remaining text budget.
@@ -1341,10 +1130,10 @@ mod tests {
     #[test]
     fn test_a_sheets_padding_allowance_names_its_own_limit_and_the_sheet() {
         let b = IrPaddingBudget::new_for_sheet();
-        assert!(b.notice().contains("set_max_sheet_ir_padding_bytes"));
+        assert!(b.notice().contains("set_max_memory_bytes"));
         assert!(b.notice().starts_with("[sheet truncated"));
         let d = IrPaddingBudget::new();
-        assert!(d.notice().contains("set_max_ir_padding_bytes"));
+        assert!(d.notice().contains("set_max_memory_bytes"));
         assert!(d.notice().starts_with("[workbook truncated"));
     }
 
@@ -1364,16 +1153,14 @@ mod tests {
         let notices = b.notices();
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(notices[0].contains("'A'") && notices[0].contains("and 2 more"), "{notices:?}");
-        assert!(notices[0].contains("set_max_sheet_grid_padding_cells"));
+        assert!(notices[0].contains("set_max_memory_bytes"));
         let mut b = GridBudget::with_limits(15, 10);
         b.begin_sheet("A");
         assert!(b.charge(10));
         b.begin_sheet("B");
         assert!(!b.charge(6), "only 5 of the document's allowance is left");
         let notices = b.notices();
-        assert!(
-            notices[0].contains("sheet 'B'") && notices[0].contains("set_max_grid_padding_cells")
-        );
+        assert!(notices[0].contains("sheet 'B'") && notices[0].contains("set_max_memory_bytes"));
     }
 
     #[test]
@@ -1392,14 +1179,10 @@ mod tests {
         // One more than the default of a limit that only sheet-by-sheet
         // conversions read, so no other test in this binary can notice it.
         let mut limits = test_support::LimitScope::new();
-        limits.set(
-            max_total_image_bytes,
-            set_max_total_image_bytes,
-            DEFAULT_MAX_TOTAL_IMAGE_BYTES + 1,
-        );
-        assert_eq!(max_total_image_bytes(), DEFAULT_MAX_TOTAL_IMAGE_BYTES + 1);
+        limits.set(max_memory_bytes, set_max_memory_bytes, DEFAULT_MAX_MEMORY_BYTES + 1);
+        assert_eq!(max_memory_bytes(), DEFAULT_MAX_MEMORY_BYTES + 1);
         drop(limits);
-        assert_eq!(max_total_image_bytes(), DEFAULT_MAX_TOTAL_IMAGE_BYTES);
+        assert_eq!(max_memory_bytes(), DEFAULT_MAX_MEMORY_BYTES);
     }
 
     /// A conversion that returns early (or fails) leaves nothing behind for
@@ -1486,7 +1269,7 @@ mod tests {
     }
 }
 
-/// Every limit in this module as one value, for use per call.
+/// Every limit the crate lets you set, as one value, for use per call.
 ///
 /// The `set_max_*` functions change the process-wide defaults, which suits a
 /// program that configures the library once. A server reading documents for
@@ -1496,6 +1279,14 @@ mod tests {
 /// [`Document::open_with`](crate::Document::open_with). Nothing global
 /// changes; other threads are unaffected.
 ///
+/// Eight settings, grouped by what they guard: the zip layer (`part_bytes`,
+/// `package_bytes`, `package_entries`, `inflate_ratio`, the same four Apache
+/// POI's `ZipSecureFile` has), the output (`text_chars`, as POI's
+/// `setMaxTextSize`), embedded packages (`embedded_depth`,
+/// `embedded_packages`) and one memory budget (`memory_bytes`, as
+/// `image::Limits::max_alloc`) from which every bound on copies, padding and
+/// writing is derived. Anything finer is an internal constant.
+///
 /// [`Limits::default`] holds the documented defaults, [`Limits::current`] the
 /// process-wide values now in force, [`Limits::strict`] a tighter set for
 /// untrusted input, and [`Limits::unlimited`] switches every bound off.
@@ -1504,48 +1295,20 @@ mod tests {
 pub struct Limits {
     /// Entries one OOXML package may hold. See [`max_package_entries`].
     pub package_entries: usize,
-    /// Decompressed bytes read from one OOXML package. See [`max_package_bytes`].
+    /// Decompressed bytes read from one OOXML package (embedded packages read within a quarter of it). See [`max_package_bytes`].
     pub package_bytes: u64,
     /// Decompressed size of one part. See [`max_part_bytes`].
     pub part_bytes: u64,
-    /// Decompressed-to-stored ratio of a part larger than [`INFLATE_RATIO_FLOOR_BYTES`]. See [`max_inflate_ratio`].
+    /// Decompressed-to-stored ratio of a part larger than 64 MiB. See [`max_inflate_ratio`].
     pub inflate_ratio: u64,
     /// Depth to which embedded packages are opened. See [`max_embedded_depth`].
     pub embedded_depth: usize,
     /// Embedded packages opened for one document. See [`max_embedded_packages`].
     pub embedded_packages: usize,
-    /// Bytes of embedded packages opened for one document. See [`max_embedded_bytes`].
-    pub embedded_bytes: u64,
     /// Characters of text one document may produce. See [`max_text_chars`].
     pub text_chars: usize,
-    /// Empty cells that pad a spreadsheet grid. See [`max_grid_padding_cells`].
-    pub grid_padding_cells: usize,
-    /// Empty cells that pad one sheet's grid. See [`max_sheet_grid_padding_cells`].
-    pub sheet_grid_padding_cells: usize,
-    /// Bytes a compressed metafile may inflate to. See [`max_inflated_image_bytes`].
-    pub inflated_image_bytes: u64,
-    /// Bytes of padding in a document's IR. See [`max_ir_padding_bytes`].
-    pub ir_padding_bytes: usize,
-    /// Bytes of padding in one sheet's IR. See [`max_sheet_ir_padding_bytes`].
-    pub sheet_ir_padding_bytes: usize,
-    /// Bytes of one picture copied into the IR. See [`max_image_bytes`].
-    pub image_bytes: usize,
-    /// Bytes of all pictures copied into the IR. See [`max_total_image_bytes`].
-    pub total_image_bytes: u64,
-    /// Estimated bytes a document being written may take. See [`max_write_bytes`].
-    pub write_bytes: u64,
-    /// Worksheets a workbook being written may have. See [`max_write_sheets`].
-    pub write_sheets: usize,
-    /// List items read from Markdown. See [`max_markdown_list_items`]. Like the
-    /// other two `markdown_*` limits, this applies to Markdown parsed by
-    /// [`DocumentIR::from_markdown`](crate::ir::DocumentIR::from_markdown) and
-    /// `create_from_markdown` through the process-wide setter only: neither
-    /// takes `ParseOptions`.
-    pub markdown_list_items: usize,
-    /// Table cells read from Markdown. See [`max_markdown_table_cells`].
-    pub markdown_table_cells: usize,
-    /// Elements read from Markdown. See [`max_markdown_elements`].
-    pub markdown_elements: usize,
+    /// Memory the conversion of one document may spend on what a small file can multiply: pictures copied or inflated, the empty cells that pad a sparse grid, and what a writer builds. Every such bound is a fixed fraction of it. See [`max_memory_bytes`].
+    pub memory_bytes: u64,
 }
 
 impl Default for Limits {
@@ -1557,20 +1320,8 @@ impl Default for Limits {
             inflate_ratio: DEFAULT_MAX_INFLATE_RATIO,
             embedded_depth: DEFAULT_MAX_EMBEDDED_DEPTH,
             embedded_packages: DEFAULT_MAX_EMBEDDED_PACKAGES,
-            embedded_bytes: DEFAULT_MAX_EMBEDDED_BYTES,
             text_chars: DEFAULT_MAX_TEXT_CHARS,
-            grid_padding_cells: DEFAULT_MAX_GRID_PADDING_CELLS,
-            sheet_grid_padding_cells: DEFAULT_MAX_SHEET_GRID_PADDING_CELLS,
-            inflated_image_bytes: DEFAULT_MAX_INFLATED_IMAGE_BYTES,
-            ir_padding_bytes: DEFAULT_MAX_IR_PADDING_BYTES,
-            sheet_ir_padding_bytes: DEFAULT_MAX_SHEET_IR_PADDING_BYTES,
-            image_bytes: DEFAULT_MAX_IMAGE_BYTES,
-            total_image_bytes: DEFAULT_MAX_TOTAL_IMAGE_BYTES,
-            write_bytes: DEFAULT_MAX_WRITE_BYTES,
-            write_sheets: DEFAULT_MAX_WRITE_SHEETS,
-            markdown_list_items: DEFAULT_MAX_MARKDOWN_LIST_ITEMS,
-            markdown_table_cells: DEFAULT_MAX_MARKDOWN_TABLE_CELLS,
-            markdown_elements: DEFAULT_MAX_MARKDOWN_ELEMENTS,
+            memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
         }
     }
 }
@@ -1586,20 +1337,8 @@ impl Limits {
             inflate_ratio: MAX_INFLATE_RATIO.load(Ordering::Relaxed),
             embedded_depth: MAX_EMBEDDED_DEPTH.load(Ordering::Relaxed),
             embedded_packages: MAX_EMBEDDED_PACKAGES.load(Ordering::Relaxed),
-            embedded_bytes: MAX_EMBEDDED_BYTES.load(Ordering::Relaxed),
             text_chars: MAX_TEXT_CHARS.load(Ordering::Relaxed),
-            grid_padding_cells: MAX_GRID_PADDING_CELLS.load(Ordering::Relaxed),
-            sheet_grid_padding_cells: MAX_SHEET_GRID_PADDING_CELLS.load(Ordering::Relaxed),
-            inflated_image_bytes: MAX_INFLATED_IMAGE_BYTES.load(Ordering::Relaxed),
-            ir_padding_bytes: MAX_IR_PADDING_BYTES.load(Ordering::Relaxed),
-            sheet_ir_padding_bytes: MAX_SHEET_IR_PADDING_BYTES.load(Ordering::Relaxed),
-            image_bytes: MAX_IMAGE_BYTES.load(Ordering::Relaxed),
-            total_image_bytes: MAX_TOTAL_IMAGE_BYTES.load(Ordering::Relaxed),
-            write_bytes: MAX_WRITE_BYTES.load(Ordering::Relaxed),
-            write_sheets: MAX_WRITE_SHEETS.load(Ordering::Relaxed),
-            markdown_list_items: MAX_MARKDOWN_LIST_ITEMS.load(Ordering::Relaxed),
-            markdown_table_cells: MAX_MARKDOWN_TABLE_CELLS.load(Ordering::Relaxed),
-            markdown_elements: MAX_MARKDOWN_ELEMENTS.load(Ordering::Relaxed),
+            memory_bytes: MAX_MEMORY_BYTES.load(Ordering::Relaxed),
         }
     }
 
@@ -1616,20 +1355,8 @@ impl Limits {
             inflate_ratio: 100,
             embedded_depth: 1,
             embedded_packages: d.embedded_packages / 8,
-            embedded_bytes: d.embedded_bytes / 8,
             text_chars: d.text_chars / 8,
-            grid_padding_cells: d.grid_padding_cells / 8,
-            sheet_grid_padding_cells: d.sheet_grid_padding_cells / 8,
-            inflated_image_bytes: d.inflated_image_bytes / 8,
-            ir_padding_bytes: d.ir_padding_bytes / 8,
-            sheet_ir_padding_bytes: d.sheet_ir_padding_bytes / 8,
-            image_bytes: d.image_bytes / 8,
-            total_image_bytes: d.total_image_bytes / 8,
-            write_bytes: d.write_bytes / 8,
-            write_sheets: d.write_sheets,
-            markdown_list_items: d.markdown_list_items / 8,
-            markdown_table_cells: d.markdown_table_cells / 8,
-            markdown_elements: d.markdown_elements / 8,
+            memory_bytes: d.memory_bytes / 8,
         }
     }
 
@@ -1642,20 +1369,8 @@ impl Limits {
             inflate_ratio: u64::MAX,
             embedded_depth: usize::MAX,
             embedded_packages: usize::MAX,
-            embedded_bytes: u64::MAX,
             text_chars: usize::MAX,
-            grid_padding_cells: usize::MAX,
-            sheet_grid_padding_cells: usize::MAX,
-            inflated_image_bytes: u64::MAX,
-            ir_padding_bytes: usize::MAX,
-            sheet_ir_padding_bytes: usize::MAX,
-            image_bytes: usize::MAX,
-            total_image_bytes: u64::MAX,
-            write_bytes: u64::MAX,
-            write_sheets: usize::MAX,
-            markdown_list_items: usize::MAX,
-            markdown_table_cells: usize::MAX,
-            markdown_elements: usize::MAX,
+            memory_bytes: u64::MAX,
         }
     }
 
@@ -1667,20 +1382,8 @@ impl Limits {
         MAX_INFLATE_RATIO.store(self.inflate_ratio, Ordering::Relaxed);
         MAX_EMBEDDED_DEPTH.store(self.embedded_depth, Ordering::Relaxed);
         MAX_EMBEDDED_PACKAGES.store(self.embedded_packages, Ordering::Relaxed);
-        MAX_EMBEDDED_BYTES.store(self.embedded_bytes, Ordering::Relaxed);
         MAX_TEXT_CHARS.store(self.text_chars, Ordering::Relaxed);
-        MAX_GRID_PADDING_CELLS.store(self.grid_padding_cells, Ordering::Relaxed);
-        MAX_SHEET_GRID_PADDING_CELLS.store(self.sheet_grid_padding_cells, Ordering::Relaxed);
-        MAX_INFLATED_IMAGE_BYTES.store(self.inflated_image_bytes, Ordering::Relaxed);
-        MAX_IR_PADDING_BYTES.store(self.ir_padding_bytes, Ordering::Relaxed);
-        MAX_SHEET_IR_PADDING_BYTES.store(self.sheet_ir_padding_bytes, Ordering::Relaxed);
-        MAX_IMAGE_BYTES.store(self.image_bytes, Ordering::Relaxed);
-        MAX_TOTAL_IMAGE_BYTES.store(self.total_image_bytes, Ordering::Relaxed);
-        MAX_WRITE_BYTES.store(self.write_bytes, Ordering::Relaxed);
-        MAX_WRITE_SHEETS.store(self.write_sheets, Ordering::Relaxed);
-        MAX_MARKDOWN_LIST_ITEMS.store(self.markdown_list_items, Ordering::Relaxed);
-        MAX_MARKDOWN_TABLE_CELLS.store(self.markdown_table_cells, Ordering::Relaxed);
-        MAX_MARKDOWN_ELEMENTS.store(self.markdown_elements, Ordering::Relaxed);
+        MAX_MEMORY_BYTES.store(self.memory_bytes, Ordering::Relaxed);
     }
 }
 
@@ -1693,84 +1396,46 @@ impl Limits {
         "inflate_ratio",
         "embedded_depth",
         "embedded_packages",
-        "embedded_bytes",
         "text_chars",
-        "grid_padding_cells",
-        "sheet_grid_padding_cells",
-        "inflated_image_bytes",
-        "ir_padding_bytes",
-        "sheet_ir_padding_bytes",
-        "image_bytes",
-        "total_image_bytes",
-        "write_bytes",
-        "write_sheets",
-        "markdown_list_items",
-        "markdown_table_cells",
-        "markdown_elements",
+        "memory_bytes",
     ];
 
     /// Set the limit called `name` (a field name; see [`Limits::NAMES`]) to
     /// `value`. For callers that cannot name a Rust field: the command line,
-    /// the C interface and the language bindings take limits by name. A value
-    /// past what a `usize` holds is the maximum, i.e. no bound.
+    /// the C interface and the language bindings take limits by name. On a
+    /// target where `usize` is narrower than 64 bits a count too large for it
+    /// is an error; `u64::MAX` alone means no bound.
     pub fn set(&mut self, name: &str, value: u64) -> Result<(), LimitError> {
-        // On a target where `usize` is narrower than 64 bits a count too large
-        // for it is an error, not "no bound"; `u64::MAX` alone means no bound.
         let too_big = usize::try_from(value).is_err() && value != u64::MAX;
-        if too_big
-            && !matches!(
-                name,
-                "package_bytes"
-                    | "part_bytes"
-                    | "inflate_ratio"
-                    | "embedded_bytes"
-                    | "inflated_image_bytes"
-                    | "total_image_bytes"
-                    | "write_bytes"
-            )
-            && Limits::NAMES.contains(&name)
-        {
-            return Err(LimitError::TooLarge(name.to_string(), value));
-        }
         match name {
             "package_entries" => {
-                self.package_entries = usize::try_from(value).unwrap_or(usize::MAX)
+                if too_big {
+                    return Err(LimitError::TooLarge(name.to_string(), value));
+                }
+                self.package_entries = usize::try_from(value).unwrap_or(usize::MAX);
             },
             "package_bytes" => self.package_bytes = value,
             "part_bytes" => self.part_bytes = value,
             "inflate_ratio" => self.inflate_ratio = value,
-            "embedded_depth" => self.embedded_depth = usize::try_from(value).unwrap_or(usize::MAX),
+            "embedded_depth" => {
+                if too_big {
+                    return Err(LimitError::TooLarge(name.to_string(), value));
+                }
+                self.embedded_depth = usize::try_from(value).unwrap_or(usize::MAX);
+            },
             "embedded_packages" => {
-                self.embedded_packages = usize::try_from(value).unwrap_or(usize::MAX)
+                if too_big {
+                    return Err(LimitError::TooLarge(name.to_string(), value));
+                }
+                self.embedded_packages = usize::try_from(value).unwrap_or(usize::MAX);
             },
-            "embedded_bytes" => self.embedded_bytes = value,
-            "text_chars" => self.text_chars = usize::try_from(value).unwrap_or(usize::MAX),
-            "grid_padding_cells" => {
-                self.grid_padding_cells = usize::try_from(value).unwrap_or(usize::MAX)
+            "text_chars" => {
+                if too_big {
+                    return Err(LimitError::TooLarge(name.to_string(), value));
+                }
+                self.text_chars = usize::try_from(value).unwrap_or(usize::MAX);
             },
-            "sheet_grid_padding_cells" => {
-                self.sheet_grid_padding_cells = usize::try_from(value).unwrap_or(usize::MAX)
-            },
-            "inflated_image_bytes" => self.inflated_image_bytes = value,
-            "ir_padding_bytes" => {
-                self.ir_padding_bytes = usize::try_from(value).unwrap_or(usize::MAX)
-            },
-            "sheet_ir_padding_bytes" => {
-                self.sheet_ir_padding_bytes = usize::try_from(value).unwrap_or(usize::MAX)
-            },
-            "image_bytes" => self.image_bytes = usize::try_from(value).unwrap_or(usize::MAX),
-            "total_image_bytes" => self.total_image_bytes = value,
-            "write_bytes" => self.write_bytes = value,
-            "write_sheets" => self.write_sheets = usize::try_from(value).unwrap_or(usize::MAX),
-            "markdown_list_items" => {
-                self.markdown_list_items = usize::try_from(value).unwrap_or(usize::MAX)
-            },
-            "markdown_table_cells" => {
-                self.markdown_table_cells = usize::try_from(value).unwrap_or(usize::MAX)
-            },
-            "markdown_elements" => {
-                self.markdown_elements = usize::try_from(value).unwrap_or(usize::MAX)
-            },
+            "memory_bytes" => self.memory_bytes = value,
             _ => return Err(LimitError::Unknown(name.to_string())),
         }
         Ok(())

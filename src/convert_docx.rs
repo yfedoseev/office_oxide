@@ -483,7 +483,7 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
         last.elements.push(Element::Paragraph(Paragraph {
             content: vec![InlineContent::Text(TextSpan::plain(format!(
                 "[some pictures not shown: together they exceed the {} byte picture budget \
-                 (office_oxide::limits::set_max_image_bytes)]",
+                 (office_oxide::limits::set_max_memory_bytes)]",
                 crate::limits::max_image_bytes()
             )))],
             ..Default::default()
@@ -1371,7 +1371,7 @@ fn linked_image_url(d: &crate::docx::DrawingInfo) -> Option<String> {
 /// holds them.
 ///
 /// The bytes are shared in the document and copied into each IR `Image`;
-/// each copy is charged to the image-byte budget (`limits::set_max_image_bytes`)
+/// each copy is charged to the image-byte budget (`limits::set_max_memory_bytes`)
 /// and, once it is spent, the image keeps its place without its bytes.
 fn embedded_image(
     d: &crate::docx::DrawingInfo,

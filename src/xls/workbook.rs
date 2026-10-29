@@ -2482,7 +2482,7 @@ mod tests {
         assert_eq!(doc.sheets[1].rows.len(), 1, "only what is left of the total");
         let text = doc.plain_text();
         assert!(text.contains("sheet 'Second'"), "{text}");
-        assert!(text.contains("set_max_grid_padding_cells"), "{text}");
+        assert!(text.contains("set_max_memory_bytes"), "{text}");
     }
 
     /// Once the allowance is spent by a sparse sheet, a later sheet whose
@@ -2536,7 +2536,7 @@ mod tests {
     #[test]
     fn test_default_padding_allowance_bounds_the_sparse_worst_case() {
         let slot = std::mem::size_of::<CellValue>() + std::mem::size_of::<u16>();
-        let worst = crate::limits::DEFAULT_MAX_GRID_PADDING_CELLS * slot;
+        let worst = crate::limits::max_grid_padding_cells() * slot;
         assert!(worst <= 640 << 20, "{} MiB of padding at the default allowance", worst >> 20);
         let mut body = Vec::new();
         for r in 0..=u16::MAX - 1 {
@@ -2555,7 +2555,7 @@ mod tests {
         .expect("parses");
         let kept: usize = doc.sheets.iter().map(|s| s.rows.len()).sum();
         assert!(
-            kept * 255 <= crate::limits::DEFAULT_MAX_GRID_PADDING_CELLS + 255 * doc.sheets.len(),
+            kept * 255 <= crate::limits::max_grid_padding_cells() + 255 * doc.sheets.len(),
             "{kept} sparse rows kept"
         );
         assert!(kept < 3 * 65_535, "the allowance cut the sparse sheets");

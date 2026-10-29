@@ -300,7 +300,7 @@ pub struct XlsxWriter {
     defined_names: Vec<crate::ir::DefinedName>,
     /// The names of `sheets`, for making the next one unique.
     names: SheetNames,
-    /// Where the cells of a sheet past [`crate::limits::max_write_sheets`] go
+    /// Where the cells of a sheet past `max_write_sheets` go
     /// (the handle `add_sheet` must return); never written out.
     refused_sheet: Option<SheetDataInner>,
     /// How many sheets were refused; writing the workbook is an error then.
@@ -1019,7 +1019,7 @@ impl XlsxWriter {
     /// collides with an existing sheet gains a numeric suffix rather than
     /// silently replacing it.
     ///
-    /// A workbook holds at most [`crate::limits::max_write_sheets`] sheets.
+    /// A workbook holds at most `max_write_sheets` sheets.
     /// The sheet that would exceed it is not added: the returned handle
     /// writes into a scratch sheet that is discarded, and
     /// [`save`](Self::save) / [`write_to`](Self::write_to) return an error
@@ -1038,7 +1038,7 @@ impl XlsxWriter {
 
     /// Add a sheet and return its 0-based index (for use with index-based API).
     ///
-    /// Past [`crate::limits::max_write_sheets`] no sheet is added and the
+    /// Past `max_write_sheets` no sheet is added and the
     /// returned index is out of range (the index-based setters then return
     /// `false`); writing the workbook is an error. See [`Self::add_sheet`].
     pub fn add_sheet_get_index(&mut self, name: &str) -> usize {
@@ -1166,8 +1166,7 @@ impl XlsxWriter {
     fn write_parts<W: Write + Seek>(&self, opc: &mut OpcWriter<W>) -> Result<()> {
         if self.refused_sheets > 0 {
             return Err(crate::core::Error::PackageLimit(format!(
-                "{} sheets were added beyond the {} a workbook may be written with; the limit is \
-                 office_oxide::limits::set_max_write_sheets",
+                "{} sheets were added beyond the {} a workbook may be written with (Excel's own limit)",
                 self.refused_sheets,
                 crate::limits::max_write_sheets()
             ))

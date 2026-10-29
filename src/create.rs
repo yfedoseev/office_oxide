@@ -121,7 +121,7 @@ fn written_table_cells(table: &Table, format: DocumentFormat) -> usize {
 }
 
 /// What one cell costs the writer for `format`, in bytes (see
-/// [`crate::limits::max_write_bytes`]).
+/// `max_write_bytes`).
 fn bytes_per_cell(format: DocumentFormat) -> u64 {
     match format {
         DocumentFormat::Docx => crate::limits::WRITE_BYTES_PER_DOCX_CELL,
@@ -130,7 +130,7 @@ fn bytes_per_cell(format: DocumentFormat) -> u64 {
     }
 }
 
-/// Refuse a write that would need more than [`crate::limits::max_write_bytes`]
+/// Refuse a write that would need more than `max_write_bytes`
 /// for `cells` cells of `format`, for the IR path and for the writers used
 /// directly alike.
 pub(crate) fn check_write_cells(
@@ -142,7 +142,7 @@ pub(crate) fn check_write_cells(
     if cells.saturating_mul(per_cell) > limit {
         return Err(crate::core::Error::PackageLimit(format!(
             "the document holds more than {} table cells, about {limit} bytes to write as \
-             {format:?}; the limit is office_oxide::limits::set_max_write_bytes",
+             {format:?}; the limit is office_oxide::limits::set_max_memory_bytes",
             limit / per_cell
         )));
     }
@@ -150,8 +150,8 @@ pub(crate) fn check_write_cells(
 }
 
 /// Refuse an IR that exceeds the write limits: more sections than
-/// [`crate::limits::max_write_sheets`] for `.xlsx`, or tables whose cells the
-/// writer would need more than [`crate::limits::max_write_bytes`] to build: the
+/// `max_write_sheets` for `.xlsx`, or tables whose cells the
+/// writer would need more than `max_write_bytes` to build: the
 /// writers build every cell in memory, so the count, weighed by what a cell of
 /// the format costs, is the cost.
 ///
@@ -164,7 +164,7 @@ fn check_write_budget(ir: &DocumentIR, format: DocumentFormat) -> Result<()> {
         if ir.sections.len() > limit {
             return Err(crate::core::Error::PackageLimit(format!(
                 "the document holds {} sections, more than the {limit} worksheets a workbook \
-                 may be written with; the limit is office_oxide::limits::set_max_write_sheets",
+                 may be written with; Excel allows at most 32,767",
                 ir.sections.len()
             ))
             .into());

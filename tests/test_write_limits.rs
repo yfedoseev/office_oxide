@@ -9,9 +9,15 @@ use office_oxide::core::Error as CoreError;
 use office_oxide::create::create_from_ir_to_writer;
 use office_oxide::ir::*;
 use office_oxide::limits::{
-    DEFAULT_MAX_WRITE_BYTES, WRITE_BYTES_PER_DOCX_CELL, WRITE_BYTES_PER_XLSX_CELL, max_write_bytes,
-    max_write_sheets, set_max_write_bytes, set_max_write_sheets,
+    DEFAULT_MAX_MEMORY_BYTES, WRITE_BYTES_PER_DOCX_CELL, WRITE_BYTES_PER_XLSX_CELL,
+    max_memory_bytes, set_max_memory_bytes,
 };
+
+/// The memory budget under which a writer may build `bytes` bytes: the write
+/// estimate is half of the budget.
+fn memory_for_write(bytes: u64) -> u64 {
+    bytes * 2
+}
 
 mod common;
 use common::LimitScope;
@@ -60,7 +66,7 @@ fn write(ir: &DocumentIR, format: DocumentFormat) -> Result<(), OfficeError> {
 #[test]
 fn test_a_table_with_too_many_cells_is_refused_when_writing() {
     let mut limits = LimitScope::new();
-    limits.set(max_write_bytes, set_max_write_bytes, BYTE_LIMIT);
+    limits.set(max_memory_bytes, set_max_memory_bytes, memory_for_write(BYTE_LIMIT));
     for format in [DocumentFormat::Docx, DocumentFormat::Pptx] {
         // A `.pptx` cell weighs about a third of a `.docx` cell to the writer,
         // so the same limit holds three times as many of them.
@@ -75,7 +81,7 @@ fn test_a_table_with_too_many_cells_is_refused_when_writing() {
             matches!(err, OfficeError::Core(CoreError::PackageLimit(_))),
             "{format:?}: {err:?}"
         );
-        assert!(err.to_string().contains("set_max_write_bytes"));
+        assert!(err.to_string().contains("set_max_memory_bytes"));
 
         // Within the limit the document is written as before.
         let small = ir_with(vec![Element::Table(table(5, 5))], format);
@@ -88,7 +94,7 @@ fn test_a_table_with_too_many_cells_is_refused_when_writing() {
 #[test]
 fn test_one_wide_row_among_many_narrow_rows_is_charged_at_the_padded_width() {
     let mut limits = LimitScope::new();
-    limits.set(max_write_bytes, set_max_write_bytes, BYTE_LIMIT);
+    limits.set(max_memory_bytes, set_max_memory_bytes, memory_for_write(BYTE_LIMIT));
     let mut t = table(20, 1);
     t.rows.extend(table(1, 20).rows);
     for format in [DocumentFormat::Docx, DocumentFormat::Pptx] {
@@ -107,7 +113,7 @@ fn test_one_wide_row_among_many_narrow_rows_is_charged_at_the_padded_width() {
 #[test]
 fn test_column_spans_are_charged_as_the_grid_they_widen() {
     let mut limits = LimitScope::new();
-    limits.set(max_write_bytes, set_max_write_bytes, BYTE_LIMIT);
+    limits.set(max_memory_bytes, set_max_memory_bytes, memory_for_write(BYTE_LIMIT));
     let mut t = table(3, 1);
     for row in &mut t.rows {
         row.cells[0].col_span = 100;
@@ -129,7 +135,7 @@ fn test_column_spans_are_charged_as_the_grid_they_widen() {
 #[test]
 fn test_cells_are_counted_across_tables_and_inside_nested_content() {
     let mut limits = LimitScope::new();
-    limits.set(max_write_bytes, set_max_write_bytes, BYTE_LIMIT);
+    limits.set(max_memory_bytes, set_max_memory_bytes, memory_for_write(BYTE_LIMIT));
     // Three 20-cell tables: none is over the limit alone, together they are.
     let three =
         ir_with((0..3).map(|_| Element::Table(table(4, 5))).collect(), DocumentFormat::Docx);
@@ -142,10 +148,12 @@ fn test_cells_are_counted_across_tables_and_inside_nested_content() {
     assert!(write(&nested, DocumentFormat::Docx).is_err());
 }
 
+/// Excel's own limit: 32,767 sheets.
+const MAX_SHEETS: usize = 32_767;
+
 #[test]
 fn test_a_workbook_with_too_many_sections_is_refused_when_writing() {
-    let mut limits = LimitScope::new();
-    limits.set(max_write_sheets, set_max_write_sheets, 3);
+    let _defaults = common::default_limits();
     let sections = |n: usize| DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Xlsx,
@@ -153,32 +161,33 @@ fn test_a_workbook_with_too_many_sections_is_refused_when_writing() {
         },
         sections: (0..n).map(|_| Section::default()).collect(),
     };
-    let err =
-        write(&sections(4), DocumentFormat::Xlsx).expect_err("4 sections exceed a limit of 3");
+    let err = write(&sections(MAX_SHEETS + 1), DocumentFormat::Xlsx)
+        .expect_err("one more section than Excel allows sheets");
     assert!(matches!(err, OfficeError::Core(CoreError::PackageLimit(_))), "{err:?}");
-    assert!(err.to_string().contains("set_max_write_sheets"));
+    assert!(err.to_string().contains("32,767"), "{err}");
     write(&sections(3), DocumentFormat::Xlsx).expect("3 sections are within the limit");
 }
 
 #[test]
 fn test_a_direct_writer_caller_past_the_sheet_limit_gets_an_error() {
     use office_oxide::xlsx::write::{CellData, XlsxWriter};
-    let mut limits = LimitScope::new();
-    limits.set(max_write_sheets, set_max_write_sheets, 3);
+    let _defaults = common::default_limits();
     let mut w = XlsxWriter::new();
-    for i in 0..3 {
+    for i in 0..MAX_SHEETS {
         w.add_sheet(&format!("s{i}"));
     }
-    w.write_to(Cursor::new(Vec::new()))
-        .expect("3 sheets are within the limit");
-    // The fourth is not kept; the handle still accepts writes.
+    // The next is not kept; the handle still accepts writes.
     w.add_sheet("extra")
         .set_cell(0, 0, CellData::String("x".into()));
-    assert_eq!(w.add_sheet_get_index("more"), 3, "no index is handed out past the limit");
+    assert_eq!(
+        w.add_sheet_get_index("more"),
+        MAX_SHEETS,
+        "no index is handed out past the limit"
+    );
     let err = w
         .write_to(Cursor::new(Vec::new()))
         .expect_err("two sheets were refused");
-    assert!(err.to_string().contains("set_max_write_sheets"), "{err}");
+    assert!(err.to_string().contains("32,767") || err.to_string().contains("Excel"), "{err}");
 }
 
 /// What a cell costs the writer differs by format, so the one limit is in
@@ -188,7 +197,7 @@ fn test_a_direct_writer_caller_past_the_sheet_limit_gets_an_error() {
 #[test]
 fn test_a_cell_is_charged_what_its_formats_writer_costs() {
     let mut limits = LimitScope::new();
-    limits.set(max_write_bytes, set_max_write_bytes, BYTE_LIMIT);
+    limits.set(max_memory_bytes, set_max_memory_bytes, memory_for_write(BYTE_LIMIT));
     let hundred = |format| ir_with(vec![Element::Table(table(10, 10))], format);
     assert!(write(&hundred(DocumentFormat::Docx), DocumentFormat::Docx).is_err());
     write(&hundred(DocumentFormat::Pptx), DocumentFormat::Pptx).expect("a pptx cell costs less");
@@ -199,12 +208,16 @@ fn test_a_cell_is_charged_what_its_formats_writer_costs() {
 #[test]
 fn test_a_worksheet_with_too_many_cells_is_refused_when_writing() {
     let mut limits = LimitScope::new();
-    limits.set(max_write_bytes, set_max_write_bytes, 50 * WRITE_BYTES_PER_XLSX_CELL);
-    assert_eq!(max_write_bytes(), 50 * WRITE_BYTES_PER_XLSX_CELL);
+    limits.set(
+        max_memory_bytes,
+        set_max_memory_bytes,
+        memory_for_write(50 * WRITE_BYTES_PER_XLSX_CELL),
+    );
+    assert_eq!(max_memory_bytes(), memory_for_write(50 * WRITE_BYTES_PER_XLSX_CELL));
     let big = ir_with(vec![Element::Table(table(10, 10))], DocumentFormat::Xlsx);
     let err = write(&big, DocumentFormat::Xlsx).expect_err("100 cells exceed a limit of 50");
     assert!(matches!(err, OfficeError::Core(CoreError::PackageLimit(_))), "{err:?}");
-    assert!(err.to_string().contains("set_max_write_bytes"), "{err}");
+    assert!(err.to_string().contains("set_max_memory_bytes"), "{err}");
     // Cells are counted across the workbook's sheets, padded to the widest row.
     let two = DocumentIR {
         metadata: Metadata {
@@ -227,7 +240,7 @@ fn test_a_worksheet_with_too_many_cells_is_refused_when_writing() {
 #[test]
 fn test_the_default_write_limit_leaves_ordinary_documents_alone() {
     let _defaults = common::default_limits();
-    assert_eq!(max_write_bytes(), DEFAULT_MAX_WRITE_BYTES);
+    assert_eq!(max_memory_bytes(), DEFAULT_MAX_MEMORY_BYTES);
     for format in [
         DocumentFormat::Docx,
         DocumentFormat::Pptx,
@@ -246,9 +259,9 @@ fn test_a_writer_used_directly_is_held_to_the_write_limit() {
     use office_oxide::pptx::write::{PptxWriter, Run};
     use office_oxide::xlsx::write::{CellData, XlsxWriter};
     let mut limits = LimitScope::new();
-    limits.set(max_write_bytes, set_max_write_bytes, BYTE_LIMIT);
+    limits.set(max_memory_bytes, set_max_memory_bytes, memory_for_write(BYTE_LIMIT));
     let refused = |err: office_oxide::OfficeError| {
-        assert!(err.to_string().contains("set_max_write_bytes"), "{err}");
+        assert!(err.to_string().contains("set_max_memory_bytes"), "{err}");
     };
 
     // 10 x 10 = 100 cells: past 50 `.docx` cells.
@@ -308,7 +321,7 @@ fn test_save_and_the_other_containers_are_held_to_the_write_limit_too() {
     use office_oxide::docx::write::DocxWriter;
     use office_oxide::pptx::write::{PptxWriter, Run};
     let mut limits = LimitScope::new();
-    limits.set(max_write_bytes, set_max_write_bytes, BYTE_LIMIT);
+    limits.set(max_memory_bytes, set_max_memory_bytes, memory_for_write(BYTE_LIMIT));
     let dir = std::env::temp_dir().join(format!("office_oxide_save_limit_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let docx_path = dir.join("big.docx");
@@ -351,7 +364,7 @@ fn test_a_cell_placed_far_right_is_budgeted_as_the_row_it_makes() {
     // 200 rows of two cells look like 400 cells, but the writer stores each row
     // up to its second cell, 1,001 columns in: about 200,000 slots.
     let mut limits = LimitScope::new();
-    limits.set(max_write_bytes, set_max_write_bytes, 5_000_000);
+    limits.set(max_memory_bytes, set_max_memory_bytes, memory_for_write(5_000_000));
     let ir = ir_with(vec![Element::Table(wide_gap_table(200, 1000))], DocumentFormat::Xlsx);
     let err = write(&ir, DocumentFormat::Xlsx).expect_err("200,000 slots do not fit 5 MB");
     assert!(matches!(err, OfficeError::Core(CoreError::PackageLimit(_))), "{err:?}");

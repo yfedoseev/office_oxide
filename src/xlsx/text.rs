@@ -417,13 +417,13 @@ impl XlsxDocument {
     ///
     /// The allowances that bound the IR's memory are therefore a sheet's,
     /// fresh for each: the empty cells that pad its rows
-    /// ([`limits::max_sheet_ir_padding_bytes`](crate::limits::max_sheet_ir_padding_bytes))
+    /// (`max_sheet_ir_padding_bytes`)
     /// and the picture bytes it copies
-    /// ([`limits::max_image_bytes`](crate::limits::max_image_bytes)). What
+    /// (`max_image_bytes`). What
     /// bounds the run as a whole stays document-wide: the text budget
     /// ([`limits::max_text_chars`](crate::limits::max_text_chars)), which the
     /// padding is charged to as well, and the total of picture bytes copied
-    /// ([`limits::max_total_image_bytes`](crate::limits::max_total_image_bytes)).
+    /// (`max_total_image_bytes`).
     /// A sheet that does not fit its own allowance is cut, with a notice in
     /// the section, a [`SheetIr::warnings`](super::SheetIr::warnings) entry
     /// and [`SheetIr::text_truncated`](super::SheetIr::text_truncated), and

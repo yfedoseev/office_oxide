@@ -15,10 +15,10 @@ use common::{
 };
 use office_oxide::ir::Element;
 use office_oxide::limits::{
-    max_embedded_bytes, max_embedded_depth, max_embedded_packages, max_text_chars,
+    max_embedded_depth, max_embedded_packages, max_package_bytes, max_text_chars,
 };
 use office_oxide::limits::{
-    set_max_embedded_bytes, set_max_embedded_depth, set_max_embedded_packages, set_max_text_chars,
+    set_max_embedded_depth, set_max_embedded_packages, set_max_package_bytes, set_max_text_chars,
 };
 use office_oxide::{Document, DocumentFormat};
 use std::io::Cursor;
@@ -288,7 +288,8 @@ fn test_a_document_without_embedded_objects_is_unchanged() {
 #[test]
 fn test_the_byte_allowance_stops_reading_embedded_documents() {
     let mut scope = LimitScope::new();
-    scope.set(max_embedded_bytes, set_max_embedded_bytes, 16);
+    // Embedded packages may take a quarter of the package budget: 16 bytes.
+    scope.set(max_package_bytes, set_max_package_bytes, 64);
     let doc = open(host(vec![word_object("_1", "never read text")]));
     let text = doc.plain_text();
     assert!(text.contains(PLACEHOLDER) && !text.contains("never read text"), "{text:?}");

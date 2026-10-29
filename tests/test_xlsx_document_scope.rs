@@ -9,7 +9,7 @@ use std::io::{Cursor, Write};
 
 use office_oxide::ir::{Element, Section};
 use office_oxide::limits::{
-    max_ir_padding_bytes, max_text_chars, set_max_ir_padding_bytes, set_max_text_chars,
+    max_memory_bytes, max_text_chars, set_max_memory_bytes, set_max_text_chars,
 };
 use office_oxide::{Document, DocumentFormat};
 
@@ -112,7 +112,8 @@ fn big_dense_padded() -> Vec<u8> {
 #[test]
 fn test_a_sheet_after_the_one_that_spent_the_padding_allowance_is_still_converted() {
     let mut limits = serial();
-    limits.set(max_ir_padding_bytes, set_max_ir_padding_bytes, 1_680 * cell_bytes());
+    // The document-wide padding allowance is half the memory budget.
+    limits.set(max_memory_bytes, set_max_memory_bytes, 2 * (1_680 * cell_bytes()) as u64);
     let ir = open(big_dense_padded()).to_ir();
     let titles: Vec<_> = ir
         .sections
@@ -159,7 +160,8 @@ fn test_a_sheet_after_the_one_that_spent_the_padding_allowance_is_still_converte
 #[test]
 fn test_every_renderer_agrees_the_dense_sheet_is_whole() {
     let mut limits = serial();
-    limits.set(max_ir_padding_bytes, set_max_ir_padding_bytes, 1_680 * cell_bytes());
+    // The document-wide padding allowance is half the memory budget.
+    limits.set(max_memory_bytes, set_max_memory_bytes, 2 * (1_680 * cell_bytes()) as u64);
     let doc = open(big_dense_padded());
     for (name, out) in [
         ("plain_text", doc.plain_text()),

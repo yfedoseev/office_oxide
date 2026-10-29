@@ -199,7 +199,7 @@ impl BlipDiagnostics {
         if self.over_budget > 0 {
             out.push(format!(
                 "{} compressed picture(s) left out: the document's pictures exceed the {} byte \
-                 inflation allowance (office_oxide::limits::set_max_inflated_image_bytes)",
+                 inflation allowance (office_oxide::limits::set_max_memory_bytes)",
                 self.over_budget,
                 crate::limits::max_inflated_image_bytes()
             ));
@@ -253,7 +253,7 @@ fn inflate_metafile(
         diag.over_budget += 1;
         log::warn!(
             "office art: compressed picture of {limit} bytes exceeds the document's \
-             inflated-image allowance (office_oxide::limits::set_max_inflated_image_bytes); skipped"
+             inflated-image allowance (office_oxide::limits::set_max_memory_bytes); skipped"
         );
         return Err(InflateFailure::OverBudget);
     }
@@ -345,7 +345,7 @@ pub(crate) fn extract_one_blip(
 /// than past a sibling of it, so those don't count.
 ///
 /// The compressed metafiles of one call share one allowance of inflated
-/// bytes ([`limits::set_max_inflated_image_bytes`](crate::limits::set_max_inflated_image_bytes)):
+/// bytes ([`limits::set_max_memory_bytes`](crate::limits::set_max_memory_bytes)):
 /// a picture that does not fit is left out. A document has one such stream,
 /// so the allowance is the document's.
 pub fn extract_blip_images(data: &[u8]) -> Vec<BlipImage> {
@@ -812,7 +812,7 @@ pub(crate) mod tests {
         let warnings = diag.warnings();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].starts_with("2 compressed picture(s) left out"), "{warnings:?}");
-        assert!(warnings[0].contains("set_max_inflated_image_bytes"));
+        assert!(warnings[0].contains("set_max_memory_bytes"));
     }
 
     /// A picture whose stream ends early hands back what it did not use.

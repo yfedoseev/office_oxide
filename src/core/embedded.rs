@@ -17,7 +17,7 @@
 //!   ([`crate::limits::max_embedded_packages`]), and a blob reached again by
 //!   another entry name is recognised by its content and not opened again;
 //! * **bytes** — the blobs' sizes, and what opening them inflates, share one
-//!   allowance ([`crate::limits::max_embedded_bytes`]), and an embedded
+//!   allowance (a quarter of [`crate::limits::max_package_bytes`]), and an embedded
 //!   package's own package-byte limit is what is left of it;
 //! * **text** — the text the embedded packages yield is charged to the text
 //!   budget ([`crate::limits::max_text_chars`]); while a package is open, that

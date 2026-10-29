@@ -224,7 +224,7 @@ impl<'d> SheetConverter<'d> {
                 if self.image_budget.exhausted() {
                     warnings.push(format!(
                         "some pictures were left out: the document's pictures exceed the {} byte budget \
-                         (office_oxide::limits::set_max_image_bytes)",
+                         (office_oxide::limits::set_max_memory_bytes)",
                         self.image_budget.limit()
                     ));
                 }
@@ -274,7 +274,7 @@ impl<'d> SheetConverter<'d> {
             if self.image_budget.exhausted() {
                 self.warnings.push(format!(
                     "sheet {name:?}: some pictures were left out: the sheet's pictures exceed the {} \
-                     byte budget (office_oxide::limits::set_max_image_bytes)",
+                     byte budget (office_oxide::limits::set_max_memory_bytes)",
                     self.image_budget.limit()
                 ));
             }
@@ -802,7 +802,7 @@ impl<'d> SheetConverter<'d> {
             combined.push(Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain(format!(
                     "[some pictures not shown: together they exceed the {} byte picture budget \
-                     (office_oxide::limits::set_max_image_bytes)]",
+                     (office_oxide::limits::set_max_memory_bytes)]",
                     image_budget.limit()
                 )))],
                 ..Default::default()
@@ -1193,7 +1193,7 @@ fn charge_picture(
 fn total_image_notice(budget: &crate::limits::TextBudget) -> String {
     format!(
         "[some pictures not shown: the workbook's pictures together exceed the {} byte total \
-         (office_oxide::limits::set_max_total_image_bytes)]",
+         (office_oxide::limits::set_max_memory_bytes)]",
         budget.limit()
     )
 }

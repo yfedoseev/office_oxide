@@ -889,7 +889,8 @@ fn test_docx_to_ir_does_not_keep_a_table_styles_face_name_per_table() {
 #[test]
 fn test_a_markdown_header_row_at_the_cell_limit_stays_within_its_memory_bound() {
     let _serial = serial();
-    let cells = office_oxide::limits::max_markdown_table_cells();
+    // The fixed table-cell limit of the Markdown reader.
+    let cells = 150_000;
     let md = format!("|{}\n|{}\n", "h|".repeat(cells), "-|".repeat(cells));
     let (ir, bytes) = bytes_during(|| {
         office_oxide::DocumentIR::from_markdown(&md, office_oxide::DocumentFormat::Docx)

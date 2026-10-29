@@ -107,7 +107,7 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
 
         // Slide comments are review content that reached no consumer at
         // all. Carry them as endnotes so every renderer sees them.
-        for (i, c) in slide.comments.iter().enumerate() {
+        for (i, c) in slide.comments().enumerate() {
             // Each slide's endnotes are copies of the shared comments: charged
             // to the document's copy budget, so a deck of many slides that name
             // one large comments part cannot multiply it without bound.

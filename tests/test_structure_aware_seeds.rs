@@ -11,10 +11,7 @@ use common::LimitScope;
 use common::ppt::aliasing_deck;
 use common::sparse_xls;
 use office_oxide::ir::Element;
-use office_oxide::limits::{
-    max_grid_padding_cells, max_sheet_grid_padding_cells, set_max_grid_padding_cells,
-    set_max_sheet_grid_padding_cells,
-};
+use office_oxide::limits::{max_memory_bytes, set_max_memory_bytes};
 use office_oxide::{Document, DocumentFormat};
 
 fn generator(seed: u64) -> impl FnMut() -> u64 {
@@ -77,8 +74,9 @@ fn test_ppt_overlapping_containers_are_read_once_and_reported() {
 #[test]
 fn test_xls_sparse_sheets_stay_within_the_padding_allowances() {
     let mut limits = LimitScope::new();
-    limits.set(max_grid_padding_cells, set_max_grid_padding_cells, 3_000);
-    limits.set(max_sheet_grid_padding_cells, set_max_sheet_grid_padding_cells, 1_000);
+    // The padding allowances are fractions of the memory budget: 2,000 cells
+    // for the document and 1,000 for a sheet.
+    limits.set(max_memory_bytes, set_max_memory_bytes, 128_000);
     let mut next = generator(0xD1B5_4A32_D192_ED03);
     for round in 0..60 {
         let mut sheets: Vec<Vec<(u16, u16)>> = vec![Vec::new(); 4];

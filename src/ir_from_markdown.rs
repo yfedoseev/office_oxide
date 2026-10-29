@@ -30,14 +30,14 @@ impl DocumentIR {
     /// assert!(!ir.sections.is_empty());
     /// ```
     ///
-    /// At most [`crate::limits::max_markdown_list_items`] list items are
+    /// At most `max_markdown_list_items` list items are
     /// kept (each is about 250 bytes of IR, from as little as four bytes of
     /// Markdown); the rest are dropped, a notice paragraph ends the last
     /// section, and `Metadata::text_truncated` and a warning say so.
     /// The document as a whole is bounded the same way by
-    /// [`crate::limits::max_markdown_elements`]: past it the rest of the
+    /// `max_markdown_elements`: past it the rest of the
     /// Markdown is not read. Table cells have an allowance of their own,
-    /// [`crate::limits::max_markdown_table_cells`]: the rows of a table past
+    /// `max_markdown_table_cells`: the rows of a table past
     /// it are dropped, with a notice, and the rest of the document is read.
     pub fn from_markdown(markdown: &str, format: DocumentFormat) -> Self {
         Self::from_markdown_with_limits(
@@ -82,22 +82,19 @@ impl DocumentIR {
         let mut notices: Vec<String> = Vec::new();
         if parser.dropped_list_items > 0 {
             notices.push(format!(
-                "[{} list item(s) dropped: the document exceeds the {} list item limit \
-                 (office_oxide::limits::set_max_markdown_list_items)]",
+                "[{} list item(s) dropped: the document exceeds the {} list item limit]",
                 parser.dropped_list_items, max_list_items
             ));
         }
         if parser.dropped_table_rows > 0 {
             notices.push(format!(
-                "[{} table row(s) dropped: the document's tables exceed the {} cell limit \
-                 (office_oxide::limits::set_max_markdown_table_cells)]",
+                "[{} table row(s) dropped: the document's tables exceed the {} cell limit]",
                 parser.dropped_table_rows, max_table_cells
             ));
         }
         if parser.elements_exhausted {
             notices.push(format!(
-                "[the rest of the document was dropped: it exceeds the {max_elements} block \
-                 limit (office_oxide::limits::set_max_markdown_elements)]"
+                "[the rest of the document was dropped: it exceeds the {max_elements} block limit]"
             ));
         }
         for notice in notices {
@@ -1303,7 +1300,7 @@ mod tests {
         // Ten paragraphs, then the notice.
         assert_eq!(block_count(&ir), 11);
         assert!(ir.metadata.text_truncated);
-        assert!(ir.metadata.warnings[0].contains("set_max_markdown_elements"));
+        assert!(ir.metadata.warnings[0].contains("limit"));
         assert!(ir.plain_text().contains("block limit"), "the notice reaches every renderer");
         assert!(!ir.plain_text().contains("late"), "nothing after the cut is read");
     }
@@ -1374,7 +1371,7 @@ mod tests {
         assert!(text.contains("after the table"), "the rest of the document is kept");
         assert!(text.contains("41 table row(s)"), "{text}");
         assert!(ir.metadata.text_truncated);
-        assert!(ir.metadata.warnings[0].contains("set_max_markdown_table_cells"));
+        assert!(ir.metadata.warnings[0].contains("limit"));
     }
 
     /// A first row that alone is over the cell limit leaves no table, and the

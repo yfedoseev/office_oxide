@@ -145,11 +145,13 @@ pub fn handle_tools_call(id: &Value, params: &Value) -> Value {
 /// say) reaches the limit at fewer characters than ASCII does.
 const MAX_EXTRACT_BYTES: usize = 32 * 1024 * 1024;
 
-/// Largest total of image bytes one document conversion may carry, in bytes.
+/// The memory budget one tool call may spend on what a small file can multiply
+/// (see `office_oxide::limits::max_memory_bytes`): 192 MiB, which allows a
+/// picture of 24 MiB.
 ///
 /// Images reach a result only as base64 (`markdown-with-images`, `ir`), which
 /// is four thirds of the bytes, so this keeps them near [`MAX_EXTRACT_BYTES`].
-const MAX_EXTRACT_IMAGE_BYTES: usize = 24 * 1024 * 1024;
+const MAX_EXTRACT_MEMORY_BYTES: u64 = 192 * 1024 * 1024;
 
 /// The options a tool call reads its document under: the library's per-document
 /// budgets brought down to what one tool result can hold.
@@ -180,7 +182,7 @@ fn tool_options(args: &Value) -> office_oxide::options::ParseOptions {
         office_oxide::options::ParseOptions::default()
     };
     options.limits.text_chars = options.limits.text_chars.min(MAX_EXTRACT_BYTES);
-    options.limits.image_bytes = options.limits.image_bytes.min(MAX_EXTRACT_IMAGE_BYTES);
+    options.limits.memory_bytes = options.limits.memory_bytes.min(MAX_EXTRACT_MEMORY_BYTES);
     options
 }
 
@@ -434,17 +436,17 @@ mod tests {
     /// opens documents under the defaults (they hold the read lock) runs
     /// meanwhile, and no tool call lowers the budgets meanwhile.
     struct TestLimits {
-        before: (usize, usize),
+        before: (usize, u64),
         _lock: std::sync::RwLockWriteGuard<'static, ()>,
     }
 
     impl TestLimits {
-        fn bound_to(text_chars: usize, image_bytes: usize) -> Self {
+        fn bound_to(text_chars: usize, memory_bytes: u64) -> Self {
             let lock = LIMITS.write().unwrap_or_else(|e| e.into_inner());
             let before =
-                (office_oxide::limits::max_text_chars(), office_oxide::limits::max_image_bytes());
+                (office_oxide::limits::max_text_chars(), office_oxide::limits::max_memory_bytes());
             office_oxide::limits::set_max_text_chars(text_chars);
-            office_oxide::limits::set_max_image_bytes(image_bytes);
+            office_oxide::limits::set_max_memory_bytes(memory_bytes);
             Self {
                 before,
                 _lock: lock,
@@ -455,7 +457,7 @@ mod tests {
     impl Drop for TestLimits {
         fn drop(&mut self) {
             office_oxide::limits::set_max_text_chars(self.before.0);
-            office_oxide::limits::set_max_image_bytes(self.before.1);
+            office_oxide::limits::set_max_memory_bytes(self.before.1);
         }
     }
 
@@ -511,7 +513,7 @@ mod tests {
             }
         }
         w.save(&path).unwrap();
-        let scope = TestLimits::bound_to(2_000, 1_000);
+        let scope = TestLimits::bound_to(2_000, 8_000);
         let doc = office_oxide::Document::open_with(&path, &tool_options(&json!({}))).unwrap();
         let cut = render(&doc, "markdown", usize::MAX);
         let info = call_info(&json!(1), &json!({ "file_path": path.to_str().unwrap() }));
@@ -540,18 +542,18 @@ mod tests {
     fn test_test_limits_restore_the_limits_when_the_test_inside_it_panics() {
         let _defaults = default_limits();
         let before =
-            (office_oxide::limits::max_text_chars(), office_oxide::limits::max_image_bytes());
+            (office_oxide::limits::max_text_chars(), office_oxide::limits::max_memory_bytes());
         drop(_defaults);
         let panicked = std::panic::catch_unwind(|| {
             let _scope = TestLimits::bound_to(123, 45);
             assert_eq!(office_oxide::limits::max_text_chars(), 123);
-            assert_eq!(office_oxide::limits::max_image_bytes(), 45);
+            assert_eq!(office_oxide::limits::max_memory_bytes(), 45);
             panic!("an assertion inside the scope fails");
         });
         assert!(panicked.is_err());
         let _defaults = default_limits();
         assert_eq!(
-            (office_oxide::limits::max_text_chars(), office_oxide::limits::max_image_bytes()),
+            (office_oxide::limits::max_text_chars(), office_oxide::limits::max_memory_bytes()),
             before
         );
     }
@@ -560,18 +562,18 @@ mod tests {
     /// a lower process-wide budget, and change nothing process-wide.
     #[test]
     fn test_tool_options_cap_the_budgets_without_touching_the_process() {
-        use office_oxide::limits::{max_image_bytes, max_text_chars};
+        use office_oxide::limits::{max_memory_bytes, max_text_chars};
         {
-            let _limits = TestLimits::bound_to(usize::MAX, usize::MAX);
+            let _limits = TestLimits::bound_to(usize::MAX, u64::MAX);
             let options = tool_options(&json!({}));
             assert_eq!(options.limits.text_chars, MAX_EXTRACT_BYTES);
-            assert_eq!(options.limits.image_bytes, MAX_EXTRACT_IMAGE_BYTES);
-            assert_eq!((max_text_chars(), max_image_bytes()), (usize::MAX, usize::MAX));
+            assert_eq!(options.limits.memory_bytes, MAX_EXTRACT_MEMORY_BYTES);
+            assert_eq!((max_text_chars(), max_memory_bytes()), (usize::MAX, u64::MAX));
         }
         let _limits = TestLimits::bound_to(1_000, 500);
         let options = tool_options(&json!({}));
         assert_eq!(
-            (options.limits.text_chars, options.limits.image_bytes),
+            (options.limits.text_chars, options.limits.memory_bytes),
             (1_000, 500),
             "a lower budget is kept"
         );
@@ -624,7 +626,7 @@ mod tests {
     /// them, is not cut short by tiny ones.
     #[test]
     fn test_tool_calls_restore_the_budgets_and_replace_text_ignores_them() {
-        use office_oxide::limits::{max_image_bytes, max_text_chars};
+        use office_oxide::limits::{max_memory_bytes, max_text_chars};
         let dir = scratch_dir("restore");
         let path = dir.join("doc.docx");
         let text = "lorem ipsum ".repeat(200);
@@ -636,7 +638,7 @@ mod tests {
                 handle_tools_call(&json!(1), &json!({ "name": tool, "arguments": arguments }));
             assert!(out["result"]["isError"].is_null(), "{tool}: {out}");
             assert_eq!(
-                (max_text_chars(), max_image_bytes()),
+                (max_text_chars(), max_memory_bytes()),
                 (10_000_000_000, 10_000_000_000),
                 "{tool} left the budgets lowered"
             );

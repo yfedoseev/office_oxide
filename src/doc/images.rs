@@ -20,7 +20,7 @@ use crate::limits::InflateBudget;
 /// Extract images from a DOC Data stream by scanning for BLIP record signatures.
 ///
 /// The stream's compressed metafiles share the document's allowance of
-/// inflated image bytes (`limits::set_max_inflated_image_bytes`).
+/// inflated image bytes (`limits::set_max_memory_bytes`).
 pub fn extract_images(data: &[u8]) -> Vec<DocImage> {
     extract_images_diagnosed(data).0
 }

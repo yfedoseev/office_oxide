@@ -396,8 +396,7 @@ fn test_comment_authors_resolve_for_legacy_and_modern_comments() {
     let doc = pkg.open();
     let authored = |i: usize| -> Vec<(Option<String>, String)> {
         doc.slides[i]
-            .comments
-            .iter()
+            .comments()
             .map(|c| (c.author.clone(), c.text.clone()))
             .collect()
     };

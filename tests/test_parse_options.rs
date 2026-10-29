@@ -263,14 +263,15 @@ fn test_saving_runs_under_the_documents_own_write_limit() {
     let target = dir.join("out.docx");
 
     let mut options = ParseOptions::default();
-    options.limits.write_bytes = 1000;
+    // The write estimate is half the memory budget: 1,000 bytes to write.
+    options.limits.memory_bytes = 2000;
     let limited = open_with(&bytes, &options).unwrap();
     let refused = limited.save_as(&target);
     assert!(refused.is_err(), "100 cells cost far more than 1,000 bytes to write");
 
     let plain = open_with(&bytes, &ParseOptions::default()).unwrap();
     plain.save_as(&target).unwrap();
-    assert_eq!(limits::max_write_bytes(), limits::DEFAULT_MAX_WRITE_BYTES);
+    assert_eq!(limits::max_memory_bytes(), limits::DEFAULT_MAX_MEMORY_BYTES);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

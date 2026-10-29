@@ -32,20 +32,28 @@ fn cell_bytes() -> usize {
 }
 
 /// Picture bytes in the one picture each sheet of the picture workbook draws.
-const PICTURE: usize = 6_000;
+const PICTURE: usize = 200;
 
-/// The document-wide allowance holds one sheet's padding and a half, so the
-/// eager IR is cut in the second sheet; each sheet has the same allowance to
-/// itself, so each fits. A sheet's pictures have room for one picture and a
-/// half, and the whole run for two and a third.
+/// Every bound on copies and padding is a fraction of the memory budget: the
+/// document-wide padding allowance is half of it and a sheet's own the whole.
+/// Here the document-wide allowance holds one sheet's padding and a half, so
+/// the eager IR is cut in the second sheet; a sheet's own allowance is twice
+/// that, so each sheet fits.
 fn set_budgets() -> LimitScope {
     let padding = PADDING_PER_SHEET * 3 / 2 * cell_bytes();
     let mut scope = LimitScope::new();
     scope.set(max_text_chars, set_max_text_chars, 200_000);
-    scope.set(max_ir_padding_bytes, set_max_ir_padding_bytes, padding);
-    scope.set(max_sheet_ir_padding_bytes, set_max_sheet_ir_padding_bytes, padding);
-    scope.set(max_image_bytes, set_max_image_bytes, PICTURE * 3 / 2);
-    scope.set(max_total_image_bytes, set_max_total_image_bytes, (PICTURE * 7 / 3) as u64);
+    scope.set(max_memory_bytes, set_max_memory_bytes, 2 * padding as u64);
+    scope
+}
+
+/// A memory budget under which a picture of [`PICTURE`] bytes fits a sheet's
+/// allowance one and a half times over (an eighth of the budget), and the run
+/// may copy 48 of them (four times the budget).
+fn set_picture_budgets() -> LimitScope {
+    let mut scope = LimitScope::new();
+    scope.set(max_text_chars, set_max_text_chars, 200_000);
+    scope.set(max_memory_bytes, set_max_memory_bytes, 12 * PICTURE as u64);
     scope
 }
 
@@ -210,14 +218,14 @@ fn test_the_sheet_by_sheet_ir_returns_each_sheet_whole() {
 #[test]
 fn test_a_sheet_past_its_own_allowance_is_cut_and_the_next_sheet_is_whole() {
     let _limits = set_budgets();
-    // The middle sheet needs 100 rows of padding, the allowance holds 60.
-    let doc = open(workbook_of_rows(&[ROWS, 100, ROWS], FAR));
+    // The middle sheet needs 200 rows of padding, the allowance holds 120.
+    let doc = open(workbook_of_rows(&[ROWS, 200, ROWS], FAR));
     let items: Vec<_> = doc.as_xlsx().unwrap().sheets_ir().collect();
     assert_eq!(items.len(), 3);
     assert_eq!(table_rows(&items[0].section), ROWS);
     assert!(!items[0].text_truncated);
     let cut = table_rows(&items[1].section);
-    assert!((60..100).contains(&cut), "{cut} rows");
+    assert!((120..200).contains(&cut), "{cut} rows");
     assert!(items[1].text_truncated, "the cut sheet is not flagged");
     assert!(mentions(&items[1].section, "[sheet truncated"), "no notice on the sheet");
     assert!(
@@ -237,7 +245,7 @@ fn test_a_sheet_past_its_own_allowance_is_cut_and_the_next_sheet_is_whole() {
     let html = doc.to_html();
     assert!(html.contains("[sheet truncated"), "HTML names no cause");
     assert!(html.contains(&format!("s3r{ROWS}")));
-    assert!(html.contains("set_max_sheet_ir_padding_bytes"));
+    assert!(html.contains("set_max_memory_bytes"));
 }
 
 /// Every sheet draws one picture of [`PICTURE`] bytes, all from one media part.
@@ -283,28 +291,29 @@ fn images(section: &office_oxide::ir::Section) -> usize {
 
 #[test]
 fn test_a_sheets_pictures_are_its_own_allowance_and_the_run_has_a_total() {
-    let _limits = set_budgets();
-    let doc = open(picture_sheets(4));
-    // Held at once, four pictures of 6,000 bytes do not fit 9,000.
+    let _limits = set_picture_budgets();
+    let doc = open(picture_sheets(60));
+    // Held at once, 60 pictures of 200 bytes do not fit 300.
     let eager = doc.to_ir();
     let eager_images: usize = eager.sections.iter().map(images).sum();
     assert_eq!(eager_images, 1, "the whole-document IR keeps one picture");
     assert!(eager.metadata.text_truncated);
     // One sheet at a time, each picture fits its sheet's allowance, until
-    // the total the run may copy (14,000) is spent: two pictures.
+    // the total the run may copy (9,600 bytes) is spent: 48 pictures.
     let items: Vec<_> = doc.as_xlsx().unwrap().sheets_ir().collect();
     let counts: Vec<usize> = items.iter().map(|i| images(&i.section)).collect();
-    assert_eq!(counts, vec![1, 1, 0, 0], "{counts:?}");
-    assert!(!items[1].text_truncated);
-    assert!(items[2].text_truncated, "the sheet that spent the total is not flagged");
-    assert!(mentions(&items[2].section, "set_max_total_image_bytes"), "no notice");
+    let expected: Vec<usize> = (0..60).map(|i| usize::from(i < 48)).collect();
+    assert_eq!(counts, expected, "{counts:?}");
+    assert!(!items[47].text_truncated);
+    assert!(items[48].text_truncated, "the sheet that spent the total is not flagged");
+    assert!(mentions(&items[48].section, "set_max_memory_bytes"), "no notice");
     assert!(
-        items[2]
+        items[48]
             .warnings
             .iter()
-            .any(|w| w.contains("set_max_total_image_bytes")),
+            .any(|w| w.contains("set_max_memory_bytes")),
         "{:?}",
-        items[2].warnings
+        items[48].warnings
     );
-    assert!(!mentions(&items[3].section, "set_max_total_image_bytes"), "the notice repeats");
+    assert!(!mentions(&items[49].section, "set_max_memory_bytes"), "the notice repeats");
 }

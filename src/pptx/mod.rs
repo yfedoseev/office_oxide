@@ -650,11 +650,7 @@ impl PptxDocument {
                         problems.push((comments_part.clone(), error.clone()));
                     }
                 }
-                parsed.comments = match taken.as_slice() {
-                    [] => parsed.comments,
-                    [only] => std::sync::Arc::clone(only),
-                    several => several.iter().flat_map(|c| c.iter().cloned()).collect(),
-                };
+                parsed.comment_parts = taken.into_iter().map(std::sync::Arc::clone).collect();
                 let chain = b
                     .layout_index
                     .and_then(|i| layout_entries.get(i))
@@ -1473,13 +1469,16 @@ mod part_cache_tests {
         let doc = PptxDocument::from_reader(Cursor::new(shared_comments_package())).unwrap();
         assert_eq!(doc.slides.len(), 3);
         for slide in &doc.slides {
-            let texts: Vec<_> = slide.comments.iter().map(|c| c.text.as_str()).collect();
+            let texts: Vec<_> = slide.comments().map(|c| c.text.as_str()).collect();
             assert_eq!(texts, ["first remark", "second remark"]);
         }
         assert_eq!(slide::COMMENT_PARSES.with(|n| n.get()), 1);
         // Shared, not copied: every slide holds the one allocation.
-        assert!(std::sync::Arc::ptr_eq(&doc.slides[0].comments, &doc.slides[1].comments));
-        assert!(std::sync::Arc::ptr_eq(&doc.slides[0].comments, &doc.slides[2].comments));
+        let first = &doc.slides[0].comment_parts;
+        assert_eq!(first.len(), 1);
+        for other in &doc.slides[1..] {
+            assert!(std::sync::Arc::ptr_eq(&first[0], &other.comment_parts[0]));
+        }
     }
 
     /// Byte-sniffed image formats, used when a relationship target has no

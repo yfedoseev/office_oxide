@@ -223,7 +223,12 @@ fn test_embedded_packages_share_one_byte_allowance() {
     let leaves: Vec<Vec<u8>> = (0..4).map(|i| leaf(&format!("child{i}x"))).collect();
     // Room for two of the packages and not a third.
     let each = leaves[0].len() as u64;
-    scope.set(limits::max_embedded_bytes, limits::set_max_embedded_bytes, each * 2 + each / 2);
+    // Embedded packages share a quarter of the package budget.
+    scope.set(
+        limits::max_package_bytes,
+        limits::set_max_package_bytes,
+        (each * 2 + each / 2) * 4,
+    );
     let inner: Vec<(&Vec<u8>, usize)> = leaves.iter().map(|l| (l, 1)).collect();
     let doc = open(docx_embedding("top", &inner));
     let text = doc.plain_text();
@@ -316,9 +321,9 @@ fn test_one_blob_under_several_names_is_read_and_copied_once() {
     let mut scope = LimitScope::new();
     let blob = leaf("shared child");
     scope.set(
-        limits::max_embedded_bytes,
-        limits::set_max_embedded_bytes,
-        blob.len() as u64 * 5 / 2,
+        limits::max_package_bytes,
+        limits::set_max_package_bytes,
+        blob.len() as u64 * 5 / 2 * 4,
     );
     scope.set(limits::max_embedded_packages, limits::set_max_embedded_packages, 1);
     let doc = open(docx_embedding("top", &[(&blob, 5)]));

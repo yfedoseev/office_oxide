@@ -78,9 +78,11 @@ pub struct Slide {
     /// content is still extracted, but a consumer can now tell that the
     /// author excluded it, which was impossible before.
     pub hidden: bool,
-    /// Comments attached to this slide, from `ppt/comments/*.xml`. Shared:
-    /// every slide that names one comments part holds the same allocation.
-    pub comments: std::sync::Arc<[SlideComment]>,
+    /// The comments parts this slide names, from `ppt/comments/*.xml`, each
+    /// shared: every slide that names a part holds the same allocation, and a
+    /// slide that names several holds each, never a concatenation of them. Read
+    /// them through [`Slide::comments`].
+    pub comment_parts: Vec<std::sync::Arc<[SlideComment]>>,
     /// Why this slide's part could not be read, when it could not. The
     /// slide keeps its place in the deck with no content, so every
     /// renderer can show a notice where it was; the part and the reason are
@@ -112,6 +114,12 @@ fn make_content_reader(xml_data: &[u8]) -> quick_xml::Reader<&[u8]> {
 }
 
 impl Slide {
+    /// Every comment on this slide, part by part in the order the slide names
+    /// them.
+    pub fn comments(&self) -> impl Iterator<Item = &SlideComment> {
+        self.comment_parts.iter().flat_map(|part| part.iter())
+    }
+
     /// Parse a slide from its XML data.
     ///
     /// `media` maps an image relationship id to its bytes and format;
@@ -160,7 +168,7 @@ impl Slide {
             notes: None,
             background_rgb,
             hidden,
-            comments: Vec::new().into(),
+            comment_parts: Vec::new(),
             parse_error: None,
             layout_index: None,
             hide_master_shapes,
