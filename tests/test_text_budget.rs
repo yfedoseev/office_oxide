@@ -213,12 +213,10 @@ fn test_docx_ir_stops_copying_a_shared_header_at_the_budget() {
     );
 }
 
-/// The default is one flat number: a tiny workbook and a larger one are cut at
-/// the same place, whatever the size of the file. A bound that moved with the
-/// input would cut genuine small files and still let a large crafted one
-/// through (see `DEFAULT_MAX_TEXT_CHARS`).
+/// A configured limit is the ceiling for every input, whatever its size and
+/// whatever the floor a small input would otherwise get.
 #[test]
-fn test_the_budget_does_not_depend_on_the_size_of_the_input() {
+fn test_a_configured_ceiling_applies_to_every_input_size() {
     let mut limits = LimitScope::new();
     limits.set(max_text_chars, set_max_text_chars, BUDGET);
     let small = xlsx_fan_out(3);
@@ -243,4 +241,78 @@ fn test_the_truncation_notice_names_the_setter() {
         "{}",
         &text[text.len().saturating_sub(300)..]
     );
+}
+
+/// A workbook whose one shared string of `chars` characters is named by
+/// `cells` cells, plus `padding` incompressible bytes in a part nothing reads.
+/// Deflated, the character data costs a few KB however long it is.
+fn xlsx_big_string(chars: usize, cells: usize, padding: usize) -> Vec<u8> {
+    let big = "x".repeat(chars);
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let deflated: zip::write::FileOptions<'_, '_, ()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let stored: zip::write::FileOptions<'_, '_, ()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let mut row = String::from(
+        r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>"#,
+    );
+    for r in 1..=cells {
+        row.push_str(&format!(r#"<row r="{r}"><c r="A{r}" t="s"><v>0</v></c></row>"#));
+    }
+    row.push_str("</sheetData></worksheet>");
+    let parts: Vec<(&str, String)> = vec![
+        ("[Content_Types].xml", r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#.into()),
+        ("_rels/.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#.into()),
+        ("xl/workbook.xml", r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#.into()),
+        ("xl/_rels/workbook.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>"#.into()),
+        ("xl/sharedStrings.xml", format!(r#"<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1"><si><t>{big}</t></si></sst>"#)),
+        ("xl/worksheets/sheet1.xml", row),
+    ];
+    for (name, data) in parts {
+        zip.start_file(name, deflated).unwrap();
+        zip.write_all(data.as_bytes()).unwrap();
+    }
+    if padding > 0 {
+        let mut state = 0x9E37_79B9u32;
+        let noise: Vec<u8> = (0..padding)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        zip.start_file("customXml/unused.bin", stored).unwrap();
+        zip.write_all(&noise).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+/// A tiny file is bounded by the floor, not by the whole limit: 3,000 cells of
+/// a 32,000-character string (a cell holds at most 32,767) would be 96 million
+/// characters, more than the floor of 64 Mi and far less than the 256 Mi limit.
+#[test]
+fn test_a_small_input_is_bounded_by_the_floor_not_the_whole_limit() {
+    let _defaults = common::default_limits();
+    let bytes = xlsx_big_string(32_000, 3_000, 0);
+    assert!(bytes.len() < 64 * 1024, "the fixture must be a small file: {}", bytes.len());
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx).unwrap();
+    let text = doc.plain_text();
+    let chars = text.matches('x').count();
+    assert!(
+        (60_000_000..=office_oxide::limits::TEXT_BUDGET_FLOOR_CHARS).contains(&chars),
+        "{chars}"
+    );
+    assert!(text.contains("set_max_text_chars"), "the cut is reported");
+}
+
+/// The same text from a file of 64 KB or more is bounded by the limit alone
+/// (96 million characters fit under 256 Mi), so nothing is cut.
+#[test]
+fn test_a_larger_input_is_bounded_by_the_limit() {
+    let _defaults = common::default_limits();
+    let bytes = xlsx_big_string(32_000, 3_000, 80 * 1024);
+    assert!(bytes.len() >= 64 * 1024);
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx).unwrap();
+    let text = doc.plain_text();
+    assert_eq!(text.matches('x').count(), 96_000_000);
+    assert!(!text.contains("set_max_text_chars"));
 }

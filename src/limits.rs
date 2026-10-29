@@ -159,15 +159,62 @@ pub fn set_max_embedded_bytes(bytes: u64) {
 
 /// The default per-document text budget: 256 Mi characters.
 ///
-/// The default is one flat number, not a multiple of the input's size. The
-/// size of the input is not known where the text is copied (a reader hands the
-/// converters parsed parts, not the file), and a repeated shared string or an
-/// embedded package legitimately turns a small file into far more text than
-/// its size: a bound that moved with the file would cut genuine small files
-/// and still let a large crafted one through. A flat bound is predictable;
-/// a process that reads only small documents lowers it with
-/// [`set_max_text_chars`], one that reads huge workbooks raises it.
+/// The budget scales *down* with a small input. A document opened through
+/// [`crate::Document`] knows the size of the file it came from, and its text is
+/// bounded by the larger of [`TEXT_BUDGET_FLOOR_CHARS`] (64 Mi characters, which
+/// no genuine small document comes near) and [`TEXT_BUDGET_CHARS_PER_INPUT_BYTE`]
+/// (4,096) characters per byte of input, and never by more than this limit. So
+/// a file under 64 KB cannot produce more than the floor, where before it could
+/// produce all 256 Mi characters; a larger file is bounded by this limit as
+/// before. Raising or lowering the limit with [`set_max_text_chars`] still
+/// sets the ceiling. The readers of a single format used directly (for instance
+/// `XlsxDocument::plain_text`) do not know the file's size and use the limit
+/// as it is.
 pub const DEFAULT_MAX_TEXT_CHARS: usize = 256 << 20;
+
+/// The least a small input is allowed to produce: 64 Mi characters.
+pub const TEXT_BUDGET_FLOOR_CHARS: usize = 64 << 20;
+
+/// The characters an input may produce for each of its bytes before the limit
+/// ([`DEFAULT_MAX_TEXT_CHARS`]) applies: 4,096.
+pub const TEXT_BUDGET_CHARS_PER_INPUT_BYTE: u64 = 4096;
+
+thread_local! {
+    /// The size of the input file of the document being opened or converted
+    /// on this thread (see [`InputSizeScope`]).
+    static INPUT_BYTES: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// While alive, text budgets created on this thread scale with an input of
+/// `bytes` bytes. Restores what it replaced when dropped.
+#[must_use = "the scale ends as soon as the scope is dropped; bind it for the length of the conversion"]
+pub(crate) struct InputSizeScope(Option<u64>);
+
+impl InputSizeScope {
+    /// An input of `bytes` bytes; `0` is an unknown size and changes nothing.
+    pub(crate) fn new(bytes: u64) -> Self {
+        let previous = INPUT_BYTES.with(|c| c.get());
+        if bytes > 0 {
+            INPUT_BYTES.with(|c| c.set(Some(bytes)));
+        }
+        Self(previous)
+    }
+}
+
+impl Drop for InputSizeScope {
+    fn drop(&mut self) {
+        INPUT_BYTES.with(|c| c.set(self.0));
+    }
+}
+
+/// The text budget for an input of `input` bytes (when known) under the
+/// ceiling `limit`.
+fn text_limit_for_input(limit: usize, input: Option<u64>) -> usize {
+    let Some(bytes) = input else { return limit };
+    let scaled = bytes.saturating_mul(TEXT_BUDGET_CHARS_PER_INPUT_BYTE);
+    let scaled = usize::try_from(scaled).unwrap_or(usize::MAX);
+    limit.min(scaled.max(TEXT_BUDGET_FLOOR_CHARS))
+}
 
 static MAX_TEXT_CHARS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_TEXT_CHARS);
 
@@ -830,9 +877,8 @@ pub(crate) fn image_budget_notice() -> Option<String> {
 /// The writers build every cell in memory; a million-cell table took
 /// 2.2 GB to write, about 2 KB a cell, so 250,000 cells is about half a
 /// gigabyte. Genuine tables in these formats stay far below this. A worksheet
-/// is not counted: the `.xlsx` writer costs well under 0.3 KB a cell on top
-/// of the IR it is handed (measured at 250,000, 1,000,000 and 2,000,000
-/// cells), so a worksheet is bounded by [`max_write_sheets`] alone.
+/// is bounded by [`max_write_sheet_cells`] instead, which is far higher
+/// because the `.xlsx` writer costs far less a cell.
 pub const DEFAULT_MAX_WRITE_TABLE_CELLS: usize = 250_000;
 
 static MAX_WRITE_TABLE_CELLS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_WRITE_TABLE_CELLS);
@@ -847,6 +893,32 @@ pub fn max_write_table_cells() -> usize {
 /// disables the bound.
 pub fn set_max_write_table_cells(cells: usize) {
     MAX_WRITE_TABLE_CELLS.store(cells, Ordering::Relaxed);
+}
+
+/// The default most cells one IR may hold when it is written to `.xlsx`:
+/// 10,000,000.
+///
+/// A worksheet is not counted against [`max_write_table_cells`]: the `.xlsx`
+/// writer costs well under 0.3 KB a cell on top of the IR it is handed
+/// (measured at 250,000, 1,000,000 and 2,000,000 cells), so the limit for a
+/// document, which has to hold the IR already, is two orders higher: ten
+/// million cells is about 1.5 GB for the writer and a workbook of some 25 MB.
+/// Excel's own sheet is 17 billion cells; a process that writes more raises
+/// the limit with [the setter](set_max_write_sheet_cells).
+pub const DEFAULT_MAX_WRITE_SHEET_CELLS: usize = 10_000_000;
+
+static MAX_WRITE_SHEET_CELLS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_WRITE_SHEET_CELLS);
+
+/// The most cells (padded to each table's widest row) an IR written to `.xlsx`
+/// may hold before the write is refused.
+pub fn max_write_sheet_cells() -> usize {
+    MAX_WRITE_SHEET_CELLS.load(Ordering::Relaxed)
+}
+
+/// Set the worksheet-cell limit for every write afterwards. `usize::MAX`
+/// disables the bound.
+pub fn set_max_write_sheet_cells(cells: usize) {
+    MAX_WRITE_SHEET_CELLS.store(cells, Ordering::Relaxed);
 }
 
 /// The default most worksheets an IR written to `.xlsx` may hold: 32,767.
@@ -949,7 +1021,7 @@ pub(crate) struct TextBudget {
 impl TextBudget {
     /// A fresh budget at the configured limit.
     pub(crate) fn new() -> Self {
-        Self::with_limit(max_text_chars())
+        Self::with_limit(text_limit_for_input(max_text_chars(), INPUT_BYTES.with(|c| c.get())))
     }
 
     pub(crate) fn with_limit(total: usize) -> Self {
@@ -1092,6 +1164,45 @@ pub(crate) fn classify_style_name(raw: &str) -> StyleName {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_a_small_input_gets_the_floor_and_a_large_one_the_limit() {
+        let limit = DEFAULT_MAX_TEXT_CHARS;
+        // Unknown size: the limit as it is.
+        assert_eq!(text_limit_for_input(limit, None), limit);
+        // A tiny input gets the floor, not the whole limit.
+        assert_eq!(text_limit_for_input(limit, Some(1)), TEXT_BUDGET_FLOOR_CHARS);
+        assert_eq!(text_limit_for_input(limit, Some(10_000)), TEXT_BUDGET_FLOOR_CHARS);
+        // 64 KB is where 4,096 characters a byte reaches the limit.
+        let at = limit as u64 / TEXT_BUDGET_CHARS_PER_INPUT_BYTE;
+        assert_eq!(text_limit_for_input(limit, Some(at)), limit);
+        assert_eq!(text_limit_for_input(limit, Some(at * 1000)), limit);
+        // Between the two it scales.
+        let mid = TEXT_BUDGET_FLOOR_CHARS as u64 / TEXT_BUDGET_CHARS_PER_INPUT_BYTE * 2;
+        assert_eq!(
+            text_limit_for_input(limit, Some(mid)),
+            mid as usize * TEXT_BUDGET_CHARS_PER_INPUT_BYTE as usize
+        );
+        // A configured ceiling below the floor is the ceiling.
+        assert_eq!(text_limit_for_input(1000, Some(1)), 1000);
+        // No overflow with an absurd size or limit.
+        assert_eq!(text_limit_for_input(usize::MAX, Some(u64::MAX)), usize::MAX);
+    }
+
+    #[test]
+    fn test_the_input_scope_applies_to_budgets_and_restores() {
+        let _lock = test_support::LimitScope::new();
+        assert_eq!(TextBudget::new().total, max_text_chars());
+        {
+            let _scope = InputSizeScope::new(100);
+            assert_eq!(TextBudget::new().total, max_text_chars().min(TEXT_BUDGET_FLOOR_CHARS));
+            {
+                let _unknown = InputSizeScope::new(0);
+                assert_eq!(TextBudget::new().total, max_text_chars().min(TEXT_BUDGET_FLOOR_CHARS));
+            }
+        }
+        assert_eq!(TextBudget::new().total, max_text_chars());
+    }
 
     #[test]
     fn test_an_allowance_spends_what_is_left_on_a_refusal_and_refills_for_the_next_owner() {

@@ -9,7 +9,8 @@ use office_oxide::core::Error as CoreError;
 use office_oxide::create::create_from_ir_to_writer;
 use office_oxide::ir::*;
 use office_oxide::limits::{
-    max_write_sheets, max_write_table_cells, set_max_write_sheets, set_max_write_table_cells,
+    max_write_sheet_cells, max_write_sheets, max_write_table_cells, set_max_write_sheet_cells,
+    set_max_write_sheets, set_max_write_table_cells,
 };
 
 mod common;
@@ -173,9 +174,10 @@ fn test_a_direct_writer_caller_past_the_sheet_limit_gets_an_error() {
 }
 
 /// The `.docx` and `.pptx` writers cost a couple of kilobytes a table cell,
-/// which is why they are counted; the `.xlsx` writer's cost is a small
-/// multiple of the IR it is handed, so a worksheet is bounded by the sheet
-/// limit alone and the table-cell limit does not apply to it.
+/// which is why a table is held to 250,000; the `.xlsx` writer's cost is a
+/// small multiple of the IR it is handed, so a worksheet has a limit of its
+/// own, far higher (`max_write_sheet_cells`), and the table-cell limit does
+/// not apply to it.
 #[test]
 fn test_the_table_cell_limit_does_not_apply_to_a_worksheet() {
     let mut limits = LimitScope::new();
@@ -184,4 +186,40 @@ fn test_the_table_cell_limit_does_not_apply_to_a_worksheet() {
     write(&sheet, DocumentFormat::Xlsx).expect("100 cells in a worksheet are written");
     let doc = ir_with(vec![Element::Table(table(10, 10))], DocumentFormat::Docx);
     assert!(write(&doc, DocumentFormat::Docx).is_err());
+}
+
+#[test]
+fn test_a_worksheet_with_too_many_cells_is_refused_when_writing() {
+    let mut limits = LimitScope::new();
+    limits.set(max_write_sheet_cells, set_max_write_sheet_cells, CELL_LIMIT);
+    assert_eq!(max_write_sheet_cells(), CELL_LIMIT);
+    let big = ir_with(vec![Element::Table(table(10, 10))], DocumentFormat::Xlsx);
+    let err = write(&big, DocumentFormat::Xlsx).expect_err("100 cells exceed a limit of 50");
+    assert!(matches!(err, OfficeError::Core(CoreError::PackageLimit(_))), "{err:?}");
+    assert!(err.to_string().contains("set_max_write_sheet_cells"), "{err}");
+    // Cells are counted across the workbook's sheets, padded to the widest row.
+    let two = DocumentIR {
+        metadata: Metadata {
+            format: DocumentFormat::Xlsx,
+            ..Default::default()
+        },
+        sections: (0..2)
+            .map(|_| Section {
+                elements: vec![Element::Table(table(4, 7))],
+                ..Default::default()
+            })
+            .collect(),
+    };
+    assert!(write(&two, DocumentFormat::Xlsx).is_err(), "56 cells exceed a limit of 50");
+    // Within the limit the workbook is written as before.
+    let small = ir_with(vec![Element::Table(table(5, 5))], DocumentFormat::Xlsx);
+    write(&small, DocumentFormat::Xlsx).expect("25 cells are within a limit of 50");
+}
+
+#[test]
+fn test_the_default_worksheet_limit_leaves_ordinary_workbooks_alone() {
+    let _defaults = common::default_limits();
+    assert_eq!(max_write_sheet_cells(), 10_000_000);
+    let sheet = ir_with(vec![Element::Table(table(1_000, 20))], DocumentFormat::Xlsx);
+    write(&sheet, DocumentFormat::Xlsx).expect("20,000 cells are written");
 }

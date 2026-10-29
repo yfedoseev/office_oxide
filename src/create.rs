@@ -68,8 +68,9 @@ fn written_table_cells(table: &Table, format: DocumentFormat) -> usize {
 
 /// Refuse an IR that exceeds the write limits: more sections than
 /// [`crate::limits::max_write_sheets`] for `.xlsx`, or tables holding more cells than
-/// [`crate::limits::max_write_table_cells`]: the `.docx` and `.pptx`
-/// writers build every cell in memory, so the count is the cost.
+/// [`crate::limits::max_write_table_cells`] (`.docx`, `.pptx`) or
+/// [`crate::limits::max_write_sheet_cells`] (`.xlsx`): the writers build every
+/// cell in memory, so the count is the cost.
 ///
 /// Counted with an explicit stack: the IR is `Deserialize` and can nest
 /// deeper than the call stack allows.
@@ -86,10 +87,15 @@ fn check_write_budget(ir: &DocumentIR, format: DocumentFormat) -> Result<()> {
             .into());
         }
     }
-    if !matches!(format, DocumentFormat::Docx | DocumentFormat::Pptx) {
-        return Ok(());
-    }
-    let limit = crate::limits::max_write_table_cells();
+    let (limit, setter) = match format {
+        DocumentFormat::Docx | DocumentFormat::Pptx => {
+            (crate::limits::max_write_table_cells(), "set_max_write_table_cells")
+        },
+        DocumentFormat::Xlsx => {
+            (crate::limits::max_write_sheet_cells(), "set_max_write_sheet_cells")
+        },
+        _ => return Ok(()),
+    };
     let mut cells = 0usize;
     let mut stack: Vec<&[Element]> = Vec::new();
     for s in &ir.sections {
@@ -127,7 +133,7 @@ fn check_write_budget(ir: &DocumentIR, format: DocumentFormat) -> Result<()> {
                     if cells > limit {
                         return Err(crate::core::Error::PackageLimit(format!(
                             "the document holds more than {limit} table cells; the limit is \
-                             office_oxide::limits::set_max_write_table_cells"
+                             office_oxide::limits::{setter}"
                         ))
                         .into());
                     }

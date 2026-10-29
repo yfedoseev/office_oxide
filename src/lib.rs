@@ -312,6 +312,15 @@ fn cfb_stream_format<R: Read + Seek>(reader: &mut R) -> Option<DocumentFormat> {
 }
 
 /// Dispatch a method call to the inner document type across all variants.
+/// The length of `reader`'s data (0 when it cannot be told), leaving the
+/// position where it was.
+fn stream_len<R: Seek>(reader: &mut R) -> u64 {
+    let here = reader.stream_position().unwrap_or(0);
+    let end = reader.seek(std::io::SeekFrom::End(0)).unwrap_or(0);
+    let _ = reader.seek(std::io::SeekFrom::Start(here));
+    end
+}
+
 macro_rules! dispatch_inner {
     ($self:expr, $method:ident) => {
         match &$self.inner {
@@ -328,6 +337,10 @@ macro_rules! dispatch_inner {
 /// A unified document handle supporting DOCX, XLSX, PPTX, DOC, XLS, and PPT formats.
 pub struct Document {
     inner: DocumentInner,
+    /// The size of the file the document was read from, when it is known (0
+    /// when it is not): small inputs get a text budget scaled to them (see
+    /// [`limits::DEFAULT_MAX_TEXT_CHARS`]).
+    input_bytes: u64,
 }
 
 enum DocumentInner {
@@ -340,6 +353,19 @@ enum DocumentInner {
 }
 
 impl Document {
+    fn new(inner: DocumentInner) -> Self {
+        Self {
+            inner,
+            input_bytes: 0,
+        }
+    }
+
+    /// This document read from `bytes` bytes of input.
+    fn from_input(mut self, bytes: u64) -> Self {
+        self.input_bytes = bytes;
+        self
+    }
+
     /// The parts of this OOXML document that could not be read, as `(part,
     /// reason)`, for the document that embeds it to report: its text carries
     /// the in-band notices already, but its warnings do not. Bounded as the
@@ -369,7 +395,11 @@ impl Document {
     #[must_use = "opening a document allocates — use the returned handle or drop it"]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_owned();
-        with_parse_stack(move || Self::open_inner(&path))
+        let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+        with_parse_stack(move || {
+            let _scale = limits::InputSizeScope::new(bytes);
+            Self::open_inner(&path).map(|doc| doc.from_input(bytes))
+        })
     }
 
     fn open_inner(path: &Path) -> Result<Self> {
@@ -416,21 +446,15 @@ impl Document {
         match format {
             DocumentFormat::Docx => {
                 let doc = docx::DocxDocument::open(path)?;
-                Ok(Self {
-                    inner: DocumentInner::Docx(Box::new(doc)),
-                })
+                Ok(Self::new(DocumentInner::Docx(Box::new(doc))))
             },
             DocumentFormat::Xlsx => {
                 let doc = xlsx::XlsxDocument::open(path)?;
-                Ok(Self {
-                    inner: DocumentInner::Xlsx(Box::new(doc)),
-                })
+                Ok(Self::new(DocumentInner::Xlsx(Box::new(doc))))
             },
             DocumentFormat::Pptx => {
                 let doc = pptx::PptxDocument::open(path)?;
-                Ok(Self {
-                    inner: DocumentInner::Pptx(Box::new(doc)),
-                })
+                Ok(Self::new(DocumentInner::Pptx(Box::new(doc))))
             },
             DocumentFormat::Doc | DocumentFormat::Xls | DocumentFormat::Ppt => {
                 match Self::open_legacy(path, format) {
@@ -458,15 +482,13 @@ impl Document {
 
     fn open_legacy(path: &Path, format: DocumentFormat) -> Result<Self> {
         Ok(match format {
-            DocumentFormat::Doc => Self {
-                inner: DocumentInner::Doc(Box::new(doc::DocDocument::open(path)?)),
+            DocumentFormat::Doc => {
+                Self::new(DocumentInner::Doc(Box::new(doc::DocDocument::open(path)?)))
             },
-            DocumentFormat::Xls => Self {
-                inner: DocumentInner::Xls(Box::new(xls::XlsDocument::open(path)?)),
+            DocumentFormat::Xls => {
+                Self::new(DocumentInner::Xls(Box::new(xls::XlsDocument::open(path)?)))
             },
-            _ => Self {
-                inner: DocumentInner::Ppt(Box::new(ppt::PptDocument::open(path)?)),
-            },
+            _ => Self::new(DocumentInner::Ppt(Box::new(ppt::PptDocument::open(path)?))),
         })
     }
 
@@ -474,6 +496,8 @@ impl Document {
     #[cfg(feature = "mmap")]
     pub fn open_mmap(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        let bytes = std::fs::metadata(path).map_or(0, |m| m.len());
+        let _scale = limits::InputSizeScope::new(bytes);
         let format = DocumentFormat::from_path(path).ok_or_else(|| {
             OfficeError::UnsupportedFormat(
                 path.extension()
@@ -486,21 +510,15 @@ impl Document {
         match format {
             DocumentFormat::Docx => {
                 let doc = docx::DocxDocument::open_mmap(path)?;
-                Ok(Self {
-                    inner: DocumentInner::Docx(Box::new(doc)),
-                })
+                Ok(Self::new(DocumentInner::Docx(Box::new(doc))).from_input(bytes))
             },
             DocumentFormat::Xlsx => {
                 let doc = xlsx::XlsxDocument::open_mmap(path)?;
-                Ok(Self {
-                    inner: DocumentInner::Xlsx(Box::new(doc)),
-                })
+                Ok(Self::new(DocumentInner::Xlsx(Box::new(doc))).from_input(bytes))
             },
             DocumentFormat::Pptx => {
                 let doc = pptx::PptxDocument::open_mmap(path)?;
-                Ok(Self {
-                    inner: DocumentInner::Pptx(Box::new(doc)),
-                })
+                Ok(Self::new(DocumentInner::Pptx(Box::new(doc))).from_input(bytes))
             },
             _ => Err(OfficeError::UnsupportedFormat(format!("{format:?}"))),
         }
@@ -512,7 +530,12 @@ impl Document {
         reader: R,
         format: DocumentFormat,
     ) -> Result<Self> {
-        with_parse_stack(move || Self::from_reader_inner(reader, format))
+        with_parse_stack(move || {
+            let mut reader = reader;
+            let bytes = stream_len(&mut reader);
+            let _scale = limits::InputSizeScope::new(bytes);
+            Self::from_reader_inner(reader, format).map(|doc| doc.from_input(bytes))
+        })
     }
 
     /// Open a package embedded in a document, charging it to that document's
@@ -521,7 +544,12 @@ impl Document {
         reader: R,
         format: DocumentFormat,
     ) -> Result<Self> {
-        with_nested_parse_stack(move || Self::from_reader_inner(reader, format))
+        with_nested_parse_stack(move || {
+            let mut reader = reader;
+            let bytes = stream_len(&mut reader);
+            let _scale = limits::InputSizeScope::new(bytes);
+            Self::from_reader_inner(reader, format).map(|doc| doc.from_input(bytes))
+        })
     }
 
     fn from_reader_inner<R: Read + Seek>(mut reader: R, format: DocumentFormat) -> Result<Self> {
@@ -545,21 +573,15 @@ impl Document {
         match format {
             DocumentFormat::Docx => {
                 let doc = docx::DocxDocument::from_reader(reader)?;
-                Ok(Self {
-                    inner: DocumentInner::Docx(Box::new(doc)),
-                })
+                Ok(Self::new(DocumentInner::Docx(Box::new(doc))))
             },
             DocumentFormat::Xlsx => {
                 let doc = xlsx::XlsxDocument::from_reader(reader)?;
-                Ok(Self {
-                    inner: DocumentInner::Xlsx(Box::new(doc)),
-                })
+                Ok(Self::new(DocumentInner::Xlsx(Box::new(doc))))
             },
             DocumentFormat::Pptx => {
                 let doc = pptx::PptxDocument::from_reader(reader)?;
-                Ok(Self {
-                    inner: DocumentInner::Pptx(Box::new(doc)),
-                })
+                Ok(Self::new(DocumentInner::Pptx(Box::new(doc))))
             },
             DocumentFormat::Doc | DocumentFormat::Xls | DocumentFormat::Ppt => {
                 match Self::legacy_from_reader(&mut reader, format) {
@@ -582,15 +604,13 @@ impl Document {
             .seek(std::io::SeekFrom::Start(0))
             .map_err(core::Error::from)?;
         Ok(match format {
-            DocumentFormat::Doc => Self {
-                inner: DocumentInner::Doc(Box::new(doc::DocDocument::from_reader(reader)?)),
+            DocumentFormat::Doc => {
+                Self::new(DocumentInner::Doc(Box::new(doc::DocDocument::from_reader(reader)?)))
             },
-            DocumentFormat::Xls => Self {
-                inner: DocumentInner::Xls(Box::new(xls::XlsDocument::from_reader(reader)?)),
+            DocumentFormat::Xls => {
+                Self::new(DocumentInner::Xls(Box::new(xls::XlsDocument::from_reader(reader)?)))
             },
-            _ => Self {
-                inner: DocumentInner::Ppt(Box::new(ppt::PptDocument::from_reader(reader)?)),
-            },
+            _ => Self::new(DocumentInner::Ppt(Box::new(ppt::PptDocument::from_reader(reader)?))),
         })
     }
 
@@ -608,11 +628,13 @@ impl Document {
 
     /// Extract plain text using the format-specific implementation.
     pub fn plain_text(&self) -> String {
+        let _scale = limits::InputSizeScope::new(self.input_bytes);
         dispatch_inner!(self, plain_text)
     }
 
     /// Convert to markdown using the format-specific implementation.
     pub fn to_markdown(&self) -> String {
+        let _scale = limits::InputSizeScope::new(self.input_bytes);
         dispatch_inner!(self, to_markdown)
     }
 
@@ -644,6 +666,7 @@ impl Document {
     /// `SheetIr::text_truncated` are only available from
     /// [`xlsx::XlsxDocument::sheets_ir`].
     pub fn to_markdown_with(&self, options: ir_render::MarkdownOptions) -> String {
+        let _scale = limits::InputSizeScope::new(self.input_bytes);
         match &self.inner {
             DocumentInner::Xlsx(doc) => {
                 ir_render::markdown_from_sections(doc.sheets_ir().map(|s| s.section), options)
@@ -657,6 +680,7 @@ impl Document {
     /// A spreadsheet is converted and rendered one sheet at a time (see
     /// [`Self::to_html_with`]).
     pub fn to_html(&self) -> String {
+        let _scale = limits::InputSizeScope::new(self.input_bytes);
         self.to_html_with(ir_render::HtmlOptions::default())
     }
 
@@ -688,6 +712,7 @@ impl Document {
     /// `SheetIr::text_truncated` are only available from
     /// [`xlsx::XlsxDocument::sheets_ir`].
     pub fn to_html_with(&self, options: ir_render::HtmlOptions) -> String {
+        let _scale = limits::InputSizeScope::new(self.input_bytes);
         match &self.inner {
             DocumentInner::Xlsx(doc) => {
                 ir_render::html_from_sections(doc.sheets_ir().map(|s| s.section), options)
@@ -700,6 +725,7 @@ impl Document {
     /// produced, so the text is never held in memory; the other formats
     /// build it first.
     pub fn write_plain_text<W: std::io::Write + ?Sized>(&self, out: &mut W) -> std::io::Result<()> {
+        let _scale = limits::InputSizeScope::new(self.input_bytes);
         match &self.inner {
             DocumentInner::Xlsx(doc) => doc.write_plain_text(out),
             _ => out.write_all(self.plain_text().as_bytes()),
@@ -710,6 +736,7 @@ impl Document {
     /// produced, so the Markdown is never held in memory; the other formats
     /// build it first.
     pub fn write_markdown<W: std::io::Write + ?Sized>(&self, out: &mut W) -> std::io::Result<()> {
+        let _scale = limits::InputSizeScope::new(self.input_bytes);
         match &self.inner {
             DocumentInner::Xlsx(doc) => doc.write_markdown(out),
             _ => out.write_all(self.to_markdown().as_bytes()),
@@ -741,6 +768,7 @@ impl Document {
         options: ir_render::MarkdownOptions,
         out: &mut W,
     ) -> std::io::Result<()> {
+        let _scale = limits::InputSizeScope::new(self.input_bytes);
         match &self.inner {
             DocumentInner::Xlsx(doc) => stream::render_to_io(out, |sink| {
                 ir_render::write_markdown_sections(
@@ -756,6 +784,7 @@ impl Document {
     /// Write [`Self::to_html`] to `out`. A spreadsheet is converted and
     /// written a sheet at a time; the other formats build it first.
     pub fn write_html<W: std::io::Write + ?Sized>(&self, out: &mut W) -> std::io::Result<()> {
+        let _scale = limits::InputSizeScope::new(self.input_bytes);
         self.write_html_with(ir_render::HtmlOptions::default(), out)
     }
 
@@ -784,6 +813,7 @@ impl Document {
         options: ir_render::HtmlOptions,
         out: &mut W,
     ) -> std::io::Result<()> {
+        let _scale = limits::InputSizeScope::new(self.input_bytes);
         match &self.inner {
             DocumentInner::Xlsx(doc) => stream::render_to_io(out, |sink| {
                 ir_render::write_html_sections(doc.sheets_ir().map(|s| s.section), options, sink)
@@ -803,6 +833,7 @@ impl Document {
     /// padding and picture allowances instead. Here every cut is in the
     /// content and in `Metadata::warnings` and `Metadata::text_truncated`.
     pub fn to_ir(&self) -> DocumentIR {
+        let _scale = limits::InputSizeScope::new(self.input_bytes);
         match &self.inner {
             DocumentInner::Docx(doc) => convert_docx::docx_to_ir(doc),
             DocumentInner::Xlsx(doc) => convert_xlsx::xlsx_to_ir(doc),
