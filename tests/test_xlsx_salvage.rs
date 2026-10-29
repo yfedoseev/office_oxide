@@ -117,18 +117,21 @@ fn test_every_surface_says_the_sheet_was_cut_short() {
 
 #[test]
 fn test_a_sheet_damaged_before_its_first_row_is_still_unreadable() {
-    let bad = workbook(&[(
-        "Gone",
-        sheet(r#"<row r="1"><c r="A1" t=inlineStr"><is><t>x</t></is></c></row>"#),
-    )]);
-    // No complete row, so nothing to keep: unreadable, as before.
-    let result = Document::from_reader(Cursor::new(bad), DocumentFormat::Xlsx);
-    match result {
-        Ok(doc) => {
-            assert!(doc.plain_text().contains("unreadable sheet \"Gone\""), "{}", doc.plain_text())
-        },
-        Err(_) => {},
-    }
+    // One sheet beside a damaged one, so the workbook opens: the damaged sheet
+    // has no complete row, so there is nothing to keep, and it is reported as
+    // unreadable, as before.
+    let bad = workbook(&[
+        (
+            "Gone",
+            sheet(r#"<row r="1"><c r="A1" t=inlineStr"><is><t>x</t></is></c></row>"#),
+        ),
+        ("Fine", sheet(&row(1, "kept", "also"))),
+    ]);
+    let doc = open(bad);
+    let text = doc.plain_text();
+    assert!(text.contains("unreadable sheet \"Gone\""), "{text}");
+    assert!(!text.contains("cut short"), "{text}");
+    assert!(text.contains("kept") && text.contains("also"), "{text}");
 }
 
 /// The cut falls between rows: a row the damage reaches is dropped whole, never
