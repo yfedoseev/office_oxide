@@ -261,3 +261,51 @@ fn test_pptx_notes_cut_off_mid_shape_keep_the_shapes_before_it() {
     let warnings = cut.to_ir().metadata.warnings;
     assert!(warnings.iter().any(|w| w.contains("notesSlide1.xml")), "{warnings:?}");
 }
+
+fn pptx_with_layout(layout: &str) -> Vec<u8> {
+    let mut writer = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
+    let pres = PartName::new("/ppt/presentation.xml").unwrap();
+    let slide_part = PartName::new("/ppt/slides/slide1.xml").unwrap();
+    let layout_part = PartName::new("/ppt/slideLayouts/slideLayout1.xml").unwrap();
+    let presentation = format!(
+        r#"<p:presentation xmlns:p="{PML}" xmlns:r="{REL}"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="9144000" cy="6858000"/></p:presentation>"#
+    );
+    let ct = "application/vnd.openxmlformats-officedocument.presentationml";
+    writer
+        .add_part(&pres, &format!("{ct}.presentation.main+xml"), presentation.as_bytes())
+        .unwrap();
+    let slide_xml = slide(&format!("{}</p:spTree></p:cSld></p:sld>", shape(2, "slide text")));
+    writer
+        .add_part(&slide_part, &format!("{ct}.slide+xml"), slide_xml.as_bytes())
+        .unwrap();
+    writer
+        .add_part(&layout_part, &format!("{ct}.slideLayout+xml"), layout.as_bytes())
+        .unwrap();
+    writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "ppt/presentation.xml");
+    writer.add_part_rel(&pres, rel_types::SLIDE, "slides/slide1.xml");
+    writer.add_part_rel(&slide_part, rel_types::SLIDE_LAYOUT, "../slideLayouts/slideLayout1.xml");
+    writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn test_a_pptx_layout_cut_off_mid_shape_keeps_the_shapes_before_it() {
+    let head = format!(
+        r#"<p:sldLayout xmlns:p="{PML}" xmlns:a="{DML}"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>{}"#,
+        shape(3, "static layout text")
+    );
+    let sound = open(
+        pptx_with_layout(&format!("{head}</p:spTree></p:cSld></p:sldLayout>")),
+        DocumentFormat::Pptx,
+    )
+    .unwrap();
+    assert!(sound.plain_text().contains("static layout text"), "{}", sound.plain_text());
+    assert!(sound.to_ir().metadata.warnings.is_empty());
+    let cut = open(
+        pptx_with_layout(&format!(r#"{head}<p:sp><p:txBody><a:p><a:r a=""#)),
+        DocumentFormat::Pptx,
+    )
+    .unwrap();
+    assert!(cut.plain_text().contains("static layout text"), "{}", cut.plain_text());
+    let warnings = cut.to_ir().metadata.warnings;
+    assert!(warnings.iter().any(|w| w.contains("slideLayout1.xml")), "{warnings:?}");
+}

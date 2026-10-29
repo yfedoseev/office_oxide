@@ -923,8 +923,30 @@ impl PartCache {
         match Slide::parse(data, String::new(), rels, &media, &part_text) {
             Ok(s) => (s.shapes, s.hide_master_shapes),
             Err(e) => {
-                self.unreadable.record(part.as_str(), &e);
-                (Vec::new(), false)
+                // Malformed part-way: the shapes before the damage are kept,
+                // as for a slide, and the loss is reported.
+                let salvaged =
+                    crate::core::xml::salvage_prefix(data, 3).and_then(|(prefix, shapes)| {
+                        Slide::parse(&prefix, String::new(), rels, &media, &part_text)
+                            .ok()
+                            .map(|s| (s, shapes))
+                    });
+                match salvaged {
+                    Some((s, shapes)) => {
+                        self.unreadable.record(
+                            part.as_str(),
+                            &format!(
+                                "the XML is malformed after {shapes} shapes; the rest of the \
+                                 part was not read"
+                            ),
+                        );
+                        (s.shapes, s.hide_master_shapes)
+                    },
+                    None => {
+                        self.unreadable.record(part.as_str(), &e);
+                        (Vec::new(), false)
+                    },
+                }
             },
         }
     }
