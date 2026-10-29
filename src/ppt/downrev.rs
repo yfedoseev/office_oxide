@@ -647,15 +647,15 @@ mod tests {
         // (letters replaced by _); nothing must be added (#478).
         let slide = container(
             0x03EE,
-            &[record(0x03EF, 0, &[0u8; 8]), carrier(r#"<p:sp><a:p><a:r><a:t>___ _______</a:t></a:r></a:p></p:sp>"#)],
+            &[
+                record(0x03EF, 0, &[0u8; 8]),
+                carrier(r#"<p:sp><a:p><a:r><a:t>___ _______</a:t></a:r></a:p></p:sp>"#),
+            ],
         );
         let mut runs = Vec::new();
         let mut budget = DownrevBudget::new();
         append_slide_downrev(&slide, &mut runs, &mut budget);
-        assert!(
-            runs.is_empty(),
-            "placeholder-only package adds nothing: {runs:?}"
-        );
+        assert!(runs.is_empty(), "placeholder-only package adds nothing: {runs:?}");
     }
 
     #[test]
@@ -699,11 +699,7 @@ mod tests {
         let mut runs = Vec::new();
         let mut budget = DownrevBudget::new();
         append_slide_downrev(&slide, &mut runs, &mut budget);
-        assert!(
-            runs.len() < 100,
-            "per-file byte budget bounds the run count: {}",
-            runs.len()
-        );
+        assert!(runs.len() < 100, "per-file byte budget bounds the run count: {}", runs.len());
         assert!(
             budget.bytes_remaining <= MAX_SHAPE_XML_BYTES,
             "byte budget consumed: {}",
@@ -740,10 +736,7 @@ mod tests {
             "fragment truncated to the cap: {}",
             runs[0].text.len()
         );
-        assert!(
-            !runs[0].text.is_empty(),
-            "truncated fragment still yields text"
-        );
+        assert!(!runs[0].text.is_empty(), "truncated fragment still yields text");
     }
 
     // R1 (known bug, NOT yet fixed): `seen_packages` lives in the per-file
@@ -837,8 +830,8 @@ mod tests {
         let xml = format!("<p:sp><a:p><a:r><a:t>{bulk}</a:t></a:r></a:p></p:sp>");
         let package = carrier(&xml);
         let mut budget = DownrevBudget::new();
-        let out = shape_xml_in_payload(&package, &mut budget)
-            .expect("oversized fragment still reads");
+        let out =
+            shape_xml_in_payload(&package, &mut budget).expect("oversized fragment still reads");
         assert!(out.len() <= MAX_SHAPE_XML_BYTES as usize, "truncated to the cap");
         assert!(out.contains("AAAA"), "leading text survives truncation");
         assert!(!out.is_empty(), "truncation still yields text");
@@ -857,9 +850,6 @@ mod tests {
         let mut runs = Vec::new();
         let mut budget = DownrevBudget::new();
         append_slide_downrev(&slide, &mut runs, &mut budget);
-        assert!(
-            runs.is_empty(),
-            "symbol-only package is intentionally dropped (R4)"
-        );
+        assert!(runs.is_empty(), "symbol-only package is intentionally dropped (R4)");
     }
 }
