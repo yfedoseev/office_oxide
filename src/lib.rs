@@ -28,6 +28,7 @@
 //! | `wasm` | wasm-bindgen WASM bindings |
 //! | `mmap` | Memory-mapped file I/O |
 //! | `parallel` | Rayon-based parallel processing |
+//! | `default-password` | Open files Office encrypts with its fixed default password (`VelvetSweatshop`); uses MD5 and RC4, which are not FIPS 140 approved, so it is off by default |
 
 // Sub-modules (previously separate crates)
 /// Library version (matches the Cargo package version).
@@ -376,6 +377,10 @@ impl Document {
             )
             && is_encrypted_ooxml_cfb(path)
         {
+            #[cfg(feature = "default-password")]
+            if let Some(package) = decrypt_default_password(std::fs::File::open(path).ok()) {
+                return Self::from_reader_inner(std::io::Cursor::new(package), ext_format);
+            }
             return Err(OfficeError::UnsupportedFormat(
                 "the file is a password-protected (encrypted) OOXML package; \
                  decryption is not supported"
@@ -502,6 +507,10 @@ impl Document {
         if matches!(format, DocumentFormat::Docx | DocumentFormat::Xlsx | DocumentFormat::Pptx)
             && is_cfb_container(&mut reader)?
         {
+            #[cfg(feature = "default-password")]
+            if let Some(package) = decrypt_default_password(Some(&mut reader)) {
+                return Self::from_reader_inner(std::io::Cursor::new(package), format);
+            }
             return Err(OfficeError::UnsupportedFormat(
                 "the file is a password-protected (encrypted) OOXML package; \
                  decryption is not supported"
@@ -870,6 +879,27 @@ fn is_encrypted_ooxml_cfb(path: &Path) -> bool {
         return false;
     };
     reader.has_stream("EncryptionInfo") && reader.has_stream("EncryptedPackage")
+}
+
+/// The zip inside an encrypted OOXML compound file when one of Office's
+/// default passwords opens it; `None` when the file needs a real password,
+/// is not encrypted, or uses a scheme this reader does not implement (the
+/// caller then refuses it as before).
+#[cfg(feature = "default-password")]
+fn decrypt_default_password<R: Read + Seek>(source: Option<R>) -> Option<Vec<u8>> {
+    let mut reader = crate::cfb::CfbReader::new(source?).ok()?;
+    if !(reader.has_stream("EncryptionInfo") && reader.has_stream("EncryptedPackage")) {
+        return None;
+    }
+    let info = reader.open_stream("EncryptionInfo").ok()?;
+    let package = reader.open_stream("EncryptedPackage").ok()?;
+    match core::offcrypto::decrypt_package(&info, &package) {
+        Ok(zip) => Some(zip),
+        Err(why) => {
+            info!("default-password decryption not possible: {why:?}");
+            None
+        },
+    }
 }
 
 fn sniff_format(path: &Path, ext_format: DocumentFormat) -> DocumentFormat {

@@ -16,6 +16,9 @@ pub(crate) mod codepage;
 pub mod content_types;
 /// Shared `docProps/core.xml` generator used by DOCX, PPTX, XLSX writers.
 pub mod core_properties;
+/// MD5, SHA-1, SHA-2, AES decryption and RC4, for the default-password path.
+#[cfg(feature = "default-password")]
+pub(crate) mod crypto;
 /// In-place editing of OPC packages (preserves unchanged parts).
 pub mod editable;
 pub(crate) mod embedded;
@@ -26,6 +29,9 @@ pub mod embedded_fonts;
 pub mod error;
 /// Markdown escaping shared by every renderer.
 pub mod markdown;
+/// Decrypting a document protected with Office's default password.
+#[cfg(feature = "default-password")]
+pub(crate) mod offcrypto;
 /// OPC (Open Packaging Conventions) reader and writer for ZIP-based packages.
 pub mod opc;
 /// Parallel processing helpers (Rayon-based, feature-gated).

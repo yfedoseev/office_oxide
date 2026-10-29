@@ -254,7 +254,21 @@ impl XlsDocument {
         // Drop CFB early to free file handle and memory.
         drop(cfb);
 
+        // A workbook Excel encrypted with its default password opens with it.
+        #[cfg(feature = "default-password")]
+        let (stream_data, default_password) = {
+            let mut stream_data = stream_data;
+            let decrypted = crate::core::offcrypto::decrypt_workbook(&mut stream_data);
+            (stream_data, decrypted == Ok(true))
+        };
         let mut doc = Self::parse_workbook_stream(&stream_data)?;
+        #[cfg(feature = "default-password")]
+        if default_password {
+            warnings.push(
+                "the workbook is encrypted with the default password and was decrypted with it"
+                    .to_string(),
+            );
+        }
         doc.has_macros = has_macros;
         doc.summary_properties = summary_properties;
         doc.warnings = warnings;
@@ -1702,6 +1716,25 @@ mod tests {
         } else {
             biff_rec(RT_MSODRAWINGGROUP, &blip)
         }
+    }
+
+    #[cfg(feature = "default-password")]
+    #[test]
+    fn test_an_encrypted_xls_opens_with_the_default_password() {
+        let plain = workbook_stream_with_globals(&[], &[("Sheet1", 0, label(0, 0, "cell marker"))]);
+        let stream =
+            crate::core::offcrypto::tests::encrypt_whole_workbook(&plain, "VelvetSweatshop");
+        let doc = XlsDocument::from_reader(std::io::Cursor::new(
+            crate::core::offcrypto::tests::cfb_with_streams(&[("Workbook", &stream)]),
+        ))
+        .unwrap();
+        assert!(doc.plain_text().contains("cell marker"), "{}", doc.plain_text());
+        // Under another password it is refused, as before.
+        let stream = crate::core::offcrypto::tests::encrypt_whole_workbook(&plain, "hunter2");
+        let refused = XlsDocument::from_reader(std::io::Cursor::new(
+            crate::core::offcrypto::tests::cfb_with_streams(&[("Workbook", &stream)]),
+        ));
+        assert!(matches!(refused, Err(XlsError::Encrypted)));
     }
 
     /// Pictures were found by scanning every byte of the Workbook stream

@@ -23,6 +23,10 @@ path = "src/main.rs"
 # the library's doc directory; a parallel doc build races on it.
 doc = false
 
+[features]
+# Open documents protected with Office's default password (off by default).
+default-password = ["office_oxide/default-password"]
+
 [dependencies]
 office_oxide = { version = "0.1.16", path = "../.." }
 clap = { version = "4", features = ["derive"] }

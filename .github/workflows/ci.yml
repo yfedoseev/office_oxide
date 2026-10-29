@@ -251,6 +251,7 @@ jobs:
           - ""
           - "mmap"
           - "parallel"
+          - "default-password"
           - "python"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -267,7 +268,7 @@ jobs:
 
       - name: Test with features
         run: cargo test -p office_oxide --no-default-features --features "${{ matrix.features }}"
-        if: matrix.features == 'mmap' || matrix.features == 'parallel'
+        if: matrix.features == 'mmap' || matrix.features == 'parallel' || matrix.features == 'default-password'
 
       - name: Build without features
         run: cargo build -p office_oxide --no-default-features

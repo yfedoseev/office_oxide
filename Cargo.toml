@@ -107,6 +107,10 @@ python = ["dep:pyo3"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen"]
 mmap = ["dep:memmap2"]
 parallel = ["dep:rayon"]
+# Open the documents Office protects with its fixed default password
+# (`VelvetSweatshop`, or an empty one): RC4 workbooks and OOXML encryption.
+# Off by default; adds no dependency. MD5 and RC4 are not FIPS 140 approved.
+default-password = []
 
 [package.metadata.docs.rs]
 features = ["python", "parallel"]
