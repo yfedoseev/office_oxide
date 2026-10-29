@@ -644,7 +644,7 @@ mod tests {
     #[test]
     fn test_append_slide_downrev_skips_placeholder_only_packages() {
         // Empty legacy text, but the package only carries placeholder runs
-        // (letters replaced by _); nothing must be added (#478).
+        // (letters replaced by _); nothing must be added.
         let slide = container(
             0x03EE,
             &[
