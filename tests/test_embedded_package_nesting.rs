@@ -306,12 +306,13 @@ fn test_what_an_embedded_package_could_not_read_is_reported_by_the_document_that
     assert!(sound.as_docx().unwrap().unreadable_parts.is_empty());
 }
 
-/// A package reached through several entry names is charged to the byte
-/// allowance and to the package count once, not once per name: five names for
-/// one blob fit an allowance of two and a half packages (five charges would
-/// need five), and all five places in the document carry its text.
+/// A package reached through several entry names is read once and its text is
+/// given once, where it first appears; each further name is one short line that
+/// says so. Charged once for bytes and count, and not copied again: five names
+/// for one blob fit an allowance of two and a half packages (five charges would
+/// need five).
 #[test]
-fn test_one_blob_under_several_names_is_charged_once() {
+fn test_one_blob_under_several_names_is_read_and_copied_once() {
     let mut scope = LimitScope::new();
     let blob = leaf("shared child");
     scope.set(
@@ -322,5 +323,24 @@ fn test_one_blob_under_several_names_is_charged_once() {
     scope.set(limits::max_embedded_packages, limits::set_max_embedded_packages, 1);
     let doc = open(docx_embedding("top", &[(&blob, 5)]));
     assert!(skipped(&doc).is_empty(), "{:?}", skipped(&doc));
-    assert_eq!(doc.plain_text().matches("shared child").count(), 5);
+    let text = doc.plain_text();
+    assert_eq!(text.matches("shared child").count(), 1, "{text}");
+    assert_eq!(text.matches("embedded package repeated").count(), 4, "{text}");
+}
+
+/// The text of a package named many times is not multiplied by the names: a
+/// package of a few KB named 300 times adds 300 short lines, not 300 copies.
+#[test]
+fn test_many_names_for_one_package_do_not_multiply_its_text() {
+    let _defaults = common::default_limits();
+    let blob = leaf(&"long embedded paragraph ".repeat(200));
+    let doc = open(docx_embedding("top", &[(&blob, 300)]));
+    let text = doc.plain_text();
+    assert_eq!(text.matches("long embedded paragraph").count(), 200);
+    assert_eq!(text.matches("embedded package repeated").count(), 299);
+    assert!(
+        text.len() < 40_000,
+        "{} bytes, against 1.4 MB if each name copied the text",
+        text.len()
+    );
 }

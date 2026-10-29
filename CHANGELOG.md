@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An embedded package named more than once is given once.** A `.docx` that names one embedded package under several entry names, or relates to one part from several places, copied the package's text into the document once per name; a crafted file multiplied it by its number of names. The text is now given where the package first appears and every further name is one line saying so (`[embedded package repeated: its text is given where it first appears]`), charged to the embedded-package account; the bytes and the package count were already charged once.
+
 - **A `.doc` whose header is destroyed takes the language of its 8-bit text from the font table.** A header whose version is not a Word version lost its language, so the text was read as Windows-1252 and said so. Each font in the font table declares the character set it was chosen for ([MS-DOC] §2.9.102), so the text of a Cyrillic, Greek, Hebrew, Arabic, Baltic, Central European, Turkish, Vietnamese, Thai or East Asian document is now read in the code page of the character set most of its fonts declare, and the warning says where the language came from. A document whose fonts declare none, and every document with an intact header, are read as before.
 
 - **The per-sheet and the document-wide padding allowances are one mechanism.** The empty-slot allowance of a `.xls` and the empty-cell allowance of an `.xlsx` IR kept their own copies of the same charge-and-spend logic; both are now two instances of one `Allowance`. No limit, default or message changed. The text-budget default is documented as deliberately flat.

@@ -2726,8 +2726,29 @@ impl DeferredParts {
 /// blob reached through several entry names is opened once.
 #[derive(Clone)]
 struct OpenedPackage {
-    paragraphs: Option<Vec<BlockElement>>,
-    chars: usize,
+    /// The package's text was kept, so a repeat has somewhere to point to.
+    has_text: bool,
+}
+
+/// What stands for an embedded package that was already read, found again
+/// under another name: one short paragraph, charged to the account, in place of
+/// a second copy of its text. `None` when even that does not fit.
+fn repeated_package_notice(
+    session: &crate::core::embedded::Session,
+    part: &str,
+) -> Option<Vec<BlockElement>> {
+    const NOTICE: &str = "[embedded package repeated: its text is given where it first appears]";
+    if let Err(refusal) = crate::core::embedded::charge_text(session, NOTICE.chars().count()) {
+        crate::core::embedded::refuse(session, part, refusal);
+        return None;
+    }
+    Some(vec![BlockElement::Paragraph(Paragraph {
+        properties: None,
+        content: vec![ParagraphContent::Run(Run {
+            properties: None,
+            content: vec![RunContent::Text(NOTICE.to_string())],
+        })],
+    })])
 }
 
 fn resolve_one_deferred_part<R: Read + Seek>(
@@ -2753,7 +2774,10 @@ fn resolve_one_deferred_part<R: Read + Seek>(
         return None;
     }
     if let Some(found) = done.done.get(&part) {
-        return found.clone();
+        // The same part named again: its text is where it first appears.
+        return found
+            .as_ref()
+            .and_then(|_| repeated_package_notice(&done.session, part.as_str()));
     }
     let found = open_deferred_part(&part, opc, &done.session, skip);
     done.done.insert(part, found.clone());
@@ -2777,17 +2801,17 @@ fn open_deferred_part<R: Read + Seek>(
         },
     };
     // The same package reached through another entry name costs what the
-    // first did to find, and nothing to open again; its text is charged
-    // again, as it is copied again.
+    // first did to find, and nothing to open again; its text is not copied
+    // again either, one line points to where it is.
     let fingerprint = embedded::Fingerprint::of(&data);
-    if let Some(OpenedPackage { paragraphs, chars }) =
+    if let Some(OpenedPackage { has_text }) =
         embedded::cached::<OpenedPackage>(session, fingerprint)
     {
-        if let Err(refusal) = embedded::charge_text(session, chars) {
-            embedded::refuse(session, part.as_str(), refusal);
-            return None;
-        }
-        return paragraphs;
+        // Another name for a package already read: its text is where it first
+        // appears, and is not copied again.
+        return has_text
+            .then(|| repeated_package_notice(session, part.as_str()))
+            .flatten();
     }
     let admission = match embedded::admit(session, data.len() as u64) {
         Ok(admission) => admission,
@@ -2814,14 +2838,7 @@ fn open_deferred_part<R: Read + Seek>(
         },
         Err(e) => {
             skip(part.as_str(), &e);
-            embedded::remember(
-                session,
-                fingerprint,
-                OpenedPackage {
-                    paragraphs: None,
-                    chars: 0,
-                },
-            );
+            embedded::remember(session, fingerprint, OpenedPackage { has_text: false });
             return None;
         },
     };
@@ -2840,18 +2857,18 @@ fn open_deferred_part<R: Read + Seek>(
         })
         .collect();
     let paragraphs = (!paragraphs.is_empty()).then_some(paragraphs);
+    if let Err(refusal) = embedded::charge_text(session, chars) {
+        embedded::refuse(session, part.as_str(), refusal);
+        embedded::remember(session, fingerprint, OpenedPackage { has_text: false });
+        return None;
+    }
     embedded::remember(
         session,
         fingerprint,
         OpenedPackage {
-            paragraphs: paragraphs.clone(),
-            chars,
+            has_text: paragraphs.is_some(),
         },
     );
-    if let Err(refusal) = embedded::charge_text(session, chars) {
-        embedded::refuse(session, part.as_str(), refusal);
-        return None;
-    }
     paragraphs
 }
 
