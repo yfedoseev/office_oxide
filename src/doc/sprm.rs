@@ -896,11 +896,9 @@ fn toggle(operand: u8, current: bool) -> bool {
 /// Character-property flags distilled from a CHP grpprl (`sgc` == 2).
 ///
 /// Revision-mark flags and
-/// bold/italic/underline/color/font-size. Font *name* (`sprmCRgFtc0` — an
-/// index into the `SttbfFfn` font table) is deliberately not attempted
-/// here: resolving it needs a whole separate STTB+FFN parser that nothing
-/// in `src/doc/` touches yet, unlike font *size* (`sprmCHps`), which is a
-/// self-contained 2-byte operand.
+/// bold/italic/underline/color/font-size. The font is kept as an index
+/// only (`sprmCRgFtc2`, see [`ChpProps::ftc_other`]); resolving it to a name
+/// is `super::fonts`' job, because it needs the `SttbfFfn` font table.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChpProps {
     /// `sprmCFRMarkDel` (0x0800): the run is formatted as deleted
@@ -928,6 +926,10 @@ pub struct ChpProps {
     pub color: Option<[u8; 3]>,
     /// `sprmCHps` (0x4A43): font size in half-points.
     pub font_size_half_pt: Option<u32>,
+    /// `sprmCRgFtc2` (0x4A51): the font-table index of the font used for text
+    /// outside U+0020..U+007F, which is where the private-use characters of a
+    /// symbol font are. `None` when the run does not set it.
+    pub ftc_other: Option<u16>,
     /// `sprmCFStrike` (0x0837) / `sprmCFDStrike` (0x2A53): single or
     /// double strikethrough.
     pub strike: bool,
@@ -1090,6 +1092,16 @@ chp_sprm_dispatch! {
         if operand.len() >= 4 {
             props.color =
                 if operand[3] != 0 { None } else { Some([operand[0], operand[1], operand[2]]) };
+        }
+    }
+
+    /// Signed 2-byte integer (spra 2): an index into the font table
+    /// (`SttbfFfn`) of the font used for a character outside U+0020..U+007F
+    /// ([MS-DOC] §2.6.1). A negative operand cannot be an index and is ignored.
+    "sprmCRgFtc2" @ "2.6.1" => [0x4A51] (props, operand) {
+        if operand.len() >= 2 {
+            let ftc = i16::from_le_bytes([operand[0], operand[1]]);
+            props.ftc_other = u16::try_from(ftc).ok();
         }
     }
 
@@ -2006,6 +2018,7 @@ mod tests {
         (0x2A3E, "sprmCKul"),
         (0x6870, "sprmCCv"),
         (0x4A43, "sprmCHps"),
+        (0x4A51, "sprmCRgFtc2"),
         (0x0837, "sprmCFStrike"),
         (0x2A53, "sprmCFDStrike"),
         (0x083C, "sprmCFVanish"),
@@ -2062,6 +2075,17 @@ mod tests {
                 "0x{opcode:04X} ({name}) is registered but decoding it changes nothing"
             );
         }
+    }
+
+    /// `sprmCRgFtc2` is a signed 2-byte index into the font table; a negative
+    /// operand cannot be one, and a short operand carries none.
+    #[test]
+    fn test_font_index_for_text_outside_ascii_is_read() {
+        assert_eq!(extract_chp_props(&[0x51, 0x4A, 0x03, 0x00]).ftc_other, Some(3));
+        assert_eq!(extract_chp_props(&[0x51, 0x4A, 0xFF, 0x7F]).ftc_other, Some(0x7FFF));
+        assert_eq!(extract_chp_props(&[0x51, 0x4A, 0xFF, 0xFF]).ftc_other, None);
+        assert_eq!(extract_chp_props(&[0x4F, 0x4A, 0x01, 0x00]).ftc_other, None); // sprmCRgFtc0 is not it
+        assert_eq!(ChpProps::default().ftc_other, None);
     }
 
     #[test]

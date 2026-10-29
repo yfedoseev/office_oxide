@@ -9,6 +9,7 @@
 //! - Unicode (UTF-16LE): 2 bytes per character, fc is used directly
 
 use super::error::{DocError, Result};
+use super::fonts::{SymbolRuns, push_utf16};
 
 /// A single piece descriptor.
 #[derive(Debug, Clone)]
@@ -323,6 +324,19 @@ pub fn extract_text_range(
     range_end: u32,
     lid: u16,
 ) -> String {
+    extract_text_range_symbols(word_doc, pieces, range_start, range_end, lid, &SymbolRuns::none())
+}
+
+/// As [`extract_text_range`], with the characters of the runs in a symbol
+/// font (`symbols`) read by that font's table.
+pub fn extract_text_range_symbols(
+    word_doc: &[u8],
+    pieces: &[Piece],
+    range_start: u32,
+    range_end: u32,
+    lid: u16,
+    symbols: &SymbolRuns,
+) -> String {
     let mut text = String::new();
     if range_end <= range_start {
         return text;
@@ -365,7 +379,7 @@ pub fn extract_text_range(
                         u16::from_le_bytes([word_doc[o], word_doc[o + 1]])
                     })
                     .collect();
-                text.push_str(&String::from_utf16_lossy(&chars));
+                push_utf16(&mut text, &chars, piece.cp_start + skip, symbols);
             }
         }
     }
@@ -384,16 +398,18 @@ pub fn extract_text_range(
 /// read and then filtered out of the decoded string, so a deleted range
 /// straddling a piece boundary or a multi-byte encoding still slices
 /// cleanly on a CP boundary.
-pub fn extract_text_range_excluding(
+pub fn extract_text_range_excluding_symbols(
     word_doc: &[u8],
     pieces: &[Piece],
     range_start: u32,
     range_end: u32,
     lid: u16,
     excluded: &[(u32, u32)],
+    symbols: &SymbolRuns,
 ) -> String {
+    let extract = |a, b| extract_text_range_symbols(word_doc, pieces, a, b, lid, symbols);
     if excluded.is_empty() {
-        return extract_text_range(word_doc, pieces, range_start, range_end, lid);
+        return extract(range_start, range_end);
     }
     let mut text = String::new();
     let mut cursor = range_start;
@@ -404,14 +420,35 @@ pub fn extract_text_range_excluding(
             continue;
         }
         if cursor < ex_start {
-            text.push_str(&extract_text_range(word_doc, pieces, cursor, ex_start, lid));
+            text.push_str(&extract(cursor, ex_start));
         }
         cursor = cursor.max(ex_end);
     }
     if cursor < range_end {
-        text.push_str(&extract_text_range(word_doc, pieces, cursor, range_end, lid));
+        text.push_str(&extract(cursor, range_end));
     }
     text
+}
+
+/// As [`extract_text_range_excluding_symbols`], with no run in a symbol font.
+#[cfg(test)]
+pub fn extract_text_range_excluding(
+    word_doc: &[u8],
+    pieces: &[Piece],
+    range_start: u32,
+    range_end: u32,
+    lid: u16,
+    excluded: &[(u32, u32)],
+) -> String {
+    extract_text_range_excluding_symbols(
+        word_doc,
+        pieces,
+        range_start,
+        range_end,
+        lid,
+        excluded,
+        &SymbolRuns::none(),
+    )
 }
 
 /// The largest CP of `piece` that is actually backed by bytes in a stream of
@@ -452,12 +489,13 @@ pub(crate) fn piece_backed_cp_end(piece: &Piece, word_doc_len: usize) -> u32 {
 /// exactly where it belongs, and compressed (8-bit) pieces are decoded by
 /// their own stride. A truncated/out-of-range segment is skipped per-CP
 /// rather than dropping the entire piece, which keeps later ranges aligned.
-pub(crate) fn decode_cp_range(
+pub(crate) fn decode_cp_range_symbols(
     word_doc: &[u8],
     pieces: &[Piece],
     cp_start: u32,
     cp_end: u32,
     lid: u16,
+    symbols: &SymbolRuns,
 ) -> String {
     let mut out = String::new();
     if cp_end <= cp_start {
@@ -507,10 +545,22 @@ pub(crate) fn decode_cp_range(
                     u16s.push(u16::from_le_bytes([word_doc[off], word_doc[off + 1]]));
                 }
             }
-            out.push_str(&String::from_utf16_lossy(&u16s));
+            push_utf16(&mut out, &u16s, seg_start, symbols);
         }
     }
     out
+}
+
+/// As [`decode_cp_range_symbols`], with no run in a symbol font.
+#[cfg(test)]
+pub(crate) fn decode_cp_range(
+    word_doc: &[u8],
+    pieces: &[Piece],
+    cp_start: u32,
+    cp_end: u32,
+    lid: u16,
+) -> String {
+    decode_cp_range_symbols(word_doc, pieces, cp_start, cp_end, lid, &SymbolRuns::none())
 }
 
 /// Convert a CP1252 byte to a Unicode char.

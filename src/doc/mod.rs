@@ -14,6 +14,7 @@ mod codepage;
 mod document;
 mod error;
 mod fib;
+mod fonts;
 pub mod images;
 mod list_format;
 mod ole_objects;

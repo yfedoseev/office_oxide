@@ -5,17 +5,21 @@ use std::sync::Arc;
 
 use crate::cfb::{CfbReader, SummaryProperties};
 
-use super::chpx::{parse_chpx_runs, resolve_excluded_cp_ranges_from_runs};
+use super::chpx::{
+    FkpRun, parse_chpx_runs, resolve_chp_cp_runs, resolve_excluded_cp_ranges_from_runs,
+};
 use super::error::{DocError, Result};
 use super::fib::Fib;
+use super::fonts::{SymbolRuns, parse_symbol_fonts};
 use super::images::{DocImage, extract_images_diagnosed};
 use super::list_format::ListFormatting;
 use super::papx::{
-    DocParagraph, build_paragraphs, parse_papx_paragraphs, resolve_huge_papx, runs_work_too_large,
+    DocParagraph, build_paragraphs_symbols, parse_papx_paragraphs, resolve_huge_papx,
+    runs_work_too_large,
 };
 use super::piece_table::{
-    ParsedPieces, covers_declared_length, extract_text_range_excluding, parse_clx_diagnosed,
-    sanitize_text,
+    ParsedPieces, Piece, covers_declared_length, extract_text_range_excluding_symbols,
+    extract_text_range_symbols, parse_clx_diagnosed, sanitize_text,
 };
 use super::styles::parse_style_sheet;
 use crate::cfb::blip::BlipDiagnostics;
@@ -353,13 +357,15 @@ impl DocDocument {
         // applies the same exclusion to the structured paragraphs.
         let deleted_ranges =
             resolve_excluded_cp_ranges_from_runs(&chpx_runs, &pieces, fib.text_len);
-        let raw_text = extract_text_range_excluding(
+        let symbols = symbol_runs(&table_stream, &fib, &chpx_runs, &pieces);
+        let raw_text = extract_text_range_excluding_symbols(
             &word_doc,
             &pieces,
             0,
             fib.text_len,
             fib.lid,
             &deleted_ranges,
+            &symbols,
         );
         let text = sanitize_text(&raw_text);
 
@@ -393,7 +399,7 @@ impl DocDocument {
                 continue;
             }
             let end = cp.saturating_add(len);
-            let raw = super::piece_table::extract_text_range(&word_doc, &pieces, cp, end, fib.lid);
+            let raw = extract_text_range_symbols(&word_doc, &pieces, cp, end, fib.lid, &symbols);
             // The header document opens with six fixed stories — the
             // footnote/endnote separators and "continued" notices Word
             // shows only when a note spans pages ([MS-DOC] "Headers").
@@ -516,7 +522,7 @@ impl DocDocument {
                 let sheet = parse_style_sheet(&table_stream, &fib);
                 style_warnings.extend(sheet.warnings);
                 let styles = sheet.styles;
-                build_paragraphs(
+                build_paragraphs_symbols(
                     &word_doc,
                     &pieces,
                     &fkp,
@@ -525,6 +531,7 @@ impl DocDocument {
                     &chpx_runs,
                     &section_ends,
                     &styles,
+                    &symbols,
                 )
             }
         } else {
@@ -624,7 +631,7 @@ impl DocDocument {
             Vec::new()
         } else {
             let section_ends = parse_plcf_sed_ends(word_doc, fib.fc_plcf_sed, fib.lcb_plcf_sed);
-            build_paragraphs(
+            build_paragraphs_symbols(
                 word_doc,
                 &pieces,
                 &papx.runs,
@@ -633,6 +640,7 @@ impl DocDocument {
                 &[],
                 &section_ends,
                 &[],
+                &SymbolRuns::none(),
             )
         };
         let mut warnings = container_warnings(cfb);
@@ -894,6 +902,16 @@ impl DocDocument {
 /// Whether the file carries a VBA project: Word keeps it in a root
 /// `Macros` storage holding the `VBA` storage ([MS-OVBA] §2.2.1 project
 /// storage; Excel's equivalent root storage is `_VBA_PROJECT_CUR`).
+/// The runs of the document set in a symbol font (see [`super::fonts`]):
+/// nothing is computed for a document whose font table names none.
+fn symbol_runs(table: &[u8], fib: &Fib, chpx_runs: &[FkpRun], pieces: &[Piece]) -> SymbolRuns {
+    let fonts = parse_symbol_fonts(table, fib.fc_sttbf_ffn, fib.lcb_sttbf_ffn);
+    if fonts.iter().all(Option::is_none) {
+        return SymbolRuns::none();
+    }
+    SymbolRuns::from_runs(&resolve_chp_cp_runs(chpx_runs, pieces), &fonts)
+}
+
 /// The warning for a piece table whose character positions are not ascending.
 const PIECE_TABLE_OUT_OF_ORDER: &str = "the piece table's character positions are not in ascending \
      order ([MS-DOC] PlcPcd); its pieces were resolved by the lookup rule of the text retrieval \
@@ -1064,7 +1082,16 @@ fn embedded_word_main_text<R: Read + Seek>(
         chpx_runs.clear();
     }
     let excluded = resolve_excluded_cp_ranges_from_runs(&chpx_runs, &pieces, fib.text_len);
-    let raw = extract_text_range_excluding(&word_doc, &pieces, 0, fib.text_len, fib.lid, &excluded);
+    let symbols = symbol_runs(&table_stream, &fib, &chpx_runs, &pieces);
+    let raw = extract_text_range_excluding_symbols(
+        &word_doc,
+        &pieces,
+        0,
+        fib.text_len,
+        fib.lid,
+        &excluded,
+        &symbols,
+    );
     Ok(EmbeddedRead {
         text: sanitize_text(&raw).trim().to_string(),
         fingerprint,

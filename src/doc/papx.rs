@@ -20,8 +20,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::chpx::{FkpRun, resolve_chp_cp_runs, resolve_chp_segments};
+use super::fonts::SymbolRuns;
 use super::piece_table::{
-    HyperlinkSpan, Piece, decode_cp_range, sanitize_text_with_hyperlinks_and_chp,
+    HyperlinkSpan, Piece, decode_cp_range_symbols, sanitize_text_with_hyperlinks_and_chp,
 };
 use super::sprm::{ChpProps, HugeBudget, PapProps};
 use super::sprm::{LevelSource, OutlineLevel};
@@ -526,7 +527,7 @@ fn resolve_outline_level(props: &PapProps, istd: u16, styles: &[StyleDef]) -> Op
 /// paragraph here (terminator `0x0C`)
 /// rather than merging it with the next section's first. A 0x0C anywhere
 /// else is a page break inside a paragraph.
-pub fn build_paragraphs(
+pub fn build_paragraphs_symbols(
     word_doc: &[u8],
     pieces: &[Piece],
     fkp: &[FkpParagraph],
@@ -535,6 +536,7 @@ pub fn build_paragraphs(
     chp_runs: &[FkpRun],
     section_ends: &[u32],
     styles: &[StyleDef],
+    symbols: &SymbolRuns,
 ) -> Vec<DocParagraph> {
     // PAPX runs in CP space: every FKP run intersected with every piece.
     // A paragraph is then the text up to and including the next paragraph
@@ -591,7 +593,8 @@ pub fn build_paragraphs(
             cursor = seg_b;
             let segments = resolve_chp_segments(&sorted_chp_runs, seg_a, seg_b);
             for (seg_start, seg_end, props) in &segments {
-                let chunk = decode_cp_range(word_doc, pieces, *seg_start, *seg_end, lid);
+                let chunk =
+                    decode_cp_range_symbols(word_doc, pieces, *seg_start, *seg_end, lid, symbols);
                 let mut cp = *seg_start;
                 for ch in chunk.chars() {
                     let this_cp = cp;
@@ -638,6 +641,31 @@ pub fn build_paragraphs(
         emit_paragraph(&mut buf, &mut buf_props, last, cursor, styles, &mut pap_cache, &mut out);
     }
     out
+}
+
+/// As [`build_paragraphs_symbols`], with no run in a symbol font.
+#[cfg(test)]
+pub fn build_paragraphs(
+    word_doc: &[u8],
+    pieces: &[Piece],
+    fkp: &[FkpParagraph],
+    text_len: u32,
+    lid: u16,
+    chp_runs: &[FkpRun],
+    section_ends: &[u32],
+    styles: &[StyleDef],
+) -> Vec<DocParagraph> {
+    build_paragraphs_symbols(
+        word_doc,
+        pieces,
+        fkp,
+        text_len,
+        lid,
+        chp_runs,
+        section_ends,
+        styles,
+        &SymbolRuns::none(),
+    )
 }
 
 /// Turn the buffered characters (ending with their paragraph mark) into a

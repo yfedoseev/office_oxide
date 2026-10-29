@@ -128,6 +128,11 @@ pub struct Fib {
     /// style sheet is normally the first thing written to the Table stream, so
     /// `0` is its usual value on real files. Test [`lcb_stshf`] for absence.
     pub fc_stshf: u32,
+    /// `fcSttbfFfn` (absolute 0x0112, [MS-DOC] §2.5.6): the font table in the
+    /// Table stream. `lcb_sttbf_ffn` is its size.
+    pub fc_sttbf_ffn: u32,
+    /// See [`Fib::fc_sttbf_ffn`].
+    pub lcb_sttbf_ffn: u32,
     /// Byte length of the style sheet in the Table stream (0x00A6). The only
     /// valid absence test: [MS-DOC] `FibRgFcLcb97` requires this to be
     /// non-zero, and `STSH` states every FIB contains a style sheet.
@@ -334,6 +339,12 @@ impl Fib {
             (0, 0)
         };
 
+        let (fc_sttbf_ffn, lcb_sttbf_ffn) = if data.len() > 0x0119 {
+            (read_u32(data, 0x0112), read_u32(data, 0x0116))
+        } else {
+            (0, 0)
+        };
+
         Ok(Self {
             lid,
             n_fib,
@@ -373,6 +384,8 @@ impl Fib {
             lcb_plc_spa_mom,
             fc_stshf,
             lcb_stshf,
+            fc_sttbf_ffn,
+            lcb_sttbf_ffn,
         })
     }
 }
