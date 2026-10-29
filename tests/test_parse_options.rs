@@ -273,3 +273,28 @@ fn test_saving_runs_under_the_documents_own_write_limit() {
     assert_eq!(limits::max_write_bytes(), limits::DEFAULT_MAX_WRITE_BYTES);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_every_named_limit_can_be_set_by_name_and_unknown_names_are_refused() {
+    let mut options = ParseOptions::default();
+    for name in Limits::NAMES {
+        options
+            .set_option(name, 12_345)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
+    assert_eq!(options.limits.text_chars, 12_345);
+    assert_eq!(options.limits.part_bytes, 12_345);
+    options.set_option("part_bytes", u64::MAX).unwrap();
+    assert_eq!(options.limits.part_bytes, u64::MAX);
+
+    options.set_option("include_hidden_text", 1).unwrap();
+    options.set_option("on_incomplete", 1).unwrap();
+    assert!(options.include_hidden_text);
+    assert_eq!(options.on_incomplete, OnIncomplete::Error);
+    options.set_option("on_incomplete", 0).unwrap();
+    assert_eq!(options.on_incomplete, OnIncomplete::Report);
+
+    let err = options.set_option("no_such_option", 1).unwrap_err();
+    assert!(err.to_string().contains("text_chars"), "{err}");
+    assert!(Limits::default().set("no_such_limit", 1).is_err());
+}

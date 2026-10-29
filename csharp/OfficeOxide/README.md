@@ -111,6 +111,26 @@ If something's broken or missing, [open an issue](https://github.com/yfedoseev/o
 
 — Yury
 
+## Per-document options and limits
+
+```csharp
+using var options = new ParseOptions(strict: true).Set("text_chars", 5_000_000UL);
+try
+{
+    using var doc = Document.Open("upload.docx", options);
+}
+catch (OfficeOxideException e) when (e.IsIncomplete)
+{
+    // refused: part of the document is missing
+}
+
+using var d = Document.FromBytes(data, "xlsx");
+foreach (var damage in d.Damage()) Console.WriteLine($"{damage.Kind} {damage.Part} {damage.Detail}");
+```
+
+The options belong to the document: nothing global changes. `ParseOptions.Names()`
+lists every option.
+
 ## License
 
 Dual-licensed under [MIT](../../LICENSE-MIT) or [Apache-2.0](../../LICENSE-APACHE) at your option.

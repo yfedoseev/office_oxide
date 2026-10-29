@@ -19,6 +19,21 @@ _CellValue: TypeAlias = str | bool | int | float | None
 class OfficeOxideError(Exception):
     """Raised for any parse, IO, or conversion failure inside office_oxide."""
 
+class ParseOptions:
+    """Options for one document: limits, which text is kept, and whether an
+    incomplete result is an error. ``strict=True`` starts from tighter limits
+    and makes an incomplete result raise ``IncompleteDocumentError``; keyword
+    arguments set any option by name (see ``ParseOptions.names()``)."""
+
+    def __init__(
+        self, *, strict: bool = False, **options: int | bool | str
+    ) -> None: ...
+    def set(self, name: str, value: int | bool | str) -> None: ...
+    @staticmethod
+    def names() -> list[str]: ...
+
+class IncompleteDocumentError(OfficeOxideError): ...
+
 class Document:
     """A parsed Office document (read-only).
 
@@ -29,9 +44,12 @@ class Document:
     """
 
     @staticmethod
-    def open(path: _Path, /) -> Document: ...
+    def open(path: _Path, /, *, options: ParseOptions | None = None) -> Document: ...
     @staticmethod
-    def from_bytes(data: bytes, format: FormatName, /) -> Document: ...
+    def from_bytes(
+        data: bytes, format: FormatName, /, *, options: ParseOptions | None = None
+    ) -> Document: ...
+    def damage(self) -> list[dict[str, str | None]]: ...
     @property
     def format(self) -> FormatName: ...
     def format_name(self) -> FormatName: ...

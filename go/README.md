@@ -165,6 +165,22 @@ If it saves you a dependency or a license audit, a star on GitHub genuinely help
 
 — Yury
 
+## Per-document options and limits
+
+```go
+opts, _ := officeoxide.NewStrictParseOptions() // tighter limits; error if incomplete
+defer opts.Close()
+_ = opts.Set("text_chars", 5_000_000)
+
+doc, err := officeoxide.OpenWith("upload.docx", opts)
+if officeoxide.IsIncomplete(err) { /* refused: part of the document is missing */ }
+
+damage, _ := doc.Damage() // []Damage{Kind, Part, Detail}; empty when sound
+```
+
+The options belong to the document: nothing global changes. `OptionNames()` lists
+every option; `NoLimit` switches a limit off.
+
 ## License
 
 Dual-licensed under [MIT](../LICENSE-MIT) or [Apache-2.0](../LICENSE-APACHE) at your option.

@@ -77,7 +77,8 @@ Two classes: `WasmDocument` reads, `WasmEditableDocument` edits.
 
 | Method | Description |
 | --- | --- |
-| `new WasmDocument(bytes, format)` | Open from `Uint8Array`. `format`: `"docx" \| "xlsx" \| "pptx" \| "doc" \| "xls" \| "ppt"`. |
+| `new WasmDocument(bytes, format, options?)` | Open from `Uint8Array`. `format`: `"docx" \| "xlsx" \| "pptx" \| "doc" \| "xls" \| "ppt"`. `options`: a `WasmParseOptions` (below). |
+| `.damage()` | What is wrong with the document: an array of `{kind, part, detail}` (`kind`: `unreadable_part`, `truncated` or `recovered`); empty when sound. |
 | `.formatName()` | Detected format as a string. |
 | `.plainText()` | Extract plain text. |
 | `.toMarkdown()` | Convert to Markdown (images dropped). |
@@ -85,6 +86,21 @@ Two classes: `WasmDocument` reads, `WasmEditableDocument` edits.
 | `.toHtml()` | Convert to an HTML fragment. |
 | `.toIr()` | Return the format-agnostic document IR (JS object). |
 | `.free()` | Release the underlying WASM memory. `[Symbol.dispose]` is also supported. |
+
+### `WasmParseOptions`
+
+Options for one document; nothing global changes. `new WasmParseOptions(true)`
+starts from tighter limits and makes a document that cannot be read completely
+throw (the message contains `incomplete`). `.set(name, value)` sets any option by
+name (`WasmParseOptions.names()` lists them): a limit such as `text_chars` or
+`part_bytes` with a number (`Infinity` for none), `include_hidden_text` and
+`include_deleted_text` with a boolean, `on_incomplete` with `"report"` or `"error"`.
+
+```js
+const opts = new WasmParseOptions(true);
+opts.set("text_chars", 1_000_000);
+const doc = new WasmDocument(bytes, "docx", opts); // throws if incomplete
+```
 
 ### `WasmEditableDocument`
 

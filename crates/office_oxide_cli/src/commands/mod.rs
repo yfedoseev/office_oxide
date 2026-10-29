@@ -70,6 +70,22 @@ fn emit_with(
     out.flush()
 }
 
+static OPTIONS: std::sync::OnceLock<office_oxide::options::ParseOptions> =
+    std::sync::OnceLock::new();
+
+/// The options every document of this run is read under (set once, by `main`).
+pub fn set_options(options: office_oxide::options::ParseOptions) {
+    let _ = OPTIONS.set(options);
+}
+
+/// Open `file` under this run's options.
+pub fn open(file: &str) -> office_oxide::Result<office_oxide::Document> {
+    match OPTIONS.get() {
+        Some(options) => office_oxide::Document::open_with(file, options),
+        None => office_oxide::Document::open(file),
+    }
+}
+
 pub fn run(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         Command::Text { file } => text::run(&file),

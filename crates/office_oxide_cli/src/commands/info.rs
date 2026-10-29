@@ -1,14 +1,18 @@
 use std::fmt::Write as _;
 use std::io::Write as _;
 
-use office_oxide::{Document, DocumentIR};
+use office_oxide::DocumentIR;
 
 pub fn run(file: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let doc = Document::open(file)?;
+    let doc = super::open(file)?;
+    let damage = doc.damage();
     let ir = doc.to_ir();
     let size = std::fs::metadata(file).ok().map(|m| m.len());
     let mut out = std::io::stdout().lock();
     out.write_all(render(&ir, size).as_bytes())?;
+    for d in damage.iter().filter(|d| d.is_loss()) {
+        writeln!(out, "Incomplete: {d}")?;
+    }
     out.flush()?;
     Ok(())
 }

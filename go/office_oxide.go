@@ -39,9 +39,11 @@ package officeoxide
 import "C"
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 	"unsafe"
 )
 
@@ -72,6 +74,8 @@ func (e *Error) Error() string {
 		kind = "internal error"
 	case int(C.OFFICE_ERR_UNSUPPORTED):
 		kind = "unsupported format"
+	case int(C.OFFICE_ERR_INCOMPLETE):
+		kind = "incomplete document"
 	default:
 		kind = fmt.Sprintf("code=%d", e.Code)
 	}
@@ -94,6 +98,13 @@ func statusErr(rc C.int32_t, op string) error {
 		e.Detail = "the target is out of range, so nothing was written"
 	}
 	return e
+}
+
+// IsIncomplete reports whether err is a document that was read but is known to
+// be incomplete, refused because the ParseOptions asked for an error then.
+func IsIncomplete(err error) bool {
+	var e *Error
+	return errors.As(err, &e) && e.Code == int(C.OFFICE_ERR_INCOMPLETE)
 }
 
 // ErrClosed is returned when using a handle that has already been closed.
@@ -162,6 +173,162 @@ func OpenFromBytes(data []byte, format string) (*Document, error) {
 	d := &Document{handle: h}
 	runtime.SetFinalizer(d, func(d *Document) { d.Close() })
 	return d, nil
+}
+
+// ─── Parse options (per document) ───────────────────────────────────────────
+
+// NoLimit is the value that switches a limit off.
+const NoLimit = ^uint64(0)
+
+// ParseOptions are the options for one document: limits, which text is kept,
+// and whether an incomplete result is an error. Nothing global changes; a
+// document copies the options it is opened with. Call Close when done.
+type ParseOptions struct {
+	handle *C.OfficeParseOptionsHandle
+}
+
+// NewParseOptions returns options holding the process-wide settings in force.
+func NewParseOptions() (*ParseOptions, error) {
+	h := C.office_options_new()
+	if h == nil {
+		return nil, &Error{Code: int(C.OFFICE_ERR_INTERNAL), Op: "NewParseOptions"}
+	}
+	o := &ParseOptions{handle: h}
+	runtime.SetFinalizer(o, func(o *ParseOptions) { o.Close() })
+	return o, nil
+}
+
+// NewStrictParseOptions returns options for untrusted input: tighter limits,
+// and a document that cannot be read completely is an error (IsIncomplete).
+func NewStrictParseOptions() (*ParseOptions, error) {
+	h := C.office_options_strict()
+	if h == nil {
+		return nil, &Error{Code: int(C.OFFICE_ERR_INTERNAL), Op: "NewStrictParseOptions"}
+	}
+	o := &ParseOptions{handle: h}
+	runtime.SetFinalizer(o, func(o *ParseOptions) { o.Close() })
+	return o, nil
+}
+
+// Set sets an option by name (see OptionNames): a limit such as "text_chars"
+// or "part_bytes" with a count (NoLimit for none), "include_hidden_text" and
+// "include_deleted_text" with 0 or 1, "on_incomplete" with 0 (report) or 1
+// (error). An unknown name is an error.
+func (o *ParseOptions) Set(name string, value uint64) error {
+	if o == nil || o.handle == nil {
+		return ErrClosed
+	}
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
+	rc := C.office_options_set(o.handle, cname, C.uint64_t(value))
+	if rc != 0 {
+		return &Error{Code: int(rc), Op: "ParseOptions.Set", Detail: "unknown option '" + name + "'; the options are: " + strings.Join(OptionNames(), ", ")}
+	}
+	return nil
+}
+
+// SetBool sets an on/off option such as "include_hidden_text".
+func (o *ParseOptions) SetBool(name string, on bool) error {
+	if on {
+		return o.Set(name, 1)
+	}
+	return o.Set(name, 0)
+}
+
+// OptionNames lists the names Set accepts.
+func OptionNames() []string {
+	out := C.office_options_names()
+	if out == nil {
+		return nil
+	}
+	defer C.office_oxide_free_string(out)
+	return strings.Split(C.GoString(out), ",")
+}
+
+// Close releases the options. Safe to call multiple times.
+func (o *ParseOptions) Close() {
+	if o == nil || o.handle == nil {
+		return
+	}
+	C.office_options_free(o.handle)
+	o.handle = nil
+	runtime.SetFinalizer(o, nil)
+}
+
+func (o *ParseOptions) raw() *C.OfficeParseOptionsHandle {
+	if o == nil {
+		return nil
+	}
+	return o.handle
+}
+
+// OpenWith is Open under options (nil for the process-wide settings).
+func OpenWith(path string, options *ParseOptions) (*Document, error) {
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+	var errCode C.int
+	h := C.office_document_open_with(cpath, options.raw(), &errCode)
+	if h == nil {
+		return nil, &Error{Code: int(errCode), Op: "OpenWith"}
+	}
+	d := &Document{handle: h}
+	runtime.SetFinalizer(d, func(d *Document) { d.Close() })
+	return d, nil
+}
+
+// OpenFromBytesWith is OpenFromBytes under options (nil for the process-wide
+// settings).
+func OpenFromBytesWith(data []byte, format string, options *ParseOptions) (*Document, error) {
+	if len(data) == 0 {
+		return nil, &Error{Code: int(C.OFFICE_ERR_INVALID_ARG), Op: "OpenFromBytesWith"}
+	}
+	cfmt := C.CString(format)
+	defer C.free(unsafe.Pointer(cfmt))
+	var errCode C.int
+	h := C.office_document_open_from_bytes_with(
+		(*C.uint8_t)(unsafe.Pointer(&data[0])),
+		C.size_t(len(data)),
+		cfmt,
+		options.raw(),
+		&errCode,
+	)
+	if h == nil {
+		return nil, &Error{Code: int(errCode), Op: "OpenFromBytesWith"}
+	}
+	d := &Document{handle: h}
+	runtime.SetFinalizer(d, func(d *Document) { d.Close() })
+	return d, nil
+}
+
+// Damage is one thing wrong with a document.
+type Damage struct {
+	// Kind is "unreadable_part", "truncated" or "recovered".
+	Kind string `json:"kind"`
+	// Part is the part concerned, or nil when the reader does not know it.
+	Part   *string `json:"part"`
+	Detail string  `json:"detail"`
+}
+
+// IsLoss reports whether content is missing (every kind but "recovered").
+func (d Damage) IsLoss() bool { return d.Kind != "recovered" }
+
+// Damage lists what is wrong with the document; empty when sound. It
+// converts the document once.
+func (d *Document) Damage() ([]Damage, error) {
+	if d.handle == nil {
+		return nil, ErrClosed
+	}
+	var errCode C.int
+	out := C.office_document_damage_json(d.handle, &errCode)
+	text, err := cStrOrErr(out, errCode, "Damage")
+	if err != nil {
+		return nil, err
+	}
+	var found []Damage
+	if err := json.Unmarshal([]byte(text), &found); err != nil {
+		return nil, err
+	}
+	return found, nil
 }
 
 // Close releases the underlying document handle. Safe to call multiple times.

@@ -259,3 +259,114 @@ func TestToMarkdownWithImages(t *testing.T) {
 		t.Fatalf("no embedded image: %q", md)
 	}
 }
+
+// A .xlsx of 200 cells of 200 characters each: 40,000 characters of text.
+func bigSheet(t *testing.T) []byte {
+	t.Helper()
+	w := NewXlsxWriter()
+	defer w.Close()
+	w.AddSheet("S")
+	for i := 0; i < 200; i++ {
+		if err := w.SetCell(0, uint32(i), 0, strings.Repeat("x", 200)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, err := w.ToBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestOptionsApplyToOneDocumentOnly(t *testing.T) {
+	data := bigSheet(t)
+	opts, err := NewParseOptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opts.Close()
+	if err := opts.Set("text_chars", 5000); err != nil {
+		t.Fatal(err)
+	}
+	small, err := OpenFromBytesWith(data, "xlsx", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer small.Close()
+	plain, err := OpenFromBytes(data, "xlsx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plain.Close()
+	a, _ := small.PlainText()
+	b, _ := plain.PlainText()
+	if len(a) >= len(b) {
+		t.Fatalf("the limit did not apply: %d vs %d", len(a), len(b))
+	}
+}
+
+func TestDamageAndIncompleteError(t *testing.T) {
+	data := bigSheet(t)
+	opts, _ := NewParseOptions()
+	defer opts.Close()
+	_ = opts.Set("text_chars", 5000)
+	doc, err := OpenFromBytesWith(data, "xlsx", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doc.Close()
+	damage, err := doc.Damage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cut := false
+	for _, d := range damage {
+		if d.Kind == "truncated" && d.IsLoss() {
+			cut = true
+		}
+	}
+	if !cut {
+		t.Fatalf("expected a truncated entry, got %+v", damage)
+	}
+
+	if err := opts.SetBool("on_incomplete", true); err != nil {
+		t.Fatal(err)
+	}
+	_, err = OpenFromBytesWith(data, "xlsx", opts)
+	if !IsIncomplete(err) {
+		t.Fatalf("expected an incomplete-document error, got %v", err)
+	}
+}
+
+func TestStrictOptionsAcceptASoundDocumentAndBadNamesAreRefused(t *testing.T) {
+	w := NewXlsxWriter()
+	w.AddSheet("S")
+	_ = w.SetCell(0, 0, 0, "hello")
+	data, _ := w.ToBytes()
+	w.Close()
+	strict, err := NewStrictParseOptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer strict.Close()
+	doc, err := OpenFromBytesWith(data, "xlsx", strict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doc.Close()
+	if text, _ := doc.PlainText(); !strings.Contains(text, "hello") {
+		t.Fatalf("lost the text: %q", text)
+	}
+	if err := strict.Set("no_such_limit", 1); err == nil {
+		t.Fatal("an unknown option was accepted")
+	}
+	found := false
+	for _, n := range OptionNames() {
+		if n == "part_bytes" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("part_bytes is not listed")
+	}
+}

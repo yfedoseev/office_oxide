@@ -24,8 +24,46 @@ struct Cli {
     /// Keep text a tracked change deleted (left out by default)
     #[arg(long, global = true)]
     include_deleted: bool,
+    /// For input nobody vouches for: tighter limits, and a document that
+    /// could not be read completely is an error
+    #[arg(long, global = true)]
+    strict: bool,
+    /// Set an option for this run: a limit such as `text_chars=1000000` or
+    /// `part_bytes=1048576` (`max` for none), or `include_hidden_text=1`;
+    /// repeatable
+    #[arg(long = "limit", value_name = "NAME=VALUE", global = true)]
+    limits: Vec<String>,
     #[command(subcommand)]
     command: commands::Command,
+}
+
+/// The options this run reads documents under, from the flags.
+fn parse_options(cli: &Cli) -> Result<office_oxide::options::ParseOptions, String> {
+    let mut options = if cli.strict {
+        office_oxide::options::ParseOptions::strict()
+    } else {
+        office_oxide::options::ParseOptions::default()
+    };
+    if cli.include_hidden {
+        options.include_hidden_text = true;
+    }
+    if cli.include_deleted {
+        options.include_deleted_text = true;
+    }
+    for setting in &cli.limits {
+        let (name, value) = setting
+            .split_once('=')
+            .ok_or_else(|| format!("--limit expects NAME=VALUE, not '{setting}'"))?;
+        let value = if matches!(value, "max" | "none" | "unlimited") {
+            u64::MAX
+        } else {
+            value
+                .parse::<u64>()
+                .map_err(|_| format!("--limit {name}: '{value}' is not a number or 'max'"))?
+        };
+        options.set_option(name, value).map_err(|e| e.to_string())?;
+    }
+    Ok(options)
 }
 
 fn main() {
@@ -41,8 +79,13 @@ fn main() {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let cli = Cli::parse();
-    office_oxide::read_options::set_include_hidden_text(cli.include_hidden);
-    office_oxide::read_options::set_include_deleted_text(cli.include_deleted);
+    match parse_options(&cli) {
+        Ok(options) => commands::set_options(options),
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(2);
+        },
+    }
     if let Err(e) = commands::run(cli.command) {
         eprintln!("error: {e}");
         process::exit(1);

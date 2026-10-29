@@ -28,7 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`Document::damage()`** lists what is wrong with a document as `options::Damage { kind, part, detail }` (`UnreadablePart`, `Truncated`, `Recovered`), with `is_loss()` to tell missing content from a repair that left it intact.
 - **Per-part size and inflate-ratio limits.** `limits::set_max_part_bytes` (default 512 MiB, the former fixed cap) and `limits::set_max_inflate_ratio` (default 1,000, applied only to parts larger than 64 MiB so a small, highly compressible part is never refused): a zip-bomb part is refused before it is inflated past either bound. The stored size a header declares is bounded by the room the file's layout leaves that entry, so a header cannot raise its own cap. `Document::save_as` writes under the document's own limits.
 
+- **The options reach every surface.** C interface (`office_options_*`, `office_document_open_with`, `office_document_open_from_bytes_with`, `office_document_damage_json`, error code `OFFICE_ERR_INCOMPLETE` = 7), Python (`ParseOptions`, `Document.open(path, options=...)`, `Document.damage()`, `IncompleteDocumentError`), Node (`ParseOptions`, `Document.open(path, options)`, `damage()`, error code 7), Go (`ParseOptions`, `OpenWith`, `OpenFromBytesWith`, `Document.Damage`, `IsIncomplete`), C# (`ParseOptions`, `Document.Open(path, options)`, `Document.Damage()`, `OfficeOxideException.IsIncomplete`) and WASM (`WasmParseOptions`, `new WasmDocument(bytes, format, options)`, `damage()`). `ParseOptions::set_option(name, value)` and `Limits::set(name, value)` set an option by name for callers that cannot name a Rust field.
+- **CLI:** `--strict` and `--limit NAME=VALUE` (repeatable; `max` for none); `info` lists what is missing.
+
 ### Changed (limits, options and damage)
+
+- **MCP server:** `extract` and `info` read the document under per-call options that cap the text and image budgets, instead of lowering the process-wide budgets and restoring them; they take `"strict": true`. No lock on the process-wide limits is needed any more.
 
 - `OfficeError` is `#[non_exhaustive]` and has a new variant, `Incomplete`; match it with a wildcard arm.
 - The `default-password` feature now uses the RustCrypto crates instead of primitives written in this crate (see above); the feature is still off by default and a default build links none of them.

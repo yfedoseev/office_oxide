@@ -131,6 +131,26 @@ If it saves you a dependency or a license audit, a star on GitHub genuinely help
 
 — Yury
 
+## Per-document options and limits
+
+```python
+from office_oxide import Document, ParseOptions, IncompleteDocumentError
+
+opts = ParseOptions(strict=True, text_chars=5_000_000)   # tighter limits; error if incomplete
+try:
+    doc = Document.open("upload.docx", options=opts)
+except IncompleteDocumentError as e:
+    print("refused:", e)
+
+doc = Document.from_bytes(data, "xlsx")                  # default: read what can be read
+for d in doc.damage():                                   # what is missing, if anything
+    print(d["kind"], d["part"], d["detail"])
+```
+
+The options belong to the document: nothing global changes. `ParseOptions.names()`
+lists every option (limits such as `text_chars`, `part_bytes`, `embedded_depth`;
+`include_hidden_text`, `include_deleted_text`; `on_incomplete="error"`).
+
 ## License
 
 Dual-licensed under [MIT](../LICENSE-MIT) or [Apache-2.0](../LICENSE-APACHE) at your option.

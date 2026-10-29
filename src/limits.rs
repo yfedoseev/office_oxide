@@ -20,7 +20,7 @@
 //! process-wide defaults: every document read or written afterwards, on every
 //! thread, so set them once at start-up. For limits that belong to one
 //! document (a server with different tenants, a test beside others) use
-//! [`Limits`] in [`ParseOptions`](crate::options::ParseOptions) with
+//! [`Limits`](crate::limits::Limits) in [`ParseOptions`](crate::options::ParseOptions) with
 //! [`Document::open_with`](crate::Document::open_with): they apply to that
 //! document's reading and conversions and to nothing else. (The tuning
 //! constants behind the scaled text budget and the write-memory estimate are
@@ -51,12 +51,12 @@
 
 //!
 //! OOXML packages are zip archives. A part is bounded by its decompressed size
-//! ([`max_part_bytes`], 512 MiB) and, once it is larger than
-//! [`INFLATE_RATIO_FLOOR_BYTES`], by its ratio to the bytes that store it
-//! ([`max_inflate_ratio`], 1,000; Apache POI's `ZipSecureFile` does the same
+//! ([`max_part_bytes`](crate::limits::max_part_bytes), 512 MiB) and, once it is larger than
+//! [`INFLATE_RATIO_FLOOR_BYTES`](crate::limits::INFLATE_RATIO_FLOOR_BYTES), by its ratio to the bytes that store it
+//! ([`max_inflate_ratio`](crate::limits::max_inflate_ratio), 1,000; Apache POI's `ZipSecureFile` does the same
 //! with 100). Two package-wide bounds sit on top, as POI's do: the number of
-//! entries an archive may hold ([`max_package_entries`]) and the total
-//! decompressed bytes read from one package ([`max_package_bytes`]). A
+//! entries an archive may hold ([`max_package_entries`](crate::limits::max_package_entries)) and the total
+//! decompressed bytes read from one package ([`max_package_bytes`](crate::limits::max_package_bytes)). A
 //! package or part that exceeds any is refused with
 //! [`Error::PackageLimit`](crate::core::Error::PackageLimit) or
 //! [`Error::DecompressionLimit`](crate::core::Error::DecompressionLimit).
@@ -1671,6 +1671,93 @@ impl Limits {
         MAX_MARKDOWN_ELEMENTS.store(self.markdown_elements, Ordering::Relaxed);
     }
 }
+
+impl Limits {
+    /// The name of every limit, as [`Limits::set`] takes it: the field names.
+    pub const NAMES: &'static [&'static str] = &[
+        "package_entries",
+        "package_bytes",
+        "part_bytes",
+        "inflate_ratio",
+        "embedded_depth",
+        "embedded_packages",
+        "embedded_bytes",
+        "text_chars",
+        "grid_padding_cells",
+        "sheet_grid_padding_cells",
+        "inflated_image_bytes",
+        "ir_padding_bytes",
+        "sheet_ir_padding_bytes",
+        "image_bytes",
+        "total_image_bytes",
+        "write_bytes",
+        "write_sheets",
+        "markdown_list_items",
+        "markdown_table_cells",
+        "markdown_elements",
+    ];
+
+    /// Set the limit called `name` (a field name; see [`Limits::NAMES`]) to
+    /// `value`. For callers that cannot name a Rust field: the command line,
+    /// the C interface and the language bindings take limits by name. A value
+    /// past what a `usize` holds is the maximum, i.e. no bound.
+    pub fn set(&mut self, name: &str, value: u64) -> Result<(), UnknownLimit> {
+        match name {
+            "package_entries" => {
+                self.package_entries = usize::try_from(value).unwrap_or(usize::MAX)
+            },
+            "package_bytes" => self.package_bytes = value,
+            "part_bytes" => self.part_bytes = value,
+            "inflate_ratio" => self.inflate_ratio = value,
+            "embedded_depth" => self.embedded_depth = usize::try_from(value).unwrap_or(usize::MAX),
+            "embedded_packages" => {
+                self.embedded_packages = usize::try_from(value).unwrap_or(usize::MAX)
+            },
+            "embedded_bytes" => self.embedded_bytes = value,
+            "text_chars" => self.text_chars = usize::try_from(value).unwrap_or(usize::MAX),
+            "grid_padding_cells" => {
+                self.grid_padding_cells = usize::try_from(value).unwrap_or(usize::MAX)
+            },
+            "sheet_grid_padding_cells" => {
+                self.sheet_grid_padding_cells = usize::try_from(value).unwrap_or(usize::MAX)
+            },
+            "inflated_image_bytes" => self.inflated_image_bytes = value,
+            "ir_padding_bytes" => {
+                self.ir_padding_bytes = usize::try_from(value).unwrap_or(usize::MAX)
+            },
+            "sheet_ir_padding_bytes" => {
+                self.sheet_ir_padding_bytes = usize::try_from(value).unwrap_or(usize::MAX)
+            },
+            "image_bytes" => self.image_bytes = usize::try_from(value).unwrap_or(usize::MAX),
+            "total_image_bytes" => self.total_image_bytes = value,
+            "write_bytes" => self.write_bytes = value,
+            "write_sheets" => self.write_sheets = usize::try_from(value).unwrap_or(usize::MAX),
+            "markdown_list_items" => {
+                self.markdown_list_items = usize::try_from(value).unwrap_or(usize::MAX)
+            },
+            "markdown_table_cells" => {
+                self.markdown_table_cells = usize::try_from(value).unwrap_or(usize::MAX)
+            },
+            "markdown_elements" => {
+                self.markdown_elements = usize::try_from(value).unwrap_or(usize::MAX)
+            },
+            _ => return Err(UnknownLimit(name.to_string())),
+        }
+        Ok(())
+    }
+}
+
+/// A limit name [`Limits::set`] does not know.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownLimit(pub String);
+
+impl std::fmt::Display for UnknownLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown limit '{}'; the limits are: {}", self.0, Limits::NAMES.join(", "))
+    }
+}
+
+impl std::error::Error for UnknownLimit {}
 
 thread_local! {
     /// The limits of the call running on this thread (see [`LimitsScope`]).

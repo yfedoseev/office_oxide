@@ -342,6 +342,13 @@ cargo binstall office_oxide_cli      # Pre-built binary
 cargo install office_oxide_mcp
 ```
 
+### Per-document options
+
+Limits, hidden/deleted text and "refuse an incomplete result" can be set per document instead of process-wide:
+`ParseOptions` with `Document::open_with` (Rust), `ParseOptions(strict=True)` (Python), `new ParseOptions({ strict: true })`
+(Node), `NewStrictParseOptions` (Go), `new ParseOptions(strict: true)` (C#), `WasmParseOptions` (WASM), `--strict` and
+`--limit NAME=VALUE` (CLI), `"strict": true` (MCP). `Document::damage()` (`.damage()`) lists what is missing.
+
 ## CLI
 
 `office-oxide` provides fast Office document processing from your terminal:
@@ -356,6 +363,8 @@ office-oxide info report.docx                    # Show format and metadata
 office-oxide replace report.docx OLD NEW         # Find/replace text (DOCX/PPTX), in place
 office-oxide replace report.docx OLD NEW --output edited.docx   # …written to a new file
 office-oxide text report.docx --include-hidden --include-deleted  # also hidden text and tracked deletions
+office-oxide text upload.docx --strict           # untrusted input: tighter limits, error if anything is missing
+office-oxide text big.xlsx --limit text_chars=50000000   # set a limit by name (`max` for none)
 ```
 
 All six formats are supported for reading (docx, xlsx, pptx, doc, xls, ppt); `replace` writes

@@ -81,6 +81,9 @@ pub const OFFICE_ERR_PARSE: i32 = 3;
 pub const OFFICE_ERR_EXTRACTION: i32 = 4;
 pub const OFFICE_ERR_INTERNAL: i32 = 5;
 pub const OFFICE_ERR_UNSUPPORTED: i32 = 6;
+/// The document was read but the result is known to be incomplete, and the
+/// options asked for an error in that case.
+pub const OFFICE_ERR_INCOMPLETE: i32 = 7;
 
 fn set_err(ptr: *mut i32, code: i32) {
     if !ptr.is_null() {
@@ -133,6 +136,7 @@ fn classify_error(e: &crate::OfficeError) -> i32 {
         E::Ppt(crate::ppt::PptError::Cfb(c)) => classify_cfb(c),
         E::Ppt(crate::ppt::PptError::Encrypted) => OFFICE_ERR_UNSUPPORTED,
         E::UnsupportedFormat(_) => OFFICE_ERR_UNSUPPORTED,
+        E::Incomplete(_) => OFFICE_ERR_INCOMPLETE,
         E::Panic(_) => OFFICE_ERR_INTERNAL,
         // Every remaining format-level variant describes content the parser
         // could not accept.
@@ -332,6 +336,176 @@ pub extern "C" fn office_document_open_from_bytes(
             },
             Err(e) => {
                 set_err(error_code, classify_error(&e));
+                ptr::null_mut()
+            },
+        }
+    })
+}
+
+// ─── Parse options ──────────────────────────────────────────────────────────
+
+/// Opaque handle for per-document options: limits, which text is kept, and
+/// whether an incomplete result is an error. Not shared between threads
+/// without synchronisation; a document copies the options it is opened with.
+pub struct OfficeParseOptionsHandle {
+    opts: crate::options::ParseOptions,
+}
+
+fn new_options(opts: crate::options::ParseOptions) -> *mut OfficeParseOptionsHandle {
+    Box::into_raw(Box::new(OfficeParseOptionsHandle { opts }))
+}
+
+/// Options holding the process-wide settings in force now. Free with
+/// `office_options_free`.
+#[unsafe(no_mangle)]
+pub extern "C" fn office_options_new() -> *mut OfficeParseOptionsHandle {
+    guard(ptr::null_mut(), ptr::null_mut(), || {
+        new_options(crate::options::ParseOptions::default())
+    })
+}
+
+/// Options for input from a source nobody vouches for: tighter limits, and an
+/// incomplete result is an error. Free with `office_options_free`.
+#[unsafe(no_mangle)]
+pub extern "C" fn office_options_strict() -> *mut OfficeParseOptionsHandle {
+    guard(ptr::null_mut(), ptr::null_mut(), || {
+        new_options(crate::options::ParseOptions::strict())
+    })
+}
+
+/// Free an options handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn office_options_free(handle: *mut OfficeParseOptionsHandle) {
+    guard(ptr::null_mut(), (), || {
+        if !handle.is_null() {
+            drop(unsafe { Box::from_raw(handle) });
+        }
+    })
+}
+
+/// Set an option by name. Returns OFFICE_OK, or OFFICE_ERR_INVALID_ARG for a
+/// null handle or a name that is not an option.
+#[unsafe(no_mangle)]
+pub extern "C" fn office_options_set(
+    handle: *mut OfficeParseOptionsHandle,
+    name: *const c_char,
+    value: u64,
+) -> i32 {
+    guard(ptr::null_mut(), OFFICE_ERR_INTERNAL, || {
+        let Some(name) = cstr_to_str(name) else {
+            return OFFICE_ERR_INVALID_ARG;
+        };
+        if handle.is_null() {
+            return OFFICE_ERR_INVALID_ARG;
+        }
+        match unsafe { &mut *handle }.opts.set_option(name, value) {
+            Ok(()) => OFFICE_OK,
+            Err(_) => OFFICE_ERR_INVALID_ARG,
+        }
+    })
+}
+
+/// The names `office_options_set` accepts, comma-separated. Free with
+/// `office_oxide_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn office_options_names() -> *mut c_char {
+    guard(ptr::null_mut(), ptr::null_mut(), || {
+        let mut names = vec![
+            "include_hidden_text",
+            "include_deleted_text",
+            "on_incomplete",
+        ];
+        names.extend_from_slice(crate::limits::Limits::NAMES);
+        to_c_string(&names.join(","))
+    })
+}
+
+/// Open a document from a file path under `options` (NULL for the
+/// process-wide settings, as `office_document_open`).
+#[unsafe(no_mangle)]
+pub extern "C" fn office_document_open_with(
+    path: *const c_char,
+    options: *const OfficeParseOptionsHandle,
+    error_code: *mut i32,
+) -> *mut OfficeDocumentHandle {
+    guard(error_code, ptr::null_mut(), || {
+        let Some(path) = cstr_to_pathbuf(path) else {
+            set_err(error_code, OFFICE_ERR_INVALID_ARG);
+            return ptr::null_mut();
+        };
+        let result = match unsafe { options.as_ref() } {
+            Some(o) => Document::open_with(&path, &o.opts),
+            None => Document::open(&path),
+        };
+        document_handle(result, error_code)
+    })
+}
+
+/// Open a document from an in-memory buffer under `options` (NULL for the
+/// process-wide settings, as `office_document_open_from_bytes`).
+#[unsafe(no_mangle)]
+pub extern "C" fn office_document_open_from_bytes_with(
+    data: *const u8,
+    len: usize,
+    format: *const c_char,
+    options: *const OfficeParseOptionsHandle,
+    error_code: *mut i32,
+) -> *mut OfficeDocumentHandle {
+    guard(error_code, ptr::null_mut(), || {
+        if data.is_null() || len == 0 {
+            set_err(error_code, OFFICE_ERR_INVALID_ARG);
+            return ptr::null_mut();
+        }
+        let Some(fmt) = cstr_to_str(format).and_then(parse_format) else {
+            set_err(error_code, OFFICE_ERR_UNSUPPORTED);
+            return ptr::null_mut();
+        };
+        let cursor = std::io::Cursor::new(unsafe { slice::from_raw_parts(data, len) }.to_vec());
+        let result = match unsafe { options.as_ref() } {
+            Some(o) => Document::from_reader_with(cursor, fmt, &o.opts),
+            None => Document::from_reader(cursor, fmt),
+        };
+        document_handle(result, error_code)
+    })
+}
+
+fn document_handle(
+    result: crate::Result<Document>,
+    error_code: *mut i32,
+) -> *mut OfficeDocumentHandle {
+    match result {
+        Ok(doc) => {
+            set_err(error_code, OFFICE_OK);
+            Box::into_raw(Box::new(OfficeDocumentHandle { _doc: doc })) as *mut _
+        },
+        Err(e) => {
+            set_err(error_code, classify_error(&e));
+            ptr::null_mut()
+        },
+    }
+}
+
+/// What is wrong with the document, as a JSON array of `{kind, part, detail}`
+/// (`kind` is `unreadable_part`, `truncated` or `recovered`; `part` may be
+/// null); `[]` for a sound document. Converts the document once. Free with
+/// `office_oxide_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn office_document_damage_json(
+    handle: *const OfficeDocumentHandle,
+    error_code: *mut i32,
+) -> *mut c_char {
+    guard(error_code, ptr::null_mut(), || {
+        if handle.is_null() {
+            set_err(error_code, OFFICE_ERR_INVALID_ARG);
+            return ptr::null_mut();
+        }
+        match serde_json::to_string(&unsafe { &*handle }._doc.damage()) {
+            Ok(s) => {
+                set_err(error_code, OFFICE_OK);
+                to_c_string(&s)
+            },
+            Err(_) => {
+                set_err(error_code, OFFICE_ERR_EXTRACTION);
                 ptr::null_mut()
             },
         }
@@ -1519,5 +1693,104 @@ mod error_code_tests {
         assert_eq!(len, 7);
         assert_eq!(unsafe { slice::from_raw_parts(ptr, len) }, b"payload");
         unsafe { office_oxide_free_bytes(ptr, len) };
+    }
+}
+
+#[cfg(test)]
+mod options_tests {
+    use super::*;
+    use std::ffi::CString;
+
+    fn cstr(s: &str) -> CString {
+        CString::new(s).unwrap()
+    }
+
+    fn take_string(ptr: *mut c_char) -> String {
+        assert!(!ptr.is_null());
+        let s = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap().to_string();
+        unsafe { office_oxide_free_string(ptr) };
+        s
+    }
+
+    /// A `.docx` whose body is cut off part-way.
+    fn cut_off_docx() -> Vec<u8> {
+        use crate::core::opc::{OpcWriter, PartName};
+        use crate::core::relationships::rel_types;
+        let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>kept</w:t></w:r></w:p><w:p><w:r><w:t>cut"#;
+        let mut w = OpcWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+        w.add_part(
+            &PartName::new("/word/document.xml").unwrap(),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+            xml.as_bytes(),
+        )
+        .unwrap();
+        w.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        w.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn test_options_are_set_by_name_and_unknown_names_are_refused() {
+        let o = office_options_new();
+        assert_eq!(office_options_set(o, cstr("text_chars").as_ptr(), 1000), OFFICE_OK);
+        assert_eq!(office_options_set(o, cstr("include_hidden_text").as_ptr(), 1), OFFICE_OK);
+        assert_eq!(
+            office_options_set(o, cstr("no_such_limit").as_ptr(), 1),
+            OFFICE_ERR_INVALID_ARG
+        );
+        assert_eq!(
+            office_options_set(ptr::null_mut(), cstr("text_chars").as_ptr(), 1),
+            OFFICE_ERR_INVALID_ARG
+        );
+        assert!(take_string(office_options_names()).contains("part_bytes"));
+        unsafe { office_options_free(o) };
+    }
+
+    #[test]
+    fn test_an_incomplete_document_is_reported_or_refused_as_the_options_say() {
+        let bytes = cut_off_docx();
+        let format = cstr("docx");
+        let mut code = -1;
+
+        let report = office_options_new();
+        let doc = office_document_open_from_bytes_with(
+            bytes.as_ptr(),
+            bytes.len(),
+            format.as_ptr(),
+            report,
+            &mut code,
+        );
+        assert_eq!((code, doc.is_null()), (OFFICE_OK, false));
+        let damage = take_string(office_document_damage_json(doc, &mut code));
+        assert!(
+            damage.contains("unreadable_part") && damage.contains("word/document.xml"),
+            "{damage}"
+        );
+        unsafe { office_document_free(doc) };
+
+        let strict = office_options_new();
+        assert_eq!(office_options_set(strict, cstr("on_incomplete").as_ptr(), 1), OFFICE_OK);
+        let refused = office_document_open_from_bytes_with(
+            bytes.as_ptr(),
+            bytes.len(),
+            format.as_ptr(),
+            strict,
+            &mut code,
+        );
+        assert_eq!((code, refused.is_null()), (OFFICE_ERR_INCOMPLETE, true));
+
+        // No options at all behaves as the plain open.
+        let plain = office_document_open_from_bytes_with(
+            bytes.as_ptr(),
+            bytes.len(),
+            format.as_ptr(),
+            ptr::null(),
+            &mut code,
+        );
+        assert_eq!((code, plain.is_null()), (OFFICE_OK, false));
+        unsafe {
+            office_document_free(plain);
+            office_options_free(report);
+            office_options_free(strict);
+        }
     }
 }

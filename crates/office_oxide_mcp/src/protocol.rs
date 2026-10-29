@@ -43,6 +43,13 @@ pub fn handle_tools_list(id: &Value) -> Value {
                                     "Output format (default: text). \
                                      `markdown-with-images` embeds each image inline as \
                                      [image-base64:...] at its position in the flow."
+                            },
+                            "strict": {
+                                "type": "boolean",
+                                "description":
+                                    "Read untrusted input: tighter limits, and an error \
+                                     instead of a partial result when part of the document \
+                                     cannot be read or a limit cut it (default: false)"
                             }
                         },
                         "required": ["file_path"]
@@ -91,6 +98,13 @@ pub fn handle_tools_list(id: &Value) -> Value {
                             "file_path": {
                                 "type": "string",
                                 "description": "Path to the document file"
+                            },
+                            "strict": {
+                                "type": "boolean",
+                                "description":
+                                    "Read untrusted input: tighter limits, and an error \
+                                     instead of a partial result when part of the document \
+                                     cannot be read or a limit cut it (default: false)"
                             }
                         },
                         "required": ["file_path"]
@@ -137,60 +151,37 @@ const MAX_EXTRACT_BYTES: usize = 32 * 1024 * 1024;
 /// is four thirds of the bytes, so this keeps them near [`MAX_EXTRACT_BYTES`].
 const MAX_EXTRACT_IMAGE_BYTES: usize = 24 * 1024 * 1024;
 
-/// Serialises the scopes that lower the library's process-wide budgets, so
-/// that one scope never saves, and later restores, the values another has
-/// lowered.
-static BUDGETS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// The library's per-document budgets brought down to what one tool result
-/// can hold, for as long as the scope lives; the values it found are put
-/// back when it drops, however it ends.
+/// The options a tool call reads its document under: the library's per-document
+/// budgets brought down to what one tool result can hold.
 ///
 /// The renderers build their whole output before it can be measured, and the
 /// library's default text budget (256 Mi characters) lets a spreadsheet run
-/// to gigabytes before the size check could refuse it. Within the scope the
+/// to gigabytes before the size check could refuse it. Under these options the
 /// text budget is [`MAX_EXTRACT_BYTES`] characters, so a spreadsheet's output
 /// stops there with the library's usual truncation notice; the image budget
 /// is lowered the same way. A budget that is already lower is kept.
 ///
-/// Only the tools that convert a document to text or to the IR take the
-/// scope: `extract`, and `info`, which converts the whole document to read
-/// its metadata (it would otherwise build an IR of up to the default budget,
+/// The options belong to the call: nothing process-wide is changed, so calls
+/// no longer have to be serialised against each other or against a library
+/// user's own settings. With `"strict": true` the document is read under the
+/// library's strict limits and refused if it cannot be read completely.
+///
+/// Only the tools that convert a document to text or to the IR take them:
+/// `extract`, and `info`, which converts the whole document to read its
+/// metadata (it would otherwise build an IR of up to the default budget,
 /// gigabytes for a hostile spreadsheet; a document with more than 32 Mi
 /// characters of text is reported there as incompletely extracted).
-/// `replace_text` edits the package's XML in place, reads none of these
-/// budgets, and runs under whatever the process has set. The budgets are
-/// process-wide, so the scope takes a lock: tool calls are handled one at a
-/// time, and a library user who changes the limits while the server is
-/// handling a call is not supported.
-struct BudgetScope {
-    before: (usize, usize),
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-impl BudgetScope {
-    fn extract_limits() -> Self {
-        Self::bound_to(MAX_EXTRACT_BYTES, MAX_EXTRACT_IMAGE_BYTES)
-    }
-
-    fn bound_to(text_chars: usize, image_bytes: usize) -> Self {
-        use office_oxide::limits;
-        let lock = BUDGETS.lock().unwrap_or_else(|e| e.into_inner());
-        let before = (limits::max_text_chars(), limits::max_image_bytes());
-        limits::set_max_text_chars(before.0.min(text_chars));
-        limits::set_max_image_bytes(before.1.min(image_bytes));
-        Self {
-            before,
-            _lock: lock,
-        }
-    }
-}
-
-impl Drop for BudgetScope {
-    fn drop(&mut self) {
-        office_oxide::limits::set_max_text_chars(self.before.0);
-        office_oxide::limits::set_max_image_bytes(self.before.1);
-    }
+/// `replace_text` edits the package's XML in place and reads none of these
+/// budgets.
+fn tool_options(args: &Value) -> office_oxide::options::ParseOptions {
+    let mut options = if args["strict"].as_bool().unwrap_or(false) {
+        office_oxide::options::ParseOptions::strict()
+    } else {
+        office_oxide::options::ParseOptions::default()
+    };
+    options.limits.text_chars = options.limits.text_chars.min(MAX_EXTRACT_BYTES);
+    options.limits.image_bytes = options.limits.image_bytes.min(MAX_EXTRACT_IMAGE_BYTES);
+    options
 }
 
 fn call_extract(id: &Value, args: &Value) -> Value {
@@ -199,10 +190,9 @@ fn call_extract(id: &Value, args: &Value) -> Value {
     };
     let format = args["format"].as_str().unwrap_or("text");
 
-    // Opening is inside the scope: the legacy spreadsheet reader copies shared
-    // strings into cells as it opens.
-    let _budgets = BudgetScope::extract_limits();
-    let doc = match office_oxide::Document::open(file_path) {
+    // The options apply to the opening too: the legacy spreadsheet reader
+    // copies shared strings into cells as it opens.
+    let doc = match office_oxide::Document::open_with(file_path, &tool_options(args)) {
         Ok(d) => d,
         Err(e) => return tool_error(id, &e.to_string()),
     };
@@ -226,7 +216,7 @@ fn call_extract(id: &Value, args: &Value) -> Value {
 /// streaming writer in the library: its text, Markdown or HTML is built whole
 /// (the IR is built whole, then serialised into the buffer) before the buffer
 /// can refuse it, and memory is bounded there by the library's text and image
-/// budgets (see [`BudgetScope`]), not by `limit`.
+/// budgets (see [`tool_options`]), not by `limit`.
 fn render(doc: &office_oxide::Document, format: &str, limit: usize) -> Result<String, String> {
     // Every format is written through a bounded buffer, so an oversized
     // document stops at the limit instead of building the whole string (and
@@ -336,8 +326,7 @@ fn call_info(id: &Value, args: &Value) -> Value {
         return error_response(id, INVALID_PARAMS, "missing file_path");
     };
 
-    let _budgets = BudgetScope::extract_limits();
-    let doc = match office_oxide::Document::open(file_path) {
+    let doc = match office_oxide::Document::open_with(file_path, &tool_options(args)) {
         Ok(d) => d,
         Err(e) => return tool_error(id, &e.to_string()),
     };
@@ -523,12 +512,15 @@ mod tests {
         }
         w.save(&path).unwrap();
         let scope = TestLimits::bound_to(2_000, 1_000);
-        let doc = office_oxide::Document::open(&path).unwrap();
+        let doc = office_oxide::Document::open_with(&path, &tool_options(&json!({}))).unwrap();
         let cut = render(&doc, "markdown", usize::MAX);
         let info = call_info(&json!(1), &json!({ "file_path": path.to_str().unwrap() }));
         drop(scope);
         let _defaults = default_limits();
-        let full = render(&doc, "text", usize::MAX).unwrap();
+        // The document keeps the options it was opened with, so the whole text
+        // comes from one opened without them.
+        let whole = office_oxide::Document::open(&path).unwrap();
+        let full = render(&whole, "text", usize::MAX).unwrap();
         assert!(full.len() >= 20_000);
 
         let cut = cut.unwrap();
@@ -564,31 +556,67 @@ mod tests {
         );
     }
 
-    /// The budgets are lowered for the length of a tool call that converts a
-    /// document and put back after it, not for the life of the process; a
-    /// budget already lower is kept; and a panic inside the scope still
-    /// restores them and leaves the lock usable.
+    /// A tool call's options cap the budgets at what one result can hold, keep
+    /// a lower process-wide budget, and change nothing process-wide.
     #[test]
-    fn test_the_lowered_budgets_last_only_as_long_as_the_scope() {
+    fn test_tool_options_cap_the_budgets_without_touching_the_process() {
         use office_oxide::limits::{max_image_bytes, max_text_chars};
         {
             let _limits = TestLimits::bound_to(usize::MAX, usize::MAX);
-            {
-                let _scope = super::BudgetScope::extract_limits();
-                assert_eq!(max_text_chars(), MAX_EXTRACT_BYTES);
-                assert_eq!(max_image_bytes(), MAX_EXTRACT_IMAGE_BYTES);
-            }
-            assert_eq!((max_text_chars(), max_image_bytes()), (usize::MAX, usize::MAX));
-            let panicked = std::panic::catch_unwind(|| {
-                let _scope = super::BudgetScope::extract_limits();
-                panic!("the call fails inside the scope");
-            });
-            assert!(panicked.is_err());
+            let options = tool_options(&json!({}));
+            assert_eq!(options.limits.text_chars, MAX_EXTRACT_BYTES);
+            assert_eq!(options.limits.image_bytes, MAX_EXTRACT_IMAGE_BYTES);
             assert_eq!((max_text_chars(), max_image_bytes()), (usize::MAX, usize::MAX));
         }
         let _limits = TestLimits::bound_to(1_000, 500);
-        let _scope = super::BudgetScope::extract_limits();
-        assert_eq!((max_text_chars(), max_image_bytes()), (1_000, 500), "a lower budget is kept");
+        let options = tool_options(&json!({}));
+        assert_eq!(
+            (options.limits.text_chars, options.limits.image_bytes),
+            (1_000, 500),
+            "a lower budget is kept"
+        );
+    }
+
+    /// `"strict": true` reads under the strict limits and refuses a document
+    /// that cannot be read completely; without it the readable part is returned.
+    #[test]
+    fn test_strict_refuses_an_incomplete_document() {
+        use office_oxide::core::opc::{OpcWriter, PartName};
+        use office_oxide::core::relationships::rel_types;
+        let _defaults = default_limits();
+        let dir = scratch_dir("strict");
+        let path = dir.join("cut.docx");
+        let body = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>kept</w:t></w:r></w:p><w:p><w:r><w:t>cut"#;
+        let mut writer = OpcWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+        writer
+            .add_part(
+                &PartName::new("/word/document.xml").unwrap(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                body.as_bytes(),
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        std::fs::write(&path, writer.finish().unwrap().into_inner()).unwrap();
+        let file = path.to_str().unwrap();
+
+        for tool in ["extract", "info"] {
+            let lenient = handle_tools_call(
+                &json!(1),
+                &json!({ "name": tool, "arguments": { "file_path": file } }),
+            );
+            assert!(lenient["result"]["isError"].is_null(), "{tool}: {lenient}");
+            let strict = handle_tools_call(
+                &json!(1),
+                &json!({ "name": tool, "arguments": { "file_path": file, "strict": true } }),
+            );
+            assert_eq!(strict["result"]["isError"], json!(true), "{tool}: {strict}");
+            let message = strict["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                message.contains("incomplete") && message.contains("word/document.xml"),
+                "{message}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `extract` and `info` leave the process's budgets as they found them,

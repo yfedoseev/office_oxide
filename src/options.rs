@@ -72,13 +72,57 @@ impl ParseOptions {
         }
     }
 
+    /// Set an option by name, for callers that cannot name a Rust field (the
+    /// command line, the C interface, the language bindings).
+    ///
+    /// `name` is a limit (see [`Limits::NAMES`]) with a number as its value, or
+    /// one of `include_hidden_text` and `include_deleted_text` (0 or 1), or
+    /// `on_incomplete` (0 reports, 1 is an error).
+    pub fn set_option(&mut self, name: &str, value: u64) -> Result<(), UnknownOption> {
+        match name {
+            "include_hidden_text" => self.include_hidden_text = value != 0,
+            "include_deleted_text" => self.include_deleted_text = value != 0,
+            "on_incomplete" => {
+                self.on_incomplete = if value == 0 {
+                    OnIncomplete::Report
+                } else {
+                    OnIncomplete::Error
+                }
+            },
+            limit => self
+                .limits
+                .set(limit, value)
+                .map_err(|_| UnknownOption(name.to_string()))?,
+        }
+        Ok(())
+    }
+
     pub(crate) fn read_settings(&self) -> (bool, bool) {
         (self.include_hidden_text, self.include_deleted_text)
     }
 }
 
+/// An option name [`ParseOptions::set_option`] does not know.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownOption(pub String);
+
+impl std::fmt::Display for UnknownOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unknown option '{}'; the options are: include_hidden_text, include_deleted_text, \
+             on_incomplete, {}",
+            self.0,
+            Limits::NAMES.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for UnknownOption {}
+
 /// How a document came to be incomplete.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum DamageKind {
     /// A part of the file could not be read and its content is missing (an
@@ -95,7 +139,7 @@ pub enum DamageKind {
 }
 
 /// One thing wrong with a document, found while reading it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[non_exhaustive]
 pub struct Damage {
     /// What kind of loss it is.

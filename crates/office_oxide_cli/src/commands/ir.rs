@@ -1,7 +1,5 @@
 use std::io::{BufWriter, Write};
 
-use office_oxide::Document;
-
 /// Dump the document IR as JSON — the IR's own serde form, byte-for-byte
 /// what the Python, MCP, C and WASM surfaces already emit.
 ///
@@ -15,7 +13,7 @@ use office_oxide::Document;
 /// 2.5 GB of RSS and 18 s; on a 14 MB one, 9.8 GB and an OOM kill. The IR
 /// itself for those files is a quarter of a gigabyte.
 pub fn run(file: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let doc = Document::open(file)?;
+    let doc = super::open(file)?;
     let ir = doc.to_ir();
     let stdout = std::io::stdout();
     let mut out = BufWriter::new(stdout.lock());

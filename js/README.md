@@ -152,6 +152,24 @@ If something's broken or missing, [open an issue](https://github.com/yfedoseev/o
 
 — Yury
 
+## Per-document options and limits
+
+```js
+import { Document, ParseOptions, OfficeOxideError } from 'office-oxide';
+
+const opts = new ParseOptions({ strict: true, text_chars: 5_000_000 }); // error if incomplete
+try {
+  const doc = Document.open('upload.docx', opts);
+} catch (e) {
+  if (e instanceof OfficeOxideError && e.code === 7) console.log('refused:', e.message);
+}
+const doc = Document.fromBytes(bytes, 'xlsx');   // default: read what can be read
+console.log(doc.damage());                       // [{ kind, part, detail }], empty when sound
+```
+
+The options belong to the document: nothing global changes. `ParseOptions.names()`
+lists every option. Call `close()` on options and documents when done.
+
 ## License
 
 MIT OR Apache-2.0
