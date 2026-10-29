@@ -27,8 +27,13 @@ pub(crate) fn parse_symbol_fonts(table: &[u8], fc: u32, lcb: u32) -> Vec<Option<
     }
     let end = start.saturating_add(lcb as usize).min(table.len());
     let sttb = &table[start..end];
-    let c_data = usize::from(u16::from_le_bytes([sttb[0], sttb[1]])).min(MAX_FONTS);
-    let cb_extra = usize::from(u16::from_le_bytes([sttb[2], sttb[3]]));
+    // The size is clamped to the stream, so fewer than the four header bytes
+    // can remain.
+    let [c0, c1, e0, e1, ..] = *sttb else {
+        return Vec::new();
+    };
+    let c_data = usize::from(u16::from_le_bytes([c0, c1])).min(MAX_FONTS);
+    let cb_extra = usize::from(u16::from_le_bytes([e0, e1]));
     let mut fonts = Vec::with_capacity(c_data.min(256));
     let mut pos = 4usize;
     for _ in 0..c_data {
@@ -198,6 +203,21 @@ mod tests {
         // An entry too short to hold the fixed part has no name.
         let short = [1u8, 0, 0, 0, 3, 1, 2, 3];
         assert_eq!(parse_symbol_fonts(&short, 0, short.len() as u32), vec![None]);
+    }
+
+    /// A font table whose offset lies within the last bytes of the stream leaves
+    /// fewer than the four header bytes after clamping: no panic, no fonts.
+    #[test]
+    fn test_a_font_table_at_the_very_end_of_the_stream_is_ignored() {
+        let table = vec![0x55u8; 10];
+        for fc in 0..=12u32 {
+            for lcb in [0u32, 1, 3, 4, 5, 100, u32::MAX] {
+                let _ = parse_symbol_fonts(&table, fc, lcb);
+            }
+        }
+        assert!(parse_symbol_fonts(&table, 8, 100).is_empty());
+        assert!(parse_symbol_fonts(&table, 9, 4).is_empty());
+        assert!(parse_symbol_fonts(&table, u32::MAX, u32::MAX).is_empty());
     }
 
     fn props(ftc: Option<u16>) -> ChpProps {
