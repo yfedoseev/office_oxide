@@ -327,9 +327,27 @@ impl DocxDocument {
         let doc_data = opc.read_part(&main_part)?;
         // A part cut off mid-element parses to whatever was read before the
         // cut and reports success; check the root actually closed.
-        xml::check_root_closed(&doc_data, main_part.as_str(), "document")?;
-        let (mut body, sections, alt_chunk_rids, alt_chunk_positions) =
-            parse_document(&doc_data, &doc_rels, &links)?;
+        let whole = xml::check_root_closed(&doc_data, main_part.as_str(), "document")
+            .and_then(|()| parse_document(&doc_data, &doc_rels, &links));
+        let (mut body, sections, alt_chunk_rids, alt_chunk_positions) = match whole {
+            Ok(parsed) => parsed,
+            // A body that is malformed part-way (or cut off) keeps the blocks
+            // before the damage, and the loss is reported.
+            Err(error) => match xml::salvage_prefix(&doc_data, 2) {
+                Some((prefix, blocks)) => {
+                    let parsed = parse_document(&prefix, &doc_rels, &links).map_err(|_| error)?;
+                    skip_unreadable(
+                        main_part.as_str(),
+                        &format!(
+                            "the XML is malformed after {blocks} body blocks; the rest of the \
+                             document was not read"
+                        ),
+                    );
+                    parsed
+                },
+                None => return Err(error.into()),
+            },
+        };
 
         // Resolve each `<w:altChunk>` and splice its text in at the point
         // the document references it. HTML and plain-text chunks are read;

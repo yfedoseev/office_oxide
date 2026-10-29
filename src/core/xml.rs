@@ -365,6 +365,69 @@ pub fn unescape_attr_value(attr: &quick_xml::events::attributes::Attribute<'_>) 
     Ok(unescaped.into_owned())
 }
 
+/// The part of a damaged XML part that is well-formed: the data up to the end
+/// of the last complete element whose parent chain is exactly `depth`
+/// elements deep (`depth` 2 for the children of `<w:body>` in a
+/// `<w:document>`, 3 for the shapes under `<p:spTree>` of a slide), closed with
+/// the end tags of the elements still open there, and how many such elements
+/// it holds.
+///
+/// `None` when the data is not damaged (an end tag that does not match, a
+/// syntax error, or an element still open at the end) or holds no complete
+/// element at that depth: the caller keeps its error. An element the damage
+/// reaches is never kept, so none is ever cut in two. The stack of open names
+/// is bounded by the data it came from.
+pub(crate) fn salvage_prefix(data: &[u8], depth: usize) -> Option<(Vec<u8>, usize)> {
+    let mut reader = quick_xml::Reader::from_reader(data);
+    let config = reader.config_mut();
+    config.trim_text(true);
+    config.check_comments = false;
+    // `check_end_names` stays on: a mismatched end tag is the damage.
+    let mut open: Vec<Vec<u8>> = Vec::new();
+    let mut cut: Option<(usize, Vec<Vec<u8>>)> = None;
+    let mut kept = 0usize;
+    let damaged;
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) => {
+                open.push(e.name().as_ref().as_bytes().to_vec());
+            },
+            Ok(quick_xml::events::Event::End(_)) => {
+                open.pop();
+                if open.len() == depth {
+                    kept += 1;
+                    cut = Some((reader.buffer_position() as usize, open.clone()));
+                }
+            },
+            Ok(quick_xml::events::Event::Empty(_)) if open.len() == depth => {
+                kept += 1;
+                cut = Some((reader.buffer_position() as usize, open.clone()));
+            },
+            Ok(quick_xml::events::Event::Eof) => {
+                damaged = !open.is_empty();
+                break;
+            },
+            Err(_) => {
+                damaged = true;
+                break;
+            },
+            Ok(_) => {},
+        }
+    }
+    if !damaged {
+        return None;
+    }
+    let (end, open) = cut?;
+    let mut out = Vec::with_capacity(end + 64);
+    out.extend_from_slice(data.get(..end)?);
+    for name in open.iter().rev() {
+        out.extend_from_slice(b"</");
+        out.extend_from_slice(name);
+        out.push(b'>');
+    }
+    Some((out, kept))
+}
+
 /// Fail when an XML part ends before its root element is closed.
 ///
 /// A parse loop that breaks on `Event::Eof` returns whatever it read, so a
@@ -1149,5 +1212,44 @@ mod ensure_utf8_tests {
         let xml = b"<a>caf\xE9</a>";
         let out = String::from_utf8(ensure_utf8(xml).unwrap()).unwrap();
         assert_eq!(out, "<a>caf\u{e9}</a>");
+    }
+}
+
+#[cfg(test)]
+mod salvage_tests {
+    use super::salvage_prefix;
+
+    fn text(r: Option<(Vec<u8>, usize)>) -> Option<(String, usize)> {
+        r.map(|(b, n)| (String::from_utf8(b).unwrap(), n))
+    }
+
+    #[test]
+    fn test_the_blocks_before_the_damage_are_kept_and_closed() {
+        let data = b"<d xmlns:w=\"u\"><w:body><w:p>a</w:p><w:p>b</w:p><w:p>c";
+        assert_eq!(
+            text(salvage_prefix(data, 2)),
+            Some(("<d xmlns:w=\"u\"><w:body><w:p>a</w:p><w:p>b</w:p></w:body></d>".into(), 2))
+        );
+    }
+
+    #[test]
+    fn test_a_mismatched_end_tag_is_damage() {
+        let data = b"<d><b><p>a</p><p>b</q></b></d>";
+        assert_eq!(text(salvage_prefix(data, 2)), Some(("<d><b><p>a</p></b></d>".into(), 1)));
+    }
+
+    #[test]
+    fn test_sound_data_and_data_with_no_complete_block_are_not_salvaged() {
+        assert!(salvage_prefix(b"<d><b><p>a</p></b></d>", 2).is_none());
+        assert!(salvage_prefix(b"<d><b><p>a", 2).is_none());
+        assert!(salvage_prefix(b"", 2).is_none());
+    }
+
+    #[test]
+    fn test_an_empty_element_at_the_depth_counts_as_a_block() {
+        assert_eq!(
+            text(salvage_prefix(b"<d><b><p/><p>", 2)),
+            Some(("<d><b><p/></b></d>".into(), 1))
+        );
     }
 }

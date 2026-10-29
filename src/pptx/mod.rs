@@ -514,14 +514,42 @@ impl PptxDocument {
                     Err(e) => return Ok((unreadable_slide(e.clone()), problems)),
                 };
                 let name = xml_csl_name(data);
-                let mut parsed =
-                    match Slide::parse(data, name, &b.slide_rels, &b.media, &b.part_text) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            problems.push((b.part_name.clone(), e.to_string()));
-                            return Ok((unreadable_slide(e.to_string()), problems));
-                        },
-                    };
+                // A slide cut off mid-element parses to what was read before
+                // the cut and reports success, so the root must have closed.
+                let whole = crate::core::xml::check_root_closed(data, &b.part_name, "sld")
+                    .and_then(|()| {
+                        Slide::parse(data, name.clone(), &b.slide_rels, &b.media, &b.part_text)
+                    });
+                let mut parsed = match whole {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // A slide malformed part-way keeps the shapes before
+                        // the damage, and the loss is reported.
+                        let salvaged = crate::core::xml::salvage_prefix(data, 3).and_then(
+                            |(prefix, shapes)| {
+                                Slide::parse(&prefix, name, &b.slide_rels, &b.media, &b.part_text)
+                                    .ok()
+                                    .map(|slide| (slide, shapes))
+                            },
+                        );
+                        match salvaged {
+                            Some((slide, shapes)) => {
+                                problems.push((
+                                    b.part_name.clone(),
+                                    format!(
+                                        "the XML is malformed after {shapes} shapes; the rest \
+                                         of the slide was not read"
+                                    ),
+                                ));
+                                slide
+                            },
+                            None => {
+                                problems.push((b.part_name.clone(), e.to_string()));
+                                return Ok((unreadable_slide(e.to_string()), problems));
+                            },
+                        }
+                    },
+                };
                 parsed.layout_index = b.layout_index;
                 parsed.notes = b.notes.clone();
                 for (comments_part, data) in &b.comments_data {
