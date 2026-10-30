@@ -56,6 +56,7 @@ try
     }
 
     Console.WriteLine("\nAll formats created and verified.");
+    Console.WriteLine("OK 02_create_from_markdown");
 }
 finally
 {

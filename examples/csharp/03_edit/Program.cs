@@ -54,6 +54,7 @@ try
     if (text.Contains("{{DATE}}")) throw new Exception("placeholder {{DATE}} still present");
 
     Console.WriteLine("Edit verified successfully.");
+    Console.WriteLine("OK 03_edit");
     Console.WriteLine("--- final text ---");
     Console.WriteLine(text);
 }

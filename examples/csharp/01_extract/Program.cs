@@ -42,6 +42,7 @@ try
     if (!text.Contains("Office Oxide Extract Demo")) throw new Exception("heading missing");
 
     Console.WriteLine("\nAll checks passed.");
+    Console.WriteLine("OK 01_extract");
 }
 finally
 {
