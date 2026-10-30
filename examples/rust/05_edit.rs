@@ -1,48 +1,71 @@
-//! 05_edit — Edit an existing document via EditableDocument.
-//!
-//! Creates a DOCX with placeholder text "Hello {{NAME}}", saves it, opens
-//! with EditableDocument, replaces "{{NAME}}" with "World", saves again, and
-//! reads back to verify the final text.
+//! 03_edit: replace text in a DOCX and set a cell in an XLSX, in memory.
 //!
 //! Run: `cargo run --example 05_edit`
 
-use office_oxide::Document;
-use office_oxide::docx::write::DocxWriter;
+use std::io::Cursor;
+
+use office_oxide::create::create_from_markdown_to_writer;
 use office_oxide::edit::EditableDocument;
+use office_oxide::xlsx::edit::CellValue;
+use office_oxide::xlsx::write::{CellData, XlsxWriter};
+use office_oxide::{Document, DocumentFormat};
+
+const MARKDOWN: &str = "# Quarterly Report\n\nRevenue grew in every region.\n\n\
+| Region | Q1  | Q2  |\n|--------|-----|-----|\n| North  | 120 | 135 |\n| South  | 95  | 110 |\n";
+
+fn build_docx_bytes(markdown: &str) -> Vec<u8> {
+    let mut buf = Cursor::new(Vec::new());
+    create_from_markdown_to_writer(markdown, DocumentFormat::Docx, &mut buf).expect("create DOCX");
+    buf.into_inner()
+}
+
+/// Assert with a message; a failure exits non-zero.
+fn check(condition: bool, message: &str) {
+    if !condition {
+        eprintln!("FAIL: {message}");
+        std::process::exit(1);
+    }
+}
 
 fn main() {
-    let template_path = std::env::temp_dir().join("oo_example_05_template.docx");
-    let output_path = std::env::temp_dir().join("oo_example_05_output.docx");
+    println!("step 1: build a DOCX in memory");
+    let bytes = build_docx_bytes(MARKDOWN);
 
-    // ── Create template ─────────────────────────────────────────────────────
-    let mut w = DocxWriter::new();
-    w.add_heading("Greeting Template", 1);
-    w.add_paragraph("Hello {{NAME}}, welcome to Office Oxide!");
-    w.add_paragraph("Sincerely, {{SENDER}}");
-    w.save(&template_path).expect("save template");
+    println!("step 2: replace text");
+    let mut editable = EditableDocument::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
+        .expect("open editable DOCX");
+    let replaced = editable
+        .replace_text("Quarterly Report", "Annual Report")
+        .expect("replace_text");
+    println!("  replacements: {replaced}");
+    check(replaced >= 1, "replace_text must report at least one replacement");
 
-    // ── Edit ────────────────────────────────────────────────────────────────
-    let mut ed = EditableDocument::open(&template_path).expect("open editable");
-    let n1 = ed
-        .replace_text("{{NAME}}", "World")
-        .expect("docx supports replace");
-    let n2 = ed
-        .replace_text("{{SENDER}}", "The Office Oxide Team")
-        .expect("docx supports replace");
-    ed.save(&output_path).expect("save edited document");
-
-    println!("Replacements: {{NAME}} x{n1}, {{SENDER}} x{n2}");
-
-    // ── Read back and verify ────────────────────────────────────────────────
-    let doc = Document::open(&output_path).expect("open output");
+    println!("step 3: save to bytes and check the text");
+    let mut out = Cursor::new(Vec::new());
+    editable.write_to(&mut out).expect("save edited DOCX");
+    let doc =
+        Document::from_reader(Cursor::new(out.into_inner()), DocumentFormat::Docx).expect("reopen");
     let text = doc.plain_text();
+    check(text.contains("Annual Report"), "edited text must contain the new title");
+    check(!text.contains("Quarterly Report"), "edited text must not contain the old title");
 
-    assert!(text.contains("Hello World"), "replacement failed: expected 'Hello World'");
-    assert!(text.contains("The Office Oxide Team"), "replacement failed: expected team name");
-    assert!(!text.contains("{{NAME}}"), "placeholder still present");
-    assert!(!text.contains("{{SENDER}}"), "placeholder still present");
-
-    println!("Edit verified successfully.");
-    println!("--- final text ---");
-    println!("{text}");
+    println!("step 4: set a cell in an XLSX");
+    let mut writer = XlsxWriter::new();
+    writer
+        .add_sheet("Sales")
+        .set_cell(0, 0, CellData::String("Region".into()));
+    let mut buf = Cursor::new(Vec::new());
+    writer.write_to(&mut buf).expect("write XLSX");
+    let mut sheet =
+        EditableDocument::from_reader(Cursor::new(buf.into_inner()), DocumentFormat::Xlsx)
+            .expect("open editable XLSX");
+    sheet
+        .set_cell(0, "B1", CellValue::String("Edited".into()))
+        .expect("set_cell");
+    let mut out = Cursor::new(Vec::new());
+    sheet.write_to(&mut out).expect("save edited XLSX");
+    let doc =
+        Document::from_reader(Cursor::new(out.into_inner()), DocumentFormat::Xlsx).expect("reopen");
+    check(doc.plain_text().contains("Edited"), "edited sheet must contain the new cell");
+    println!("OK 03_edit");
 }

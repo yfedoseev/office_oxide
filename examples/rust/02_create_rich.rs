@@ -59,4 +59,6 @@ fn main() {
 
     println!("DOCX created and verified: {}", out.display());
     println!("Plain text snippet: {}", text.lines().next().unwrap_or(""));
+    std::fs::remove_file(&out).expect("remove temp file");
+    println!("OK 02_create_rich");
 }

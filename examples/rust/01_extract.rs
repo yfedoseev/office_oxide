@@ -1,54 +1,50 @@
-//! 01_extract — Self-contained extract demo.
-//!
-//! Creates a DOCX in memory, reads it back, and prints plain text,
-//! Markdown, and an IR summary (number of sections).
+//! 01_extract: extract plain text, Markdown and the IR from a document.
 //!
 //! Run: `cargo run --example 01_extract`
 
 use std::io::Cursor;
 
-use office_oxide::docx::write::DocxWriter;
+use office_oxide::create::create_from_markdown_to_writer;
 use office_oxide::{Document, DocumentFormat};
 
-fn main() {
-    // ── Build a DOCX in memory ──────────────────────────────────────────────
-    let mut writer = DocxWriter::new();
-    writer.add_heading("Office Oxide Extract Demo", 1);
-    writer.add_paragraph(
-        "This document was created in memory and read back via Document::from_reader.",
-    );
-    writer.add_paragraph(
-        "It demonstrates plain-text extraction, Markdown conversion, and IR access.",
-    );
+const MARKDOWN: &str = "# Quarterly Report\n\nRevenue grew in every region.\n\n\
+| Region | Q1  | Q2  |\n|--------|-----|-----|\n| North  | 120 | 135 |\n| South  | 95  | 110 |\n";
 
+fn build_docx_bytes(markdown: &str) -> Vec<u8> {
     let mut buf = Cursor::new(Vec::new());
-    writer.write_to(&mut buf).expect("write DOCX to buffer");
-    buf.set_position(0);
+    create_from_markdown_to_writer(markdown, DocumentFormat::Docx, &mut buf).expect("create DOCX");
+    buf.into_inner()
+}
 
-    // ── Read it back ────────────────────────────────────────────────────────
-    let doc = Document::from_reader(buf, DocumentFormat::Docx).expect("parse DOCX");
-
-    println!("format: {:?}", doc.format());
-
-    let text = doc.plain_text();
-    println!("--- plain text ---");
-    println!("{text}");
-
-    let md = doc.to_markdown();
-    println!("--- markdown ---");
-    println!("{md}");
-
-    let ir = doc.to_ir();
-    println!("--- IR ---");
-    println!("sections: {}", ir.sections.len());
-    for (i, s) in ir.sections.iter().enumerate() {
-        println!("  section {i}: title={:?}, elements={}", s.title, s.elements.len());
+/// Assert with a message; a failure exits non-zero.
+fn check(condition: bool, message: &str) {
+    if !condition {
+        eprintln!("FAIL: {message}");
+        std::process::exit(1);
     }
+}
 
-    // ── Verify ─────────────────────────────────────────────────────────────
-    assert!(text.contains("Office Oxide Extract Demo"), "heading missing from plain text");
-    assert!(text.contains("created in memory"), "paragraph missing from plain text");
-    assert!(!ir.sections.is_empty(), "IR must have at least one section");
+fn main() {
+    println!("step 1: build a DOCX in memory");
+    let bytes = build_docx_bytes(MARKDOWN);
 
-    println!("\nAll checks passed.");
+    println!("step 2: open it from bytes");
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).expect("open DOCX");
+    println!("  format: {}", doc.format().extension());
+
+    println!("step 3: extract text, Markdown and the IR");
+    let text = doc.plain_text();
+    let markdown = doc.to_markdown();
+    let ir = doc.to_ir();
+    println!("  chars: {}", text.len());
+
+    println!("step 4: check the text");
+    check(text.contains("Quarterly Report"), "docx text must contain the title");
+    check(
+        text.contains("Revenue grew in every region."),
+        "docx text must contain the paragraph",
+    );
+    check(markdown.contains("North"), "markdown must contain the table");
+    check(!ir.sections.is_empty(), "the IR must have at least one section");
+    println!("OK 01_extract");
 }

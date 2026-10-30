@@ -1,91 +1,86 @@
-//! 03_create_xlsx — XLSX creation with formulas, styles, and column widths.
-//!
-//! Creates a workbook with a header row (bold), data rows, a SUM formula cell
-//! with currency style, and explicit column widths. Saves to a temp file and
-//! reads back to verify text content.
+//! 05_xlsx_writer: write a workbook with typed cells, formulas, a merge and a width.
 //!
 //! Run: `cargo run --example 03_create_xlsx`
 
-use office_oxide::Document;
-use office_oxide::xlsx::write::{CellData, CellStyle, HAlign, NumberFormat, XlsxWriter};
+use std::io::Cursor;
 
-fn main() {
-    let out = std::env::temp_dir().join("oo_example_03.xlsx");
+use office_oxide::xlsx::write::{CellData, CellStyle, XlsxWriter};
+use office_oxide::{Document, DocumentFormat};
 
-    // ── Build the workbook ──────────────────────────────────────────────────
+fn build_xlsx_bytes() -> Vec<u8> {
     let mut writer = XlsxWriter::new();
     {
-        let mut sheet = writer.add_sheet("Sales Report");
-
-        // Column widths
-        sheet.set_column_width(0, 20.0);
-        sheet.set_column_width(1, 12.0);
-        sheet.set_column_width(2, 10.0);
-
-        // Header row (bold, centred)
-        let header = CellStyle::new().bold().align(HAlign::Center);
-        sheet.set_cell_styled(0, 0, CellData::String("Product".into()), header.clone());
-        sheet.set_cell_styled(0, 1, CellData::String("Price".into()), header.clone());
-        sheet.set_cell_styled(0, 2, CellData::String("Quantity".into()), header.clone());
-        sheet.set_cell_styled(0, 3, CellData::String("Revenue".into()), header);
-
-        // Data rows
-        let rows: &[(&str, f64, f64)] = &[
-            ("Widget A", 10.0, 150.0),
-            ("Widget B", 25.0, 60.0),
-            ("Widget C", 5.0, 500.0),
-        ];
-        for (i, (name, price, qty)) in rows.iter().enumerate() {
-            let row = i + 1;
-            sheet.set_cell(row, 0, CellData::String((*name).into()));
-            sheet.set_cell_styled(
-                row,
-                1,
-                CellData::Number(*price),
-                CellStyle::new().number_format(NumberFormat::Currency),
-            );
-            sheet.set_cell(row, 2, CellData::Number(*qty));
-            // Revenue = Price * Qty (formula referencing row)
-            let formula = format!("B{}*C{}", row + 1, row + 1);
-            sheet.set_cell_styled(
-                row,
+        let mut sheet = writer.add_sheet("Sales");
+        sheet.set_column_width(0, 18.0);
+        let bold = CellStyle::new().bold();
+        for (col, header) in ["Region", "Q1", "Q2", "Growth"].into_iter().enumerate() {
+            sheet.set_cell_styled(0, col, CellData::String(header.into()), bold.clone());
+        }
+        sheet.set_cell(1, 0, CellData::String("North".into()));
+        sheet.set_cell(1, 1, CellData::Number(120.0));
+        sheet.set_cell(1, 2, CellData::Number(135.0));
+        sheet.set_cell(1, 3, CellData::Boolean(true));
+        sheet.set_cell(2, 0, CellData::String("South".into()));
+        sheet.set_cell(2, 1, CellData::Number(95.0));
+        sheet.set_cell(2, 2, CellData::Number(110.0));
+        // A formula plus its cached value: readers that do not evaluate
+        // formulas (this one included) then still see the number.
+        sheet.set_cell(3, 0, CellData::String("Total".into()));
+        for (col, (formula, total)) in [("SUM(B2:B3)", 215.0), ("SUM(C2:C3)", 245.0)]
+            .into_iter()
+            .enumerate()
+        {
+            sheet.set_cell(
                 3,
-                CellData::Formula(formula),
-                CellStyle::new().number_format(NumberFormat::Currency),
+                col + 1,
+                CellData::FormulaWithValue {
+                    formula: formula.into(),
+                    cached: Box::new(CellData::Number(total)),
+                },
             );
         }
-
-        // Totals row
-        let total_row = rows.len() + 1;
-        sheet.set_cell_styled(
-            total_row,
-            0,
-            CellData::String("TOTAL".into()),
-            CellStyle::new().bold(),
-        );
-        sheet.set_cell_styled(
-            total_row,
-            3,
-            CellData::Formula(format!("SUM(D2:D{})", total_row)),
-            CellStyle::new()
-                .bold()
-                .number_format(NumberFormat::Currency),
-        );
+        sheet.set_cell(5, 0, CellData::String("Notes".into()));
+        sheet.merge_cells(5, 0, 1, 3); // A6:C6
     }
+    let mut buf = Cursor::new(Vec::new());
+    writer.write_to(&mut buf).expect("write XLSX");
+    buf.into_inner()
+}
 
-    // ── Save ────────────────────────────────────────────────────────────────
-    writer.save(&out).expect("save XLSX");
+/// Assert with a message; a failure exits non-zero.
+fn check(condition: bool, message: &str) {
+    if !condition {
+        eprintln!("FAIL: {message}");
+        std::process::exit(1);
+    }
+}
 
-    // ── Read back and verify ────────────────────────────────────────────────
-    let doc = Document::open(&out).expect("open saved XLSX");
+fn main() {
+    println!("step 1: build an XLSX in memory");
+    let bytes = build_xlsx_bytes();
+
+    println!("step 2: open it from bytes");
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx).expect("open XLSX");
     let text = doc.plain_text();
+    let sheets = doc.to_ir().sections.len();
+    println!("  sheets: {sheets}");
+    println!("  chars: {}", text.len());
 
-    assert!(text.contains("Product"), "header missing");
-    assert!(text.contains("Widget A"), "data row missing");
-    assert!(text.contains("Widget B"), "data row missing");
-    assert!(text.contains("TOTAL"), "total row missing");
-
-    println!("XLSX created and verified: {}", out.display());
-    println!("--- plain text ---");
-    println!("{text}");
+    println!("step 3: check the cells");
+    check(sheets == 1, "the workbook must have one sheet");
+    check(
+        text.contains("Region") && text.contains("North") && text.contains("South"),
+        "xlsx text must contain the labels",
+    );
+    check(
+        text.contains("120") && text.contains("110"),
+        "xlsx text must contain the numbers",
+    );
+    check(
+        text.contains("215") && text.contains("245"),
+        "xlsx text must contain the formula results",
+    );
+    check(text.to_lowercase().contains("true"), "xlsx text must contain the boolean");
+    check(text.contains("Notes"), "xlsx text must contain the merged cell text");
+    println!("OK 05_xlsx_writer");
 }

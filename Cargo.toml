@@ -165,6 +165,26 @@ path = "examples/rust/05_edit.rs"
 name = "06_from_markdown"
 path = "examples/rust/06_from_markdown.rs"
 
+[[example]]
+name = "04_open_from_bytes"
+path = "examples/rust/04_open_from_bytes.rs"
+
+[[example]]
+name = "07_all_outputs"
+path = "examples/rust/07_all_outputs.rs"
+
+[[example]]
+name = "08_limits_strict_damage"
+path = "examples/rust/08_limits_strict_damage.rs"
+
+[[example]]
+name = "09_concurrency"
+path = "examples/rust/09_concurrency.rs"
+
+[[example]]
+name = "10_detect_and_batch"
+path = "examples/rust/10_detect_and_batch.rs"
+
 [profile.release]
 lto = true
 codegen-units = 1
