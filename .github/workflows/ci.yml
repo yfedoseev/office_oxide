@@ -216,15 +216,12 @@ jobs:
       - name: Build examples
         run: cargo build --examples --verbose
 
+      # The numbered catalogue (01-10), each under a timeout, each checked for
+      # its `OK <id>` marker. See scripts/run-examples.sh.
       - name: Run Rust examples (self-contained)
         if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
-        run: |
-          cargo run --example 01_extract
-          cargo run --example 02_create_rich
-          cargo run --example 03_create_xlsx
-          cargo run --example 04_create_pptx
-          cargo run --example 05_edit
-          cargo run --example 06_from_markdown
+        timeout-minutes: 20
+        run: scripts/run-examples.sh rust
 
       # --workspace: the default members are the root package only, so a
       # plain `cargo test` never ran the CLI and MCP crates' unit tests or
@@ -374,11 +371,8 @@ jobs:
 
       - name: Run Python examples
         if: matrix.python-version == '3.12'
-        run: |
-          uv run python examples/python/01_extract/main.py
-          uv run python examples/python/02_create_from_markdown/main.py
-          uv run python examples/python/03_edit/main.py
-          uv run python examples/python/04_batch/main.py
+        timeout-minutes: 20
+        run: scripts/run-examples.sh python
 
   # Go binding test — reuses the prebuilt cdylib from build-lib.
   go:
@@ -425,10 +419,8 @@ jobs:
 
       - name: Run Go examples
         shell: bash
-        run: |
-          (cd examples/go/01_extract && go run -tags office_oxide_dev .)
-          (cd examples/go/02_create_from_markdown && go run -tags office_oxide_dev .)
-          (cd examples/go/03_edit && go run -tags office_oxide_dev .)
+        timeout-minutes: 20
+        run: scripts/run-examples.sh go
 
   # C# binding test — reuses the prebuilt cdylib from build-lib.
   csharp:
@@ -472,10 +464,33 @@ jobs:
         run: dotnet test csharp/OfficeOxide.Tests/OfficeOxide.Tests.csproj
 
       - name: Run C# examples
-        run: |
-          dotnet run --project examples/csharp/01_extract/01_extract.csproj
-          dotnet run --project examples/csharp/02_create_from_markdown/02_create_from_markdown.csproj
-          dotnet run --project examples/csharp/03_edit/03_edit.csproj
+        shell: bash
+        timeout-minutes: 25
+        run: scripts/run-examples.sh csharp
+
+  # C examples — build and run the numbered catalogue against the prebuilt
+  # cdylib. POSIX only (the examples use mkstemps and pthreads), so no Windows.
+  c-examples:
+    name: C Examples (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [build-lib]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download cdylib artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: native-lib-${{ matrix.os }}
+          path: target/release
+
+      - name: Run C examples
+        timeout-minutes: 20
+        run: scripts/run-examples.sh c
 
   # Node-native binding test (koffi) — reuses the prebuilt cdylib.
   node-native:
@@ -522,12 +537,11 @@ jobs:
           OFFICE_OXIDE_LIB: ${{ steps.lib.outputs.path }}
 
       - name: Run JS examples
+        shell: bash
+        timeout-minutes: 20
         env:
           OFFICE_OXIDE_LIB: ${{ steps.lib.outputs.path }}
-        run: |
-          node examples/javascript/01_extract.mjs
-          node examples/javascript/02_create_from_markdown.mjs
-          node examples/javascript/03_edit.mjs
+        run: scripts/run-examples.sh javascript
 
   # WASM build check
   wasm-build:
