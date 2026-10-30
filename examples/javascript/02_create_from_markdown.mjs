@@ -65,3 +65,4 @@ try {
     try { unlinkSync(p); } catch (_) {}
   }
 }
+console.log('OK 02_create_from_markdown');

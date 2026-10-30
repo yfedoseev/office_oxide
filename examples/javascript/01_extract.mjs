@@ -53,3 +53,4 @@ try {
 } finally {
   try { unlinkSync(tmpPath); } catch (_) {}
 }
+console.log('OK 01_extract');

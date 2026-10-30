@@ -68,3 +68,4 @@ try {
   try { unlinkSync(templatePath); } catch (_) {}
   try { unlinkSync(outputPath); } catch (_) {}
 }
+console.log('OK 03_edit');
