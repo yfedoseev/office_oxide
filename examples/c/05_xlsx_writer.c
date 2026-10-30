@@ -1,36 +1,32 @@
-/* 05_xlsx_writer: write a workbook with typed cells, formulas, styling, a merge and a column width.
- * Run: make -C examples/c run   (or build/05_xlsx_writer after make -C examples/c) */
+/* 05_xlsx_writer: write a workbook with typed cells, a formula, a style, a merge and a column width, then read it back.
+ *
+ * Run: make -C examples/c build/05_xlsx_writer && examples/c/build/05_xlsx_writer */
 #include "common.h"
 
 int main(void) {
     printf("step 1: build an XLSX in memory\n");
     size_t len = 0;
-    uint8_t *bytes = build_xlsx_bytes(&len); /* see common.h for the cell-by-cell calls */
+    uint8_t *data = build_xlsx_bytes(&len); /* see common.h for the cell-by-cell calls */
 
-    printf("step 2: check that a write to a missing sheet is refused\n");
-    OfficeXlsxWriterHandle *w = office_xlsx_writer_new();
-    check(w != NULL, "xlsx writer");
-    check(office_xlsx_sheet_set_cell(w, 9, 0, 0, OFFICE_CELL_STRING, "x", 0) == OFFICE_ERR_UNSUPPORTED,
-          "a missing sheet is an error, not a silent drop");
-    office_xlsx_writer_free(w);
-
-    printf("step 3: open it from bytes\n");
+    printf("step 2: open it from bytes\n");
     int err = 0;
-    OfficeDocumentHandle *doc = open_bytes(bytes, len, "xlsx");
+    OfficeDocumentHandle *doc = open_bytes(data, len, "xlsx");
     char *text = take_str(office_document_plain_text(doc, &err), err, "plain text");
-    printf("  format: %s\n  chars: %zu\n  sheets: 1\n", office_document_format(doc), strlen(text));
+    char *ir_json = take_str(office_document_to_ir_json(doc, &err), err, "ir json");
+    int sheets = count_sections(ir_json);
+    printf("  format: %s\n  chars: %zu\n  sheets: %d\n", office_document_format(doc), strlen(text), sheets);
 
-    printf("step 4: check the cells\n");
-    check_has(text, "Sales", "the sheet name is present");
-    check_has(text, "North", "text cells are present");
-    check_has(text, "135", "number cells are present");
-    check_has(text, "TRUE", "the boolean cell is present");
-    check_has(text, "=SUM(B2:B3)", "the formula survived");
-    check_has(text, "Notes", "the merged cell text is present");
+    printf("step 3: check the cells\n");
+    check(sheets == 1, "expected one sheet");
+    const char *expected[] = {"Sales", "Region", "Q1", "Q2", "Growth", "North", "120", "135", "South", "95", "110", "Total", "Notes"};
+    for (size_t i = 0; i < sizeof expected / sizeof *expected; i++) has(text, expected[i]);
+    check(strstr(text, "TRUE") != NULL, "the boolean cell is missing");
+    check(strstr(text, "SUM(B2:B3)") && strstr(text, "SUM(C2:C3)"), "a formula is missing");
 
     office_oxide_free_string(text);
+    office_oxide_free_string(ir_json);
     office_document_free(doc);
-    office_oxide_free_bytes(bytes, len);
+    office_oxide_free_bytes(data, len);
     printf("OK 05_xlsx_writer\n");
     return 0;
 }

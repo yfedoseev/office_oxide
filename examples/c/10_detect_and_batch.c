@@ -1,39 +1,37 @@
 /* 10_detect_and_batch: detect the format of bytes, then process a mixed batch.
- * Run: make -C examples/c run   (or build/10_detect_and_batch after make -C examples/c)
- * The C ABI detects a format from a path only, so the bytes are sniffed here. */
+ *
+ * Run: make -C examples/c build/10_detect_and_batch && examples/c/build/10_detect_and_batch */
 #include "common.h"
 
-/* All three formats are ZIP archives; the part names inside tell them apart. */
-static const char *detect(const uint8_t *d, size_t n) {
-    static const struct { const char *marker, *format; } kinds[] = {
-        {"word/", "docx"}, {"xl/", "xlsx"}, {"ppt/", "pptx"}};
-    for (size_t k = 0; k < 3; k++) {
-        size_t m = strlen(kinds[k].marker);
-        for (size_t i = 0; i + m <= n; i++)
-            if (memcmp(d + i, kinds[k].marker, m) == 0) return kinds[k].format;
-    }
+/* The C ABI detects a format from a path only. A ZIP stores each part name in
+ * the clear, and the main part's name tells the three formats apart. */
+static const char *detect_format(const uint8_t *data, size_t len) {
+    static const struct { const char *part, *format; } kinds[] = {
+        {"word/document.xml", "docx"}, {"xl/workbook.xml", "xlsx"}, {"ppt/presentation.xml", "pptx"}};
+    if (len < 2 || data[0] != 'P' || data[1] != 'K') return NULL;
+    for (size_t k = 0; k < 3; k++)
+        if (find_bytes(data, len, kinds[k].part) >= 0) return kinds[k].format;
     return NULL;
 }
 
 int main(void) {
     printf("step 1: build a DOCX, an XLSX and a PPTX in memory\n");
+    const char *names[] = {"report.docx", "report.xlsx", "report.pptx"};
     size_t len[3];
-    uint8_t *batch[3] = {build_docx_bytes("Quarterly Report", &len[0]), build_xlsx_bytes(&len[1]),
-                         build_pptx_bytes(&len[2])};
-    const char *expect[3] = {"docx", "xlsx", "pptx"};
+    uint8_t *batch[3] = {build_docx_bytes("Quarterly Report", &len[0]), build_xlsx_bytes(&len[1]), build_pptx_bytes(&len[2])};
 
-    printf("step 2: detect each format and process the batch\n");
+    printf("step 2: detect each format and open it from bytes\n");
     for (int i = 0; i < 3; i++) {
-        const char *format = detect(batch[i], len[i]);
-        check(format && strcmp(format, expect[i]) == 0, "the detected format matches the one built");
+        const char *format = detect_format(batch[i], len[i]);
+        check(format != NULL && strcmp(format, names[i] + strlen("report.")) == 0, "the detected format differs from the one built");
         char *text = text_of_bytes(batch[i], len[i], format);
-        printf("  report.%s: format %s, chars %zu\n", expect[i], format, strlen(text));
-        check(strlen(text) > 0, "every document has text");
+        check(strlen(text) > 0, "a document has no text");
+        printf("  %s: format %s, chars %zu\n", names[i], format, strlen(text));
         free(text);
     }
 
-    printf("step 3: check that unknown bytes are not detected\n");
-    check(detect((const uint8_t *)"not an office file", 18) == NULL, "garbage has no format");
+    printf("step 3: check that bytes that are not a document are not detected\n");
+    check(detect_format((const uint8_t *)"not an office file", 18) == NULL, "bytes that are not a document were detected as one");
 
     free(batch[0]);
     office_oxide_free_bytes(batch[1], len[1]);
