@@ -12,10 +12,20 @@ import (
 	oo "github.com/yfedoseev/office_oxide/go"
 )
 
+const markdown = `# Quarterly Report
+
+Revenue grew in every region.
+
+| Region | Q1  | Q2  |
+|--------|-----|-----|
+| North  | 120 | 135 |
+| South  | 95  | 110 |
+`
+
 // check fails the example loudly: it prints msg and exits non-zero.
 func check(ok bool, msg string) {
 	if !ok {
-		fmt.Fprintln(os.Stderr, "FAILED:", msg)
+		fmt.Fprintln(os.Stderr, "FAIL:", msg)
 		os.Exit(1)
 	}
 }
@@ -23,28 +33,44 @@ func check(ok bool, msg string) {
 // must fails the example on an unexpected error.
 func must[T any](v T, err error) T {
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "FAILED:", err)
+		fmt.Fprintln(os.Stderr, "FAIL:", err)
 		os.Exit(1)
 	}
 	return v
 }
 
-func reportMarkdown(title string) string {
-	return "# " + title + "\n\nRevenue grew in every region.\n\n" +
-		"| Region | Q1  | Q2  |\n|--------|-----|-----|\n" +
-		"| North  | 120 | 135 |\n| South  | 95  | 110 |\n"
+// must0 fails the example on an unexpected error from a call with no result.
+func must0(err error) { must(0, err) }
+
+func has(text, expected string) {
+	check(strings.Contains(text, expected), `"`+expected+`" is missing from the text`)
 }
 
-// buildDocxBytes returns a DOCX. The Go binding has no DOCX writer: a DOCX
-// comes from Markdown, which the library writes to a path, so this uses a
-// private temp file for that hop and removes it before returning.
-func buildDocxBytes(title string) []byte {
-	f := must(os.CreateTemp("", "oo_example_*.docx"))
+// markdownToBytes creates a document from Markdown. The library writes to a
+// path, so the file lives in a private temp file just long enough to read its
+// bytes back.
+func markdownToBytes(md, format string) []byte {
+	f := must(os.CreateTemp("", "oo_example_*."+format))
 	path := f.Name()
 	f.Close()
 	defer os.Remove(path)
-	check(oo.CreateFromMarkdown(reportMarkdown(title), "docx", path) == nil, "create the DOCX from Markdown")
+	must0(oo.CreateFromMarkdown(md, format, path))
 	return must(os.ReadFile(path))
+}
+
+func buildDocxBytes(title string) []byte {
+	return markdownToBytes(strings.ReplaceAll(markdown, "Quarterly Report", title), "docx")
+}
+
+func openBytes(data []byte, format string) *oo.Document {
+	return must(oo.OpenFromBytes(data, format))
+}
+
+// textOf opens bytes as the given format and returns the plain text.
+func textOf(data []byte, format string) string {
+	doc := openBytes(data, format)
+	defer doc.Close()
+	return must(doc.PlainText())
 }
 
 func main() {
@@ -52,11 +78,11 @@ func main() {
 	data := buildDocxBytes("Quarterly Report")
 
 	fmt.Println("step 2: open it from bytes")
-	doc := must(oo.OpenFromBytes(data, "docx"))
+	doc := openBytes(data, "docx")
 	defer doc.Close()
 	format := must(doc.Format())
 	fmt.Println("  format:", format)
-	check(format == "docx", "format is docx")
+	check(format == "docx", "the opened format differs from the requested one")
 
 	fmt.Println("step 3: extract plain text, Markdown and IR JSON")
 	text := must(doc.PlainText())
@@ -65,9 +91,9 @@ func main() {
 	fmt.Println("  chars:", len(text))
 
 	fmt.Println("step 4: check the output")
-	check(strings.Contains(text, "Revenue grew in every region."), "plain text has the paragraph")
-	check(strings.Contains(md, "Quarterly Report"), "markdown has the title")
-	check(strings.HasPrefix(ir, "{"), "IR JSON is an object")
+	has(text, "Revenue grew in every region.")
+	has(md, "Quarterly Report")
+	check(strings.HasPrefix(ir, "{"), "the IR JSON is not an object")
 
 	fmt.Println("OK 01_extract")
 }

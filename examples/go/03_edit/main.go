@@ -1,6 +1,6 @@
 //go:build office_oxide_dev
 
-// 03_edit: edit documents in memory with ReplaceText and SetCell.
+// 03_edit: replace text in a DOCX and set cells in an XLSX, in memory.
 // Run: (cd examples/go/03_edit && go run -tags office_oxide_dev .)
 package main
 
@@ -12,10 +12,20 @@ import (
 	oo "github.com/yfedoseev/office_oxide/go"
 )
 
+const markdown = `# Quarterly Report
+
+Revenue grew in every region.
+
+| Region | Q1  | Q2  |
+|--------|-----|-----|
+| North  | 120 | 135 |
+| South  | 95  | 110 |
+`
+
 // check fails the example loudly: it prints msg and exits non-zero.
 func check(ok bool, msg string) {
 	if !ok {
-		fmt.Fprintln(os.Stderr, "FAILED:", msg)
+		fmt.Fprintln(os.Stderr, "FAIL:", msg)
 		os.Exit(1)
 	}
 }
@@ -23,61 +33,68 @@ func check(ok bool, msg string) {
 // must fails the example on an unexpected error.
 func must[T any](v T, err error) T {
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "FAILED:", err)
+		fmt.Fprintln(os.Stderr, "FAIL:", err)
 		os.Exit(1)
 	}
 	return v
 }
 
-func reportMarkdown(title string) string {
-	return "# " + title + "\n\nRevenue grew in every region.\n\n" +
-		"| Region | Q1  | Q2  |\n|--------|-----|-----|\n" +
-		"| North  | 120 | 135 |\n| South  | 95  | 110 |\n"
+// must0 fails the example on an unexpected error from a call with no result.
+func must0(err error) { must(0, err) }
+
+func has(text, expected string) {
+	check(strings.Contains(text, expected), `"`+expected+`" is missing from the text`)
 }
 
-// buildDocxBytes returns a DOCX. The Go binding has no DOCX writer: a DOCX
-// comes from Markdown, which the library writes to a path, so this uses a
-// private temp file for that hop and removes it before returning.
-func buildDocxBytes(title string) []byte {
-	f := must(os.CreateTemp("", "oo_example_*.docx"))
+// markdownToBytes creates a document from Markdown. The library writes to a
+// path, so the file lives in a private temp file just long enough to read its
+// bytes back.
+func markdownToBytes(md, format string) []byte {
+	f := must(os.CreateTemp("", "oo_example_*."+format))
 	path := f.Name()
 	f.Close()
 	defer os.Remove(path)
-	check(oo.CreateFromMarkdown(reportMarkdown(title), "docx", path) == nil, "create the DOCX from Markdown")
+	must0(oo.CreateFromMarkdown(md, format, path))
 	return must(os.ReadFile(path))
 }
 
-// buildXlsxBytes returns a workbook with one sheet, "Sales": headers (bold on
-// grey), two data rows, a SUM row, a boolean, a merged note and a wide column A.
+func buildDocxBytes(title string) []byte {
+	return markdownToBytes(strings.ReplaceAll(markdown, "Quarterly Report", title), "docx")
+}
+
+func openBytes(data []byte, format string) *oo.Document {
+	return must(oo.OpenFromBytes(data, format))
+}
+
+// textOf opens bytes as the given format and returns the plain text.
+func textOf(data []byte, format string) string {
+	doc := openBytes(data, format)
+	defer doc.Close()
+	return must(doc.PlainText())
+}
+
 func buildXlsxBytes() []byte {
 	w := oo.NewXlsxWriter()
 	defer w.Close()
 	s := w.AddSheet("Sales")
 	for c, h := range []string{"Region", "Q1", "Q2", "Growth"} {
-		check(w.SetCellStyled(s, 0, uint32(c), h, true, "D3D3D3") == nil, "write a header cell")
+		must0(w.SetCellStyled(s, 0, uint32(c), h, true, "")) // bold header row
 	}
 	cells := []struct {
 		row, col uint32
 		v        any
 	}{
-		{1, 0, "North"}, {1, 1, 120}, {1, 2, 135}, {1, 3, true},
+		{1, 0, "North"}, {1, 1, 120}, {1, 2, 135}, {1, 3, true}, // D2
 		{2, 0, "South"}, {2, 1, 95}, {2, 2, 110},
-		{3, 0, "Total"}, {3, 1, oo.Formula("=SUM(B2:B3)")}, {3, 2, oo.Formula("=SUM(C2:C3)")},
+		{3, 0, "Total"}, {3, 1, oo.Formula("SUM(B2:B3)")}, {3, 2, oo.Formula("SUM(C2:C3)")},
 		{5, 0, "Notes"},
 	}
 	for _, c := range cells {
-		check(w.SetCell(s, c.row, c.col, c.v) == nil, "write a cell")
+		must0(w.SetCell(s, c.row, c.col, c.v))
 	}
-	w.MergeCells(s, 5, 0, 1, 3)
+	w.MergeCells(s, 5, 0, 1, 3) // A6:C6
 	w.SetColumnWidth(s, 0, 18)
 	return must(w.ToBytes())
-}
-
-// textOf opens bytes as the given format and returns the plain text.
-func textOf(data []byte, format string) string {
-	doc := must(oo.OpenFromBytes(data, format))
-	defer doc.Close()
-	return must(doc.PlainText())
 }
 
 func main() {
@@ -86,32 +103,32 @@ func main() {
 
 	fmt.Println("step 2: replace text")
 	ed := must(oo.OpenEditableFromBytes(docx, "docx"))
-	n := must(ed.ReplaceText("Quarterly Report", "Annual Report"))
-	check(n == 1, "one replacement was made")
-	fmt.Println("  replacements:", n)
+	replaced := must(ed.ReplaceText("Quarterly Report", "Annual Report"))
+	fmt.Println("  replacements:", replaced)
+	check(replaced == 1, "replace_text did not make exactly one replacement")
 
 	fmt.Println("step 3: save to bytes and check the text")
-	out := must(ed.SaveToBytes())
+	edited := must(ed.SaveToBytes())
 	ed.Close()
-	text := textOf(out, "docx")
-	check(strings.Contains(text, "Annual Report"), "the new title is present")
-	check(!strings.Contains(text, "Quarterly Report"), "the old title is gone")
+	text := textOf(edited, "docx")
+	has(text, "Annual Report")
+	check(!strings.Contains(text, "Quarterly Report"), "the old title is still present")
 
 	fmt.Println("step 4: build an XLSX in memory")
 	xlsx := buildXlsxBytes()
 
 	fmt.Println("step 5: set cells")
 	ed = must(oo.OpenEditableFromBytes(xlsx, "xlsx"))
-	check(ed.SetCell(0, "B2", oo.NewNumberCell(999)) == nil, "set B2")
-	check(ed.SetCell(0, "A2", oo.NewStringCell("Central")) == nil, "set A2")
+	must0(ed.SetCell(0, "B2", oo.NewNumberCell(999)))
+	must0(ed.SetCell(0, "A2", oo.NewStringCell("Central")))
 
 	fmt.Println("step 6: save to bytes and check the cells")
-	out = must(ed.SaveToBytes())
+	edited = must(ed.SaveToBytes())
 	ed.Close()
-	text = textOf(out, "xlsx")
-	check(strings.Contains(text, "Central"), "A2 was replaced")
-	check(strings.Contains(text, "999"), "B2 was replaced")
-	check(!strings.Contains(text, "North"), "the old A2 is gone")
+	text = textOf(edited, "xlsx")
+	has(text, "Central")
+	has(text, "999")
+	check(!strings.Contains(text, "North"), "the old A2 value is still present")
 
 	fmt.Println("OK 03_edit")
 }

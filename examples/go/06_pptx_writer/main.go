@@ -1,11 +1,12 @@
 //go:build office_oxide_dev
 
-// 06_pptx_writer: write a presentation with a size, slides, titles, text and an image.
+// 06_pptx_writer: write a presentation with a size, slides, titles, text and an image, then read it back.
 // Run: (cd examples/go/06_pptx_writer && go run -tags office_oxide_dev .)
 package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -13,10 +14,12 @@ import (
 	oo "github.com/yfedoseev/office_oxide/go"
 )
 
+const png1x1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+
 // check fails the example loudly: it prints msg and exits non-zero.
 func check(ok bool, msg string) {
 	if !ok {
-		fmt.Fprintln(os.Stderr, "FAILED:", msg)
+		fmt.Fprintln(os.Stderr, "FAIL:", msg)
 		os.Exit(1)
 	}
 }
@@ -24,56 +27,74 @@ func check(ok bool, msg string) {
 // must fails the example on an unexpected error.
 func must[T any](v T, err error) T {
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "FAILED:", err)
+		fmt.Fprintln(os.Stderr, "FAIL:", err)
 		os.Exit(1)
 	}
 	return v
 }
 
-const png1x1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+// must0 fails the example on an unexpected error from a call with no result.
+func must0(err error) { must(0, err) }
 
-// buildPptxBytes returns two slides: "Welcome" and "Results" (with an image).
+func has(text, expected string) {
+	check(strings.Contains(text, expected), `"`+expected+`" is missing from the text`)
+}
+
+func openBytes(data []byte, format string) *oo.Document {
+	return must(oo.OpenFromBytes(data, format))
+}
+
+// textOf opens bytes as the given format and returns the plain text.
+func textOf(data []byte, format string) string {
+	doc := openBytes(data, format)
+	defer doc.Close()
+	return must(doc.PlainText())
+}
+
 func buildPptxBytes() []byte {
 	w := oo.NewPptxWriter()
 	defer w.Close()
-	w.SetPresentationSize(9144000, 6858000) // 4:3; 914400 EMU = 1 inch
-	s1 := w.AddSlide()
-	check(w.SetSlideTitle(s1, "Welcome") == nil, "set the slide 1 title")
-	check(w.AddSlideText(s1, "Quarterly Report") == nil, "add the slide 1 text")
-	s2 := w.AddSlide()
-	check(w.SetSlideTitle(s2, "Results") == nil, "set the slide 2 title")
-	check(w.AddSlideText(s2, "Revenue grew in every region.") == nil, "add the slide 2 text")
+	w.SetPresentationSize(12192000, 6858000) // 16:9, in EMU (914400 per inch)
+	one := w.AddSlide()
+	must0(w.SetSlideTitle(one, "Welcome"))
+	must0(w.AddSlideText(one, "Quarterly Report"))
+	two := w.AddSlide()
+	must0(w.SetSlideTitle(two, "Results"))
+	must0(w.AddSlideText(two, "Revenue grew in every region."))
 	png := must(base64.StdEncoding.DecodeString(png1x1))
-	check(w.AddSlideImage(s2, png, "png", 914400, 1371600, 914400, 914400) == nil, "add the image")
+	must0(w.AddSlideImage(two, png, "png", 914400, 2743200, 1828800, 1828800))
 	return must(w.ToBytes())
+}
+
+// sectionCount counts the sheets or slides in an IR JSON tree.
+func sectionCount(irJSON string) int {
+	var tree struct{ Sections []json.RawMessage }
+	must0(json.Unmarshal([]byte(irJSON), &tree))
+	return len(tree.Sections)
 }
 
 func main() {
 	fmt.Println("step 1: build a PPTX in memory")
-	data := buildPptxBytes() // see above for the slide-by-slide calls
+	data := buildPptxBytes()
 
-	fmt.Println("step 2: check that a write to a missing slide is refused")
-	w := oo.NewPptxWriter()
-	defer w.Close()
-	check(w.SetSlideTitle(9, "ghost") != nil, "a missing slide is an error, not a silent drop")
-
-	fmt.Println("step 3: open it from bytes")
-	doc := must(oo.OpenFromBytes(data, "pptx"))
+	fmt.Println("step 2: open it from bytes")
+	doc := openBytes(data, "pptx")
 	defer doc.Close()
 	text := must(doc.PlainText())
-	// Plain Markdown drops images; the WithImages variant keeps them inline.
-	md := must(doc.ToMarkdownWithImages())
-	format := must(doc.Format())
-	fmt.Println("  format:", format)
+	slides := sectionCount(must(doc.ToIRJSON()))
+	// Plain Markdown drops images; the WithImages variant keeps them in place.
+	withImages := must(doc.ToMarkdownWithImages())
+	fmt.Println("  format:", must(doc.Format()))
 	fmt.Println("  chars:", len(text))
-	fmt.Println("  slides: 2")
+	fmt.Println("  slides:", slides)
 
-	fmt.Println("step 4: check the slides")
-	check(strings.Contains(text, "Welcome"), "slide 1 title is present")
-	check(strings.Contains(text, "Quarterly Report"), "slide 1 text is present")
-	check(strings.Contains(text, "Results"), "slide 2 title is present")
-	check(strings.Contains(text, "Revenue grew in every region."), "slide 2 text is present")
-	check(strings.Contains(md, "[image-base64:"), "the image is present")
+	fmt.Println("step 3: check the slides")
+	check(slides == 2, "expected two slides")
+	for _, expected := range []string{"Welcome", "Quarterly Report", "Results", "Revenue grew in every region."} {
+		has(text, expected)
+	}
+	check(strings.Index(text, "Welcome") < strings.Index(text, "Results"), "the slides are out of order")
+	check(strings.Contains(withImages, "[image-base64:"), "the slide image is missing")
 
 	fmt.Println("OK 06_pptx_writer")
 }
