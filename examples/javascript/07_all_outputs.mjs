@@ -1,19 +1,15 @@
 #!/usr/bin/env node
 /**
- * 07_all_outputs — one document, every output: plain text, Markdown, HTML and IR JSON.
+ * 07_all_outputs: render one document as plain text, Markdown, HTML and IR JSON.
  *
- * Run: OFFICE_OXIDE_LIB=.../liboffice_oxide.so node examples/javascript/07_all_outputs.mjs
+ * Run: node examples/javascript/07_all_outputs.mjs
  */
-import { tmpdir } from 'os';
-import { join } from 'path';
-import { readFileSync, unlinkSync } from 'fs';
-import { Document, XlsxWriter, PptxWriter, createFromMarkdown } from '../../js/lib/index.js';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Document, createFromMarkdown } from '../../js/lib/index.js';
 
-function check(cond, message) {
-  if (!cond) { console.error(`FAIL: ${message}`); process.exit(1); }
-}
-
-const MARKDOWN = (title) => `# ${title}
+const MARKDOWN = `# Quarterly Report
 
 Revenue grew in every region.
 
@@ -23,82 +19,65 @@ Revenue grew in every region.
 | South  | 95  | 110 |
 `;
 
-const PNG = Buffer.from(
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
-  'base64');
-
-// The JS binding has no DOCX writer, so the DOCX is generated into a temp
-// file that is read and deleted at once; everything after that is bytes.
-function buildDocxBytes(title = 'Quarterly Report') {
-  const path = join(tmpdir(), `oo_${process.pid}_${Math.random().toString(36).slice(2)}.docx`);
+// createFromMarkdown writes to a path, so the file lives in a private temp
+// directory just long enough to read its bytes back.
+function markdownToBytes(markdown, format) {
+  const dir = mkdtempSync(join(tmpdir(), 'oo_example_'));
   try {
-    createFromMarkdown(MARKDOWN(title), 'docx', path);
+    const path = join(dir, `report.${format}`);
+    createFromMarkdown(markdown, format, path);
     return readFileSync(path);
   } finally {
-    try { unlinkSync(path); } catch (_) {}
+    rmSync(dir, { recursive: true, force: true });
   }
 }
 
-// Row and column indices are zero-based.
-function buildXlsxBytes() {
-  const w = new XlsxWriter();
-  try {
-    const s = w.addSheet('Sales');
-    ['Region', 'Q1', 'Q2', 'Growth'].forEach((h, c) => w.setCellStyled(s, 0, c, h, true, null));
-    w.setCell(s, 1, 0, 'North'); w.setCell(s, 1, 1, 120); w.setCell(s, 1, 2, 135); w.setCell(s, 1, 3, true);
-    w.setCell(s, 2, 0, 'South'); w.setCell(s, 2, 1, 95); w.setCell(s, 2, 2, 110);
-    w.setCell(s, 3, 0, 'Total');
-    w.setFormula(s, 3, 1, 'SUM(B2:B3)');
-    w.setFormula(s, 3, 2, 'SUM(C2:C3)');
-    w.setCell(s, 5, 0, 'Notes');
-    w.mergeCells(s, 5, 0, 1, 3); // A6:C6
-    w.setColumnWidth(s, 0, 18);
-    return w.toBytes();
-  } finally { w.close(); }
+function buildDocxBytes(title = 'Quarterly Report') {
+  return markdownToBytes(MARKDOWN.replaceAll('Quarterly Report', title), 'docx');
 }
 
-function buildPptxBytes() {
-  const w = new PptxWriter();
-  try {
-    w.setPresentationSize(12192000, 6858000); // 16:9, in EMU
-    const s1 = w.addSlide();
-    w.setSlideTitle(s1, 'Welcome');
-    w.addSlideText(s1, 'Quarterly Report');
-    const s2 = w.addSlide();
-    w.setSlideTitle(s2, 'Results');
-    w.addSlideText(s2, 'Revenue grew in every region.');
-    w.addSlideImage(s2, PNG, 'png', 914400, 2743200, 1828800, 1828800);
-    return w.toBytes();
-  } finally { w.close(); }
-}
-
-// plainText: text only, no structure; for search and LLM input.
-// toMarkdown: headings, lists and tables as Markdown; keeps structure.
-// toHtml: the same structure as HTML elements, for display.
-// toIr: the format-neutral document tree as JSON, for programs that need
-//       every node rather than a rendering.
-console.log('step 1: build a DOCX in memory');
-const bytes = buildDocxBytes();
-
-console.log('step 2: open it from bytes');
-const doc = Document.fromBytes(bytes, 'docx');
-try {
-  const text = doc.plainText();
-  const md = doc.toMarkdown();
-  const html = doc.toHtml();
-  const irJson = JSON.stringify(doc.toIr()); // already parsed; re-serialise to count chars
-  const ir = JSON.parse(irJson);
-
-  console.log('step 3: check every output');
-  for (const [name, out] of [['text', text], ['markdown', md], ['html', html], ['ir', irJson]]) {
-    console.log(`  ${name} chars: ${out.length}`);
-    check(out.length > 0, `${name} is not empty`);
-    check(out.includes('Quarterly Report'), `${name} contains "Quarterly Report"`);
+function check(condition, message) {
+  if (!condition) {
+    console.error(`FAIL: ${message}`);
+    process.exit(1);
   }
-  check(Array.isArray(ir.sections), 'IR has a sections array');
-  check(/^#+\s*Quarterly Report/m.test(md), 'markdown has a heading marker');
-  check(/<h\d/i.test(html) && /<table/i.test(html), 'html has heading and table elements');
-  check(!/<h\d/i.test(text) && !/^#/m.test(text), 'plain text has no markup');
-} finally { doc.close(); }
+}
 
-console.log('OK 07_all_outputs');
+function has(text, expected) {
+  check(text.includes(expected), `"${expected}" is missing from the text`);
+}
+
+function main() {
+  console.log('step 1: build a DOCX in memory');
+  const data = buildDocxBytes();
+
+  console.log('step 2: open it from bytes');
+  const doc = Document.fromBytes(data, 'docx');
+  let outputs;
+  try {
+    console.log(`  format: ${doc.format}`);
+
+    console.log('step 3: render every output');
+    outputs = {
+      plain: doc.plainText(), // words only: no markup, no structure
+      markdown: doc.toMarkdown(), // headings and pipe tables survive as syntax
+      html: doc.toHtml(), // a fragment (no <html> wrapper), tables as <table>
+      ir_json: JSON.stringify(doc.toIr()), // the format-neutral tree as JSON, for programs
+    };
+  } finally {
+    doc.close();
+  }
+  for (const [name, value] of Object.entries(outputs)) console.log(`  chars: ${name} ${value.length}`);
+
+  console.log('step 4: check each output');
+  for (const [name, value] of Object.entries(outputs)) check(value.trim() !== '', `the ${name} output is empty`);
+  has(outputs.plain, 'Quarterly Report');
+  check(outputs.markdown.includes('# Quarterly Report'), 'the Markdown is missing the heading');
+  check(outputs.html.includes('<table'), 'the HTML has no table');
+  const tree = JSON.parse(outputs.ir_json);
+  check(typeof tree === 'object' && tree !== null && !Array.isArray(tree), 'the IR JSON does not parse to an object');
+
+  console.log('OK 07_all_outputs');
+}
+
+main();

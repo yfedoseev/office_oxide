@@ -1,19 +1,15 @@
 #!/usr/bin/env node
 /**
- * 08_limits_strict_damage — strict mode, per-document limits and the damage report on truncated bytes.
+ * 08_limits_strict_damage: strict mode refuses a damaged archive; a lenient open reports the damage.
  *
- * Run: OFFICE_OXIDE_LIB=.../liboffice_oxide.so node examples/javascript/08_limits_strict_damage.mjs
+ * Run: node examples/javascript/08_limits_strict_damage.mjs
  */
-import { tmpdir } from 'os';
-import { join } from 'path';
-import { readFileSync, unlinkSync } from 'fs';
-import { Document, ParseOptions, OfficeOxideError, createFromMarkdown, XlsxWriter, PptxWriter } from '../../js/lib/index.js';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Document, OfficeOxideError, ParseOptions, createFromMarkdown } from '../../js/lib/index.js';
 
-function check(cond, message) {
-  if (!cond) { console.error(`FAIL: ${message}`); process.exit(1); }
-}
-
-const MARKDOWN = (title) => `# ${title}
+const MARKDOWN = `# Quarterly Report
 
 Revenue grew in every region.
 
@@ -23,101 +19,119 @@ Revenue grew in every region.
 | South  | 95  | 110 |
 `;
 
-const PNG = Buffer.from(
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
-  'base64');
-
-// The JS binding has no DOCX writer, so the DOCX is generated into a temp
-// file that is read and deleted at once; everything after that is bytes.
-function buildDocxBytes(title = 'Quarterly Report') {
-  const path = join(tmpdir(), `oo_${process.pid}_${Math.random().toString(36).slice(2)}.docx`);
+// createFromMarkdown writes to a path, so the file lives in a private temp
+// directory just long enough to read its bytes back.
+function markdownToBytes(markdown, format) {
+  const dir = mkdtempSync(join(tmpdir(), 'oo_example_'));
   try {
-    createFromMarkdown(MARKDOWN(title), 'docx', path);
+    const path = join(dir, `report.${format}`);
+    createFromMarkdown(markdown, format, path);
     return readFileSync(path);
   } finally {
-    try { unlinkSync(path); } catch (_) {}
+    rmSync(dir, { recursive: true, force: true });
   }
 }
 
-// Row and column indices are zero-based.
-function buildXlsxBytes() {
-  const w = new XlsxWriter();
-  try {
-    const s = w.addSheet('Sales');
-    ['Region', 'Q1', 'Q2', 'Growth'].forEach((h, c) => w.setCellStyled(s, 0, c, h, true, null));
-    w.setCell(s, 1, 0, 'North'); w.setCell(s, 1, 1, 120); w.setCell(s, 1, 2, 135); w.setCell(s, 1, 3, true);
-    w.setCell(s, 2, 0, 'South'); w.setCell(s, 2, 1, 95); w.setCell(s, 2, 2, 110);
-    w.setCell(s, 3, 0, 'Total');
-    w.setFormula(s, 3, 1, 'SUM(B2:B3)');
-    w.setFormula(s, 3, 2, 'SUM(C2:C3)');
-    w.setCell(s, 5, 0, 'Notes');
-    w.mergeCells(s, 5, 0, 1, 3); // A6:C6
-    w.setColumnWidth(s, 0, 18);
-    return w.toBytes();
-  } finally { w.close(); }
+function buildDocxBytes(title = 'Quarterly Report') {
+  return markdownToBytes(MARKDOWN.replaceAll('Quarterly Report', title), 'docx');
 }
 
-function buildPptxBytes() {
-  const w = new PptxWriter();
-  try {
-    w.setPresentationSize(12192000, 6858000); // 16:9, in EMU
-    const s1 = w.addSlide();
-    w.setSlideTitle(s1, 'Welcome');
-    w.addSlideText(s1, 'Quarterly Report');
-    const s2 = w.addSlide();
-    w.setSlideTitle(s2, 'Results');
-    w.addSlideText(s2, 'Revenue grew in every region.');
-    w.addSlideImage(s2, PNG, 'png', 914400, 2743200, 1828800, 1828800);
-    return w.toBytes();
-  } finally { w.close(); }
+const PART = 'word/_rels/document.xml.rels';
+
+// Overwrites the start of one part's compressed data. A first deflate byte of
+// 0xFF declares a reserved block type, so every inflater rejects the part, and
+// the central directory stays intact. The part is found by name, not by
+// offset, so the recipe does not depend on how big the other parts are.
+function damagePart(data) {
+  const at = data.indexOf(PART); // the first hit is the part's local header
+  check(at > 0, 'the part to damage is missing from the archive');
+  // The extra-field length sits in the two bytes just before the name.
+  const start = at + PART.length + data.readUInt16LE(at - 2);
+  const damaged = Buffer.from(data);
+  damaged.fill(0xff, start, start + 16);
+  return damaged;
 }
 
-function openOrError(bytes, options) {
+// Opens bytes as a DOCX; returns the error, or null when the open succeeded.
+function openError(data, options) {
   try {
-    return { doc: Document.fromBytes(bytes, 'docx', options) };
+    Document.fromBytes(data, 'docx', options).close();
+    return null;
   } catch (e) {
-    check(e instanceof OfficeOxideError, 'failure is an OfficeOxideError');
-    return { error: e };
+    if (!(e instanceof OfficeOxideError)) throw e;
+    return e;
   }
 }
 
-console.log('step 1: build a DOCX in memory and keep the first half of its bytes');
-const good = buildDocxBytes();
-const truncated = good.subarray(0, Math.floor(good.length / 2));
-console.log(`  option names: ${ParseOptions.names().join(', ')}`);
-
-console.log('step 2: strict mode rejects damaged bytes');
-const strict = new ParseOptions({ strict: true });
-try {
-  const ok = Document.fromBytes(good, 'docx', strict);
-  try { check(ok.damage().length === 0, 'a sound document has no damage'); } finally { ok.close(); }
-  for (const [name, bytes] of [['truncated', truncated]]) {
-    const r = openOrError(bytes, strict);
-    if (r.doc) r.doc.close();
-    check(r.error, `strict open of ${name} bytes fails`);
-    console.log(`  error: ${name}: code ${r.error.code}: ${r.error.message}`);
+function check(condition, message) {
+  if (!condition) {
+    console.error(`FAIL: ${message}`);
+    process.exit(1);
   }
-} finally { strict.close(); }
+}
 
-console.log('step 3: a lenient open reports damage or fails, never looks clean');
-for (const [name, bytes] of [['truncated', truncated]]) {
-  const r = openOrError(bytes);
-  if (r.error) { console.log(`  error: ${name}: code ${r.error.code}: ${r.error.message}`); continue; }
+function has(text, expected) {
+  check(text.includes(expected), `"${expected}" is missing from the text`);
+}
+
+function main() {
+  console.log('step 1: build a DOCX in memory');
+  const good = buildDocxBytes();
+
+  console.log(`step 2: damage one part: overwrite 16 bytes of ${PART}`);
+  const damaged = damagePart(good);
+
+  console.log('step 3: open it in strict mode');
+  const strict = new ParseOptions({ strict: true });
   try {
-    const damage = r.doc.damage();
-    console.log(`  damage: ${name}: ${damage.map((d) => d.kind).join(', ')}`);
-    check(damage.length > 0, `lenient open of ${name} bytes reports damage`);
-  } finally { r.doc.close(); }
+    const error = openError(damaged, strict);
+    check(error !== null, 'strict mode accepted a damaged part');
+    console.log(`  error: ${error.message}`);
+
+    console.log('step 4: open it leniently');
+    const doc = Document.fromBytes(damaged, 'docx');
+    let kinds, text;
+    try {
+      kinds = doc.damage().map((d) => d.kind);
+      text = doc.plainText();
+    } finally {
+      doc.close();
+    }
+    console.log(`  damage: ${kinds.join(', ')}`);
+    check(kinds.includes('unreadable_part'), 'the damage report does not name an unreadable part');
+    has(text, 'Quarterly Report');
+
+    console.log('step 5: truncate the archive to its first half and open it both ways');
+    const half = good.subarray(0, Math.floor(good.length / 2));
+    for (const [options, message] of [
+      [strict, 'strict mode accepted a truncated archive'],
+      [undefined, 'a lenient open accepted a truncated archive'],
+    ]) {
+      const error = openError(half, options);
+      check(error !== null, message);
+      console.log(`  error: ${error.message}`);
+    }
+  } finally {
+    strict.close();
+  }
+
+  console.log('step 6: a limit applies to one document only');
+  const limited = new ParseOptions({ part_bytes: 100 });
+  try {
+    const error = openError(good, limited);
+    check(error !== null, 'the part_bytes limit was not applied');
+    console.log(`  error: ${error.message}`);
+  } finally {
+    limited.close();
+  }
+  const doc = Document.fromBytes(good, 'docx'); // the default limits still accept it
+  try {
+    has(doc.plainText(), 'Quarterly Report');
+  } finally {
+    doc.close();
+  }
+
+  console.log('OK 08_limits_strict_damage');
 }
 
-console.log('step 4: a limit applies to one document only');
-const capped = new ParseOptions({ package_bytes: 100 });
-try {
-  const r = openOrError(good, capped);
-  if (r.doc) r.doc.close();
-  check(r.error, 'package_bytes=100 rejects the document');
-  console.log(`  error: capped: code ${r.error.code}: ${r.error.message}`);
-} finally { capped.close(); }
-Document.fromBytes(good, 'docx').close(); // default options still open it
-
-console.log('OK 08_limits_strict_damage');
+main();

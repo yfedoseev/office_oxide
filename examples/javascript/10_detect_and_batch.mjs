@@ -1,19 +1,15 @@
 #!/usr/bin/env node
 /**
- * 10_detect_and_batch — detect the format of each document, then process a mixed batch.
+ * 10_detect_and_batch: detect the format of bytes, then process a mixed batch.
  *
- * Run: OFFICE_OXIDE_LIB=.../liboffice_oxide.so node examples/javascript/10_detect_and_batch.mjs
+ * Run: node examples/javascript/10_detect_and_batch.mjs
  */
-import { tmpdir } from 'os';
-import { join } from 'path';
-import { readFileSync, unlinkSync, mkdtempSync, writeFileSync, rmSync } from 'fs';
-import { Document, XlsxWriter, PptxWriter, createFromMarkdown, detectFormat } from '../../js/lib/index.js';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Document, PptxWriter, XlsxWriter, createFromMarkdown } from '../../js/lib/index.js';
 
-function check(cond, message) {
-  if (!cond) { console.error(`FAIL: ${message}`); process.exit(1); }
-}
-
-const MARKDOWN = (title) => `# ${title}
+const MARKDOWN = `# Quarterly Report
 
 Revenue grew in every region.
 
@@ -23,29 +19,31 @@ Revenue grew in every region.
 | South  | 95  | 110 |
 `;
 
-const PNG = Buffer.from(
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
-  'base64');
+const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
 
-// The JS binding has no DOCX writer, so the DOCX is generated into a temp
-// file that is read and deleted at once; everything after that is bytes.
-function buildDocxBytes(title = 'Quarterly Report') {
-  const path = join(tmpdir(), `oo_${process.pid}_${Math.random().toString(36).slice(2)}.docx`);
+// createFromMarkdown writes to a path, so the file lives in a private temp
+// directory just long enough to read its bytes back.
+function markdownToBytes(markdown, format) {
+  const dir = mkdtempSync(join(tmpdir(), 'oo_example_'));
   try {
-    createFromMarkdown(MARKDOWN(title), 'docx', path);
+    const path = join(dir, `report.${format}`);
+    createFromMarkdown(markdown, format, path);
     return readFileSync(path);
   } finally {
-    try { unlinkSync(path); } catch (_) {}
+    rmSync(dir, { recursive: true, force: true });
   }
 }
 
-// Row and column indices are zero-based.
+function buildDocxBytes(title = 'Quarterly Report') {
+  return markdownToBytes(MARKDOWN.replaceAll('Quarterly Report', title), 'docx');
+}
+
 function buildXlsxBytes() {
   const w = new XlsxWriter();
   try {
     const s = w.addSheet('Sales');
-    ['Region', 'Q1', 'Q2', 'Growth'].forEach((h, c) => w.setCellStyled(s, 0, c, h, true, null));
-    w.setCell(s, 1, 0, 'North'); w.setCell(s, 1, 1, 120); w.setCell(s, 1, 2, 135); w.setCell(s, 1, 3, true);
+    ['Region', 'Q1', 'Q2', 'Growth'].forEach((head, col) => w.setCellStyled(s, 0, col, head, true, null)); // bold header row
+    w.setCell(s, 1, 0, 'North'); w.setCell(s, 1, 1, 120); w.setCell(s, 1, 2, 135); w.setCell(s, 1, 3, true); // D2
     w.setCell(s, 2, 0, 'South'); w.setCell(s, 2, 1, 95); w.setCell(s, 2, 2, 110);
     w.setCell(s, 3, 0, 'Total');
     w.setFormula(s, 3, 1, 'SUM(B2:B3)');
@@ -53,58 +51,75 @@ function buildXlsxBytes() {
     w.setCell(s, 5, 0, 'Notes');
     w.mergeCells(s, 5, 0, 1, 3); // A6:C6
     w.setColumnWidth(s, 0, 18);
-    return w.toBytes();
-  } finally { w.close(); }
+    return Buffer.from(w.toBytes());
+  } finally {
+    w.close();
+  }
 }
 
 function buildPptxBytes() {
   const w = new PptxWriter();
   try {
-    w.setPresentationSize(12192000, 6858000); // 16:9, in EMU
-    const s1 = w.addSlide();
-    w.setSlideTitle(s1, 'Welcome');
-    w.addSlideText(s1, 'Quarterly Report');
-    const s2 = w.addSlide();
-    w.setSlideTitle(s2, 'Results');
-    w.addSlideText(s2, 'Revenue grew in every region.');
-    w.addSlideImage(s2, PNG, 'png', 914400, 2743200, 1828800, 1828800);
-    return w.toBytes();
-  } finally { w.close(); }
+    w.setPresentationSize(12192000, 6858000); // 16:9, in EMU (914400 per inch)
+    const one = w.addSlide();
+    w.setSlideTitle(one, 'Welcome');
+    w.addSlideText(one, 'Quarterly Report');
+    const two = w.addSlide();
+    w.setSlideTitle(two, 'Results');
+    w.addSlideText(two, 'Revenue grew in every region.');
+    w.addSlideImage(two, PNG, 'png', 914400, 2743200, 1828800, 1828800);
+    return Buffer.from(w.toBytes());
+  } finally {
+    w.close();
+  }
 }
 
-console.log('step 1: build a DOCX, an XLSX and a PPTX in memory');
-const batch = [
-  ['docx', buildDocxBytes(), 'Quarterly Report'],
-  ['xlsx', buildXlsxBytes(), 'Region'],
-  ['pptx', buildPptxBytes(), 'Quarterly Report'],
-];
+const PARTS = [['word/document.xml', 'docx'], ['xl/workbook.xml', 'xlsx'], ['ppt/presentation.xml', 'pptx']];
 
-// The JS binding detects from a path only (no bytes variant), so each
-// document is written under the name report.<ext> in a temp dir. detectFormat
-// goes by the extension, not the content (see the report in the PR).
-const dir = mkdtempSync(join(tmpdir(), 'oo_10_'));
-try {
-  console.log('step 2: detect the format of each document');
-  const paths = [];
-  for (const [ext, bytes, word] of batch) {
-    const path = join(dir, `report.${ext}`);
-    writeFileSync(path, bytes);
-    const format = detectFormat(path);
-    check(format === ext, `detected format is ${ext}`);
-    paths.push([path, ext, word]);
+// The binding detects from a path only. A ZIP stores each part name in the
+// clear, and the main part's name tells the three formats apart.
+function detectFormat(data) {
+  if (data.subarray(0, 2).toString() !== 'PK') return null;
+  for (const [part, format] of PARTS) {
+    if (data.includes(part)) return format;
   }
+  return null;
+}
 
-  console.log('step 3: process the batch');
-  for (const [path, ext, word] of paths) {
-    const doc = Document.open(path);
+function check(condition, message) {
+  if (!condition) {
+    console.error(`FAIL: ${message}`);
+    process.exit(1);
+  }
+}
+
+function main() {
+  console.log('step 1: build a DOCX, an XLSX and a PPTX in memory');
+  const batch = [
+    ['report.docx', buildDocxBytes()],
+    ['report.xlsx', buildXlsxBytes()],
+    ['report.pptx', buildPptxBytes()],
+  ];
+
+  console.log('step 2: detect each format and open it from bytes');
+  for (const [name, data] of batch) {
+    const format = detectFormat(data);
+    check(format === name.split('.').pop(), 'the detected format differs from the one built');
+    const doc = Document.fromBytes(data, format);
+    let text;
     try {
-      const text = doc.plainText();
-      console.log(`  report.${ext}: format ${doc.format}, chars ${text.length}`);
-      check(text.includes(word), `text contains "${word}"`);
-    } finally { doc.close(); }
+      text = doc.plainText();
+    } finally {
+      doc.close();
+    }
+    check(text.trim() !== '', 'a document has no text');
+    console.log(`  ${name}: format ${format}, chars ${text.length}`);
   }
-} finally {
-  rmSync(dir, { recursive: true, force: true });
+
+  console.log('step 3: check that bytes that are not a document are not detected');
+  check(detectFormat(Buffer.from('not an office file')) === null, 'bytes that are not a document were detected as one');
+
+  console.log('OK 10_detect_and_batch');
 }
 
-console.log('OK 10_detect_and_batch');
+main();

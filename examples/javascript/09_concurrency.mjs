@@ -1,21 +1,20 @@
 #!/usr/bin/env node
 /**
- * 09_concurrency — open and read 32 documents from 8 worker threads at once.
+ * 09_concurrency: open and read 32 documents from 8 workers at once, with logging on.
  *
- * Run: OFFICE_OXIDE_LIB=.../liboffice_oxide.so node examples/javascript/09_concurrency.mjs
+ * Run: node examples/javascript/09_concurrency.mjs
  */
-import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
-import { tmpdir } from 'os';
-import { join } from 'path';
-import { readFileSync, unlinkSync } from 'fs';
+import { isMainThread, parentPort, Worker, workerData } from 'node:worker_threads';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Document, createFromMarkdown } from '../../js/lib/index.js';
 
-function check(cond, message) {
-  if (!cond) { console.error(`FAIL: ${message}`); process.exit(1); }
-}
+const WORKERS = 8;
+const DOCUMENTS = 32;
 
-const MARKDOWN = (title) => `# ${title}
+const MARKDOWN = `# Quarterly Report
 
 Revenue grew in every region.
 
@@ -25,63 +24,74 @@ Revenue grew in every region.
 | South  | 95  | 110 |
 `;
 
-// The JS binding has no DOCX writer, so the DOCX is generated into a temp
-// file that is read and deleted at once; everything after that is bytes.
-function buildDocxBytes(title = 'Quarterly Report') {
-  const path = join(tmpdir(), `oo_${process.pid}_${Math.random().toString(36).slice(2)}.docx`);
+// createFromMarkdown writes to a path, so the file lives in a private temp
+// directory just long enough to read its bytes back.
+function markdownToBytes(markdown, format) {
+  const dir = mkdtempSync(join(tmpdir(), 'oo_example_'));
   try {
-    createFromMarkdown(MARKDOWN(title), 'docx', path);
+    const path = join(dir, `report.${format}`);
+    createFromMarkdown(markdown, format, path);
     return readFileSync(path);
   } finally {
-    try { unlinkSync(path); } catch (_) {}
+    rmSync(dir, { recursive: true, force: true });
   }
 }
 
+function buildDocxBytes(title = 'Quarterly Report') {
+  return markdownToBytes(MARKDOWN.replaceAll('Quarterly Report', title), 'docx');
+}
 
-const WORKERS = 8;
-const DOCUMENTS = 32;
-
-if (isMainThread) {
-  // Real worker_threads (koffi loads in workers), not Promise.all: a native
-  // call blocks its thread, so only separate threads exercise the parser's
-  // helper threads in parallel. The JS binding has no host logger bridge, so
-  // there is no logging to switch on; the aim is the same, to show parsing
-  // from many threads cannot deadlock the host. A watchdog turns a hang into
-  // a failure.
-  console.log(`step 1: start ${WORKERS} workers for ${DOCUMENTS} documents`);
-  const watchdog = setTimeout(() => {
-    console.error('FAIL: workers finish in time (deadlock?)');
+function check(condition, message) {
+  if (!condition) {
+    console.error(`FAIL: ${message}`);
     process.exit(1);
-  }, 60_000);
-  const url = fileURLToPath(import.meta.url);
+  }
+}
+
+// Each worker thread loads the binding itself and parses its share of the
+// documents. Real threads, not Promise.all: a native call blocks its thread,
+// so only separate threads exercise the parser's helper threads in parallel.
+function parseInWorker() {
+  const texts = workerData.items.map(([i, data]) => {
+    const doc = Document.fromBytes(Buffer.from(data), 'docx');
+    try {
+      return [i, doc.plainText()];
+    } finally {
+      doc.close();
+    }
+  });
+  parentPort.postMessage(texts);
+}
+
+async function main() {
+  console.log('step 1: build 32 DOCX files in memory');
+  const inputs = Array.from({ length: DOCUMENTS }, (_, i) => buildDocxBytes(`Quarterly Report ${i}`));
+  console.log(`  documents: ${DOCUMENTS}`);
+
+  console.log('step 2: skipped, the JS binding has no host logger bridge');
+
+  console.log('step 3: parse them on 8 workers');
+  // A watchdog turns a deadlock into a failure instead of a hang.
+  const watchdog = setTimeout(() => check(false, 'a parse did not finish: possible deadlock'), 60_000);
   const jobs = Array.from({ length: WORKERS }, (_, w) => {
-    const ids = [];
-    for (let i = w; i < DOCUMENTS; i += WORKERS) ids.push(i);
+    const items = inputs.flatMap((data, i) => (i % WORKERS === w ? [[i, data]] : []));
     return new Promise((resolve, reject) => {
-      const worker = new Worker(url, { workerData: { ids } });
+      const worker = new Worker(fileURLToPath(import.meta.url), { workerData: { items } });
       worker.once('message', resolve);
       worker.once('error', reject);
-      worker.once('exit', (c) => c !== 0 && reject(new Error(`worker exited ${c}`)));
     });
   });
-
-  console.log('step 2: open and read every document');
-  const results = (await Promise.all(jobs)).flat();
+  const texts = [];
+  for (const [i, text] of (await Promise.all(jobs)).flat()) texts[i] = text;
   clearTimeout(watchdog);
-
-  console.log('step 3: check every result');
   console.log(`  workers: ${WORKERS}`);
-  console.log(`  documents: ${results.length}`);
-  check(results.length === DOCUMENTS, `${DOCUMENTS} results`);
-  for (const r of results) check(r.ok, `text contains "Quarterly Report ${r.i}"`);
+
+  console.log('step 4: check every result');
+  check(texts.length === DOCUMENTS && texts.every((t) => t), 'not every document was read');
+  texts.forEach((text, i) => check(text.includes(`Quarterly Report ${i}`), `document ${i} came back with the wrong text`));
+
   console.log('OK 09_concurrency');
-} else {
-  const out = [];
-  for (const i of workerData.ids) {
-    const doc = Document.fromBytes(buildDocxBytes(`Quarterly Report ${i}`), 'docx');
-    try {
-      out.push({ i, ok: doc.plainText().includes(`Quarterly Report ${i}`) });
-    } finally { doc.close(); }
-  }
-  parentPort.postMessage(out);
 }
+
+if (isMainThread) await main();
+else parseInWorker();

@@ -1,71 +1,122 @@
 #!/usr/bin/env node
 /**
- * 03_edit — Edit a document by replacing placeholder text.
+ * 03_edit: replace text in a DOCX and set cells in an XLSX, in memory.
  *
- * Creates a DOCX from Markdown with {{NAME}} and {{DATE}} placeholders,
- * opens with EditableDocument, replaces both, saves to a second temp file,
- * then reads back and verifies. Exit 0 on success.
- *
- * Run: OFFICE_OXIDE_LIB=.../liboffice_oxide.so node examples/javascript/03_edit.mjs
+ * Run: node examples/javascript/03_edit.mjs
  */
-import { tmpdir } from 'os';
-import { join } from 'path';
-import { unlinkSync } from 'fs';
-import { Document, EditableDocument, createFromMarkdown } from '../../js/lib/index.js';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Document, EditableDocument, XlsxWriter, createFromMarkdown } from '../../js/lib/index.js';
 
-const markdown = `# Invoice
+const MARKDOWN = `# Quarterly Report
 
-Dear {{NAME}},
+Revenue grew in every region.
 
-Please find attached your invoice for services rendered on {{DATE}}.
-
-## Summary
-
-- Service: Office Oxide Pro License
-- Amount: $499.00
-- Due date: 30 days from {{DATE}}
-
-Thank you for your business!
+| Region | Q1  | Q2  |
+|--------|-----|-----|
+| North  | 120 | 135 |
+| South  | 95  | 110 |
 `;
 
-const ts = Date.now();
-const templatePath = join(tmpdir(), `oo_03_template_${ts}.docx`);
-const outputPath = join(tmpdir(), `oo_03_output_${ts}.docx`);
-
-try {
-  // Create template
-  createFromMarkdown(markdown, 'docx', templatePath);
-
-  // Edit
-  const ed = EditableDocument.open(templatePath);
-  let n1, n2;
+// createFromMarkdown writes to a path, so the file lives in a private temp
+// directory just long enough to read its bytes back.
+function markdownToBytes(markdown, format) {
+  const dir = mkdtempSync(join(tmpdir(), 'oo_example_'));
   try {
-    n1 = ed.replaceText('{{NAME}}', 'Alice Smith');
-    n2 = ed.replaceText('{{DATE}}', '2026-04-26');
-    ed.save(outputPath);
+    const path = join(dir, `report.${format}`);
+    createFromMarkdown(markdown, format, path);
+    return readFileSync(path);
   } finally {
-    ed.close();
+    rmSync(dir, { recursive: true, force: true });
   }
-  console.log(`Replacements: {{NAME}} x${n1}, {{DATE}} x${n2}`);
+}
 
-  // Verify
-  const doc = Document.open(outputPath);
+function buildDocxBytes(title = 'Quarterly Report') {
+  return markdownToBytes(MARKDOWN.replaceAll('Quarterly Report', title), 'docx');
+}
+
+function buildXlsxBytes() {
+  const w = new XlsxWriter();
   try {
-    const text = doc.plainText();
+    const s = w.addSheet('Sales');
+    ['Region', 'Q1', 'Q2', 'Growth'].forEach((head, col) => w.setCellStyled(s, 0, col, head, true, null)); // bold header row
+    w.setCell(s, 1, 0, 'North'); w.setCell(s, 1, 1, 120); w.setCell(s, 1, 2, 135); w.setCell(s, 1, 3, true); // D2
+    w.setCell(s, 2, 0, 'South'); w.setCell(s, 2, 1, 95); w.setCell(s, 2, 2, 110);
+    w.setCell(s, 3, 0, 'Total');
+    w.setFormula(s, 3, 1, 'SUM(B2:B3)');
+    w.setFormula(s, 3, 2, 'SUM(C2:C3)');
+    w.setCell(s, 5, 0, 'Notes');
+    w.mergeCells(s, 5, 0, 1, 3); // A6:C6
+    w.setColumnWidth(s, 0, 18);
+    return Buffer.from(w.toBytes());
+  } finally {
+    w.close();
+  }
+}
 
-    if (!text.includes('Alice Smith')) throw new Error("name replacement failed: 'Alice Smith' not found");
-    if (!text.includes('2026-04-26')) throw new Error("date replacement failed: '2026-04-26' not found");
-    if (text.includes('{{NAME}}')) throw new Error('placeholder {{NAME}} still present');
-    if (text.includes('{{DATE}}')) throw new Error('placeholder {{DATE}} still present');
+function check(condition, message) {
+  if (!condition) {
+    console.error(`FAIL: ${message}`);
+    process.exit(1);
+  }
+}
 
-    console.log('Edit verified successfully.');
-    console.log('--- final text ---');
-    console.log(text);
+function has(text, expected) {
+  check(text.includes(expected), `"${expected}" is missing from the text`);
+}
+
+// Opens bytes, reads the plain text and closes the document.
+function textOf(data, format) {
+  const doc = Document.fromBytes(data, format);
+  try {
+    return doc.plainText();
   } finally {
     doc.close();
   }
-} finally {
-  try { unlinkSync(templatePath); } catch (_) {}
-  try { unlinkSync(outputPath); } catch (_) {}
 }
-console.log('OK 03_edit');
+
+function main() {
+  console.log('step 1: build a DOCX in memory');
+  const docx = buildDocxBytes();
+
+  console.log('step 2: replace text');
+  let ed = EditableDocument.fromBytes(docx, 'docx');
+  let edited;
+  try {
+    const replaced = ed.replaceText('Quarterly Report', 'Annual Report');
+    console.log(`  replacements: ${replaced}`);
+    check(replaced === 1, 'replace_text did not make exactly one replacement');
+
+    console.log('step 3: save to bytes and check the text');
+    edited = ed.toBytes();
+  } finally {
+    ed.close();
+  }
+  let text = textOf(edited, 'docx');
+  has(text, 'Annual Report');
+  check(!text.includes('Quarterly Report'), 'the old title is still present');
+
+  console.log('step 4: build an XLSX in memory');
+  const xlsx = buildXlsxBytes();
+
+  console.log('step 5: set cells');
+  ed = EditableDocument.fromBytes(xlsx, 'xlsx');
+  try {
+    ed.setCell(0, 'B2', 999);
+    ed.setCell(0, 'A2', 'Central');
+
+    console.log('step 6: save to bytes and check the cells');
+    edited = ed.toBytes();
+  } finally {
+    ed.close();
+  }
+  text = textOf(edited, 'xlsx');
+  has(text, 'Central');
+  has(text, '999');
+  check(!text.includes('North'), 'the old A2 value is still present');
+
+  console.log('OK 03_edit');
+}
+
+main();
