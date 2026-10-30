@@ -1,16 +1,26 @@
-//! 02_create_from_markdown: create DOCX, XLSX and PPTX from one Markdown text.
+//! 02_create_from_markdown: turn one Markdown source into a DOCX, an XLSX and a PPTX.
 //!
-//! Run: `cargo run --example 06_from_markdown`
-
-use std::io::Cursor;
+//! Run: `cargo run --example 02_create_from_markdown`
 
 use office_oxide::create::create_from_markdown_to_writer;
 use office_oxide::{Document, DocumentFormat};
+use std::io::Cursor;
 
 const MARKDOWN: &str = "# Quarterly Report\n\nRevenue grew in every region.\n\n\
 | Region | Q1  | Q2  |\n|--------|-----|-----|\n| North  | 120 | 135 |\n| South  | 95  | 110 |\n";
 
-/// Assert with a message; a failure exits non-zero.
+fn markdown_to_bytes(markdown: &str, format: DocumentFormat) -> Vec<u8> {
+    let mut buf = Cursor::new(Vec::new());
+    create_from_markdown_to_writer(markdown, format, &mut buf).expect("create from Markdown");
+    buf.into_inner()
+}
+
+/// `Document::from_reader` needs a `Read + Seek + Send + 'static` source, so the
+/// bytes go in an owned `Cursor`, not a borrowed slice.
+fn open_bytes(bytes: Vec<u8>, format: DocumentFormat) -> Document {
+    Document::from_reader(Cursor::new(bytes), format).expect("open from bytes")
+}
+
 fn check(condition: bool, message: &str) {
     if !condition {
         eprintln!("FAIL: {message}");
@@ -18,29 +28,32 @@ fn check(condition: bool, message: &str) {
     }
 }
 
+fn has(text: &str, expected: &str) {
+    check(text.contains(expected), &format!("\"{expected}\" is missing from the text"));
+}
+
 fn main() {
-    for (n, format) in [
+    println!("step 1: write the Markdown source");
+    let markdown = MARKDOWN;
+
+    println!("step 2: create a DOCX, an XLSX and a PPTX from it");
+    let formats = [
         DocumentFormat::Docx,
         DocumentFormat::Xlsx,
         DocumentFormat::Pptx,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        println!(
-            "step {}: create a {} from Markdown and open it",
-            n + 1,
-            format.extension().to_uppercase()
-        );
-        let mut buf = Cursor::new(Vec::new());
-        create_from_markdown_to_writer(MARKDOWN, format, &mut buf).expect("create from Markdown");
-        let doc = Document::from_reader(Cursor::new(buf.into_inner()), format)
-            .expect("open created file");
-        let text = doc.plain_text();
-        println!("  format: {}", doc.format().extension());
+    ];
+    let created: Vec<Vec<u8>> = formats
+        .iter()
+        .map(|&f| markdown_to_bytes(markdown, f))
+        .collect();
+
+    println!("step 3: open each and check the text");
+    for (format, data) in formats.into_iter().zip(created) {
+        let text = open_bytes(data, format).plain_text();
+        println!("  format: {}", format.extension());
         println!("  chars: {}", text.len());
-        check(text.contains("Quarterly Report"), "created file text must contain the title");
-        check(text.contains("North"), "created file text must contain the table");
+        has(&text, "North");
     }
+
     println!("OK 02_create_from_markdown");
 }

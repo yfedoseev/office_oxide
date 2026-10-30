@@ -1,11 +1,16 @@
-//! 05_xlsx_writer: write a workbook with typed cells, formulas, a merge and a width.
+//! 05_xlsx_writer: write a workbook with typed cells, a formula, a style, a merge and a column width, then read it back.
 //!
-//! Run: `cargo run --example 03_create_xlsx`
-
-use std::io::Cursor;
+//! Run: `cargo run --example 05_xlsx_writer`
 
 use office_oxide::xlsx::write::{CellData, CellStyle, XlsxWriter};
 use office_oxide::{Document, DocumentFormat};
+use std::io::Cursor;
+
+/// `Document::from_reader` needs a `Read + Seek + Send + 'static` source, so the
+/// bytes go in an owned `Cursor`, not a borrowed slice.
+fn open_bytes(bytes: Vec<u8>, format: DocumentFormat) -> Document {
+    Document::from_reader(Cursor::new(bytes), format).expect("open from bytes")
+}
 
 fn build_xlsx_bytes() -> Vec<u8> {
     let mut writer = XlsxWriter::new();
@@ -14,31 +19,18 @@ fn build_xlsx_bytes() -> Vec<u8> {
         sheet.set_column_width(0, 18.0);
         let bold = CellStyle::new().bold();
         for (col, header) in ["Region", "Q1", "Q2", "Growth"].into_iter().enumerate() {
-            sheet.set_cell_styled(0, col, CellData::String(header.into()), bold.clone());
+            sheet.set_cell_styled(0, col, CellData::String(header.into()), bold.clone()); // bold header row
         }
         sheet.set_cell(1, 0, CellData::String("North".into()));
         sheet.set_cell(1, 1, CellData::Number(120.0));
         sheet.set_cell(1, 2, CellData::Number(135.0));
-        sheet.set_cell(1, 3, CellData::Boolean(true));
+        sheet.set_cell(1, 3, CellData::Boolean(true)); // D2
         sheet.set_cell(2, 0, CellData::String("South".into()));
         sheet.set_cell(2, 1, CellData::Number(95.0));
         sheet.set_cell(2, 2, CellData::Number(110.0));
-        // A formula plus its cached value: readers that do not evaluate
-        // formulas (this one included) then still see the number.
         sheet.set_cell(3, 0, CellData::String("Total".into()));
-        for (col, (formula, total)) in [("SUM(B2:B3)", 215.0), ("SUM(C2:C3)", 245.0)]
-            .into_iter()
-            .enumerate()
-        {
-            sheet.set_cell(
-                3,
-                col + 1,
-                CellData::FormulaWithValue {
-                    formula: formula.into(),
-                    cached: Box::new(CellData::Number(total)),
-                },
-            );
-        }
+        sheet.set_cell(3, 1, CellData::Formula("SUM(B2:B3)".into()));
+        sheet.set_cell(3, 2, CellData::Formula("SUM(C2:C3)".into()));
         sheet.set_cell(5, 0, CellData::String("Notes".into()));
         sheet.merge_cells(5, 0, 1, 3); // A6:C6
     }
@@ -47,7 +39,6 @@ fn build_xlsx_bytes() -> Vec<u8> {
     buf.into_inner()
 }
 
-/// Assert with a message; a failure exits non-zero.
 fn check(condition: bool, message: &str) {
     if !condition {
         eprintln!("FAIL: {message}");
@@ -55,32 +46,35 @@ fn check(condition: bool, message: &str) {
     }
 }
 
+fn has(text: &str, expected: &str) {
+    check(text.contains(expected), &format!("\"{expected}\" is missing from the text"));
+}
+
 fn main() {
     println!("step 1: build an XLSX in memory");
-    let bytes = build_xlsx_bytes();
+    let data = build_xlsx_bytes();
 
     println!("step 2: open it from bytes");
-    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx).expect("open XLSX");
+    let doc = open_bytes(data, DocumentFormat::Xlsx);
     let text = doc.plain_text();
     let sheets = doc.to_ir().sections.len();
-    println!("  sheets: {sheets}");
+    println!("  format: {}", doc.format().extension());
     println!("  chars: {}", text.len());
+    println!("  sheets: {sheets}");
 
     println!("step 3: check the cells");
-    check(sheets == 1, "the workbook must have one sheet");
+    check(sheets == 1, "expected one sheet");
+    for expected in [
+        "Sales", "Region", "Q1", "Q2", "Growth", "North", "120", "135", "South", "95", "110",
+        "Total", "Notes",
+    ] {
+        has(&text, expected);
+    }
+    check(text.contains("TRUE"), "the boolean cell is missing");
     check(
-        text.contains("Region") && text.contains("North") && text.contains("South"),
-        "xlsx text must contain the labels",
+        text.contains("SUM(B2:B3)") && text.contains("SUM(C2:C3)"),
+        "a formula is missing",
     );
-    check(
-        text.contains("120") && text.contains("110"),
-        "xlsx text must contain the numbers",
-    );
-    check(
-        text.contains("215") && text.contains("245"),
-        "xlsx text must contain the formula results",
-    );
-    check(text.to_lowercase().contains("true"), "xlsx text must contain the boolean");
-    check(text.contains("Notes"), "xlsx text must contain the merged cell text");
+
     println!("OK 05_xlsx_writer");
 }

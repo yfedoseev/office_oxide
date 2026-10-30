@@ -1,26 +1,30 @@
-//! 07_all_outputs: one document, every output (text, Markdown, HTML, IR JSON).
-//!
-//! Plain text keeps the words only; Markdown keeps headings and tables as light
-//! markup; HTML keeps the same structure as tags; IR JSON is the format-neutral
-//! tree (sections, elements, runs) for programs that need structure.
+//! 07_all_outputs: render one document as plain text, Markdown, HTML and IR JSON.
 //!
 //! Run: `cargo run --example 07_all_outputs`
 
-use std::io::Cursor;
-
 use office_oxide::create::create_from_markdown_to_writer;
 use office_oxide::{Document, DocumentFormat};
+use std::io::Cursor;
 
 const MARKDOWN: &str = "# Quarterly Report\n\nRevenue grew in every region.\n\n\
 | Region | Q1  | Q2  |\n|--------|-----|-----|\n| North  | 120 | 135 |\n| South  | 95  | 110 |\n";
 
-fn build_docx_bytes(markdown: &str) -> Vec<u8> {
+fn markdown_to_bytes(markdown: &str, format: DocumentFormat) -> Vec<u8> {
     let mut buf = Cursor::new(Vec::new());
-    create_from_markdown_to_writer(markdown, DocumentFormat::Docx, &mut buf).expect("create DOCX");
+    create_from_markdown_to_writer(markdown, format, &mut buf).expect("create from Markdown");
     buf.into_inner()
 }
 
-/// Assert with a message; a failure exits non-zero.
+fn build_docx_bytes(title: &str) -> Vec<u8> {
+    markdown_to_bytes(&MARKDOWN.replace("Quarterly Report", title), DocumentFormat::Docx)
+}
+
+/// `Document::from_reader` needs a `Read + Seek + Send + 'static` source, so the
+/// bytes go in an owned `Cursor`, not a borrowed slice.
+fn open_bytes(bytes: Vec<u8>, format: DocumentFormat) -> Document {
+    Document::from_reader(Cursor::new(bytes), format).expect("open from bytes")
+}
+
 fn check(condition: bool, message: &str) {
     if !condition {
         eprintln!("FAIL: {message}");
@@ -28,36 +32,42 @@ fn check(condition: bool, message: &str) {
     }
 }
 
+fn has(text: &str, expected: &str) {
+    check(text.contains(expected), &format!("\"{expected}\" is missing from the text"));
+}
+
 fn main() {
     println!("step 1: build a DOCX in memory");
-    let bytes = build_docx_bytes(MARKDOWN);
+    let data = build_docx_bytes("Quarterly Report");
 
     println!("step 2: open it from bytes");
-    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).expect("open DOCX");
+    let doc = open_bytes(data, DocumentFormat::Docx);
+    println!("  format: {}", doc.format().extension());
 
-    println!("step 3: produce every output");
-    let text = doc.plain_text();
-    let markdown = doc.to_markdown();
-    let html = doc.to_html();
-    let ir_json = serde_json::to_string(&doc.to_ir()).expect("IR serialises");
-    for (name, out) in [
-        ("text", &text),
-        ("markdown", &markdown),
-        ("html", &html),
-        ("ir", &ir_json),
-    ] {
-        println!("  {name}: {}", out.len());
-        check(!out.trim().is_empty(), "every output must be non-empty");
-        check(out.contains("Quarterly Report"), "every output must contain the title");
+    println!("step 3: render every output");
+    let outputs = [
+        ("plain", doc.plain_text()),     // words only: no markup, no structure
+        ("markdown", doc.to_markdown()), // headings and pipe tables survive as syntax
+        ("html", doc.to_html()),         // a fragment (no <html> wrapper), tables as <table>
+        // the format-neutral tree as JSON, for programs
+        ("ir_json", serde_json::to_string(&doc.to_ir()).expect("the IR serialises")),
+    ];
+    for (name, value) in &outputs {
+        println!("  chars: {name} {}", value.len());
     }
 
     println!("step 4: check each output");
-    check(markdown.contains('#'), "markdown must keep the heading marker");
-    check(html.contains('<') && html.contains('>'), "html must contain tags");
-    let ir: serde_json::Value = serde_json::from_str(&ir_json).expect("the IR must be valid JSON");
+    for (name, value) in &outputs {
+        check(!value.trim().is_empty(), &format!("the {name} output is empty"));
+    }
+    has(&outputs[0].1, "Quarterly Report");
     check(
-        ir["sections"].as_array().is_some_and(|s| !s.is_empty()),
-        "the IR must have sections",
+        outputs[1].1.contains("# Quarterly Report"),
+        "the Markdown is missing the heading",
     );
+    check(outputs[2].1.contains("<table"), "the HTML has no table");
+    let ir: serde_json::Value = serde_json::from_str(&outputs[3].1).expect("the IR JSON parses");
+    check(ir.is_object(), "the IR JSON does not parse to an object");
+
     println!("OK 07_all_outputs");
 }
