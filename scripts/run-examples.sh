@@ -13,6 +13,7 @@
 #
 # Run from the repository root, with the native library already built
 # (`cargo build --release --lib`) for every binding except Rust.
+# EXAMPLE_PYTHON overrides the Python launcher (default `uv run python`).
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
@@ -59,7 +60,7 @@ command_for() {
   local id="$1"
   case "$lang" in
     rust)       echo "cargo run --quiet --example $id" ;;
-    python)     echo "uv run python examples/python/$id/main.py" ;;
+    python)     echo "${EXAMPLE_PYTHON:-uv run python} examples/python/$id/main.py" ;;
     go)         echo "bash -c 'cd examples/go/$id && go run -tags office_oxide_dev .'" ;;
     csharp)     echo "dotnet run --project examples/csharp/$id/$id.csproj" ;;
     javascript) echo "node examples/javascript/$id.mjs" ;;
