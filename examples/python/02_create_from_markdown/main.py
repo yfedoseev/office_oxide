@@ -1,11 +1,10 @@
-"""02_create_from_markdown — Convert Markdown to DOCX, XLSX, and PPTX.
+"""02_create_from_markdown: turn one Markdown source into a DOCX, an XLSX and a PPTX.
 
-For each format: calls create_from_markdown, opens with Document.open,
-prints a text snippet. Exit 0 on success.
+Run: python examples/python/02_create_from_markdown/main.py
 """
+import os
 import sys
 import tempfile
-import os
 
 from office_oxide import Document, create_from_markdown
 
@@ -13,58 +12,55 @@ from office_oxide import Document, create_from_markdown
 MARKDOWN = """\
 # Quarterly Report
 
-Generated automatically from Markdown using Office Oxide.
+Revenue grew in every region.
 
-## Highlights
-
-- Revenue grew by **32%** year-over-year
-- Customer satisfaction: 4.8 / 5.0
-- New products launched: Widget Pro, Widget Lite
-
-## Financial Summary
-
-| Category   | Q3 2025 | Q4 2025 |
-|------------|---------|---------|
-| Revenue    | $1.2M   | $1.6M   |
-| Expenses   | $0.8M   | $0.9M   |
-| Net Profit | $0.4M   | $0.7M   |
+| Region | Q1  | Q2  |
+|--------|-----|-----|
+| North  | 120 | 135 |
+| South  | 95  | 110 |
 """
 
-FORMATS = ["docx", "xlsx", "pptx"]
+
+def markdown_to_bytes(markdown: str, fmt: str) -> bytes:
+    # create_from_markdown writes to a path, so the file lives in the temp dir
+    # just long enough to read its bytes back.
+    fd, path = tempfile.mkstemp(suffix=f".{fmt}")
+    os.close(fd)
+    try:
+        create_from_markdown(markdown, fmt, path)
+        with open(path, "rb") as f:
+            return f.read()
+    finally:
+        os.unlink(path)
+
+
+def check(condition: bool, message: str) -> None:
+    if not condition:
+        print(f"FAIL: {message}", file=sys.stderr)
+        sys.exit(1)
+
+
+def has(text: str, expected: str) -> None:
+    check(expected in text, f'"{expected}" is missing from the text')
 
 
 def main() -> None:
-    tmps = {}
-    try:
-        for fmt in FORMATS:
-            with tempfile.NamedTemporaryFile(suffix=f".{fmt}", delete=False) as f:
-                tmps[fmt] = f.name
+    print("step 1: write the Markdown source")
+    markdown = MARKDOWN
 
-        for fmt in FORMATS:
-            path = tmps[fmt]
-            create_from_markdown(MARKDOWN, fmt, path)
+    print("step 2: create a DOCX, an XLSX and a PPTX from it")
+    created = {fmt: markdown_to_bytes(markdown, fmt) for fmt in ("docx", "xlsx", "pptx")}
 
-            with Document.open(path) as doc:
-                text = doc.plain_text()
-                md_out = doc.to_markdown()
+    print("step 3: open each and check the text")
+    for fmt, data in created.items():
+        with Document.from_bytes(data, fmt) as doc:
+            text = doc.plain_text()
+        print(f"  format: {fmt}")
+        print(f"  chars: {len(text)}")
+        has(text, "North")
 
-            assert text, f"{fmt}: plain text is empty"
-
-            print(f"\n=== {fmt.upper()} ===")
-            print(f"plain text length: {len(text)} chars")
-            print(f"markdown length:   {len(md_out)} chars")
-            print(f"first 100 chars: {text[:100]!r}")
-
-        print("OK 02_create_from_markdown")
-    finally:
-        for p in tmps.values():
-            if os.path.exists(p):
-                os.unlink(p)
+    print("OK 02_create_from_markdown")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        sys.exit(1)
+    main()

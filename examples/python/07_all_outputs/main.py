@@ -1,4 +1,4 @@
-"""07_all_outputs: one document, every output: plain text, Markdown, HTML and IR JSON.
+"""07_all_outputs: render one document as plain text, Markdown, HTML and IR JSON.
 
 Run: python examples/python/07_all_outputs/main.py
 """
@@ -22,21 +22,31 @@ Revenue grew in every region.
 """
 
 
-def build_docx_bytes(title: str = "Quarterly Report") -> bytes:
-    # The only DOCX writer is create_from_markdown, which writes a path; the
-    # file lives in the temp dir just long enough to read its bytes back.
-    fd, path = tempfile.mkstemp(suffix=".docx")
+def markdown_to_bytes(markdown: str, fmt: str) -> bytes:
+    # create_from_markdown writes to a path, so the file lives in the temp dir
+    # just long enough to read its bytes back.
+    fd, path = tempfile.mkstemp(suffix=f".{fmt}")
     os.close(fd)
     try:
-        create_from_markdown(MARKDOWN.replace("Quarterly Report", title), "docx", path)
+        create_from_markdown(markdown, fmt, path)
         with open(path, "rb") as f:
             return f.read()
     finally:
         os.unlink(path)
 
+
+def build_docx_bytes(title: str = "Quarterly Report") -> bytes:
+    return markdown_to_bytes(MARKDOWN.replace("Quarterly Report", title), "docx")
+
+
 def check(condition: bool, message: str) -> None:
     if not condition:
-        raise AssertionError(message)
+        print(f"FAIL: {message}", file=sys.stderr)
+        sys.exit(1)
+
+
+def has(text: str, expected: str) -> None:
+    check(expected in text, f'"{expected}" is missing from the text')
 
 
 def main() -> None:
@@ -46,18 +56,22 @@ def main() -> None:
     print("step 2: open it from bytes")
     with Document.from_bytes(data, "docx") as doc:
         print(f"  format: {doc.format}")
-        outputs = {
-            "plain": doc.plain_text(),        # text only: no markup, no structure
-            "markdown": doc.to_markdown(),    # headings, emphasis, pipe tables
-            "html": doc.to_html(),            # a fragment (no <html>), tables as <table>
-            "ir_json": doc.to_ir_json(),      # the full tree as JSON, for programs
-        }
 
-    print("step 3: check every output")
+        print("step 3: render every output")
+        outputs = {
+            "plain": doc.plain_text(),      # words only: no markup, no structure
+            "markdown": doc.to_markdown(),  # headings and pipe tables survive as syntax
+            "html": doc.to_html(),          # a fragment (no <html> wrapper), tables as <table>
+            "ir_json": doc.to_ir_json(),    # the format-neutral tree as JSON, for programs
+        }
     for name, value in outputs.items():
         print(f"  chars: {name} {len(value)}")
+
+    print("step 4: check each output")
+    for name, value in outputs.items():
         check(value.strip() != "", f"the {name} output is empty")
-    check("Quarterly Report" in outputs["plain"], "the plain text is missing the title")
+    has(outputs["plain"], "Quarterly Report")
+    check("# Quarterly Report" in outputs["markdown"], "the Markdown is missing the heading")
     check("<table" in outputs["html"], "the HTML has no table")
     check(isinstance(json.loads(outputs["ir_json"]), dict), "the IR JSON does not parse to an object")
 
@@ -65,8 +79,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        print(f"error: {exc!r}", file=sys.stderr)
-        sys.exit(1)
+    main()

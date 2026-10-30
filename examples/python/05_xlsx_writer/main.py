@@ -1,4 +1,4 @@
-"""05_xlsx_writer: build a workbook with typed cells, a formula, styling, a merge and a column width, save to bytes, read it back.
+"""05_xlsx_writer: write a workbook with typed cells, a formula, a style, a merge and a column width, then read it back.
 
 Run: python examples/python/05_xlsx_writer/main.py
 """
@@ -25,36 +25,38 @@ def build_xlsx_bytes() -> bytes:
     w.set_column_width(s, 0, 18.0)
     return w.to_bytes()
 
+
 def check(condition: bool, message: str) -> None:
     if not condition:
-        raise AssertionError(message)
+        print(f"FAIL: {message}", file=sys.stderr)
+        sys.exit(1)
+
+
+def has(text: str, expected: str) -> None:
+    check(expected in text, f'"{expected}" is missing from the text')
 
 
 def main() -> None:
     print("step 1: build an XLSX in memory")
     data = build_xlsx_bytes()
-    print(f"  chars: {len(data)}")
 
     print("step 2: open it from bytes")
     with Document.from_bytes(data, "xlsx") as doc:
         text = doc.plain_text()
-        ir = doc.to_ir_json()
+        sheets = len(doc.to_ir()["sections"])
         print(f"  format: {doc.format}")
         print(f"  chars: {len(text)}")
+        print(f"  sheets: {sheets}")
 
     print("step 3: check the cells")
-    for expected in ("Region", "North", "120", "135", "South", "95", "110", "Total", "Notes"):
-        check(expected in text, f"{expected!r} is missing from the text")
-    check("true" in text.lower(), "the boolean cell is missing")
+    check(sheets == 1, "expected one sheet")
+    for expected in ("Sales", "Region", "Q1", "Q2", "Growth", "North", "120", "135", "South", "95", "110", "Total", "Notes"):
+        has(text, expected)
+    check("TRUE" in text, "the boolean cell is missing")
     check("SUM(B2:B3)" in text and "SUM(C2:C3)" in text, "a formula is missing")
-    check("Sales" in ir, "the sheet name is missing from the IR")
 
     print("OK 05_xlsx_writer")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        print(f"error: {exc!r}", file=sys.stderr)
-        sys.exit(1)
+    main()

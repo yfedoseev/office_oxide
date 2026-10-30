@@ -1,13 +1,11 @@
-"""10_detect_and_batch: detect the format of bytes, then process a mixed batch and print one line per document.
+"""10_detect_and_batch: detect the format of bytes, then process a mixed batch.
 
 Run: python examples/python/10_detect_and_batch/main.py
 """
 import base64
-import io
 import os
 import sys
 import tempfile
-import zipfile
 
 from office_oxide import Document, PptxWriter, XlsxWriter, create_from_markdown
 
@@ -24,17 +22,27 @@ Revenue grew in every region.
 """
 
 
-def build_docx_bytes(title: str = "Quarterly Report") -> bytes:
-    # The only DOCX writer is create_from_markdown, which writes a path; the
-    # file lives in the temp dir just long enough to read its bytes back.
-    fd, path = tempfile.mkstemp(suffix=".docx")
+PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+)
+
+
+def markdown_to_bytes(markdown: str, fmt: str) -> bytes:
+    # create_from_markdown writes to a path, so the file lives in the temp dir
+    # just long enough to read its bytes back.
+    fd, path = tempfile.mkstemp(suffix=f".{fmt}")
     os.close(fd)
     try:
-        create_from_markdown(MARKDOWN.replace("Quarterly Report", title), "docx", path)
+        create_from_markdown(markdown, fmt, path)
         with open(path, "rb") as f:
             return f.read()
     finally:
         os.unlink(path)
+
+
+def build_docx_bytes(title: str = "Quarterly Report") -> bytes:
+    return markdown_to_bytes(MARKDOWN.replace("Quarterly Report", title), "docx")
+
 
 def build_xlsx_bytes() -> bytes:
     w = XlsxWriter()
@@ -54,14 +62,10 @@ def build_xlsx_bytes() -> bytes:
     w.set_column_width(s, 0, 18.0)
     return w.to_bytes()
 
-PNG = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
-)
-
 
 def build_pptx_bytes() -> bytes:
     w = PptxWriter()
-    w.set_presentation_size(12192000, 6858000)  # 16:9, in EMU
+    w.set_presentation_size(12192000, 6858000)  # 16:9, in EMU (914400 per inch)
     one = w.add_slide()
     w.set_slide_title(one, "Welcome")
     w.add_slide_text(one, "Quarterly Report")
@@ -71,41 +75,49 @@ def build_pptx_bytes() -> bytes:
     w.add_slide_image(two, PNG, "png", 914400, 2743200, 1828800, 1828800)
     return w.to_bytes()
 
+
+PARTS = ((b"word/document.xml", "docx"), (b"xl/workbook.xml", "xlsx"), (b"ppt/presentation.xml", "pptx"))
+
+
+def detect_format(data: bytes) -> str | None:
+    # The Python API has no byte-level detector. A ZIP stores each part name in
+    # the clear, and the main part's name tells the three formats apart.
+    if not data.startswith(b"PK"):
+        return None
+    for part, fmt in PARTS:
+        if part in data:
+            return fmt
+    return None
+
+
 def check(condition: bool, message: str) -> None:
     if not condition:
-        raise AssertionError(message)
-
-
-def detect_format(data: bytes) -> str:
-    # The Python API has no byte-level detector, so read the zip's part names:
-    # the main part lives under word/, xl/ or ppt/.
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
-        names = z.namelist()
-    for prefix, fmt in (("word/", "docx"), ("xl/", "xlsx"), ("ppt/", "pptx")):
-        if any(n.startswith(prefix) for n in names):
-            return fmt
-    raise ValueError("not a docx, xlsx or pptx package")
+        print(f"FAIL: {message}", file=sys.stderr)
+        sys.exit(1)
 
 
 def main() -> None:
     print("step 1: build a DOCX, an XLSX and a PPTX in memory")
-    batch = [("report.docx", build_docx_bytes()), ("report.xlsx", build_xlsx_bytes()), ("report.pptx", build_pptx_bytes())]
+    batch = [
+        ("report.docx", build_docx_bytes()),
+        ("report.xlsx", build_xlsx_bytes()),
+        ("report.pptx", build_pptx_bytes()),
+    ]
 
     print("step 2: detect each format and open it from bytes")
     for name, data in batch:
         fmt = detect_format(data)
-        check(fmt == name.rsplit(".", 1)[1], f"{name} was detected as {fmt}")
+        check(fmt == name.rsplit(".", 1)[1], "the detected format differs from the one built")
         with Document.from_bytes(data, fmt) as doc:
             text = doc.plain_text()
-        check(text.strip() != "", f"{name} has no text")
+        check(text.strip() != "", "a document has no text")
         print(f"  {name}: format {fmt}, chars {len(text)}")
+
+    print("step 3: check that bytes that are not a document are not detected")
+    check(detect_format(b"not an office file") is None, "bytes that are not a document were detected as one")
 
     print("OK 10_detect_and_batch")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        print(f"error: {exc!r}", file=sys.stderr)
-        sys.exit(1)
+    main()
