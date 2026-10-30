@@ -55,7 +55,7 @@ def main() -> None:
             print(f"markdown length:   {len(md_out)} chars")
             print(f"first 100 chars: {text[:100]!r}")
 
-        print("\nAll formats created and verified.")
+        print("OK 02_create_from_markdown")
     finally:
         for p in tmps.values():
             if os.path.exists(p):

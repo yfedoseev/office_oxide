@@ -60,6 +60,7 @@ def main() -> None:
         print("Edit verified successfully.")
         print("--- final text ---")
         print(text)
+        print("OK 03_edit")
     finally:
         for p in [template_tmp, output_tmp]:
             if p and os.path.exists(p):

@@ -46,7 +46,7 @@ def main() -> None:
         assert "Office Oxide Extract Demo" in text, "heading missing from plain text"
         assert "Plain text extraction" in text, "bullet missing from plain text"
 
-        print("\nAll checks passed.")
+        print("OK 01_extract")
     finally:
         os.unlink(tmp)
 
