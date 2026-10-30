@@ -1,94 +1,99 @@
 //go:build office_oxide_dev
 
-// 01_extract — Self-contained extract demo using the Go bindings.
-//
-// Creates a DOCX from Markdown (written to a temp file), opens it with
-// oo.Open, and prints the format, plain text, and Markdown output.
-// Exit 0 on success.
-//
-// Build and run (inside the monorepo, after `cargo build --release --lib`):
-//
-//	go run -tags office_oxide_dev ./examples/go/01_extract/
+// 01_extract: read a document as plain text, Markdown and IR JSON.
+// Run: (cd examples/go/01_extract && go run -tags office_oxide_dev .)
 package main
 
 import (
 	"fmt"
-	"log"
 	"os"
+	"strings"
 
 	oo "github.com/yfedoseev/office_oxide/go"
 )
 
-const markdown = `# Office Oxide Extract Demo
+const markdown = `# Quarterly Report
 
-This document was created from Markdown and parsed back via Go CGo bindings.
+Revenue grew in every region.
 
-## Features
-
-- Plain text extraction
-- Markdown conversion
-- IR (intermediate representation) access
+| Region | Q1  | Q2  |
+|--------|-----|-----|
+| North  | 120 | 135 |
+| South  | 95  | 110 |
 `
 
-func main() {
-	// Create temp file
-	f, err := os.CreateTemp("", "oo_01_extract_*.docx")
-	if err != nil {
-		log.Fatal(err)
+// check fails the example loudly: it prints msg and exits non-zero.
+func check(ok bool, msg string) {
+	if !ok {
+		fmt.Fprintln(os.Stderr, "FAIL:", msg)
+		os.Exit(1)
 	}
-	tmpPath := f.Name()
+}
+
+// must fails the example on an unexpected error.
+func must[T any](v T, err error) T {
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "FAIL:", err)
+		os.Exit(1)
+	}
+	return v
+}
+
+// must0 fails the example on an unexpected error from a call with no result.
+func must0(err error) { must(0, err) }
+
+func has(text, expected string) {
+	check(strings.Contains(text, expected), `"`+expected+`" is missing from the text`)
+}
+
+// markdownToBytes creates a document from Markdown. The library writes to a
+// path, so the file lives in a private temp file just long enough to read its
+// bytes back.
+func markdownToBytes(md, format string) []byte {
+	f := must(os.CreateTemp("", "oo_example_*."+format))
+	path := f.Name()
 	f.Close()
-	defer os.Remove(tmpPath)
+	defer os.Remove(path)
+	must0(oo.CreateFromMarkdown(md, format, path))
+	return must(os.ReadFile(path))
+}
 
-	// Create DOCX from Markdown
-	if err := oo.CreateFromMarkdown(markdown, "docx", tmpPath); err != nil {
-		log.Fatalf("CreateFromMarkdown: %v", err)
-	}
+func buildDocxBytes(title string) []byte {
+	return markdownToBytes(strings.ReplaceAll(markdown, "Quarterly Report", title), "docx")
+}
 
-	// Open and extract
-	doc, err := oo.Open(tmpPath)
-	if err != nil {
-		log.Fatalf("Open: %v", err)
-	}
+func openBytes(data []byte, format string) *oo.Document {
+	return must(oo.OpenFromBytes(data, format))
+}
+
+// textOf opens bytes as the given format and returns the plain text.
+func textOf(data []byte, format string) string {
+	doc := openBytes(data, format)
 	defer doc.Close()
+	return must(doc.PlainText())
+}
 
-	format, err := doc.Format()
-	if err != nil {
-		log.Fatalf("Format: %v", err)
-	}
+func main() {
+	fmt.Println("step 1: build a DOCX in memory")
+	data := buildDocxBytes("Quarterly Report")
 
-	text, err := doc.PlainText()
-	if err != nil {
-		log.Fatalf("PlainText: %v", err)
-	}
+	fmt.Println("step 2: open it from bytes")
+	doc := openBytes(data, "docx")
+	defer doc.Close()
+	format := must(doc.Format())
+	fmt.Println("  format:", format)
+	check(format == "docx", "the opened format differs from the requested one")
 
-	md, err := doc.ToMarkdown()
-	if err != nil {
-		log.Fatalf("ToMarkdown: %v", err)
-	}
+	fmt.Println("step 3: extract plain text, Markdown and IR JSON")
+	text := must(doc.PlainText())
+	md := must(doc.ToMarkdown())
+	ir := must(doc.ToIRJSON())
+	fmt.Println("  chars:", len(text))
 
-	irJSON, err := doc.ToIRJSON()
-	if err != nil {
-		log.Fatalf("ToIRJSON: %v", err)
-	}
+	fmt.Println("step 4: check the output")
+	has(text, "Revenue grew in every region.")
+	has(md, "Quarterly Report")
+	check(strings.HasPrefix(ir, "{"), "the IR JSON is not an object")
 
-	fmt.Println("format:", format)
-	fmt.Println("--- plain text (first 200 chars) ---")
-	preview := text
-	if len(preview) > 200 {
-		preview = preview[:200]
-	}
-	fmt.Println(preview)
-	fmt.Println("--- markdown length:", len(md), "chars ---")
-	fmt.Println("--- IR JSON length:", len(irJSON), "chars ---")
-
-	// Verify
-	if format != "docx" {
-		log.Fatalf("expected format=docx, got %q", format)
-	}
-	if len(text) == 0 {
-		log.Fatal("plain text is empty")
-	}
-
-	fmt.Println("\nAll checks passed.")
+	fmt.Println("OK 01_extract")
 }

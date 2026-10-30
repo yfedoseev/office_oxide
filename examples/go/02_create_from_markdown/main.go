@@ -1,92 +1,91 @@
 //go:build office_oxide_dev
 
-// 02_create_from_markdown — Convert Markdown to DOCX, XLSX, and PPTX.
-//
-// For each format: calls oo.CreateFromMarkdown, opens with oo.Open,
-// prints a summary. Exit 0 on success.
-//
-// Build and run (inside the monorepo, after `cargo build --release --lib`):
-//
-//	go run -tags office_oxide_dev ./examples/go/02_create_from_markdown/
+// 02_create_from_markdown: turn one Markdown source into a DOCX, an XLSX and a PPTX.
+// Run: (cd examples/go/02_create_from_markdown && go run -tags office_oxide_dev .)
 package main
 
 import (
 	"fmt"
-	"log"
 	"os"
+	"strings"
 
 	oo "github.com/yfedoseev/office_oxide/go"
 )
 
 const markdown = `# Quarterly Report
 
-Generated automatically from Markdown using Office Oxide.
+Revenue grew in every region.
 
-## Highlights
-
-- Revenue grew by **32%** year-over-year
-- Customer satisfaction: 4.8 / 5.0
-- New products launched: Widget Pro, Widget Lite
-
-## Financial Summary
-
-| Category   | Q3 2025 | Q4 2025 |
-|------------|---------|---------|
-| Revenue    | $1.2M   | $1.6M   |
-| Expenses   | $0.8M   | $0.9M   |
-| Net Profit | $0.4M   | $0.7M   |
+| Region | Q1  | Q2  |
+|--------|-----|-----|
+| North  | 120 | 135 |
+| South  | 95  | 110 |
 `
 
-var formats = []string{"docx", "xlsx", "pptx"}
+// check fails the example loudly: it prints msg and exits non-zero.
+func check(ok bool, msg string) {
+	if !ok {
+		fmt.Fprintln(os.Stderr, "FAIL:", msg)
+		os.Exit(1)
+	}
+}
+
+// must fails the example on an unexpected error.
+func must[T any](v T, err error) T {
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "FAIL:", err)
+		os.Exit(1)
+	}
+	return v
+}
+
+// must0 fails the example on an unexpected error from a call with no result.
+func must0(err error) { must(0, err) }
+
+func has(text, expected string) {
+	check(strings.Contains(text, expected), `"`+expected+`" is missing from the text`)
+}
+
+// markdownToBytes creates a document from Markdown. The library writes to a
+// path, so the file lives in a private temp file just long enough to read its
+// bytes back.
+func markdownToBytes(md, format string) []byte {
+	f := must(os.CreateTemp("", "oo_example_*."+format))
+	path := f.Name()
+	f.Close()
+	defer os.Remove(path)
+	must0(oo.CreateFromMarkdown(md, format, path))
+	return must(os.ReadFile(path))
+}
+
+func openBytes(data []byte, format string) *oo.Document {
+	return must(oo.OpenFromBytes(data, format))
+}
+
+// textOf opens bytes as the given format and returns the plain text.
+func textOf(data []byte, format string) string {
+	doc := openBytes(data, format)
+	defer doc.Close()
+	return must(doc.PlainText())
+}
 
 func main() {
-	tmps := make(map[string]string)
+	fmt.Println("step 1: write the Markdown source")
 
-	// Create temp files
-	for _, ext := range formats {
-		f, err := os.CreateTemp("", "oo_02_create_*."+ext)
-		if err != nil {
-			log.Fatalf("TempFile: %v", err)
-		}
-		tmps[ext] = f.Name()
-		f.Close()
-	}
-	defer func() {
-		for _, p := range tmps {
-			os.Remove(p)
-		}
-	}()
-
+	fmt.Println("step 2: create a DOCX, an XLSX and a PPTX from it")
+	formats := []string{"docx", "xlsx", "pptx"}
+	created := map[string][]byte{}
 	for _, format := range formats {
-		path := tmps[format]
-		if err := oo.CreateFromMarkdown(markdown, format, path); err != nil {
-			log.Fatalf("CreateFromMarkdown(%s): %v", format, err)
-		}
-
-		doc, err := oo.Open(path)
-		if err != nil {
-			log.Fatalf("Open(%s): %v", format, err)
-		}
-
-		text, err := doc.PlainText()
-		doc.Close()
-		if err != nil {
-			log.Fatalf("PlainText(%s): %v", format, err)
-		}
-
-		if len(text) == 0 {
-			log.Fatalf("%s: plain text is empty", format)
-		}
-
-		preview := text
-		if len(preview) > 100 {
-			preview = preview[:100]
-		}
-
-		fmt.Printf("\n=== %s ===\n", format)
-		fmt.Printf("plain text length: %d chars\n", len(text))
-		fmt.Printf("first 100 chars: %q\n", preview)
+		created[format] = markdownToBytes(markdown, format)
 	}
 
-	fmt.Println("\nAll formats created and verified.")
+	fmt.Println("step 3: open each and check the text")
+	for _, format := range formats {
+		text := textOf(created[format], format)
+		fmt.Println("  format:", format)
+		fmt.Println("  chars:", len(text))
+		has(text, "North")
+	}
+
+	fmt.Println("OK 02_create_from_markdown")
 }

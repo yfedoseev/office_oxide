@@ -1,54 +1,64 @@
-//! 01_extract — Self-contained extract demo.
-//!
-//! Creates a DOCX in memory, reads it back, and prints plain text,
-//! Markdown, and an IR summary (number of sections).
+//! 01_extract: read a document as plain text, Markdown and IR JSON.
 //!
 //! Run: `cargo run --example 01_extract`
 
+use office_oxide::create::create_from_markdown_to_writer;
+use office_oxide::{Document, DocumentFormat};
 use std::io::Cursor;
 
-use office_oxide::docx::write::DocxWriter;
-use office_oxide::{Document, DocumentFormat};
+const MARKDOWN: &str = "# Quarterly Report\n\nRevenue grew in every region.\n\n\
+| Region | Q1  | Q2  |\n|--------|-----|-----|\n| North  | 120 | 135 |\n| South  | 95  | 110 |\n";
+
+fn markdown_to_bytes(markdown: &str, format: DocumentFormat) -> Vec<u8> {
+    let mut buf = Cursor::new(Vec::new());
+    create_from_markdown_to_writer(markdown, format, &mut buf).expect("create from Markdown");
+    buf.into_inner()
+}
+
+fn build_docx_bytes(title: &str) -> Vec<u8> {
+    markdown_to_bytes(&MARKDOWN.replace("Quarterly Report", title), DocumentFormat::Docx)
+}
+
+/// `Document::from_reader` needs a `Read + Seek + Send + 'static` source, so the
+/// bytes go in an owned `Cursor`, not a borrowed slice.
+fn open_bytes(bytes: Vec<u8>, format: DocumentFormat) -> Document {
+    Document::from_reader(Cursor::new(bytes), format).expect("open from bytes")
+}
+
+fn check(condition: bool, message: &str) {
+    if !condition {
+        eprintln!("FAIL: {message}");
+        std::process::exit(1);
+    }
+}
+
+fn has(text: &str, expected: &str) {
+    check(text.contains(expected), &format!("\"{expected}\" is missing from the text"));
+}
 
 fn main() {
-    // ── Build a DOCX in memory ──────────────────────────────────────────────
-    let mut writer = DocxWriter::new();
-    writer.add_heading("Office Oxide Extract Demo", 1);
-    writer.add_paragraph(
-        "This document was created in memory and read back via Document::from_reader.",
+    println!("step 1: build a DOCX in memory");
+    let data = build_docx_bytes("Quarterly Report");
+
+    println!("step 2: open it from bytes");
+    let doc = open_bytes(data, DocumentFormat::Docx);
+    println!("  format: {}", doc.format().extension());
+    check(
+        doc.format() == DocumentFormat::Docx,
+        "the opened format differs from the requested one",
     );
-    writer.add_paragraph(
-        "It demonstrates plain-text extraction, Markdown conversion, and IR access.",
-    );
 
-    let mut buf = Cursor::new(Vec::new());
-    writer.write_to(&mut buf).expect("write DOCX to buffer");
-    buf.set_position(0);
-
-    // ── Read it back ────────────────────────────────────────────────────────
-    let doc = Document::from_reader(buf, DocumentFormat::Docx).expect("parse DOCX");
-
-    println!("format: {:?}", doc.format());
-
+    println!("step 3: extract plain text, Markdown and IR JSON");
     let text = doc.plain_text();
-    println!("--- plain text ---");
-    println!("{text}");
+    let markdown = doc.to_markdown();
+    let ir_json = serde_json::to_string(&doc.to_ir()).expect("the IR serialises");
+    println!("  chars: {}", text.len());
 
-    let md = doc.to_markdown();
-    println!("--- markdown ---");
-    println!("{md}");
+    println!("step 4: check the output");
+    has(&text, "Revenue grew in every region.");
+    has(&markdown, "Quarterly Report");
+    let ir: serde_json::Value = serde_json::from_str(&ir_json).expect("the IR JSON parses");
+    check(ir.is_object(), "the IR JSON is not an object");
 
-    let ir = doc.to_ir();
-    println!("--- IR ---");
-    println!("sections: {}", ir.sections.len());
-    for (i, s) in ir.sections.iter().enumerate() {
-        println!("  section {i}: title={:?}, elements={}", s.title, s.elements.len());
-    }
-
-    // ── Verify ─────────────────────────────────────────────────────────────
-    assert!(text.contains("Office Oxide Extract Demo"), "heading missing from plain text");
-    assert!(text.contains("created in memory"), "paragraph missing from plain text");
-    assert!(!ir.sections.is_empty(), "IR must have at least one section");
-
-    println!("\nAll checks passed.");
+    println!("OK 01_extract");
 }

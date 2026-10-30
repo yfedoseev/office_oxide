@@ -1,64 +1,107 @@
-// 03_edit — Edit a document by replacing placeholder text.
-//
-// Creates a DOCX from Markdown with {{NAME}} and {{DATE}} placeholders,
-// opens with EditableDocument.Open, replaces both, saves to a second temp
-// file, then reads back and verifies. Exit 0 on success.
+// 03_edit: replace text in a DOCX and set cells in an XLSX, in memory.
 //
 // Run: dotnet run --project examples/csharp/03_edit/03_edit.csproj
-//      (set LD_LIBRARY_PATH to the directory containing liboffice_oxide.so)
 using OfficeOxide;
 
-const string markdown = """
-    # Invoice
+const string Markdown = """
+    # Quarterly Report
 
-    Dear {{NAME}},
+    Revenue grew in every region.
 
-    Please find attached your invoice for services rendered on {{DATE}}.
+    | Region | Q1  | Q2  |
+    |--------|-----|-----|
+    | North  | 120 | 135 |
+    | South  | 95  | 110 |
 
-    ## Summary
-
-    - Service: Office Oxide Pro License
-    - Amount: $499.00
-    - Due date: 30 days from {{DATE}}
-
-    Thank you for your business!
     """;
 
-var ts = Environment.TickCount64;
-var templatePath = Path.Combine(Path.GetTempPath(), $"oo_03_template_{ts}.docx");
-var outputPath = Path.Combine(Path.GetTempPath(), $"oo_03_output_{ts}.docx");
-
-try
+static void Check(bool condition, string message)
 {
-    // Create template
-    Document.CreateFromMarkdown(markdown, "docx", templatePath);
+    if (condition) return;
+    Console.Error.WriteLine($"FAIL: {message}");
+    Environment.Exit(1);
+}
 
-    // Edit
-    long n1, n2;
-    using (var ed = EditableDocument.Open(templatePath))
+static void Has(string text, string expected) =>
+    Check(text.Contains(expected), $"\"{expected}\" is missing from the text");
+
+// CreateFromMarkdown writes to a path, so the file lives in a private temp
+// file just long enough to read its bytes back.
+static byte[] MarkdownToBytes(string markdown, string format)
+{
+    var path = Path.Combine(Path.GetTempPath(), $"oo_example_{Guid.NewGuid():N}.{format}");
+    try
     {
-        n1 = ed.ReplaceText("{{NAME}}", "Alice Smith");
-        n2 = ed.ReplaceText("{{DATE}}", "2026-04-26");
-        ed.Save(outputPath);
+        Document.CreateFromMarkdown(markdown, format, path);
+        return File.ReadAllBytes(path);
     }
-
-    Console.WriteLine($"Replacements: {{NAME}} x{n1}, {{DATE}} x{n2}");
-
-    // Verify
-    using var doc = Document.Open(outputPath);
-    var text = doc.PlainText();
-
-    if (!text.Contains("Alice Smith")) throw new Exception("name replacement failed: 'Alice Smith' not found");
-    if (!text.Contains("2026-04-26")) throw new Exception("date replacement failed: '2026-04-26' not found");
-    if (text.Contains("{{NAME}}")) throw new Exception("placeholder {{NAME}} still present");
-    if (text.Contains("{{DATE}}")) throw new Exception("placeholder {{DATE}} still present");
-
-    Console.WriteLine("Edit verified successfully.");
-    Console.WriteLine("--- final text ---");
-    Console.WriteLine(text);
+    finally
+    {
+        File.Delete(path);
+    }
 }
-finally
+
+static byte[] BuildDocxBytes(string title = "Quarterly Report") =>
+    MarkdownToBytes(Markdown.Replace("Quarterly Report", title), "docx");
+
+// Opens bytes as the given format and returns the plain text.
+static string TextOf(byte[] data, string format)
 {
-    if (File.Exists(templatePath)) File.Delete(templatePath);
-    if (File.Exists(outputPath)) File.Delete(outputPath);
+    using var doc = Document.FromBytes(data, format);
+    return doc.PlainText();
 }
+
+static byte[] BuildXlsxBytes()
+{
+    using var x = new XlsxWriter();
+    var s = x.AddSheet("Sales");
+    string[] headers = ["Region", "Q1", "Q2", "Growth"];
+    for (uint c = 0; c < headers.Length; c++)
+        x.SetCellStyled(s, 0, c, headers[c], bold: true); // bold header row
+    x.SetCell(s, 1, 0, "North"); x.SetCell(s, 1, 1, 120); x.SetCell(s, 1, 2, 135); x.SetCell(s, 1, 3, true); // D2
+    x.SetCell(s, 2, 0, "South"); x.SetCell(s, 2, 1, 95); x.SetCell(s, 2, 2, 110);
+    x.SetCell(s, 3, 0, "Total");
+    x.SetFormula(s, 3, 1, "SUM(B2:B3)");
+    x.SetFormula(s, 3, 2, "SUM(C2:C3)");
+    x.SetCell(s, 5, 0, "Notes");
+    x.MergeCells(s, 5, 0, 1, 3); // A6:C6
+    x.SetColumnWidth(s, 0, 18.0);
+    return x.ToBytes();
+}
+
+Console.WriteLine("step 1: build a DOCX in memory");
+var docx = BuildDocxBytes();
+
+Console.WriteLine("step 2: replace text");
+byte[] edited;
+using (var ed = EditableDocument.FromBytes(docx, "docx"))
+{
+    var replaced = ed.ReplaceText("Quarterly Report", "Annual Report");
+    Console.WriteLine($"  replacements: {replaced}");
+    Check(replaced == 1, "replace_text did not make exactly one replacement");
+
+    Console.WriteLine("step 3: save to bytes and check the text");
+    edited = ed.SaveToBytes();
+}
+var text = TextOf(edited, "docx");
+Has(text, "Annual Report");
+Check(!text.Contains("Quarterly Report"), "the old title is still present");
+
+Console.WriteLine("step 4: build an XLSX in memory");
+var xlsx = BuildXlsxBytes();
+
+Console.WriteLine("step 5: set cells");
+using (var ed = EditableDocument.FromBytes(xlsx, "xlsx"))
+{
+    ed.SetCell(0, "B2", 999.0);
+    ed.SetCell(0, "A2", "Central");
+
+    Console.WriteLine("step 6: save to bytes and check the cells");
+    edited = ed.SaveToBytes();
+}
+text = TextOf(edited, "xlsx");
+Has(text, "Central");
+Has(text, "999");
+Check(!text.Contains("North"), "the old A2 value is still present");
+
+Console.WriteLine("OK 03_edit");
