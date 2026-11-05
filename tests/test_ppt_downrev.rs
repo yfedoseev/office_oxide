@@ -24,6 +24,7 @@ use common::{
     ppt_stream_without_persist,
 };
 
+use office_oxide::ppt::TextType;
 use office_oxide::{Document, DocumentFormat};
 use std::io::Cursor;
 
@@ -338,7 +339,7 @@ fn test_downrev_budget_is_shared_across_persist_and_fallback() {
 /// `from_reader` API. A real `.ppt` fixture is not checked in, so this
 /// synthesises an equivalent multi-slide stream; it locks the per-slide
 /// downrev-text contract end-to-end (the cross-slide dedup bug from R1 is
-/// tracked by the ignored regression below).
+/// covered by the regression below).
 #[test]
 fn test_downrev_text_per_slide_through_public_api() {
     let xml3 = downrev_shape_xml(&["Appendix", "See attached notes"]);
@@ -371,10 +372,10 @@ fn test_downrev_text_per_slide_through_public_api() {
     );
 }
 
-/// R1 (integration exposure, ignored until fixed): the same downrev package
-/// carried on two different slides must contribute its text to BOTH slides —
-/// each slide is a distinct shape. The per-file `seen_packages` set currently
-/// drops it on the second slide. Run `cargo test -- --ignored` to see it fail.
+/// R1 (integration exposure, fixed): the same downrev package carried on two
+/// different slides must contribute its text to BOTH slides — each slide is a
+/// distinct shape. `seen_packages` is scoped per slide, so the second slide
+/// keeps its copy rather than being dropped by the per-file dedup set.
 #[test]
 fn test_downrev_identical_package_kept_on_each_slide() {
     let xml = downrev_shape_xml(&["Shared heading"]);
@@ -438,4 +439,68 @@ fn test_downrev_real_file_fixture_regression() {
         1,
         "within-slide duplicate packages collapse to one run"
     );
+}
+
+/// `RT_CLIENT_TEXTBOX` ([MS-PPT] 2.5.28) and `RT_TEXT_HEADER` ([MS-PPT]
+/// 2.9.44) record types, used to build a normal legacy-text shape.
+const RT_CLIENT_TEXTBOX: u16 = 0xF00D;
+const RT_TEXT_HEADER: u16 = 0x0F9F;
+
+/// A normal legacy-text slide: one shape whose text lives in a
+/// `TextCharsAtom`, with no WPS downrev carrier anywhere in the stream.
+fn normal_legacy_text_shape(text: &str) -> Vec<u8> {
+    ppt_container(
+        common::RT_SP_CONTAINER,
+        0,
+        &[ppt_container(
+            RT_CLIENT_TEXTBOX,
+            0,
+            &[
+                ppt_record(RT_TEXT_HEADER, 0, 0, &0u32.to_le_bytes()), // Title
+                ppt_record(RT_TEXT_CHARS, 0, 0, &text_chars_payload(text)),
+            ],
+        )],
+    )
+}
+
+/// Regression: enabling the downrev scan must not change a normal legacy
+/// `.ppt` deck. A deck made only of `TextCharsAtom` text (no `0xF122`
+/// carriers) must extract exactly that text and add no `TextType::Other`
+/// runs — `Other` is the type downrev packages surface as, so its absence
+/// proves the downrev walk contributed nothing.
+#[test]
+fn test_downrev_scan_leaves_normal_deck_unchanged() {
+    let stream = ppt_stream_with_persist(
+        &[
+            vec![normal_legacy_text_shape("Quarterly results")],
+            vec![normal_legacy_text_shape("Outlook")],
+        ],
+        &[],
+    );
+    let doc = open_ppt(stream);
+    let ppt = doc.as_ppt().expect("parsed as ppt");
+    assert_eq!(ppt.slides.len(), 2, "two slides");
+    assert!(
+        ppt.slides[0]
+            .text_runs
+            .iter()
+            .any(|r| r.text.contains("Quarterly results")),
+        "slide 1 keeps its legacy text"
+    );
+    assert!(
+        ppt.slides[1]
+            .text_runs
+            .iter()
+            .any(|r| r.text.contains("Outlook")),
+        "slide 2 keeps its legacy text"
+    );
+    // No carrier means the downrev walk must have added nothing: there must
+    // be zero `TextType::Other` runs anywhere in the deck.
+    let other_runs = ppt
+        .slides
+        .iter()
+        .flat_map(|s| &s.text_runs)
+        .filter(|r| matches!(r.text_type, TextType::Other))
+        .count();
+    assert_eq!(other_runs, 0, "no downrev (TextType::Other) runs in a normal deck");
 }

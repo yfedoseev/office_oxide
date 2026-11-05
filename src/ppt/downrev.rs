@@ -739,13 +739,11 @@ mod tests {
         assert!(!runs[0].text.is_empty(), "truncated fragment still yields text");
     }
 
-    // R1 (known bug, NOT yet fixed): `seen_packages` lives in the per-file
-    // budget and is shared across slides, so a package whose bytes recur on
-    // several slides contributes its text only on the first slide. Each slide
-    // is a distinct shape, so the text must appear on every slide that
-    // carries the package. This test asserts the correct behaviour and is
-    // `#[ignore]`d until `seen_packages` is scoped per-slide (review note R1).
-    // Run with `cargo test -- --ignored` to see it fail.
+    // R1 (fixed): `seen_packages` is cleared at the start of every
+    // `append_slide_downrev` call, so a package whose bytes recur on several
+    // slides contributes its text on each slide — each slide is a distinct
+    // shape that must keep its copy. This test asserts that behaviour and runs
+    // by default.
     #[test]
     fn test_append_slide_downrev_keeps_identical_package_text_on_each_slide() {
         let xml = "<p:sp><a:p><a:r><a:t>Shared heading</a:t></a:r></a:p></p:sp>";
