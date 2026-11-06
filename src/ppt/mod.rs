@@ -10,6 +10,7 @@
 //! ```
 
 mod document;
+mod downrev;
 mod error;
 pub mod images;
 mod persist;

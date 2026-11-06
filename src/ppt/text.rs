@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use super::downrev;
 use super::persist::{self, PersistDirectory};
 use super::records::*;
 use super::style::{self, CharFormatSpan, ParaFormatSpan};
@@ -172,8 +173,11 @@ fn extract_deck_text_with_budget(
     // over the same stream, and what an earlier one spent is not available
     // to the next.
     let mut resolved = DeckText::default();
+    let mut downrev_budget = downrev::DownrevBudget::new();
     if let Some(dir) = persist::build(stream, current_user) {
-        if let Some(deck) = extract_slides_via_persist(stream, &dir, &mut text_budget) {
+        if let Some(deck) =
+            extract_slides_via_persist(stream, &dir, &mut text_budget, &mut downrev_budget)
+        {
             // A resolved-but-entirely-textless result is ambiguous: it's the
             // correct answer for a genuinely text-free deck (image-only
             // slides, or slides whose only text is on their master), but
@@ -183,15 +187,18 @@ fn extract_deck_text_with_budget(
             // come up empty, this was the right answer all along, and the
             // resolved slides are kept.
             if !deck.slides.is_empty() && deck.slides.iter().any(|s| !s.text_runs.is_empty()) {
+                let mut deck = deck;
+                deck.notices.extend(downrev_budget.notices());
                 return deck;
             }
             resolved = deck;
         }
     }
-    let slides = extract_slides_without_persist(stream, &mut text_budget);
+    let slides = extract_slides_without_persist(stream, &mut text_budget, &mut downrev_budget);
     if text_budget.exhausted() && !resolved.notices.contains(&text_budget.notice()) {
         resolved.notices.push(text_budget.notice());
     }
+    resolved.notices.extend(downrev_budget.notices());
     DeckText {
         slides: if slides.is_empty() {
             resolved.slides
@@ -210,7 +217,8 @@ fn extract_deck_text_with_budget(
 /// in the stream, then every text atom outside the masters and notes.
 fn extract_slides_without_persist(
     stream: &[u8],
-    budget: &mut crate::limits::TextBudget,
+    text_budget: &mut crate::limits::TextBudget,
+    downrev_budget: &mut downrev::DownrevBudget,
 ) -> Vec<SlideText> {
     // A best-effort fallback scope for the weaker paths below, which have
     // no persist-resolved DocumentContainer to search within at all.
@@ -218,9 +226,35 @@ fn extract_slides_without_persist(
     let stream_wide_ole_objects = parse_ex_ole_objects(stream);
 
     if let Some(slide_list) = find_descendant(stream, RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES, 0) {
-        let slides = extract_slides_from_slide_list_cache(&slide_list);
-        if !slides.is_empty() {
-            return slides;
+        let cached = extract_slides_from_slide_list_cache(&slide_list);
+        if !cached.is_empty() {
+            // The cache holds the legacy atoms' text only. Packages hang off
+            // the `Slide` containers, so a deck whose words live in them has
+            // just a stub here: take the containers when they hold more.
+            let runs_before = downrev_budget.runs_added();
+            let mut trial_budget = *text_budget;
+            let mut slides = Vec::new();
+            collect_slide_containers(
+                stream,
+                0,
+                &stream_wide_hyperlinks,
+                &stream_wide_ole_objects,
+                &mut slides,
+                &mut trial_budget,
+                downrev_budget,
+            );
+            let chars = |slides: &[SlideText]| -> usize {
+                slides
+                    .iter()
+                    .flat_map(|s| &s.text_runs)
+                    .map(|r| r.text.chars().filter(|c| c.is_alphanumeric()).count())
+                    .sum()
+            };
+            if downrev_budget.runs_added() > runs_before && chars(&slides) > chars(&cached) {
+                *text_budget = trial_budget;
+                return slides;
+            }
+            return cached;
         }
     }
 
@@ -237,7 +271,8 @@ fn extract_slides_without_persist(
         &stream_wide_hyperlinks,
         &stream_wide_ole_objects,
         &mut slides,
-        budget,
+        text_budget,
+        downrev_budget,
     );
     if slides.iter().any(|s| !s.text_runs.is_empty()) {
         return slides;
@@ -275,7 +310,7 @@ fn extract_slides_without_persist(
         &mut tables,
         &mut image_refs,
         &mut ole_object_refs,
-        budget,
+        text_budget,
     );
     runs.retain(|r| !is_field_placeholder_only(&r.text));
     if runs.is_empty() && tables.is_empty() && image_refs.is_empty() {
@@ -298,7 +333,8 @@ fn collect_slide_containers(
     hyperlinks: &HashMap<u32, String>,
     ole_objects: &HashMap<u32, OleObjectInfo>,
     out: &mut Vec<SlideText>,
-    budget: &mut crate::limits::TextBudget,
+    text_budget: &mut crate::limits::TextBudget,
+    downrev_budget: &mut downrev::DownrevBudget,
 ) {
     if depth > MAX_SHAPE_DEPTH {
         return;
@@ -307,7 +343,7 @@ fn collect_slide_containers(
         let Ok(rec) = rec else { break };
         // Slides past the document's text budget are left out, not listed
         // empty.
-        if budget.exhausted() {
+        if text_budget.exhausted() {
             return;
         }
         if rec.header.rec_type == RT_SLIDE {
@@ -327,9 +363,10 @@ fn collect_slide_containers(
                 &mut tables,
                 &mut image_refs,
                 &mut ole_object_refs,
-                budget,
+                text_budget,
             );
             runs.retain(|r| !is_field_placeholder_only(&r.text));
+            downrev::append_slide_downrev(&rec.data, &[], &mut runs, downrev_budget, text_budget);
             let hidden = slide_is_hidden(&rec.data);
             out.push(SlideText {
                 text_runs: runs,
@@ -341,7 +378,15 @@ fn collect_slide_containers(
             continue;
         }
         if rec.header.is_container() {
-            collect_slide_containers(&rec.data, depth + 1, hyperlinks, ole_objects, out, budget);
+            collect_slide_containers(
+                &rec.data,
+                depth + 1,
+                hyperlinks,
+                ole_objects,
+                out,
+                text_budget,
+                downrev_budget,
+            );
         }
     }
 }
@@ -349,7 +394,7 @@ fn collect_slide_containers(
 /// Whether a text run is nothing but `*` — the stand-in character
 /// PowerPoint stores for a date, slide-number or footer field placeholder,
 /// not text anyone typed. Language-independent, unlike a prompt string.
-fn is_field_placeholder_only(text: &str) -> bool {
+pub(super) fn is_field_placeholder_only(text: &str) -> bool {
     let t = text.trim();
     !t.is_empty() && t.chars().all(|c| c == '*' || c.is_whitespace())
 }
@@ -372,6 +417,7 @@ fn extract_slides_via_persist(
     stream: &[u8],
     dir: &PersistDirectory,
     text_budget: &mut crate::limits::TextBudget,
+    downrev_budget: &mut downrev::DownrevBudget,
 ) -> Option<DeckText> {
     let doc_offset = dir.resolve(dir.doc_persist_id)?;
     let doc_children = bounded_container_children(stream, doc_offset, RT_DOCUMENT)?;
@@ -448,6 +494,7 @@ fn extract_slides_via_persist(
             &hyperlinks,
             &ole_objects,
             text_budget,
+            downrev_budget,
             &claims,
         );
         let hf_texts = links
@@ -1090,7 +1137,8 @@ fn resolve_slide(
     outline_texts: &[TextRun],
     hyperlinks: &HashMap<u32, String>,
     ole_objects: &HashMap<u32, OleObjectInfo>,
-    budget: &mut crate::limits::TextBudget,
+    text_budget: &mut crate::limits::TextBudget,
+    downrev_budget: &mut downrev::DownrevBudget,
     claims: &ContainerClaims,
 ) -> (SlideText, SlideLinks) {
     let mut text_runs = Vec::new();
@@ -1126,9 +1174,19 @@ fn resolve_slide(
                 &mut tables,
                 &mut image_refs,
                 &mut ole_object_refs,
-                budget,
+                text_budget,
             );
             hidden = slide_is_hidden(&children);
+
+            // A shape with no legacy text of its own can keep its text in a
+            // `metroBlob` package instead.
+            downrev::append_slide_downrev(
+                &children,
+                outline_texts,
+                &mut text_runs,
+                downrev_budget,
+                text_budget,
+            );
 
             // Placeholder character/paragraph formatting a direct
             // StyleTextPropAtom left unset falls back to the slide's
@@ -2287,11 +2345,11 @@ fn slide_is_hidden(children: &[u8]) -> bool {
 /// byte of a UTF-16 character whose high byte is 0x00" — i.e. Latin-1,
 /// whatever the deck's language; PowerPoint writes a `TextCharsAtom`
 /// whenever a character needs more.
-fn decode_text_bytes(data: &[u8]) -> String {
+pub(super) fn decode_text_bytes(data: &[u8]) -> String {
     data.iter().map(|&b| b as char).collect()
 }
 
-fn decode_utf16le(data: &[u8]) -> String {
+pub(super) fn decode_utf16le(data: &[u8]) -> String {
     let (pairs, _rest) = data.as_chunks::<2>();
     let chars: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
     String::from_utf16_lossy(&chars)
