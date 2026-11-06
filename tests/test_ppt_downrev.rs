@@ -596,14 +596,20 @@ fn build_downrev_ppt_bytes() -> Vec<u8> {
 }
 
 /// The committed fixture reads from disk, per slide, with no master text. It
-/// must match its builder, so the two can't drift apart unnoticed.
+/// must read the same as its builder's deck, so the two can't drift apart
+/// unnoticed. The bytes can differ: a ZIP records the system that wrote it.
 #[test]
 fn test_committed_fixture_reads_from_a_file() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/wps_downrev.ppt");
-    let bytes = std::fs::read(path).expect("wps_downrev.ppt fixture must exist");
-    assert!(bytes == build_downrev_ppt_bytes(), "the fixture no longer matches its builder");
     let file = std::fs::File::open(path).expect("wps_downrev.ppt fixture must open");
     let doc = Document::from_reader(file, DocumentFormat::Ppt).expect("fixture opens");
+    let built = Document::from_reader(Cursor::new(build_downrev_ppt_bytes()), DocumentFormat::Ppt)
+        .expect("built deck opens");
+    assert_eq!(
+        doc.to_markdown(),
+        built.to_markdown(),
+        "the fixture no longer matches its builder"
+    );
     let ppt = doc.as_ppt().expect("parsed as ppt");
     assert_eq!(ppt.slides.len(), 2, "one slide per SlideContainer");
     let text = ppt.plain_text();
