@@ -12,5 +12,6 @@ corpus/fuzz_ppt_downrev/*
 !corpus/fuzz_ppt_downrev/ppt_downrev_degenerate
 !corpus/fuzz_ppt_downrev/ppt_downrev_short_length
 !corpus/fuzz_ppt_downrev/ppt_downrev_two_carriers
+!corpus/fuzz_ppt_downrev/ppt_downrev_trailing_property
 artifacts/
 coverage/

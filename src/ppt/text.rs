@@ -187,6 +187,8 @@ fn extract_deck_text_with_budget(
             // come up empty, this was the right answer all along, and the
             // resolved slides are kept.
             if !deck.slides.is_empty() && deck.slides.iter().any(|s| !s.text_runs.is_empty()) {
+                let mut deck = deck;
+                deck.notices.extend(downrev_budget.notices());
                 return deck;
             }
             resolved = deck;
@@ -196,6 +198,7 @@ fn extract_deck_text_with_budget(
     if text_budget.exhausted() && !resolved.notices.contains(&text_budget.notice()) {
         resolved.notices.push(text_budget.notice());
     }
+    resolved.notices.extend(downrev_budget.notices());
     DeckText {
         slides: if slides.is_empty() {
             resolved.slides
@@ -223,9 +226,35 @@ fn extract_slides_without_persist(
     let stream_wide_ole_objects = parse_ex_ole_objects(stream);
 
     if let Some(slide_list) = find_descendant(stream, RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES, 0) {
-        let slides = extract_slides_from_slide_list_cache(&slide_list);
-        if !slides.is_empty() {
-            return slides;
+        let cached = extract_slides_from_slide_list_cache(&slide_list);
+        if !cached.is_empty() {
+            // The cache holds the legacy atoms' text only. Packages hang off
+            // the `Slide` containers, so a deck whose words live in them has
+            // just a stub here: take the containers when they hold more.
+            let runs_before = downrev_budget.runs_added();
+            let mut trial_budget = *text_budget;
+            let mut slides = Vec::new();
+            collect_slide_containers(
+                stream,
+                0,
+                &stream_wide_hyperlinks,
+                &stream_wide_ole_objects,
+                &mut slides,
+                &mut trial_budget,
+                downrev_budget,
+            );
+            let chars = |slides: &[SlideText]| -> usize {
+                slides
+                    .iter()
+                    .flat_map(|s| &s.text_runs)
+                    .map(|r| r.text.chars().filter(|c| c.is_alphanumeric()).count())
+                    .sum()
+            };
+            if downrev_budget.runs_added() > runs_before && chars(&slides) > chars(&cached) {
+                *text_budget = trial_budget;
+                return slides;
+            }
+            return cached;
         }
     }
 
@@ -337,7 +366,7 @@ fn collect_slide_containers(
                 text_budget,
             );
             runs.retain(|r| !is_field_placeholder_only(&r.text));
-            downrev::append_slide_downrev(&rec.data, &mut runs, downrev_budget);
+            downrev::append_slide_downrev(&rec.data, &[], &mut runs, downrev_budget, text_budget);
             let hidden = slide_is_hidden(&rec.data);
             out.push(SlideText {
                 text_runs: runs,
@@ -365,7 +394,7 @@ fn collect_slide_containers(
 /// Whether a text run is nothing but `*` — the stand-in character
 /// PowerPoint stores for a date, slide-number or footer field placeholder,
 /// not text anyone typed. Language-independent, unlike a prompt string.
-fn is_field_placeholder_only(text: &str) -> bool {
+pub(super) fn is_field_placeholder_only(text: &str) -> bool {
     let t = text.trim();
     !t.is_empty() && t.chars().all(|c| c == '*' || c.is_whitespace())
 }
@@ -1149,9 +1178,15 @@ fn resolve_slide(
             );
             hidden = slide_is_hidden(&children);
 
-            // Shapes WPS wrote back as OOXML downrev packages keep their
-            // text in those packages, not in the legacy text atoms.
-            downrev::append_slide_downrev(&children, &mut text_runs, downrev_budget);
+            // A shape with no legacy text of its own can keep its text in a
+            // `metroBlob` package instead.
+            downrev::append_slide_downrev(
+                &children,
+                outline_texts,
+                &mut text_runs,
+                downrev_budget,
+                text_budget,
+            );
 
             // Placeholder character/paragraph formatting a direct
             // StyleTextPropAtom left unset falls back to the slide's
@@ -2310,11 +2345,11 @@ fn slide_is_hidden(children: &[u8]) -> bool {
 /// byte of a UTF-16 character whose high byte is 0x00" — i.e. Latin-1,
 /// whatever the deck's language; PowerPoint writes a `TextCharsAtom`
 /// whenever a character needs more.
-fn decode_text_bytes(data: &[u8]) -> String {
+pub(super) fn decode_text_bytes(data: &[u8]) -> String {
     data.iter().map(|&b| b as char).collect()
 }
 
-fn decode_utf16le(data: &[u8]) -> String {
+pub(super) fn decode_utf16le(data: &[u8]) -> String {
     let (pairs, _rest) = data.as_chunks::<2>();
     let chars: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
     String::from_utf16_lossy(&chars)

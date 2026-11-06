@@ -29,7 +29,7 @@ features = ["default-password"]
 # The PPT deck builders in tests/common (shared with this target via #[path])
 # assemble real ZIP packages; same version and features as the main dependency.
 [dependencies.zip]
-version = "9.0"
+version = "9.1"
 default-features = false
 features = ["deflate"]
 

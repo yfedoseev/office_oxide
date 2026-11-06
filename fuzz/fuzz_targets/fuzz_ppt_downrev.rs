@@ -22,17 +22,19 @@ use libfuzzer_sys::fuzz_target;
 use office_oxide::{Document, DocumentFormat};
 
 fuzz_target!(|data: &[u8]| {
-    // byte 0: carrier count (1-4); the rest is split into that many carrier
-    // payloads, one shape group each, on a single slide.
-    let Some((&count, rest)) = data.split_first() else {
+    // Byte 0: bits 0-1 are the carrier count less one, bits 2-7 the property
+    // count each carrier's `recInstance` declares. The rest is split into that
+    // many carrier payloads, one shape group each, on a single slide.
+    let Some((&control, rest)) = data.split_first() else {
         return;
     };
-    let n = usize::from(count % 4) + 1;
+    let n = usize::from(control & 3) + 1;
+    let properties = u16::from(control >> 2);
     let chunk = rest.len() / n;
     let mut groups: Vec<Vec<u8>> = (0..n)
         .map(|i| {
             let payload = &rest[i * chunk..((i + 1) * chunk).min(rest.len())];
-            downrev_group_from_carrier(ppt_record(RT_DOWNREV_CARRIER, 1, 3, payload))
+            downrev_group_from_carrier(ppt_record(RT_DOWNREV_CARRIER, properties, 3, payload))
         })
         .collect();
     // One well-formed package alongside the fuzzed ones, so the extraction

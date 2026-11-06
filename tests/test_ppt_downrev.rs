@@ -1,13 +1,11 @@
-//! WPS "downrev" packages in legacy `.ppt` files.
+//! Shape text in `metroBlob` packages in legacy `.ppt` files.
 //!
-//! Defect class: when WPS saves an OOXML-origin presentation to the legacy
-//! binary format, shapes that carry OOXML-only content are written back as
-//! self-contained ZIP packages — a `drs/shapexml.xml` entry holding a
-//! standard DrawingML `<p:sp>` fragment — attached to records inside the
-//! standard OfficeArt shape tree, while the legacy `TextCharsAtom` /
-//! `TextBytesAtom` atoms are left nearly empty. A reader that walks only
-//! the legacy text atoms therefore returns an almost-empty deck with `Ok`
-//! — indistinguishable from a genuinely text-free presentation.
+//! Defect class: a shape can keep its text in a self-contained package (a
+//! `drs/shapexml.xml` entry holding a DrawingML `<p:sp>` fragment) hung off its
+//! tertiary property table, with the legacy `TextCharsAtom` / `TextBytesAtom`
+//! atoms nearly empty, as WPS writes an OOXML-origin deck. A reader that walks
+//! only the atoms returns an almost-empty deck with `Ok`. PowerPoint writes
+//! the same packages beside full legacy text, which must not come out twice.
 //!
 //! Fixtures are synthesised in code (see `tests/common`): the ZIP packages
 //! are real deflate archives, the record stream is a real MS-PPT structure,
@@ -133,6 +131,35 @@ fn test_wps_downrev_shape_text_reaches_the_reader_via_persist_path() {
     assert!(doc.to_markdown().contains("Outlook"), "markdown surfaces the downrev text");
 }
 
+/// The persist path really is the one that ran: a `Slide` container the
+/// directory doesn't name, as an earlier save leaves behind, isn't read. The
+/// fallback, which walks every container, would read it.
+#[test]
+fn test_persist_path_reads_only_the_slides_the_directory_names() {
+    let mut stream = ppt_stream_with_persist(&[slide_one()], &[master_group()]);
+    let stale = downrev_shape_xml(&["Superseded slide"]);
+    stream.extend(common::ppt_slide(&[downrev_shape_group(&downrev_zip(&stale))]));
+    let text = open_ppt(stream)
+        .as_ppt()
+        .expect("parsed as ppt")
+        .plain_text();
+    assert!(text.contains("Quarterly results"), "{text:?}");
+    assert!(!text.contains("Superseded slide"), "{text:?}");
+
+    let stream = ppt_stream_without_persist(
+        &[slide_one(), vec![downrev_shape_group(&downrev_zip(&stale))]],
+        &[master_group()],
+    );
+    let text = open_ppt(stream)
+        .as_ppt()
+        .expect("parsed as ppt")
+        .plain_text();
+    assert!(
+        text.contains("Superseded slide"),
+        "the fallback reads every container: {text:?}"
+    );
+}
+
 /// The no-directory fallback path: the same containers, no persist records.
 #[test]
 fn test_wps_downrev_shape_text_reaches_the_reader_without_persist_path() {
@@ -193,22 +220,185 @@ fn test_wps_downrev_carrier_without_zip_is_skipped() {
     );
 }
 
-/// A legacy text atom and a downrev package on the same slide both reach
-/// the reader, and identical text is not duplicated.
+/// A shape with legacy text beside a shape that has only a package: both
+/// reach the reader, once each.
 #[test]
-fn test_wps_downrev_text_merges_with_legacy_text_atoms() {
-    let xml = downrev_shape_xml(&["Downrev body", "Shared line"]);
-    let legacy = ppt_record(RT_TEXT_CHARS, 0, 0, &text_chars_payload("Legacy title\rShared line"));
-    let slide = vec![legacy, downrev_shape_group(&downrev_zip(&xml))];
+fn test_shape_with_legacy_text_and_shape_with_package_both_reach_the_reader() {
+    let xml = downrev_shape_xml(&["Downrev body"]);
+    let slide = vec![
+        normal_legacy_text_shape("Legacy title"),
+        downrev_shape_group(&downrev_zip(&xml)),
+    ];
     let stream = ppt_stream_with_persist(&[slide], &[master_group()]);
     let doc = open_ppt(stream);
     let text = doc.as_ppt().expect("parsed as ppt").plain_text();
-    assert!(text.contains("Legacy title"), "legacy atom text survives: {text:?}");
-    assert!(text.contains("Downrev body"), "downrev text survives: {text:?}");
-    assert_eq!(
-        text.matches("Shared line").count(),
-        1,
-        "identical text across atom and package is not duplicated: {text:?}"
+    assert_eq!(text.matches("Legacy title").count(), 1, "{text:?}");
+    assert_eq!(text.matches("Downrev body").count(), 1, "{text:?}");
+}
+
+/// What PowerPoint writes: full legacy text with a package carrying the same
+/// shape again, in a form that differs in spacing and line breaks. The deck
+/// must read exactly as it does with no packages at all.
+#[test]
+fn test_packages_beside_full_legacy_text_change_nothing() {
+    let legacy = "Second\u{b}line\rHello";
+    let package_xml = "<p:sp><a:p><a:r><a:t>Second</a:t></a:r><a:br/><a:r><a:t>line</a:t></a:r>\
+                       </a:p><a:p><a:r><a:t>Hello </a:t></a:r></a:p></p:sp>";
+    let shape = |carrier: Option<Vec<u8>>| {
+        let mut children = vec![ppt_container(
+            RT_CLIENT_TEXTBOX,
+            0,
+            &[
+                ppt_record(RT_TEXT_HEADER, 0, 0, &1u32.to_le_bytes()),
+                ppt_record(RT_TEXT_CHARS, 0, 0, &text_chars_payload(legacy)),
+            ],
+        )];
+        children.extend(carrier);
+        ppt_container(common::RT_SP_CONTAINER, 0, &children)
+    };
+    let read = |carrier| {
+        let doc = open_ppt(ppt_stream_with_persist(&[vec![shape(carrier)]], &[]));
+        (doc.plain_text(), doc.to_markdown(), doc.to_html())
+    };
+    let with = read(Some(downrev_carrier(&downrev_zip(package_xml))));
+    let without = read(None);
+    assert_eq!(with, without);
+}
+
+/// Real tables put a simple property after `metroBlob`: its data follows
+/// every entry, not its own.
+#[test]
+fn test_package_with_a_property_after_it_reaches_the_reader() {
+    let zip = downrev_zip(&downrev_shape_xml(&["Past the next entry"]));
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&0xC3A9u16.to_le_bytes());
+    payload.extend_from_slice(&(zip.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&0x03BFu16.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&zip);
+    let carrier = ppt_record(common::RT_DOWNREV_CARRIER, 2, 3, &payload);
+    let doc = open_ppt(ppt_stream_with_persist(&[vec![downrev_group_from_carrier(carrier)]], &[]));
+    let ppt = doc.as_ppt().expect("parsed as ppt");
+    assert!(ppt.plain_text().contains("Past the next entry"));
+    assert!(ppt.warnings().is_empty(), "{:?}", ppt.warnings());
+}
+
+/// Past a limit, the deck says it isn't complete. Within one, it doesn't.
+#[test]
+fn test_text_past_a_package_limit_is_reported() {
+    let slide_of = |s: usize, shapes: usize| -> Vec<Vec<u8>> {
+        (0..shapes)
+            .map(|i| {
+                let text = format!("S{s}T{i}");
+                downrev_shape_group(&downrev_zip(&downrev_shape_xml(&[text.as_str()])))
+            })
+            .collect()
+    };
+    let doc = open_ppt(ppt_stream_with_persist(&[slide_of(0, 256)], &[]));
+    let ppt = doc.as_ppt().expect("parsed as ppt");
+    assert!(ppt.text_complete(), "{:?}", ppt.warnings());
+    assert!(ppt.plain_text().contains("S0T255"));
+
+    let doc = open_ppt(ppt_stream_with_persist(&[slide_of(0, 257)], &[]));
+    let ppt = doc.as_ppt().expect("parsed as ppt");
+    assert!(!ppt.text_complete());
+    assert!(
+        ppt.warnings().iter().any(|w| w.contains("package limit")),
+        "{:?}",
+        ppt.warnings()
+    );
+    assert!(!ppt.plain_text().contains("S0T256"));
+}
+
+/// A damaged package is reported, and the rest of the deck still reads.
+#[test]
+fn test_damaged_package_is_reported() {
+    let bad = zip_with_invalid_utf8();
+    let good = downrev_zip(&downrev_shape_xml(&["Still here"]));
+    let slide = vec![downrev_shape_group(&bad), downrev_shape_group(&good)];
+    let doc = open_ppt(ppt_stream_with_persist(&[slide], &[]));
+    let ppt = doc.as_ppt().expect("parsed as ppt");
+    assert!(ppt.plain_text().contains("Still here"));
+    assert!(!ppt.text_complete());
+    assert!(ppt.warnings().iter().any(|w| w.contains("damaged")), "{:?}", ppt.warnings());
+}
+
+fn zip_with_invalid_utf8() -> Vec<u8> {
+    use std::io::Write;
+    let mut buf = Vec::new();
+    {
+        let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        w.start_file("drs/shapexml.xml", opts).expect("zip entry");
+        w.write_all(&[0xFF; 64]).expect("zip payload");
+        w.finish().expect("zip finish");
+    }
+    buf
+}
+
+/// With no usable persist directory, a slide list holding only a stub must not
+/// hide the words the packages hold.
+#[test]
+fn test_package_text_beats_a_stub_in_the_slide_list_cache() {
+    let xml = downrev_shape_xml(&["The real words of the slide"]);
+    let slide_list = ppt_container(
+        common::RT_SLIDE_LIST_WITH_TEXT,
+        0,
+        &[
+            ppt_record(common::RT_SLIDE_PERSIST_ATOM, 0, 0, &[0u8; 20]),
+            ppt_record(RT_TEXT_HEADER, 0, 0, &0u32.to_le_bytes()),
+            ppt_record(RT_TEXT_CHARS, 0, 0, &text_chars_payload("x")),
+        ],
+    );
+    let mut stream = ppt_container(common::RT_DOCUMENT, 0, &[slide_list]);
+    stream.extend(common::ppt_slide(&[downrev_shape_group(&downrev_zip(&xml))]));
+    let text = open_ppt(stream)
+        .as_ppt()
+        .expect("parsed as ppt")
+        .plain_text();
+    assert!(text.contains("The real words of the slide"), "{text:?}");
+}
+
+/// The cache's fuller text stays when the packages hold less.
+#[test]
+fn test_slide_list_cache_with_more_text_than_the_packages_is_kept() {
+    let xml = downrev_shape_xml(&["Short"]);
+    let slide_list = ppt_container(
+        common::RT_SLIDE_LIST_WITH_TEXT,
+        0,
+        &[
+            ppt_record(common::RT_SLIDE_PERSIST_ATOM, 0, 0, &[0u8; 20]),
+            ppt_record(RT_TEXT_HEADER, 0, 0, &0u32.to_le_bytes()),
+            ppt_record(RT_TEXT_CHARS, 0, 0, &text_chars_payload("The fuller cached words")),
+        ],
+    );
+    let mut stream = ppt_container(common::RT_DOCUMENT, 0, &[slide_list]);
+    stream.extend(common::ppt_slide(&[downrev_shape_group(&downrev_zip(&xml))]));
+    let text = open_ppt(stream)
+        .as_ppt()
+        .expect("parsed as ppt")
+        .plain_text();
+    assert!(text.contains("The fuller cached words"), "{text:?}");
+}
+
+/// A title that exists only in a package renders as the slide's title: first,
+/// not after the body.
+#[test]
+fn test_title_in_a_package_renders_as_the_title() {
+    let xml = r#"<p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><a:p><a:r><a:t>The Title</a:t></a:r></a:p></p:sp>"#;
+    let slide = vec![
+        normal_legacy_text_body("Body text"),
+        downrev_shape_group(&downrev_zip(xml)),
+    ];
+    let doc = open_ppt(ppt_stream_with_persist(&[slide], &[]));
+    let ppt = doc.as_ppt().expect("parsed as ppt");
+    assert_eq!(ppt.slides[0].text_runs[0].text, "The Title");
+    assert_eq!(ppt.slides[0].text_runs[0].text_type, TextType::Title);
+    let markdown = doc.to_markdown();
+    assert!(
+        markdown.find("The Title").expect("title") < markdown.find("Body text").expect("body"),
+        "{markdown}"
     );
 }
 
@@ -316,30 +506,30 @@ fn test_deeply_nested_carrier_is_reached_through_the_container_chain() {
     );
 }
 
-/// G4: `extract_deck_text` builds a single `DownrevBudget` and threads it
-/// through BOTH the persist-directory path and the no-directory fallback
-/// inside one call. This end-to-end test pins that shared-budget plumbing so a
-/// later change that strands budget on one path (and starves the other) is
-/// caught. The persist path here consumes budget and the fallback still runs
-/// against the remainder, exercising both arms of the shared budget.
+/// One budget covers both passes over a deck: when the persist path finds no
+/// text and the fallback walks the same packages again, what the first spent
+/// isn't available to the second. 20 slides of 256 masks is 5,120 packages:
+/// within the file's 8,192 once, past it twice.
 #[test]
-fn test_downrev_budget_is_shared_across_persist_and_fallback() {
-    let stream = ppt_stream_with_persist(&[slide_one(), slide_two()], &[master_group()]);
-    let doc = open_ppt(stream);
+fn test_package_budget_is_shared_between_persist_and_fallback() {
+    let groups: Vec<Vec<u8>> = (0..256)
+        .map(|i| {
+            let mask = "_".repeat(i + 1);
+            downrev_shape_group(&downrev_zip(&downrev_shape_xml(&[mask.as_str()])))
+        })
+        .collect();
+    let slides = vec![groups; 20];
+    let doc = open_ppt(ppt_stream_with_persist(&slides, &[]));
     let ppt = doc.as_ppt().expect("parsed as ppt");
-    let text = ppt.plain_text();
-    // Both extraction arms ran against one budget; the downrev text still
-    // surfaces and within-slide duplicates collapse.
-    assert!(text.contains("Quarterly results"));
-    assert!(text.contains("Outlook"));
-    assert_eq!(text.matches("Steady growth expected").count(), 1);
+    assert!(ppt.plain_text().trim().is_empty());
+    assert!(
+        ppt.warnings().iter().any(|w| w.contains("package limit")),
+        "{:?}",
+        ppt.warnings()
+    );
 }
 
-/// G5: whole-pipeline regression guard through the public `Document` /
-/// `from_reader` API. A real `.ppt` fixture is not checked in, so this
-/// synthesises an equivalent multi-slide stream; it locks the per-slide
-/// downrev-text contract end-to-end (the cross-slide dedup bug from R1 is
-/// covered by the regression below).
+/// Each slide's packages reach that slide, through the public API.
 #[test]
 fn test_downrev_text_per_slide_through_public_api() {
     let xml3 = downrev_shape_xml(&["Appendix", "See attached notes"]);
@@ -372,10 +562,8 @@ fn test_downrev_text_per_slide_through_public_api() {
     );
 }
 
-/// R1 (integration exposure, fixed): the same downrev package carried on two
-/// different slides must contribute its text to BOTH slides — each slide is a
-/// distinct shape. `seen_packages` is scoped per slide, so the second slide
-/// keeps its copy rather than being dropped by the per-file dedup set.
+/// The same package on two slides contributes its text to both: each slide
+/// keeps its own copy.
 #[test]
 fn test_downrev_identical_package_kept_on_each_slide() {
     let xml = downrev_shape_xml(&["Shared heading"]);
@@ -395,35 +583,26 @@ fn test_downrev_identical_package_kept_on_each_slide() {
             .text_runs
             .iter()
             .any(|r| r.text.contains("Shared heading")),
-        "slide 2 must ALSO extract the shared package (R1: per-slide text)"
+        "slide 2 must also extract the shared package"
     );
 }
 
-/// Build a fully-valid (but synthesised) legacy `.ppt` byte stream carrying
-/// downrev packages on two slides, via the same `common` builders the other
-/// tests use. It is persisted as `tests/fixtures/wps_downrev.ppt` so G5 can run
-/// against a real on-disk file (not an in-memory cursor). A captured real WPS
-/// export would be a stricter fixture but is not checked in.
+/// A legacy `.ppt` carrying packages on two slides, synthesised by the same
+/// builders as the other tests and committed as
+/// `tests/fixtures/wps_downrev.ppt`. It isn't a capture from WPS.
 fn build_downrev_ppt_bytes() -> Vec<u8> {
     let stream = ppt_stream_with_persist(&[slide_one(), slide_two()], &[master_group()]);
     cfb_with_stream("PowerPoint Document", &stream)
 }
 
-/// G5 (real-file regression): a committed, fully-valid `.ppt` fixture is read
-/// from disk through the public `Document::from_reader` API (real file IO, not a
-/// cursor). Downrev text must surface per slide and master text must not leak.
-/// The fixture is (re)created from `build_downrev_ppt_bytes` only if it is
-/// missing, so the test is self-healing yet normally exercises the checked-in
-/// file.
+/// The committed fixture reads from disk, per slide, with no master text. It
+/// must match its builder, so the two can't drift apart unnoticed.
 #[test]
-fn test_downrev_real_file_fixture_regression() {
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+fn test_committed_fixture_reads_from_a_file() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/wps_downrev.ppt");
-    if !std::path::Path::new(path).exists() {
-        std::fs::create_dir_all(dir).expect("create fixtures dir");
-        std::fs::write(path, build_downrev_ppt_bytes()).expect("write fixture");
-    }
-    let file = std::fs::File::open(path).expect("wps_downrev.ppt fixture must exist");
+    let bytes = std::fs::read(path).expect("wps_downrev.ppt fixture must exist");
+    assert!(bytes == build_downrev_ppt_bytes(), "the fixture no longer matches its builder");
+    let file = std::fs::File::open(path).expect("wps_downrev.ppt fixture must open");
     let doc = Document::from_reader(file, DocumentFormat::Ppt).expect("fixture opens");
     let ppt = doc.as_ppt().expect("parsed as ppt");
     assert_eq!(ppt.slides.len(), 2, "one slide per SlideContainer");
@@ -439,6 +618,43 @@ fn test_downrev_real_file_fixture_regression() {
         1,
         "within-slide duplicate packages collapse to one run"
     );
+}
+
+/// The fuzz target's seeds must reach the package reader, by the target's own
+/// reading of them: byte 0 packs the carrier count and the property count.
+#[test]
+fn test_fuzz_seeds_reach_the_package_reader() {
+    for (seed, expected) in [
+        ("ppt_downrev_valid", "Seed text"),
+        ("ppt_downrev_decoy", "Seed text"),
+        ("ppt_downrev_degenerate", "Seed text"),
+        ("ppt_downrev_short_length", ""),
+        ("ppt_downrev_trailing_property", "Seed text"),
+        ("ppt_downrev_two_carriers", "Second seed text"),
+    ] {
+        let path = format!("{}/fuzz/corpus/fuzz_ppt_downrev/{seed}", env!("CARGO_MANIFEST_DIR"));
+        let data = std::fs::read(path).expect("seed must exist");
+        let (&control, rest) = data.split_first().expect("seed must not be empty");
+        let carriers = usize::from(control & 3) + 1;
+        let properties = u16::from(control >> 2);
+        let chunk = rest.len() / carriers;
+        let groups: Vec<Vec<u8>> = (0..carriers)
+            .map(|i| {
+                let payload = &rest[i * chunk..((i + 1) * chunk).min(rest.len())];
+                let carrier = ppt_record(common::RT_DOWNREV_CARRIER, properties, 3, payload);
+                downrev_group_from_carrier(carrier)
+            })
+            .collect();
+        let text = open_ppt(ppt_stream_with_persist(&[groups], &[]))
+            .as_ppt()
+            .expect("parsed as ppt")
+            .plain_text();
+        assert!(text.contains(expected), "{seed}: {text:?}");
+        assert!(!text.contains("Decoy"), "{seed}: {text:?}");
+        if expected.is_empty() {
+            assert!(text.trim().is_empty(), "{seed}: {text:?}");
+        }
+    }
 }
 
 /// `RT_CLIENT_TEXTBOX` ([MS-PPT] 2.5.28) and `RT_TEXT_HEADER` ([MS-PPT]
@@ -457,6 +673,22 @@ fn normal_legacy_text_shape(text: &str) -> Vec<u8> {
             0,
             &[
                 ppt_record(RT_TEXT_HEADER, 0, 0, &0u32.to_le_bytes()), // Title
+                ppt_record(RT_TEXT_CHARS, 0, 0, &text_chars_payload(text)),
+            ],
+        )],
+    )
+}
+
+/// As [`normal_legacy_text_shape`], typed as body text.
+fn normal_legacy_text_body(text: &str) -> Vec<u8> {
+    ppt_container(
+        common::RT_SP_CONTAINER,
+        0,
+        &[ppt_container(
+            RT_CLIENT_TEXTBOX,
+            0,
+            &[
+                ppt_record(RT_TEXT_HEADER, 0, 0, &1u32.to_le_bytes()),
                 ppt_record(RT_TEXT_CHARS, 0, 0, &text_chars_payload(text)),
             ],
         )],

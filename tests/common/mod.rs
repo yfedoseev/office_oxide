@@ -1736,15 +1736,14 @@ pub const RT_SPGR_CONTAINER: u16 = 0xF003;
 pub const RT_TEXT_CHARS: u16 = 0x0FA0;
 /// Record type carrying a WPS "downrev" package. `0xF122` is
 /// `msofbtTertiaryOpt` ([MS-ODRAW] 2.2.11), a general tertiary property
-/// table; WPS (like Office itself) hangs the package off it as the
-/// `metroBlob` complex property — `opid` `0x03A9` with `fComplex` set,
-/// followed by the 4-byte byte count of the complex data
-/// ([MS-ODRAW] 2.3.4.41). Verified against a real WPS file: 383/383
-/// packages carry `0x83A9` and an exact declared length.
+/// table, whose `recInstance` is its property count. Office and WPS hang a
+/// package off it as the `metroBlob` complex property: `opid` `0x03A9` with
+/// `fComplex` set, whose 4-byte value is the byte count of the complex data
+/// ([MS-ODRAW] 2.3.4.41), stored after every entry ([MS-ODRAW] 2.3.1).
 #[allow(dead_code)]
 pub const RT_DOWNREV_CARRIER: u16 = 0xF122;
 
-/// `metroBlob` `opid` with `fComplex` set: the low 15 bits are the property
+/// `metroBlob` `opid` with `fComplex` set: the low 14 bits are the property
 /// id (`0x03A9` per [MS-ODRAW] 2.3.4.41), the high bit is `fComplex`, which
 /// requires the complex data to be present.
 #[allow(dead_code)]
@@ -1816,8 +1815,6 @@ pub fn downrev_zip(shape_xml: &str) -> Vec<u8> {
 /// complex property: the `0xF122` payload is a tertiary property table
 /// whose single entry is `opid 0x03A9` with `fComplex` set, the 4-byte byte
 /// count of the complex data, then the package itself ([MS-ODRAW] 2.3.4.41).
-/// This is the shape real WPS files write — a census of a real file found
-/// 383/383 packages carrying `0x83A9` followed by an exact declared length.
 #[allow(dead_code)]
 pub fn downrev_carrier(zip: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(6 + zip.len());
@@ -1869,9 +1866,10 @@ pub fn downrev_group_from_carrier(carrier: Vec<u8>) -> Vec<u8> {
 
 /// A carrier whose property table opens with a non-metroBlob **complex**
 /// property holding a complete, valid ZIP that carries the *wrong* text,
-/// followed by the real metroBlob package. A signature scan stops at the
-/// first ZIP and loses the real text; a property-table walk reads the real
-/// package.
+/// followed by the real metroBlob package, per `OfficeArtRGFOPTE`
+/// ([MS-ODRAW] 2.3.1): both entries, then both properties' data in entry order.
+/// A signature scan stops at the first ZIP and loses the real text; reading
+/// the table reads the real package.
 #[allow(dead_code)]
 pub fn downrev_carrier_with_decoy(zip: &[u8]) -> Vec<u8> {
     use std::io::Write;
@@ -1894,11 +1892,11 @@ pub fn downrev_carrier_with_decoy(zip: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(12 + decoy.len() + zip.len());
     payload.extend_from_slice(&DECOY_COMPLEX_OPID.to_le_bytes()); // complex, not metroBlob
     payload.extend_from_slice(&(decoy.len() as u32).to_le_bytes());
-    payload.extend_from_slice(&decoy);
     payload.extend_from_slice(&METROBLOB_OPID_COMPLEX.to_le_bytes());
     payload.extend_from_slice(&(zip.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&decoy);
     payload.extend_from_slice(zip);
-    ppt_record(RT_DOWNREV_CARRIER, 1, 3, &payload)
+    ppt_record(RT_DOWNREV_CARRIER, 2, 3, &payload)
 }
 
 /// A carrier whose metroBlob declares fewer bytes than the package holds —
@@ -1913,8 +1911,8 @@ pub fn downrev_carrier_short_length(zip: &[u8], shortfall: usize) -> Vec<u8> {
     ppt_record(RT_DOWNREV_CARRIER, 1, 3, &payload)
 }
 
-/// A `SlideContainer` whose children are `extra` records followed by the
-/// given shape groups.
+/// A `SlideContainer` whose children are its atom followed by the given
+/// shape groups.
 #[allow(dead_code)]
 pub fn ppt_slide(shape_groups: &[Vec<u8>]) -> Vec<u8> {
     let mut children = vec![ppt_record(RT_SLIDE_ATOM, 0, 0, &[0u8; 32])];
@@ -1935,7 +1933,7 @@ pub fn ppt_stream_with_persist(
     slide_groups: &[Vec<Vec<u8>>],
     master_groups: &[Vec<u8>],
 ) -> Vec<u8> {
-    let n = slides_count(slide_groups);
+    let n = slide_groups.len();
     // Persist ids: DocumentContainer = 1, slides = 2..=n+1, master = n+2.
     let master_id = (n + 2) as u32;
 
@@ -1958,7 +1956,7 @@ pub fn ppt_stream_with_persist(
     // Top-level layout and the byte offsets the persist directory needs.
     let doc_len = doc_container.len();
     let user_edit_len = 8 + 20;
-    let pda_len = 8 + 4 * (n + 2); // one (id, offset) group per object
+    let pda_len = 8 + 8 * (n + 2); // one (id word, offset) group per object
     let user_edit_off = doc_len;
     let pda_off = user_edit_off + user_edit_len;
     let mut slide_offs = Vec::with_capacity(n);
@@ -2017,8 +2015,4 @@ pub fn ppt_stream_without_persist(
     }
     stream.extend_from_slice(&ppt_container(RT_MAIN_MASTER, 0, master_groups));
     stream
-}
-
-fn slides_count(slide_groups: &[Vec<Vec<u8>>]) -> usize {
-    slide_groups.len()
 }

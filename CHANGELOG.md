@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Legacy `.ppt`: slide text kept in `metroBlob` packages is now read.** A shape can hold its text in an embedded package (`drs/shapexml.xml`) with the legacy text atoms left nearly empty, as WPS writes an OOXML-origin deck, and such a deck came out almost empty with `Ok`. A package is used only for a shape with no legacy text of its own, so PowerPoint files that write both don't repeat their text. Titles in packages render as titles, and cached slide-number and date values are left out. Reading is bounded per file and per slide, and text a limit or a damaged package kept back is reported in `warnings()` and `text_complete()`. Reported and first implemented by @xugangqiang.
+
 ## [0.1.16] - 2026-10-30
 
 ### Added
