@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Legacy `.ppt`: slide text kept in `metroBlob` packages is now read.** A shape can hold its text in an embedded package (`drs/shapexml.xml`) with the legacy text atoms left nearly empty, as WPS writes an OOXML-origin deck, and such a deck came out almost empty with `Ok`. A package is used only for a shape with no legacy text of its own, so PowerPoint files that write both don't repeat their text. Titles in packages render as titles, and cached slide-number and date values are left out. Reading is bounded per file and per slide, and text a limit or a damaged package kept back is reported in `warnings()` and `text_complete()`. Reported and first implemented by @xugangqiang.
 
+### Changed (memory)
+
+- **Legacy `.xls`: opening a large sheet no longer holds its cells twice.** A sheet's cells were gathered into a list (32 bytes each) and the grid was built while the whole list was still alive, so the open peaked at the list, the grid and the Workbook stream together. The grid now takes the cells off the list as it fills and the list shrinks as it empties. The heap peak of opening falls from 144 to 115 MiB, 90 to 73 MiB and 117 to 82 MiB on three 13-28 MB workbooks, with output unchanged on 1,180 corpus files. A cell written by two records still holds the later one.
+
 ## [0.1.16] - 2026-10-30
 
 ### Added

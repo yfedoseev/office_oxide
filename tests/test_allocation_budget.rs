@@ -336,6 +336,37 @@ fn test_xls_cells_open_within_one_allocation_each_and_render_borrowing() {
     );
 }
 
+/// Opening a sheet gathered every cell into a list (32 bytes each) and then
+/// built the grid while the whole list was still alive, so the open peaked
+/// at the list plus the grid plus the Workbook stream: 7x the file for a
+/// large sheet. The grid now takes the cells off the list as it is filled,
+/// so the two are never both whole.
+#[test]
+fn test_xls_open_does_not_hold_the_cell_list_and_the_grid_at_once() {
+    let _serial = serial();
+    const ROWS: u16 = 2_000;
+    const COLS: u16 = 50;
+    let bytes = xls_with_cells(ROWS, COLS, &["a", "b"]);
+    let input = bytes.len();
+    let (doc, peak) = peak_during(|| {
+        office_oxide::Document::from_reader(Cursor::new(bytes), office_oxide::DocumentFormat::Xls)
+            .unwrap()
+    });
+    let live = LIVE_BYTES.load(Ordering::SeqCst);
+    let (_, after_drop) = (drop(doc), LIVE_BYTES.load(Ordering::SeqCst));
+    let kept = live.saturating_sub(after_drop);
+    let cells = (ROWS as usize) * (COLS as usize);
+    // Beyond what the document keeps and the stream it reads, the open may
+    // spend a few bytes per cell, not a second copy of every cell.
+    let transient = peak.saturating_sub(kept).saturating_sub(2 * input);
+    assert!(
+        transient < cells * 16,
+        "open peaked at {peak} bytes for {cells} cells: {kept} kept, {input} input, \
+         {transient} transient ({} per cell)",
+        transient / cells
+    );
+}
+
 // ---------------------------------------------------------------- DOCX
 
 /// A table whose widest row is wide (here, ten cells spanning 1,000 grid

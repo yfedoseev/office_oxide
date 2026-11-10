@@ -1534,7 +1534,7 @@ impl Sheet {
 }
 
 pub(super) fn build_grid(
-    cells: &mut [Cell],
+    cells: &mut Vec<Cell>,
     budget: &mut crate::limits::GridBudget,
 ) -> (Vec<Vec<CellValue>>, Vec<Vec<u16>>) {
     // Jagged, like every other spreadsheet
@@ -1573,18 +1573,34 @@ pub(super) fn build_grid(
         }
     }
     let rows_kept = width.len();
-    let mut grid: Vec<Vec<CellValue>> = width
-        .iter()
-        .map(|&w| vec![CellValue::Empty; w as usize])
-        .collect();
-    let mut xf: Vec<Vec<u16>> = width.iter().map(|&w| vec![0u16; w as usize]).collect();
-    for cell in cells
-        .iter_mut()
-        .filter(|c| in_grid(c) && (c.row as usize) < rows_kept)
-    {
+    // The cells are taken off the end of the list as the grid is filled, and
+    // the list is shrunk as it empties, so the list and the grid are never
+    // both whole: filling the grid from the full list held every cell twice
+    // at the peak (the list's 32 bytes and the grid's slot), on top of the
+    // Workbook stream. A row is allocated, at its final width, when its
+    // first cell arrives. Walking backwards, the first value that reaches a
+    // slot is the one a later record wrote, so a repeated cell resolves to
+    // the last record as it did walking forwards; every value in the list is
+    // non-empty, so an empty slot is one no later record filled.
+    cells.shrink_to_fit();
+    let mut grid: Vec<Vec<CellValue>> = std::iter::repeat_with(Vec::new).take(rows_kept).collect();
+    let mut xf: Vec<Vec<u16>> = std::iter::repeat_with(Vec::new).take(rows_kept).collect();
+    while let Some(cell) = cells.pop() {
+        if cells.len() < cells.capacity() / 2 {
+            cells.shrink_to_fit();
+        }
         let (r, c) = (cell.row as usize, cell.col as usize);
-        grid[r][c] = std::mem::take(&mut cell.value);
-        xf[r][c] = cell.xf_index;
+        if !in_grid(&cell) || r >= rows_kept {
+            continue;
+        }
+        if grid[r].is_empty() {
+            grid[r] = vec![CellValue::Empty; width[r] as usize];
+            xf[r] = vec![0u16; width[r] as usize];
+        }
+        if matches!(grid[r][c], CellValue::Empty) {
+            xf[r][c] = cell.xf_index;
+            grid[r][c] = cell.value;
+        }
     }
     // Each row already ends at its last non-empty cell; only trailing
     // rows with nothing in them remain to drop.
@@ -2377,6 +2393,33 @@ mod tests {
         assert_eq!(grid[0][0], CellValue::String("A1".into()));
         assert_eq!(grid[0][1], CellValue::Number(42.0));
         assert_eq!(grid[1], vec![CellValue::String("A2".into())], "rows are jagged");
+    }
+
+    /// A cell written by two records holds the later record's value and
+    /// format, and a blank record does not erase a value.
+    #[test]
+    fn test_build_grid_repeated_cell_keeps_the_last_record() {
+        let mk = |row: u16, col: u16, xf_index: u16, value: CellValue| Cell {
+            xf_index,
+            row,
+            col,
+            value,
+        };
+        let mut cells = vec![
+            mk(0, 0, 1, CellValue::String("first".into())),
+            mk(1, 2, 4, CellValue::Number(1.0)),
+            mk(0, 0, 2, CellValue::String("second".into())),
+            mk(1, 2, 5, CellValue::Empty),
+            mk(0, 1, 3, CellValue::Number(7.0)),
+            mk(0, 0, 9, CellValue::String("last".into())),
+        ];
+        let (grid, xf) = build_grid(&mut cells, &mut crate::limits::GridBudget::new());
+        assert_eq!(grid[0][0], CellValue::String("last".into()));
+        assert_eq!(xf[0][0], 9);
+        assert_eq!(grid[0][1], CellValue::Number(7.0));
+        assert_eq!(grid[1][2], CellValue::Number(1.0), "a blank record keeps the value");
+        assert_eq!(xf[1][2], 4);
+        assert!(cells.is_empty(), "the cells were moved into the grid");
     }
 
     /// Regression: the grid was padded to the declared extent, so four
