@@ -1047,12 +1047,20 @@ const STREAM_PIECE_BYTES: usize = 4 << 20;
 /// ever-growing buffer for one is work without bound.
 const MAX_PENDING_BYTES: usize = 4 * STREAM_PIECE_BYTES;
 
-/// The most open elements a piece may leave for the next to carry, and the
-/// most bytes of open tags they may take: every piece is parsed after them,
-/// so a deep or long-named stack would be parsed again with every piece. A
-/// worksheet row ends two elements deep (`worksheet`, `sheetData`).
-const MAX_CARRIED_DEPTH: usize = 64;
+/// The most bytes of open tags a piece may leave for the next to carry:
+/// every piece is parsed after them, so long names would be parsed again
+/// with every piece.
 const MAX_CARRIED_PREFIX_BYTES: usize = 4096;
+
+/// Whether `open`, the elements open where a piece ends, is the place a
+/// whole-part parse is in between two rows: the root and `sheetData`, and
+/// nothing else. Ending a piece anywhere else (a `</row>` nested in a row, or
+/// inside `headerFooter`) would restart the element still open with a bare
+/// start tag, losing its attributes and what it had read.
+fn between_rows(open: &[Vec<u8>]) -> bool {
+    let local = |name: &[u8]| name.rsplit(|&b| b == b':').next().unwrap_or(name).to_vec();
+    open.len() == 2 && local(&open[1]) == b"sheetData"
+}
 
 /// Where the last complete `</row>` (or `</prefix:row>`) in `data` ends,
 /// looking only at a `row>` that starts at `from` or later.
@@ -1164,7 +1172,11 @@ fn open_elements_after(xml: &[u8]) -> Option<Vec<Vec<u8>>> {
                 } else if rest.starts_with(b"[CDATA[") {
                     at + 9 + find(&rest[7..], b"]]>")? + 3
                 } else {
-                    at + 2 + memchr::memchr(b'>', rest)? + 1
+                    // A document type declaration, whose quoted literals and
+                    // internal subset the reader parses and a scan for `>`
+                    // would not. Package XML may not use one (ECMA-376
+                    // Part 2, §8.1.4), so the part is read whole.
+                    return None;
                 };
             },
             b'?' => i = at + 2 + find(&xml[at + 2..], b"?>")? + 2,
@@ -1256,7 +1268,7 @@ impl<'r> RowFeeder<'r> {
             return false;
         };
         let carried: usize = open.iter().map(|name| name.len() + 2).sum();
-        if open.len() > MAX_CARRIED_DEPTH || carried > MAX_CARRIED_PREFIX_BYTES {
+        if !between_rows(&open) || carried > MAX_CARRIED_PREFIX_BYTES {
             return false;
         }
         let keep = (end - self.prefix).min(Self::TAIL);
@@ -2349,7 +2361,6 @@ mod tests {
             "<a><!-- open",
             "<a><![CDATA[ open",
             "<a x=\"unterminated>",
-            "<!DOCTYPE d><a>",
             "plain text",
             "",
             "<a\n  b=\"1\"\t/><c\r\n>",
@@ -2361,6 +2372,8 @@ mod tests {
                 "{xml:?}"
             );
         }
+        // A document type declaration is refused, not scanned.
+        assert_eq!(open_elements_after(b"<!DOCTYPE d><a>"), None);
     }
 
     #[test]
@@ -2429,33 +2442,66 @@ mod tests {
         assert!(streamed(&xml, 1 << 20, 1 << 20).is_some());
     }
 
-    /// Open elements are carried into the next piece only while they are
-    /// few and short; a deep or long-named stack would be parsed again with
-    /// every piece, so the part is read whole instead.
+    /// A piece ends only where a whole-part parse is between two rows (the
+    /// root and `sheetData` open, nothing else) and only with short names
+    /// to carry; anywhere else the part is read whole. A `</row>` nested in
+    /// a row or inside `headerFooter`, or a document type declaration whose
+    /// quoted `>` a scan would misread, once ended a piece and lost or
+    /// duplicated rows and header settings with no warning.
     #[test]
-    fn test_a_deep_or_long_named_stack_is_not_carried_between_pieces() {
+    fn test_a_piece_ends_only_between_rows() {
         let rows: String = (1..=20)
             .map(|r| format!(r#"<row r="{r}"><c r="A{r}"><v>{r}</v></c></row>"#))
             .collect();
-        let wrapped = |names: &[String]| {
-            let open: String = names.iter().map(|n| format!("<{n}>")).collect();
-            let close: String = names.iter().rev().map(|n| format!("</{n}>")).collect();
-            format!(
-                r#"<worksheet {STREAM_NS}><sheetData>{open}{rows}{close}</sheetData></worksheet>"#
-            )
+        let sheet = |inner: &str, after: &str| {
+            format!(r#"<worksheet {STREAM_NS}><sheetData>{inner}</sheetData>{after}</worksheet>"#)
         };
-        // Within the bounds (with `worksheet` and `sheetData`): streams.
-        let shallow: Vec<String> = (0..MAX_CARRIED_DEPTH - 2)
-            .map(|i| format!("g{i}"))
-            .collect();
-        assert!(streamed(&wrapped(&shallow), 7, 40).is_some());
-        // One deeper, or one name too long: read whole.
-        let deep: Vec<String> = (0..MAX_CARRIED_DEPTH - 1)
-            .map(|i| format!("g{i}"))
-            .collect();
-        assert!(streamed(&wrapped(&deep), 7, 40).is_none());
-        let long = vec!["n".repeat(MAX_CARRIED_PREFIX_BYTES)];
-        assert!(streamed(&wrapped(&long), 7, 40).is_none());
+        let fill = "<!--".to_string() + &"f".repeat(300) + "-->";
+        let cases = [
+            // Wrapped in an element of its own.
+            sheet(&format!("<g>{rows}</g>"), ""),
+            // A row nested in a row, then more cells of the outer row.
+            sheet(
+                &format!(
+                    r#"{rows}<row r="30"><c r="A30"><v>1</v></c><row></row>{fill}<c r="B30"><v>2</v></c></row>"#
+                ),
+                "",
+            ),
+            // A row end inside the header and footer settings.
+            sheet(
+                &rows,
+                &format!(
+                    r#"<headerFooter differentFirst="1"><oddHeader>A</oddHeader><row></row>{fill}<firstHeader>F</firstHeader></headerFooter>"#
+                ),
+            ),
+            // Document type declarations with a quoted `>` or a subset.
+            sheet(&format!(r#"{rows}<!DOCTYPE x SYSTEM "a>b<row>">{rows}"#), ""),
+            sheet(&format!(r#"{rows}<!DOCTYPE x [<!ENTITY e "a>b<row>">]>{rows}"#), ""),
+        ];
+        for xml in &cases {
+            for (chunk, piece) in [(7, 40), (64, 1), (1, 300)] {
+                assert!(
+                    streamed(xml, chunk, piece).is_none(),
+                    "chunk {chunk}, piece {piece}: {xml}"
+                );
+            }
+        }
+        // Prefixed names between rows stream; a prefix too long to carry
+        // with every piece does not.
+        let long = format!(
+            r#"<{p}:worksheet xmlns:{p}="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><{p}:sheetData>{}</{p}:sheetData></{p}:worksheet>"#,
+            (1..=20)
+                .map(|r| format!(
+                    r#"<{p}:row r="{r}"><{p}:c r="A{r}"><{p}:v>{r}</{p}:v></{p}:c></{p}:row>"#,
+                    p = "x"
+                ))
+                .collect::<String>()
+                .replace("x:", &format!("{}:", "n".repeat(MAX_CARRIED_PREFIX_BYTES))),
+            p = "n".repeat(MAX_CARRIED_PREFIX_BYTES)
+        );
+        assert!(streamed(&long, 7, 40).is_none());
+        let plain = sheet(&rows, "");
+        assert!(streamed(&plain, 7, 40).is_some());
     }
     use crate::core::relationships::Relationships;
 
