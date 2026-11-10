@@ -348,6 +348,69 @@ fn test_a_strict_xls_open_does_not_build_the_ir() {
     );
 }
 
+/// A workbook of `sheets` sheets whose parts each carry `padding` bytes the
+/// reader skips (an extension block), stored uncompressed, and a few cells.
+fn workbook_of_padded_sheets(sheets: usize, padding: usize) -> Vec<u8> {
+    let mut names = String::new();
+    let mut rels = String::from(
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+    );
+    for i in 1..=sheets {
+        names.push_str(&format!(r#"<sheet name="S{i}" sheetId="{i}" r:id="rId{i}"/>"#));
+        rels.push_str(&format!(r#"<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>"#));
+    }
+    rels.push_str("</Relationships>");
+    let workbook = format!(
+        r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{names}</sheets></workbook>"#
+    );
+    let pad = "A".repeat(padding);
+    let sheet_xml: Vec<(String, String)> = (1..=sheets)
+        .map(|i| {
+            (
+                format!("xl/worksheets/sheet{i}.xml"),
+                format!(
+                    r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>{i}</v></c></row></sheetData><extLst><ext uri="{{00000000-0000-0000-0000-000000000000}}">{pad}</ext></extLst></worksheet>"#
+                ),
+            )
+        })
+        .collect();
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let mut add = |name: &str, data: &[u8]| {
+        zip.start_file(name, stored).unwrap();
+        zip.write_all(data).unwrap();
+    };
+    add("[Content_Types].xml", br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#);
+    add("_rels/.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#);
+    add("xl/_rels/workbook.xml.rels", rels.as_bytes());
+    add("xl/workbook.xml", workbook.as_bytes());
+    for (name, xml) in &sheet_xml {
+        add(name, xml.as_bytes());
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+/// Every sheet's XML was read before any was parsed, so a workbook of many
+/// large sheets held all of their XML at once. Sheets are now read and parsed
+/// in batches of bounded size, each batch's XML dropped before the next.
+#[test]
+fn test_a_many_sheet_workbook_does_not_hold_every_sheets_xml_at_once() {
+    let _serial = serial();
+    const SHEETS: usize = 6;
+    const PADDING: usize = 16 << 20;
+    let bytes = workbook_of_padded_sheets(SHEETS, PADDING);
+    let input = bytes.len();
+    let (doc, peak) = peak_during(|| open_xlsx(bytes));
+    assert_eq!(doc.as_xlsx().unwrap().worksheets.len(), SHEETS);
+    assert!(doc.plain_text().contains('6'));
+    let transient = peak.saturating_sub(input);
+    assert!(
+        transient < 4 * PADDING,
+        "opening {SHEETS} sheets of {PADDING} bytes of XML peaked {transient} bytes above the input"
+    );
+}
+
 // ---------------------------------------------------------------- DOCX
 
 /// A table whose widest row is wide (here, ten cells spanning 1,000 grid

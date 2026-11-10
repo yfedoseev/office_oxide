@@ -434,6 +434,92 @@ impl XlsxDocument {
         // content, not repeated among the embedded charts'.
         let mut chartsheet_charts: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // Phase 2, run on each batch of sheets as phase 1 gathers it: parse
+        // the worksheets (in parallel when the feature is enabled). A sheet
+        // whose part does not parse is recorded, not fatal. The
+        // shared-formula followers are written afterwards, in sheet order,
+        // against one document-wide budget.
+        let parse_bundle = |b: SheetBundle| -> Result<
+            std::result::Result<(Worksheet, shared_formula::SharedFormulas), (String, String)>,
+        > {
+            let name = b.name.clone();
+            if matches!(b.kind, crate::ir::SheetKind::Chart | crate::ir::SheetKind::Dialog) {
+                let mut ws = Worksheet::without_cells(b.name, b.kind);
+                ws.state = b.state;
+                ws.chart_text = b.chart_text;
+                return Ok(Ok((ws, shared_formula::SharedFormulas::default())));
+            }
+            // A sheet cut off between tags reaches end-of-file without an
+            // XML error and would read as complete: check the root closed.
+            // (an Excel 4.0 macro sheet's root is `macrosheet`)
+            let root = if b.kind == crate::ir::SheetKind::Macro {
+                "macrosheet"
+            } else {
+                "worksheet"
+            };
+            let whole = crate::core::xml::check_root_closed(&b.data, &b.name, root)
+                .and_then(|()| Worksheet::parse_unresolved(&b.data, b.name.clone(), &b.rels));
+            let parsed = match whole {
+                Ok(done) => Ok((done, None)),
+                // Malformed XML part-way through: the rows before the damage
+                // parsed fine, so they are kept and the loss is said. A sheet
+                // with no complete row, or whose error is not XML damage,
+                // stays unreadable.
+                Err(e) => match worksheet::salvage_prefix(&b.data) {
+                    Some((prefix, rows)) => {
+                        match Worksheet::parse_unresolved(&prefix, b.name.clone(), &b.rels) {
+                            Ok(done) => Ok((
+                                done,
+                                Some(format!(
+                                    "its XML is malformed ({e}); the {rows} complete row(s) before \
+                                     the damage were read and everything after them was not"
+                                )),
+                            )),
+                            Err(_) => Err(e),
+                        }
+                    },
+                    None => Err(e),
+                },
+            };
+            match parsed {
+                Ok(((mut ws, shared), damage)) => {
+                    ws.kind = b.kind;
+                    ws.state = b.state;
+                    ws.tables = b.tables;
+                    ws.pivot_tables = b.pivot_tables;
+                    ws.images = b.images;
+                    ws.text_shapes = b.text_shapes;
+                    ws.comments = b.comments;
+                    ws.comments_truncated = b.comments_truncated;
+                    ws.damage = damage;
+                    Ok(Ok((ws, shared)))
+                },
+                Err(e) => {
+                    log::warn!("xlsx: sheet {name:?} is unreadable and skipped: {e}");
+                    Ok(Err((name, e.to_string())))
+                },
+            }
+        };
+        // Sheets are read and parsed in batches of at most this much raw XML
+        // (and at least one sheet), each batch's XML dropped before the next
+        // is read: reading every sheet before parsing any held the XML of
+        // the whole workbook at once.
+        const BATCH_XML_BYTES: usize = 32 << 20;
+        type ParsedSheet =
+            std::result::Result<(Worksheet, shared_formula::SharedFormulas), (String, String)>;
+        let mut parsed: Vec<ParsedSheet> = Vec::with_capacity(workbook.sheets.len());
+        let mut batch_bytes = 0usize;
+        let flush = |bundles: &mut Vec<SheetBundle>,
+                     batch_bytes: &mut usize,
+                     parsed: &mut Vec<ParsedSheet>|
+         -> Result<()> {
+            *batch_bytes = 0;
+            parsed.extend(crate::core::parallel::map_collect(
+                std::mem::take(bundles),
+                parse_bundle,
+            )?);
+            Ok(())
+        };
         for sheet in &workbook.sheets {
             // Skip sheets with empty r:id (virtual sheets, VBA modules, etc.)
             if sheet.rel_id.is_empty() {
@@ -590,76 +676,12 @@ impl XlsxDocument {
                 comments,
                 comments_truncated,
             });
+            batch_bytes = batch_bytes.saturating_add(bundles.last().map_or(0, |b| b.data.len()));
+            if batch_bytes >= BATCH_XML_BYTES {
+                flush(&mut bundles, &mut batch_bytes, &mut parsed)?;
+            }
         }
-
-        // Phase 2: parse worksheets (parallel when feature enabled). A
-        // sheet whose part does not parse is recorded, not fatal. The
-        // shared-formula followers are written afterwards, in sheet order,
-        // against one document-wide budget.
-        let parsed = crate::core::parallel::map_collect(
-            bundles,
-            |b| -> Result<
-                std::result::Result<(Worksheet, shared_formula::SharedFormulas), (String, String)>,
-            > {
-                let name = b.name.clone();
-                if matches!(b.kind, crate::ir::SheetKind::Chart | crate::ir::SheetKind::Dialog) {
-                    let mut ws = Worksheet::without_cells(b.name, b.kind);
-                    ws.state = b.state;
-                    ws.chart_text = b.chart_text;
-                    return Ok(Ok((ws, shared_formula::SharedFormulas::default())));
-                }
-                // A sheet cut off between tags reaches end-of-file without an
-                // XML error and would read as complete: check the root closed.
-                // (an Excel 4.0 macro sheet's root is `macrosheet`)
-                let root = if b.kind == crate::ir::SheetKind::Macro {
-                    "macrosheet"
-                } else {
-                    "worksheet"
-                };
-                let whole = crate::core::xml::check_root_closed(&b.data, &b.name, root)
-                    .and_then(|()| Worksheet::parse_unresolved(&b.data, b.name.clone(), &b.rels));
-                let parsed = match whole {
-                    Ok(done) => Ok((done, None)),
-                    // Malformed XML part-way through: the rows before the damage
-                    // parsed fine, so they are kept and the loss is said. A sheet
-                    // with no complete row, or whose error is not XML damage,
-                    // stays unreadable.
-                    Err(e) => match worksheet::salvage_prefix(&b.data) {
-                        Some((prefix, rows)) => {
-                            match Worksheet::parse_unresolved(&prefix, b.name.clone(), &b.rels) {
-                                Ok(done) => Ok((
-                                    done,
-                                    Some(format!(
-                                        "its XML is malformed ({e}); the {rows} complete row(s) before \
-                                         the damage were read and everything after them was not"
-                                    )),
-                                )),
-                                Err(_) => Err(e),
-                            }
-                        },
-                        None => Err(e),
-                    },
-                };
-                match parsed {
-                    Ok(((mut ws, shared), damage)) => {
-                        ws.kind = b.kind;
-                        ws.state = b.state;
-                        ws.tables = b.tables;
-                        ws.pivot_tables = b.pivot_tables;
-                        ws.images = b.images;
-                        ws.text_shapes = b.text_shapes;
-                        ws.comments = b.comments;
-                        ws.comments_truncated = b.comments_truncated;
-                        ws.damage = damage;
-                        Ok(Ok((ws, shared)))
-                    },
-                    Err(e) => {
-                        log::warn!("xlsx: sheet {name:?} is unreadable and skipped: {e}");
-                        Ok(Err((name, e.to_string())))
-                    },
-                }
-            },
-        )?;
+        flush(&mut bundles, &mut batch_bytes, &mut parsed)?;
         let mut worksheets = Vec::with_capacity(parsed.len());
         let mut formula_budget = crate::limits::TextBudget::new();
         for p in parsed {

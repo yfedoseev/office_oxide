@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A strict open of a `.xls` or `.ppt` file no longer converts the document.** `OnIncomplete::Error` (and `ParseOptions::strict()`) converted the whole document to the IR at open to learn whether it was complete; for these formats the reader alone decides that, so `damage()` and the strict check read it from the reader. A strict open of a 100,000-cell synthetic workbook peaked at 80 MB, ten times a plain open; it now costs the same as one. Other formats are still converted once.
 
+- **`.xlsx`: a workbook's sheets are read and parsed in batches, so their XML is not all held at once.** Every sheet's part was read before any was parsed (serially or in parallel), so a workbook of many large sheets held the XML of all of them at its peak. Sheets are now read in batches of at most 32 MiB of XML (and at least one sheet), each batch parsed and its XML dropped before the next is read. Opening six sheets of 16 MiB of XML peaked 100 MB above the input; it now peaks under 64 MB. Results, sheet order and shared-formula resolution are unchanged.
+
 - **Legacy `.xls`: opening a large sheet no longer holds its cells twice.** A sheet's cells were gathered into a list (32 bytes each) and the grid was built while the whole list was still alive, so the open peaked at the list, the grid and the Workbook stream together. The grid now takes the cells off the list as it fills and the list shrinks as it empties. The heap peak of opening falls from 144 to 115 MiB, 90 to 73 MiB and 117 to 82 MiB on three 13-28 MB workbooks, with output unchanged on 1,180 corpus files. A cell written by two records still holds the later one.
 
 ## [0.1.16] - 2026-10-30
