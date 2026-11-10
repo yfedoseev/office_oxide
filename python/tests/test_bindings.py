@@ -264,3 +264,68 @@ def test_options_report_their_limits_and_the_bounds_derived_from_them():
     derived = opts.derived()
     assert derived["write_bytes"] == 500 and derived["image_bytes"] == 500
     assert office_oxide.ParseOptions(strict=True).limits()["embedded_depth"] == 1
+
+
+def _astral_workbook(rows: int = 1) -> bytes:
+    w = XlsxWriter()
+    w.add_sheet("S")
+    for r in range(rows):
+        w.set_cell(0, r, 0, "omega \U0001d74e and \xe9 " + "x" * 200)
+    return w.to_bytes()
+
+
+@pytest.mark.parametrize(
+    "as_str, as_bytes",
+    [
+        ("plain_text", "plain_text_bytes"),
+        ("to_markdown", "to_markdown_bytes"),
+        ("to_markdown_with_images", "to_markdown_with_images_bytes"),
+        ("to_html", "to_html_bytes"),
+        ("to_ir_json", "to_ir_json_bytes"),
+    ],
+)
+def test_bytes_forms_equal_the_string_forms_encoded(as_str, as_bytes):
+    doc = Document.from_bytes(_astral_workbook(), "xlsx")
+    text = getattr(doc, as_str)()
+    assert "\U0001d74e" in text
+    data = getattr(doc, as_bytes)()
+    assert isinstance(data, bytes)
+    assert data == text.encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "write, as_str",
+    [
+        ("write_text", "plain_text"),
+        ("write_markdown", "to_markdown"),
+        ("write_html", "to_html"),
+        ("write_ir_json", "to_ir_json"),
+    ],
+)
+def test_writing_to_a_path_or_a_file_gives_the_string_form_encoded(tmp_path, write, as_str):
+    import io
+
+    # Over a megabyte of output, so a file object receives several chunks
+    # (and under the 10,000 rows a worksheet's IR holds).
+    doc = Document.from_bytes(_astral_workbook(rows=8_000), "xlsx")
+    expected = getattr(doc, as_str)().encode("utf-8")
+    assert len(expected) > 1 << 20
+    path = tmp_path / "out"
+    getattr(doc, write)(path)
+    assert path.read_bytes() == expected
+    getattr(doc, write)(str(path))
+    assert path.read_bytes() == expected
+    buf = io.BytesIO()
+    getattr(doc, write)(buf)
+    assert buf.getvalue() == expected
+
+
+def test_markdown_with_images_can_be_written_and_bad_targets_are_refused(tmp_path):
+    doc = Document.from_bytes(_astral_workbook(), "xlsx")
+    path = tmp_path / "md"
+    doc.write_markdown(path, images=True)
+    assert path.read_bytes() == doc.to_markdown_with_images().encode("utf-8")
+    with pytest.raises(TypeError):
+        doc.write_text(42)
+    with pytest.raises(OSError):
+        doc.write_text(tmp_path / "missing-dir" / "out")

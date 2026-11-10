@@ -172,6 +172,10 @@ lists every option. Call `close()` on options and documents when done.
 
 Options bind to the document opened with them: every conversion of that document runs under them, on any thread. Opening without options reads the process-wide defaults, and so does anything the library does outside a document opened with options. Creating options copies the process-wide values in force at that moment. `opts.limits()` shows the eight limits and the bounds derived from them (picture, padding and write budgets). There is no time limit: read untrusted input under a timeout or in a subprocess.
 
+## Large output
+
+A JS string takes two bytes per character once any character is outside Latin-1. For large documents use `doc.toBuffer(kind)` (UTF-8 bytes) or `doc.writeTo(path, kind)` (streamed to a file), with `kind` one of `'text'`, `'markdown'`, `'markdown_images'`, `'html'`, `'ir_json'`.
+
 ## License
 
 MIT OR Apache-2.0

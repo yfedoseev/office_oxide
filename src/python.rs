@@ -238,6 +238,94 @@ impl PyDocument {
             .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Document is closed"))
     }
+
+    /// The document rendered as `kind` in UTF-8 bytes, built without the GIL.
+    fn render_bytes<'py>(
+        &self,
+        py: Python<'py>,
+        kind: &str,
+    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        let doc = self.get()?;
+        let mut out = Vec::new();
+        py.detach(|| doc.write_output(kind, &mut out))
+            .unwrap_or_else(|| Err(std::io::Error::other("unknown output kind")))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(pyo3::types::PyBytes::new(py, &out))
+    }
+
+    /// Write the document as `kind` to a path (streamed to the file without
+    /// the GIL) or to an object with a binary `write` method (in chunks, each
+    /// handed over with the GIL).
+    fn write_to(&self, py: Python<'_>, kind: &str, target: &Bound<'_, PyAny>) -> PyResult<()> {
+        let doc = self.get()?;
+        let result = if let Ok(path) = target.extract::<PathBuf>() {
+            py.detach(|| {
+                let file = std::fs::File::create(&path)?;
+                let mut out = std::io::BufWriter::with_capacity(1 << 16, file);
+                doc.write_output(kind, &mut out)
+                    .unwrap_or_else(|| Err(std::io::Error::other("unknown output kind")))?;
+                std::io::Write::flush(&mut out)
+            })
+        } else if target.hasattr("write")? {
+            let mut out = PyFileWriter {
+                file: target.clone().unbind(),
+                buf: Vec::with_capacity(PyFileWriter::CHUNK),
+            };
+            py.detach(|| {
+                doc.write_output(kind, &mut out)
+                    .unwrap_or_else(|| Err(std::io::Error::other("unknown output kind")))?;
+                std::io::Write::flush(&mut out)
+            })
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "target must be a path or a binary file object with a write method",
+            ));
+        };
+        result.map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+}
+
+/// A `std::io::Write` over a Python binary file object, for writing without
+/// the GIL: the bytes are gathered in chunks, and each chunk is handed to the
+/// object's `write` with the GIL taken for that call only.
+struct PyFileWriter {
+    file: Py<PyAny>,
+    buf: Vec<u8>,
+}
+
+impl PyFileWriter {
+    const CHUNK: usize = 1 << 20;
+
+    fn hand_over(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let chunk = std::mem::take(&mut self.buf);
+        Python::attach(|py| {
+            let bytes = pyo3::types::PyBytes::new(py, &chunk);
+            self.file
+                .call_method1(py, "write", (bytes,))
+                .map(|_| ())
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        })?;
+        self.buf = chunk;
+        self.buf.clear();
+        Ok(())
+    }
+}
+
+impl std::io::Write for PyFileWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= Self::CHUNK {
+            self.hand_over()?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.hand_over()
+    }
 }
 
 #[pymethods]
@@ -382,6 +470,82 @@ impl PyDocument {
         let doc = self.get()?;
         py.detach(|| doc.to_ir().to_json_string())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Plain text as UTF-8 `bytes`. A Python `str` stores every character at
+    /// the width of its widest one (four bytes each once the text holds one
+    /// character outside the Basic Multilingual Plane), so for a large
+    /// document the bytes are up to four times smaller.
+    fn plain_text_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        self.render_bytes(py, "text")
+    }
+
+    /// Markdown as UTF-8 `bytes` (see `plain_text_bytes`).
+    fn to_markdown_bytes<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        self.render_bytes(py, "markdown")
+    }
+
+    /// Markdown with images inline as UTF-8 `bytes` (see `plain_text_bytes`).
+    fn to_markdown_with_images_bytes<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        self.render_bytes(py, "markdown_images")
+    }
+
+    /// HTML as UTF-8 `bytes` (see `plain_text_bytes`).
+    fn to_html_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        self.render_bytes(py, "html")
+    }
+
+    /// The IR as JSON in UTF-8 `bytes` (see `plain_text_bytes`); for a
+    /// picture-heavy document this is the form to use, or `write_ir_json`.
+    fn to_ir_json_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        self.render_bytes(py, "ir_json")
+    }
+
+    /// Write plain text to `target`, a path or a binary file object, as UTF-8,
+    /// without building it as one string.
+    #[pyo3(signature = (target, /))]
+    fn write_text(&self, py: Python<'_>, target: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.write_to(py, "text", target)
+    }
+
+    /// Write Markdown (with images inline when `images=True`) to `target`, a
+    /// path or a binary file object, as UTF-8, without building it as one
+    /// string.
+    #[pyo3(signature = (target, /, *, images=false))]
+    fn write_markdown(
+        &self,
+        py: Python<'_>,
+        target: &Bound<'_, PyAny>,
+        images: bool,
+    ) -> PyResult<()> {
+        self.write_to(
+            py,
+            if images {
+                "markdown_images"
+            } else {
+                "markdown"
+            },
+            target,
+        )
+    }
+
+    /// Write HTML to `target`, a path or a binary file object, as UTF-8.
+    #[pyo3(signature = (target, /))]
+    fn write_html(&self, py: Python<'_>, target: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.write_to(py, "html", target)
+    }
+
+    /// Write the IR as JSON to `target`, a path or a binary file object, as
+    /// UTF-8, streaming: a picture-heavy document's JSON is never held whole.
+    #[pyo3(signature = (target, /))]
+    fn write_ir_json(&self, py: Python<'_>, target: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.write_to(py, "ir_json", target)
     }
 
     /// Save/convert the document to a file. Legacy formats are converted to OOXML.

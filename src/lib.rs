@@ -784,6 +784,43 @@ impl Document {
         }
     }
 
+    /// The output kinds [`Self::write_output`] takes.
+    pub(crate) const OUTPUT_KINDS: [&'static str; 5] =
+        ["text", "markdown", "markdown_images", "html", "ir_json"];
+
+    /// Write this document as `kind` to `out`: `text`, `markdown`,
+    /// `markdown_images` (images inline as base64), `html` or `ir_json`;
+    /// `None` for any other kind. Every kind streams through the writers, so
+    /// the output is never built whole as one string. For the C interface and
+    /// the language bindings, which take the kind by name.
+    pub(crate) fn write_output(
+        &self,
+        kind: &str,
+        out: &mut dyn std::io::Write,
+    ) -> Option<std::io::Result<()>> {
+        use ir_render::{ImageEmbed, MarkdownOptions};
+        Some(match kind {
+            "text" => self.write_plain_text(out),
+            "markdown" => self.write_markdown(out),
+            "markdown_images" => self.write_markdown_with(
+                MarkdownOptions {
+                    image_embed: ImageEmbed::Base64,
+                },
+                out,
+            ),
+            "html" => self.write_html(out),
+            "ir_json" => {
+                // Flushed here, not on drop, so a failed write is an error.
+                let mut buffered = std::io::BufWriter::with_capacity(1 << 16, out);
+                self.to_ir()
+                    .write_json(&mut buffered)
+                    .map_err(std::io::Error::other)
+                    .and_then(|()| std::io::Write::flush(&mut buffered))
+            },
+            _ => return None,
+        })
+    }
+
     /// Extract plain text using the format-specific implementation.
     pub fn plain_text(&self) -> String {
         let _scale = self.call_scope();

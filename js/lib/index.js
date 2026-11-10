@@ -201,6 +201,30 @@ class Document {
   toHtml() { return this._call(n.documentToHtml, 'toHtml'); }
   toIr() { return JSON.parse(this._call(n.documentToIrJson, 'toIr')); }
 
+  /**
+   * The document as UTF-8 bytes in a Buffer: `kind` is 'text', 'markdown',
+   * 'markdown_images', 'html' or 'ir_json'. A JS string holds two bytes per
+   * character once any character is outside Latin-1, so for a large document
+   * the Buffer is up to half the size of the string form.
+   */
+  toBuffer(kind) {
+    this._ensure();
+    const outLen = [0];
+    const e = [0];
+    const ptr = n.documentRenderBytes(this._h, kind, outLen, e);
+    if (!ptr) throw new OfficeOxideError(e[0], `toBuffer(${kind})`);
+    if (outLen[0] === 0) return Buffer.alloc(0);
+    return takeBytes(ptr, outLen[0]);
+  }
+
+  /** Write the document as `kind` (see `toBuffer`) to the file at `path`, streaming. */
+  writeTo(path, kind) {
+    this._ensure();
+    const e = [0];
+    const rc = n.documentWriteToPath(this._h, kind, path, e);
+    if (rc !== 0) throw new OfficeOxideError(rc, `writeTo(${kind})`);
+  }
+
   saveAs(p) {
     this._ensure();
     const e = [0];

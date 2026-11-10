@@ -101,6 +101,12 @@ internal static partial class NativeMethods
     [LibraryImport(Lib, EntryPoint = "office_document_to_ir_json")]
     internal static partial IntPtr OfficeDocumentToIrJson(IntPtr handle, out int errorCode);
 
+    [LibraryImport(Lib, EntryPoint = "office_document_render_bytes", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial IntPtr OfficeDocumentRenderBytes(IntPtr handle, string kind, out nuint outLen, out int errorCode);
+
+    [LibraryImport(Lib, EntryPoint = "office_document_write_to_path", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial int OfficeDocumentWriteToPath(IntPtr handle, string kind, string path, out int errorCode);
+
     [LibraryImport(Lib, EntryPoint = "office_document_save_as", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial int OfficeDocumentSaveAs(IntPtr handle, string path, out int errorCode);
 

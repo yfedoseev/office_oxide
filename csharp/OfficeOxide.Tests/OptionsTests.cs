@@ -62,4 +62,42 @@ public class OptionsTests
         Assert.Equal(500UL, derived["write_bytes"]);
         Assert.Equal(8, limits.Count);
     }
+
+    [Fact]
+    public void OutputsAsUtf8BytesStreamsAndFilesEqualTheStrings()
+    {
+        using var w = new XlsxWriter();
+        var s = w.AddSheet("S");
+        w.SetCell(s, 0, 0, "omega \U0001D74E and \u00e9");
+        using var doc = Document.FromBytes(w.ToBytes(), "xlsx");
+        var forms = new Dictionary<string, string>
+        {
+            ["text"] = doc.PlainText(),
+            ["markdown"] = doc.ToMarkdown(),
+            ["markdown_images"] = doc.ToMarkdownWithImages(),
+            ["html"] = doc.ToHtml(),
+            ["ir_json"] = doc.ToIrJson(),
+        };
+        var dir = Directory.CreateTempSubdirectory("oo-out-");
+        try
+        {
+            foreach (var (kind, text) in forms)
+            {
+                Assert.Contains("\U0001D74E", text);
+                var expected = System.Text.Encoding.UTF8.GetBytes(text);
+                Assert.Equal(expected, doc.ToUtf8Bytes(kind));
+                using var stream = new MemoryStream();
+                doc.WriteTo(stream, kind);
+                Assert.Equal(expected, stream.ToArray());
+                var path = Path.Combine(dir.FullName, kind);
+                doc.WriteTo(path, kind);
+                Assert.Equal(expected, File.ReadAllBytes(path));
+            }
+            Assert.Throws<OfficeOxideException>(() => doc.ToUtf8Bytes("pdf"));
+        }
+        finally
+        {
+            dir.Delete(recursive: true);
+        }
+    }
 }

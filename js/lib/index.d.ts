@@ -25,6 +25,9 @@ export class OfficeOxideError extends Error {
   readonly operation: string;
 }
 
+/** An output form for `Document.toBuffer` / `Document.writeTo`. */
+export type OutputKind = 'text' | 'markdown' | 'markdown_images' | 'html' | 'ir_json';
+
 /** A value `ParseOptions.set` accepts: a count, a boolean, `Infinity`/`'max'` for no bound, or for `on_incomplete` `'report'`/`'error'`. */
 export type OptionValue = number | bigint | boolean | 'max' | 'report' | 'error';
 
@@ -61,6 +64,10 @@ export class Document implements Disposable {
   toMarkdown(): string;
   /** Markdown with each image embedded inline as `[image-base64:…]`. */
   toMarkdownWithImages(): string;
+  /** The document as UTF-8 bytes; prefer it to the string forms for large documents. */
+  toBuffer(kind: OutputKind): Buffer;
+  /** Write the document as `kind` to the file at `path`, streaming. */
+  writeTo(path: string, kind: OutputKind): void;
   toHtml(): string;
   toIr(): unknown;
   saveAs(path: string): void;

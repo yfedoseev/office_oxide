@@ -435,6 +435,47 @@ func (d *Document) ToIRJSON() (string, error) {
 	return cStrOrErr(C.office_document_to_ir_json(d.handle, &errCode), errCode, "ToIRJSON")
 }
 
+// Bytes renders the document as kind ("text", "markdown", "markdown_images",
+// "html" or "ir_json") in UTF-8 bytes. It is the same content as the string
+// methods, in a form the caller can hand on without another copy.
+func (d *Document) Bytes(kind string) ([]byte, error) {
+	if d.handle == nil {
+		return nil, ErrClosed
+	}
+	ckind := C.CString(kind)
+	defer C.free(unsafe.Pointer(ckind))
+	var outLen C.size_t
+	var errCode C.int
+	ptr := C.office_document_render_bytes(d.handle, ckind, &outLen, &errCode)
+	runtime.KeepAlive(d)
+	if ptr == nil {
+		return nil, &Error{Code: int(errCode), Op: "Bytes(" + kind + ")"}
+	}
+	defer C.office_oxide_free_bytes(ptr, outLen)
+	out := make([]byte, int(outLen))
+	copy(out, unsafe.Slice((*byte)(unsafe.Pointer(ptr)), int(outLen)))
+	return out, nil
+}
+
+// WriteFile writes the document as kind (see Bytes) to the file at path,
+// streaming: the output is never held whole in memory.
+func (d *Document) WriteFile(path, kind string) error {
+	if d.handle == nil {
+		return ErrClosed
+	}
+	ckind := C.CString(kind)
+	defer C.free(unsafe.Pointer(ckind))
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+	var errCode C.int
+	rc := C.office_document_write_to_path(d.handle, ckind, cpath, &errCode)
+	runtime.KeepAlive(d)
+	if rc != 0 {
+		return &Error{Code: int(rc), Op: "WriteFile(" + kind + ")"}
+	}
+	return nil
+}
+
 // SaveAs writes the document to `path`. Target format is inferred from the
 // extension. Legacy formats (.doc/.xls/.ppt) are converted to OOXML.
 func (d *Document) SaveAs(path string) error {

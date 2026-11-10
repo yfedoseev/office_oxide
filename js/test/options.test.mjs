@@ -85,3 +85,37 @@ test('the options report their limits and the bounds derived from them', () => {
     big.close();
   }
 });
+
+test('a document as a Buffer or a file is its string form in UTF-8', async () => {
+  const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const w = new XlsxWriter();
+  w.addSheet('S');
+  w.setCell(0, 0, 0, 'omega \u{1D74E} and é');
+  const bytes = w.toBytes();
+  w.close();
+  const doc = Document.fromBytes(bytes, 'xlsx');
+  const dir = mkdtempSync(join(tmpdir(), 'oo-out-'));
+  try {
+    const forms = {
+      text: doc.plainText(),
+      markdown: doc.toMarkdown(),
+      markdown_images: doc.toMarkdownWithImages(),
+      html: doc.toHtml(),
+    };
+    for (const [kind, str] of Object.entries(forms)) {
+      assert.ok(str.includes('\u{1D74E}'), kind);
+      assert.deepEqual(doc.toBuffer(kind), Buffer.from(str, 'utf8'), kind);
+      const p = join(dir, kind);
+      doc.writeTo(p, kind);
+      assert.deepEqual(readFileSync(p), Buffer.from(str, 'utf8'), kind);
+    }
+    assert.deepEqual(JSON.parse(doc.toBuffer('ir_json').toString('utf8')), doc.toIr());
+    assert.throws(() => doc.toBuffer('pdf'), OfficeOxideError);
+    assert.throws(() => doc.writeTo(join(dir, 'no', 'such', 'dir'), 'text'), OfficeOxideError);
+  } finally {
+    doc.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

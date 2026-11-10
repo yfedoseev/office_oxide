@@ -153,6 +153,10 @@ lists every option (limits such as `text_chars`, `part_bytes`, `embedded_depth`;
 
 Options bind to the document opened with them: every conversion of that document runs under them, on any thread. Opening without options reads the process-wide defaults, and so does anything the library does outside a document opened with options. Creating options copies the process-wide values in force at that moment. `opts.limits()` / `opts.derived()` shows the eight limits and the bounds derived from them (picture, padding and write budgets). There is no time limit: read untrusted input under a timeout or in a subprocess.
 
+## Large output
+
+A Python `str` stores every character at the width of its widest one, so the IR JSON of a picture-heavy document is four times its UTF-8 size once it holds one character outside the Basic Multilingual Plane. For large documents use the `bytes` forms (`to_ir_json_bytes()`, `to_markdown_with_images_bytes()`, `plain_text_bytes()`, `to_markdown_bytes()`, `to_html_bytes()`) or write straight to a path or binary file: `write_ir_json(path)`, `write_markdown(path, images=True)`, `write_html(path)`, `write_text(path)`. On a 22 MB `.docx` with 450 MB of IR JSON, `to_ir_json()` peaks at 2.8 GiB, `to_ir_json_bytes()` at 1.5 GiB and `write_ir_json(path)` at 0.7 GiB.
+
 ## License
 
 Dual-licensed under [MIT](../LICENSE-MIT) or [Apache-2.0](../LICENSE-APACHE) at your option.

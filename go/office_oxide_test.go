@@ -394,3 +394,52 @@ func TestParseOptionsReportTheirLimitsAndTheBoundsDerivedFromThem(t *testing.T) 
 		t.Fatalf("expected the eight limits, got %v", limits)
 	}
 }
+
+func TestDocumentBytesAndFilesEqualTheStringForms(t *testing.T) {
+	w := NewXlsxWriter()
+	defer w.Close()
+	s := w.AddSheet("S")
+	if err := w.SetCell(s, 0, 0, "omega \U0001D74E and é"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := w.ToBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := OpenFromBytes(data, "xlsx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doc.Close()
+	dir := t.TempDir()
+	forms := map[string]func() (string, error){
+		"text":            doc.PlainText,
+		"markdown":        doc.ToMarkdown,
+		"markdown_images": doc.ToMarkdownWithImages,
+		"html":            doc.ToHTML,
+		"ir_json":         doc.ToIRJSON,
+	}
+	for kind, render := range forms {
+		want, err := render()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(want, "\U0001D74E") {
+			t.Fatalf("%s lost the character: %q", kind, want)
+		}
+		got, err := doc.Bytes(kind)
+		if err != nil || string(got) != want {
+			t.Fatalf("%s as bytes: %v %q", kind, err, got)
+		}
+		path := dir + "/" + kind
+		if err := doc.WriteFile(path, kind); err != nil {
+			t.Fatal(err)
+		}
+		if file, _ := os.ReadFile(path); string(file) != want {
+			t.Fatalf("%s as a file differs", kind)
+		}
+	}
+	if _, err := doc.Bytes("pdf"); err == nil {
+		t.Fatal("an unknown kind was accepted")
+	}
+}
