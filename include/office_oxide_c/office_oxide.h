@@ -209,8 +209,9 @@ uint8_t* office_document_render_bytes(const OfficeDocumentHandle* handle, const 
                                       size_t* out_len, int* error_code);
 
 /**
- * Write the document as `kind` (as above) to the file at `path`, streaming:
- * the output is never held whole in memory. Returns OFFICE_OK,
+ * Write the document as `kind` (as above) to the file at `path`: an .xlsx and
+ * the IR JSON are written as they are produced and never held whole; other
+ * formats are built once in the library and written. Returns OFFICE_OK,
  * OFFICE_ERR_INVALID_ARG (bad handle, path or kind) or OFFICE_ERR_IO.
  */
 int32_t office_document_write_to_path(const OfficeDocumentHandle* handle, const char* kind,

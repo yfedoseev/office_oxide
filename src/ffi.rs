@@ -689,7 +689,9 @@ pub extern "C" fn office_document_render_bytes(
 }
 
 /// Write the document as `kind` (see `office_document_render_bytes`) to the
-/// file at `path`, streaming: the output is never held whole in memory.
+/// file at `path`, through the writers: an `.xlsx` and the IR JSON are written
+/// as they are produced and never held whole; other formats are built once in
+/// the library and written, with no copy for the caller.
 /// Returns OFFICE_OK, OFFICE_ERR_INVALID_ARG for a bad handle, path or kind,
 /// or OFFICE_ERR_IO when the file cannot be written.
 #[unsafe(no_mangle)]

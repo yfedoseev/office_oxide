@@ -219,7 +219,7 @@ class Document {
     return takeBytes(ptr, outLen[0]);
   }
 
-  /** Write the document as `kind` (see `toBuffer`) to the file at `path`, streaming. */
+  /** Write the document as `kind` (see `toBuffer`) to the file at `path`, never as a JS string (an `.xlsx` and the IR JSON are also never held whole). */
   writeTo(path, kind) {
     this._ensure();
     const e = [0];

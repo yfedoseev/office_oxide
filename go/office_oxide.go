@@ -458,7 +458,9 @@ func (d *Document) Bytes(kind string) ([]byte, error) {
 }
 
 // WriteFile writes the document as kind (see Bytes) to the file at path,
-// streaming: the output is never held whole in memory.
+// through the library's writers: an .xlsx and the IR JSON are written as they
+// are produced and never held whole; other formats are built once in the
+// library and written, never as a Go string.
 func (d *Document) WriteFile(path, kind string) error {
 	if d.handle == nil {
 		return ErrClosed

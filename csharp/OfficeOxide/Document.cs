@@ -159,7 +159,7 @@ public sealed class Document : IDisposable
         }
     }
 
-    /// <summary>Write the document as <paramref name="kind"/> (see <see cref="ToUtf8Bytes"/>) to the file at <paramref name="path"/>, streaming.</summary>
+    /// <summary>Write the document as <paramref name="kind"/> (see <see cref="ToUtf8Bytes"/>) to the file at <paramref name="path"/>, never as a .NET string (an .xlsx and the IR JSON are also never held whole).</summary>
     public void WriteTo(string path, string kind)
     {
         EnsureOpen();

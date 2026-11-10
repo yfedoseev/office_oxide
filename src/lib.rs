@@ -794,9 +794,10 @@ impl Document {
 
     /// Write this document as `kind` to `out`: `text`, `markdown`,
     /// `markdown_images` (images inline as base64), `html` or `ir_json`;
-    /// `None` for any other kind. Every kind streams through the writers, so
-    /// the output is never built whole as one string. For the C interface and
-    /// the language bindings, which take the kind by name.
+    /// `None` for any other kind. Through the writers: an `.xlsx` (a sheet at
+    /// a time) and the IR JSON are written as they are produced and never
+    /// held whole; the other formats are built once and then written. For the
+    /// C interface and the language bindings, which take the kind by name.
     #[cfg(any(not(target_family = "wasm"), feature = "wasm"))]
     pub(crate) fn write_output(
         &self,

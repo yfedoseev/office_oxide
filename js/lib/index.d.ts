@@ -66,7 +66,7 @@ export class Document implements Disposable {
   toMarkdownWithImages(): string;
   /** The document as UTF-8 bytes; prefer it to the string forms for large documents. */
   toBuffer(kind: OutputKind): Buffer;
-  /** Write the document as `kind` to the file at `path`, streaming. */
+  /** Write the document as `kind` to the file at `path`, never as a JS string (an `.xlsx` and the IR JSON are also never held whole). */
   writeTo(path: string, kind: OutputKind): void;
   toHtml(): string;
   toIr(): unknown;
