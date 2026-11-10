@@ -423,6 +423,11 @@ impl XlsxDocument {
             streamed: Option<(Worksheet, shared_formula::SharedFormulas)>,
         }
         let mut bundles = Vec::with_capacity(workbook.sheets.len());
+        // Sheets bundled so far, and how many of them are worksheets, for the
+        // conventional part names guessed below: `bundles` is emptied each
+        // time a batch is parsed, so it cannot count them.
+        let mut bundled = 0usize;
+        let mut worksheets_bundled = 0usize;
         // Pivot cache records materialised for sources outside the
         // workbook share one text budget, like every other cell text.
         let mut pivot_budget = crate::limits::TextBudget::new();
@@ -545,7 +550,7 @@ impl XlsxDocument {
                 resolve_relative_zip_path("xl/workbook.xml", &rel.target)
             } else {
                 // Fallback: guess by index
-                let idx = bundles.len() + 1;
+                let idx = bundled + 1;
                 format!("xl/worksheets/sheet{}.xml", idx)
             };
 
@@ -569,6 +574,7 @@ impl XlsxDocument {
                 } else {
                     Vec::new()
                 };
+                bundled += 1;
                 bundles.push(SheetBundle {
                     name: sheet.name.clone(),
                     state: sheet.state,
@@ -630,11 +636,7 @@ impl XlsxDocument {
                     Err(crate::core::Error::MissingPart(_))
                         if kind == crate::ir::SheetKind::Worksheet =>
                     {
-                        let idx = bundles
-                            .iter()
-                            .filter(|b| b.kind == crate::ir::SheetKind::Worksheet)
-                            .count()
-                            + 1;
+                        let idx = worksheets_bundled + 1;
                         let alt = format!("xl/worksheets/sheet{}.xml", idx);
                         // The fallback part is a sheet's content like any other.
                         sheet_parts
@@ -707,6 +709,10 @@ impl XlsxDocument {
                 &mut pivot_budget,
             );
 
+            bundled += 1;
+            if kind == crate::ir::SheetKind::Worksheet {
+                worksheets_bundled += 1;
+            }
             bundles.push(SheetBundle {
                 name: sheet.name.clone(),
                 state: sheet.state,

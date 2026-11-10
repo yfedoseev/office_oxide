@@ -865,3 +865,49 @@ fn test_an_explicit_num_fmt_overrides_the_builtin_meaning_of_its_id() {
     );
     assert!(text.contains('2'), "the number itself must survive: {text}");
 }
+
+/// A sheet whose relationship names a missing part is read from the
+/// conventional part for its place among the worksheets, wherever that
+/// place falls among the batches the sheets are read in: after a large first
+/// sheet the guess counted only the current batch and named the first
+/// sheet's part, so the sheet was reported unreadable (or, had that part been
+/// free, given another sheet's cells).
+#[test]
+fn test_a_sheet_with_a_dangling_relationship_is_read_from_its_conventional_part_after_a_large_sheet()
+ {
+    use std::io::Write;
+    const SML: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    let pad = "A".repeat(33 << 20);
+    let sheet1 = format!(
+        r#"<worksheet xmlns="{SML}"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>first sheet</t></is></c></row></sheetData><extLst><ext uri="{{00000000-0000-0000-0000-000000000000}}">{pad}</ext></extLst></worksheet>"#
+    );
+    let sheet2 = format!(
+        r#"<worksheet xmlns="{SML}"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>second sheet</t></is></c></row></sheetData></worksheet>"#
+    );
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let parts: [(&str, String); 6] = [
+        ("[Content_Types].xml", r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#.to_string()),
+        ("_rels/.rels", format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{R}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#)),
+        ("xl/workbook.xml", format!(r#"<workbook xmlns="{SML}" xmlns:r="{R}"><sheets><sheet name="One" sheetId="1" r:id="rId1"/><sheet name="Two" sheetId="2" r:id="rId2"/></sheets></workbook>"#)),
+        ("xl/_rels/workbook.xml.rels", format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{R}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{R}/worksheet" Target="worksheets/missing.xml"/></Relationships>"#)),
+        ("xl/worksheets/sheet1.xml", sheet1),
+        ("xl/worksheets/sheet2.xml", sheet2),
+    ];
+    for (name, data) in &parts {
+        zip.start_file(*name, stored).unwrap();
+        zip.write_all(data.as_bytes()).unwrap();
+    }
+    let bytes = zip.finish().unwrap().into_inner();
+    let doc = office_oxide::Document::from_reader(
+        std::io::Cursor::new(bytes),
+        office_oxide::DocumentFormat::Xlsx,
+    )
+    .unwrap();
+    let text = doc.plain_text();
+    assert!(text.contains("first sheet"), "{text}");
+    assert!(text.contains("second sheet"), "{text}: {:?}", doc.damage());
+    assert!(doc.damage().is_empty(), "{:?}", doc.damage());
+}
