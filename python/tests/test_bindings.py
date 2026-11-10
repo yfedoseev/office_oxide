@@ -274,7 +274,8 @@ def test_a_logging_handler_that_needs_the_gil_does_not_hang_a_parse():
 def test_options_report_their_limits_and_the_bounds_derived_from_them():
     opts = office_oxide.ParseOptions(memory_bytes=1000, part_bytes=2**64 - 1)
     limits = opts.limits()
-    assert set(limits) == set(n for n in office_oxide.ParseOptions.names() if n in limits)
+    settings = {"include_hidden_text", "include_deleted_text", "on_incomplete", "lazy_pictures"}
+    assert set(limits) == set(office_oxide.ParseOptions.names()) - settings
     assert limits["memory_bytes"] == 1000
     assert limits["part_bytes"] is None
     derived = opts.derived()
@@ -365,3 +366,78 @@ def test_lazy_pictures_change_no_output():
     assert lazy.to_markdown_with_images() == eager.to_markdown_with_images()
     assert lazy.to_ir_json() == eager.to_ir_json()
     assert lazy.plain_text() == eager.plain_text()
+
+
+def test_closing_a_document_while_another_thread_reads_it_waits_for_nothing_and_raises_nothing():
+    """With the GIL released during a call, closing the document from
+    another thread raised "Already borrowed"; the call now finishes on its
+    own reference and later calls see the document closed."""
+    import threading
+
+    doc = Document.from_bytes(_big_workbook(), "xlsx")
+    started = threading.Event()
+    result = {}
+
+    def read():
+        started.set()
+        try:
+            result["text"] = doc.plain_text()
+        except Exception as e:  # noqa: BLE001 - the test reports any
+            result["error"] = e
+
+    t = threading.Thread(target=read)
+    t.start()
+    started.wait()
+    doc.close()
+    t.join(timeout=120)
+    if "error" in result:
+        assert "closed" in str(result["error"]), result["error"]
+    else:
+        assert "cell 0 0" in result["text"]
+    with pytest.raises(RuntimeError, match="closed"):
+        doc.plain_text()
+
+
+def test_an_editable_document_and_a_writer_take_calls_from_many_threads():
+    """Edits and writer calls from several threads wait for each other, as
+    the GIL made them, instead of raising "Already borrowed"."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    w = XlsxWriter()
+    w.add_sheet("S")
+    for r in range(2000):
+        w.set_cell(0, r, 0, f"word{r % 7}")
+    data = w.to_bytes()
+    ed = EditableDocument.from_bytes(data, "xlsx")
+    with ThreadPoolExecutor(8) as pool:
+        saved = list(pool.map(lambda _: len(ed.to_bytes()), range(16)))
+        written = list(pool.map(lambda i: w.set_cell(0, 3000 + i, 1, "x") or len(w.to_bytes()), range(16)))
+    assert all(n > 0 for n in saved) and all(n > 0 for n in written)
+
+
+def test_a_file_object_that_raises_raises_its_own_exception():
+    class Refused(Exception):
+        pass
+
+    class Sink:
+        def write(self, b):
+            raise Refused("full")
+
+    doc = Document.from_bytes(_big_workbook(), "xlsx")
+    with pytest.raises(Refused, match="full"):
+        doc.write_text(Sink())
+
+
+def test_a_file_object_that_takes_part_of_each_write_gets_all_of_it():
+    class Trickle:
+        def __init__(self):
+            self.parts = []
+
+        def write(self, b):
+            self.parts.append(bytes(b[:777]))
+            return min(len(b), 777)
+
+    doc = Document.from_bytes(_big_workbook(), "xlsx")
+    sink = Trickle()
+    doc.write_text(sink)
+    assert b"".join(sink.parts) == doc.plain_text().encode("utf-8")
