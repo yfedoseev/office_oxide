@@ -3,7 +3,7 @@ surface's stdout (gzipped) and one JSON line per (file, surface).
 
   python3 sweep_tree.py BIN CORPUS_ROOT OUTDIR [--jobs N] [--list FILE] [--surfaces text,markdown,html,ir]
 
-Record: {path, fmt, surface, status(ok|err|timeout|crash), code, bytes, sha, ms, err}
+Record: {path, fmt, surface, status(ok|err|timeout|crash), code, bytes, sha, ms, cpu_ms, rss_kb, err}
 Outputs land in OUTDIR/out/<relpath>.<surface>.gz so compare/diff scripts can
 read them without re-running either arm.
 """
@@ -43,7 +43,12 @@ def run_one(args):
                         if not chunk: break
                         h.update(chunk); f.write(chunk); n += len(chunk)
                     err = p.stderr.read()
-                    p.wait(timeout=max(1, TIMEOUT - (time.perf_counter() - t0)))
+                    # Reap the child ourselves to get its resource usage: peak
+                    # resident memory and CPU time are regression axes too.
+                    _, status, ru = os.wait4(p.pid, 0)
+                    p.returncode = os.waitstatus_to_exitcode(status)
+                    rec["rss_kb"] = ru.ru_maxrss
+                    rec["cpu_ms"] = round((ru.ru_utime + ru.ru_stime) * 1000, 1)
                 except subprocess.TimeoutExpired:
                     p.kill(); p.wait(); raise
             rec["ms"] = round((time.perf_counter() - t0) * 1000, 1)
