@@ -744,7 +744,9 @@ impl Drop for ImageBudgetScope {
 
 /// Start a conversion's image budget at the configured limit.
 pub(crate) fn begin_image_budget() -> ImageBudgetScope {
-    let previous = IMAGE_BUDGET.with(|b| b.replace(Some((max_image_bytes() as u64, false))));
+    // No bound is no bound on every target: `usize::MAX` widened as is is a
+    // finite 4 GiB on a 32-bit one, which `derived()` reports as none.
+    let previous = IMAGE_BUDGET.with(|b| b.replace(Some((wide_count(max_image_bytes()), false))));
     ImageBudgetScope { previous }
 }
 
@@ -808,7 +810,7 @@ pub(crate) fn copied_text_notice() -> Option<String> {
 pub(crate) fn charge_image_bytes(bytes: usize) -> bool {
     IMAGE_BUDGET.with(|b| {
         let Some((remaining, exhausted)) = b.get() else {
-            return bytes as u64 <= max_image_bytes() as u64;
+            return bytes as u64 <= wide_count(max_image_bytes());
         };
         if exhausted {
             return false;

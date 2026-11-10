@@ -91,6 +91,13 @@ test('the options report their limits and the bounds derived from them', () => {
   assert.equal(limits.memory_bytes, 1000);
   assert.equal(limits.part_bytes, Infinity);
   assert.equal(limits.package_bytes, 2n ** 60n);
+  // A number up to Number.MAX_SAFE_INTEGER, then a BigInt, as in Node.
+  const edge = new WasmParseOptions();
+  edge.set('memory_bytes', 2 ** 53 - 1);
+  assert.equal(edge.limits().limits.memory_bytes, 2 ** 53 - 1);
+  edge.set('memory_bytes', 2 ** 53);
+  assert.equal(edge.limits().limits.memory_bytes, 2n ** 53n);
+  edge.free();
   assert.equal(derived.write_bytes, 500);
   // A count with no bound reads as Infinity on wasm32, whose usize is 32 bits.
   options.set('text_chars', Infinity);

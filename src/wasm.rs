@@ -75,7 +75,8 @@ impl WasmParseOptions {
         }
         let bound = |v: &serde_json::Value| match v.as_u64() {
             Some(u64::MAX) => Bound::Number(f64::INFINITY),
-            Some(v) if v <= 1 << 53 => Bound::Number(v as f64),
+            // Number.MAX_SAFE_INTEGER, as the Node binding switches.
+            Some(v) if v < 1 << 53 => Bound::Number(v as f64),
             Some(v) => Bound::Exact(v),
             None => Bound::Number(f64::NAN),
         };
