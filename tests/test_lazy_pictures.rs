@@ -370,22 +370,31 @@ fn test_html_with_images_reads_a_picture_of_unknown_type_once() {
 }
 
 /// `slide_picture` answers the same whether pictures are read lazily or
-/// not, for any image relationship of the slide: eagerly it found only a
-/// picture shape's, so a picture only an OLE object previews was `None`.
+/// not: a picture shape's picture, and nothing for a relationship no picture
+/// shape draws (an OLE object's preview here). Lazily it answered for every
+/// image relationship, eagerly only for picture shapes'.
 #[test]
 fn test_slide_picture_answers_the_same_lazy_or_not() {
     let _serial = serial();
-    let bytes = pptx_with_ole_previews(1);
     let want = picture(0);
     for lazy in [false, true] {
-        let doc = open(&bytes, DocumentFormat::Pptx, lazy);
-        let deck = doc.as_pptx().unwrap();
+        let shapes = open(&pptx(1, 1), DocumentFormat::Pptx, lazy);
+        let deck = shapes.as_pptx().unwrap();
         let pic = deck
             .slide_picture(0, "rIdP0")
-            .expect("the preview's picture");
+            .expect("the picture shape's picture");
         assert_eq!(&pic.bytes().unwrap()[..], &want[..], "lazy {lazy}");
         assert!(deck.slide_picture(0, "rIdNone").is_none());
         assert!(deck.slide_picture(1, "rIdP0").is_none());
+        let previews = open(&pptx_with_ole_previews(1), DocumentFormat::Pptx, lazy);
+        assert!(
+            previews
+                .as_pptx()
+                .unwrap()
+                .slide_picture(0, "rIdP0")
+                .is_none(),
+            "lazy {lazy}: only a picture shape's relationship is answered"
+        );
     }
 }
 

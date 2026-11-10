@@ -72,8 +72,9 @@ pub struct PptxDocument {
     /// inputs get a text budget scaled to them (see [`crate::limits`]).
     pub(crate) input_bytes: u64,
     /// The pictures of each slide (in the order `slides` had when the deck
-    /// was read), by relationship id: every image relationship of the
-    /// slide, whether or not pictures are read lazily.
+    /// was read) that its picture shapes draw, by relationship id; filled
+    /// only when pictures are read lazily, when `PictureShape::data` is left
+    /// empty.
     pub(crate) slide_pictures:
         Vec<std::collections::HashMap<String, crate::core::picture::PictureBytes>>,
     /// Whether pictures were read lazily, leaving `PictureShape::data` empty
@@ -125,12 +126,27 @@ pub struct PptxDocument {
     pub masters: Vec<layout::SlideMaster>,
 }
 
+/// The relationship ids the picture shapes in `shapes` (and in its groups)
+/// draw.
+fn picture_rel_ids<'a>(shapes: &'a [Shape], out: &mut std::collections::HashSet<&'a str>) {
+    for shape in shapes {
+        match shape {
+            Shape::Picture(p) => {
+                if let Some(rid) = p.embed_rid.as_deref() {
+                    out.insert(rid);
+                }
+            },
+            Shape::Group(g) => picture_rel_ids(&g.children, out),
+            _ => {},
+        }
+    }
+}
+
 impl PptxDocument {
-    /// The picture the image relationship `rel_id` (a picture shape's
-    /// `embed_rid`, an OLE preview's or a fill's blip) names on slide `slide`
-    /// (its index in `slides` as the deck was read). The same answer whether
-    /// or not pictures are read lazily; when they are not, a picture shape's
-    /// is the picture its `PictureShape::data` holds.
+    /// The picture a picture shape whose `embed_rid` is `rel_id` draws on
+    /// slide `slide` (its index in `slides` as the deck was read). The same
+    /// answer whether or not pictures are read lazily; when they are not, it
+    /// is the picture `PictureShape::data` holds.
     pub fn slide_picture(
         &self,
         slide: usize,
@@ -597,15 +613,19 @@ impl PptxDocument {
         // kept here, slide by slide, for the converter and `slide_picture`.
         let slide_pictures: Vec<
             std::collections::HashMap<String, crate::core::picture::PictureBytes>,
-        > = bundles
-            .iter()
-            .map(|b| {
-                b.media
-                    .iter()
-                    .map(|(rid, m)| (rid.clone(), m.pic.clone()))
-                    .collect()
-            })
-            .collect();
+        > = if crate::read_options::lazy_pictures() {
+            bundles
+                .iter()
+                .map(|b| {
+                    b.media
+                        .iter()
+                        .map(|(rid, m)| (rid.clone(), m.pic.clone()))
+                        .collect()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let lazy_pictures = crate::read_options::lazy_pictures();
         // A comments part several slides name is parsed once.
         let mut parsed_comments: std::collections::HashMap<
@@ -776,6 +796,16 @@ impl PptxDocument {
         package_properties.crc_mismatched_parts = opc.crc_mismatched_parts();
         let (unreadable_parts, unreadable_parts_omitted, cosmetic_parts) =
             unreadable_parts.finish_with_cosmetic();
+        // Only the pictures a picture shape draws are kept: the ones it held
+        // eagerly, so `slide_picture` answers the same either way, and a
+        // background or an unused relationship is not held for the
+        // document's life.
+        let mut slide_pictures = slide_pictures;
+        for (pictures, slide) in slide_pictures.iter_mut().zip(&slides) {
+            let mut drawn = std::collections::HashSet::new();
+            picture_rel_ids(&slide.shapes, &mut drawn);
+            pictures.retain(|rid, _| drawn.contains(rid.as_str()));
+        }
         Ok(PptxDocument {
             slide_pictures,
             lazy_pictures,
