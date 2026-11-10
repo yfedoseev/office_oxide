@@ -911,3 +911,56 @@ fn test_a_sheet_with_a_dangling_relationship_is_read_from_its_conventional_part_
     assert!(text.contains("second sheet"), "{text}: {:?}", doc.damage());
     assert!(doc.damage().is_empty(), "{:?}", doc.damage());
 }
+
+/// A very large sheet's relationships are read before the sheet (it is
+/// parsed as it is inflated), but a failure among them is reported only for
+/// a sheet that could be read, as for any other sheet: an unreadable sheet
+/// is one report, not two.
+#[test]
+fn test_an_unreadable_large_sheet_does_not_also_report_its_relationships() {
+    use std::io::Write;
+    const SML: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    let pad = "A".repeat(65 << 20);
+    let sheet = format!(
+        r#"<worksheet xmlns="{SML}"><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><extLst><ext uri="{{00000000-0000-0000-0000-000000000000}}">{pad}</ext></extLst></worksheet>"#
+    );
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let deflated = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let small = format!(
+        r#"<worksheet xmlns="{SML}"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>small sheet</t></is></c></row></sheetData></worksheet>"#
+    );
+    let parts: [(&str, String); 7] = [
+        ("[Content_Types].xml", r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#.to_string()),
+        ("_rels/.rels", format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{R}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#)),
+        ("xl/workbook.xml", format!(r#"<workbook xmlns="{SML}" xmlns:r="{R}"><sheets><sheet name="Big" sheetId="1" r:id="rId1"/><sheet name="Small" sheetId="2" r:id="rId2"/></sheets></workbook>"#)),
+        ("xl/_rels/workbook.xml.rels", format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{R}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{R}/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#)),
+        ("xl/worksheets/sheet1.xml", sheet),
+        ("xl/worksheets/sheet2.xml", small),
+        ("xl/worksheets/_rels/sheet1.xml.rels", "<Relationships <broken".to_string()),
+    ];
+    for (name, data) in &parts {
+        zip.start_file(*name, deflated).unwrap();
+        zip.write_all(data.as_bytes()).unwrap();
+    }
+    let bytes = zip.finish().unwrap().into_inner();
+    let mut options = office_oxide::options::ParseOptions::default();
+    options.limits.part_bytes = 65 << 20;
+    options.limits.inflate_ratio = u64::MAX;
+    let doc = office_oxide::Document::from_reader_with(
+        std::io::Cursor::new(bytes),
+        office_oxide::DocumentFormat::Xlsx,
+        &options,
+    )
+    .unwrap();
+    assert!(doc.plain_text().contains("small sheet"));
+    let damage = doc.damage();
+    assert!(damage.iter().any(|d| d.part.as_deref() == Some("Big")), "{damage:?}");
+    assert!(
+        damage
+            .iter()
+            .all(|d| !d.part.as_deref().unwrap_or("").contains("rels")),
+        "{damage:?}"
+    );
+}

@@ -614,11 +614,14 @@ impl XlsxDocument {
                 && opc::entry_size(&mut archive, &entries, &sheet_path)
                     .is_some_and(|n| n >= worksheet::STREAMED_SHEET_BYTES)
             {
+                // Read before the sheet here, but reported only once the
+                // sheet proves readable, as when it is read after it.
+                let mut scratch = shared_parts::ReportList::default();
                 let rels = read_rels_reporting(
                     &mut archive,
                     &entries,
                     &sheet_rels_path(&sheet_path),
-                    &mut shared.unreadable,
+                    &mut scratch,
                 );
                 streamed = worksheet::parse_streamed(
                     &mut archive,
@@ -628,7 +631,7 @@ impl XlsxDocument {
                     &rels,
                     root,
                 );
-                early_rels = Some(rels);
+                early_rels = scratch.first().is_none().then_some(rels);
             }
             let read = if streamed.is_some() {
                 Ok(Vec::new())
