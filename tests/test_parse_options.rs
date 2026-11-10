@@ -372,3 +372,101 @@ fn test_a_legacy_damage_report_matches_its_ir() {
         );
     }
 }
+
+/// Enough sheets and slides that a `parallel` build parses them on worker
+/// threads, which carry none of the document's own settings: whatever the
+/// options decide must be decided before the parts are handed out, and hold
+/// for every part.
+const PARTS: usize = 16;
+
+/// Each slide's and each sheet's pictures follow the document's
+/// `lazy_pictures`, not the process-wide setting the workers would read, and
+/// that setting is left as it was.
+#[test]
+fn test_lazy_pictures_of_one_document_hold_for_every_slide_and_sheet() {
+    let _scope = LimitScope::new();
+    use common::ooxml::{pptx_with_slides, xlsx_with_picture_sheets};
+    for lazy in [true, false] {
+        let mut options = ParseOptions::default();
+        options.lazy_pictures = lazy;
+        let deck = Document::from_reader_with(
+            Cursor::new(pptx_with_slides(PARTS, 2)),
+            DocumentFormat::Pptx,
+            &options,
+        )
+        .unwrap();
+        let deck = deck.as_pptx().unwrap();
+        assert_eq!(deck.slides.len(), PARTS);
+        for (i, slide) in deck.slides.iter().enumerate() {
+            let pic = deck
+                .slide_picture(i, "rIdP")
+                .expect("each slide has its picture");
+            assert_eq!(pic.is_deflated(), lazy, "slide {i}");
+            // Reads the eager picture field kept for 0.1.x callers.
+            #[allow(deprecated)]
+            let eager = slide
+                .shapes
+                .iter()
+                .any(|s| matches!(s, office_oxide::pptx::Shape::Picture(p) if p.data.is_some()));
+            assert_eq!(eager, !lazy, "slide {i}");
+        }
+        let book = Document::from_reader_with(
+            Cursor::new(xlsx_with_picture_sheets(PARTS, 2)),
+            DocumentFormat::Xlsx,
+            &options,
+        )
+        .unwrap();
+        let book = book.as_xlsx().unwrap();
+        assert_eq!(book.worksheets.len(), PARTS);
+        for (i, ws) in book.worksheets.iter().enumerate() {
+            assert_eq!(ws.images.len(), 1, "sheet {i}");
+            assert_eq!(book.picture(&ws.images[0]).is_deflated(), lazy, "sheet {i}");
+            // Reads the eager picture field kept for 0.1.x callers.
+            #[allow(deprecated)]
+            let eager = !ws.images[0].data.is_empty();
+            assert_eq!(eager, !lazy, "sheet {i}");
+        }
+    }
+    assert!(!office_oxide::read_options::lazy_pictures());
+}
+
+/// A document's part and text limits apply to every sheet of a workbook
+/// parsed in parallel, and the process-wide limits are left as they were.
+#[test]
+fn test_the_limits_of_one_document_hold_for_every_sheet() {
+    let _scope = LimitScope::new();
+    // Sheet 9 is far larger than the others.
+    let sheets: Vec<String> = (1..=PARTS)
+        .map(|s| {
+            let text = if s == 9 {
+                "y".repeat(200_000)
+            } else {
+                format!("sheet {s}")
+            };
+            format!(r#"<row r="1"><c r="A1" t="inlineStr"><is><t>{text}</t></is></c></row>"#)
+        })
+        .collect();
+    let bytes = common::ooxml::xlsx_with_sheets(&sheets);
+    let mut options = ParseOptions::default();
+    options.limits.part_bytes = 100_000;
+    let doc = open_xlsx_with(&bytes, &options).unwrap();
+    let book = doc.as_xlsx().unwrap();
+    let read: Vec<&str> = book.worksheets.iter().map(|w| w.name.as_str()).collect();
+    assert_eq!(read.len(), PARTS - 1, "{read:?}");
+    assert!(!read.contains(&"S9"), "{read:?}");
+    // The unreadable sheet is the whole account of the loss: no second,
+    // generic "the text is incomplete" entry.
+    let damage = doc.damage();
+    assert_eq!(damage.len(), 1, "{damage:?}");
+    assert_eq!(damage[0].kind, DamageKind::UnreadablePart);
+    assert_eq!(damage[0].part.as_deref(), Some("S9"));
+    let mut options = ParseOptions::default();
+    options.limits.text_chars = 50_000;
+    let doc = open_xlsx_with(&bytes, &options).unwrap();
+    assert!(doc.plain_text().len() < 60_000);
+    assert!(doc.to_ir().metadata.text_truncated);
+    let plain = Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx).unwrap();
+    assert!(plain.plain_text().contains(&"y".repeat(200_000)));
+    assert_eq!(limits::max_part_bytes(), limits::DEFAULT_MAX_PART_BYTES);
+    assert_eq!(limits::max_text_chars(), limits::DEFAULT_MAX_TEXT_CHARS);
+}

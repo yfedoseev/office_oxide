@@ -81,6 +81,8 @@ pub mod options;
 /// Which text readers return: hidden text and tracked deletions.
 pub mod read_options;
 mod stream;
+#[cfg(test)]
+mod type_sizes;
 
 #[cfg(not(target_family = "wasm"))]
 pub mod ffi;
@@ -1224,8 +1226,8 @@ pub fn to_html(path: impl AsRef<Path>) -> Result<String> {
 
 /// The damage entries for a document's typed warnings (unreadable parts are
 /// listed by part elsewhere): every cut is a truncation, everything else a
-/// repair; a document whose text is incomplete with no cut that says why
-/// gets one generic truncation entry.
+/// repair; a document whose text is incomplete with no cut or unreadable
+/// part that says why gets one generic truncation entry.
 fn classify_notices(notices: &core::notice::Notices, truncated: bool) -> Vec<options::Damage> {
     use options::{Damage, DamageKind};
     let mut cut = Vec::new();
@@ -1243,7 +1245,10 @@ fn classify_notices(notices: &core::notice::Notices, truncated: bool) -> Vec<opt
             DamageKind::Recovered => repaired.push(entry(DamageKind::Recovered)),
         }
     }
-    if truncated && cut.is_empty() {
+    let unreadable = notices
+        .iter()
+        .any(|(kind, _)| kind == DamageKind::UnreadablePart);
+    if truncated && cut.is_empty() && !unreadable {
         cut.push(Damage {
             kind: DamageKind::Truncated,
             part: None,
@@ -1528,5 +1533,9 @@ mod tests {
         assert_eq!(found[0].detail, "the text is incomplete");
         assert_eq!(found[1].kind, DamageKind::Recovered);
         assert!(classify_notices(&core::notice::Notices::new(), false).is_empty());
+        // An unreadable part says why: no generic entry beside it.
+        let mut skipped = core::notice::Notices::new();
+        skipped.push(DamageKind::UnreadablePart, "skipped unreadable part a.xml: bad");
+        assert!(classify_notices(&skipped, true).is_empty());
     }
 }
