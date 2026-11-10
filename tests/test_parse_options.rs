@@ -356,46 +356,55 @@ fn test_a_cut_xls_names_its_cut_in_the_damage_report() {
 }
 
 /// What `damage()` reports for a `.xls` and a `.ppt`, read from the reader
-/// alone, is what their IR carries: the same warnings in the same order and
-/// the same verdict.
+/// alone, is what their IR carries: every IR warning is in the report, every
+/// entry of the report is an IR warning or a notice the text carries in band
+/// (a `.xls` reader's account of a cut) or the generic one, and the verdict
+/// is the same, for documents that lost text and for ones that did not.
 #[test]
 fn test_a_legacy_damage_report_matches_its_ir() {
     let _scope = LimitScope::new();
-    let mut options = ParseOptions::default();
-    options.limits.text_chars = 2_000;
-    let xls = Document::from_reader_with(
-        Cursor::new(common::xls_with_cells(200, 20, &["alpha", "beta"])),
-        DocumentFormat::Xls,
-        &options,
-    )
-    .unwrap();
-    let ppt = Document::from_reader_with(
-        Cursor::new(ppt_builder::build_ppt(&["one", "two"], &[])),
-        DocumentFormat::Ppt,
-        &options,
-    )
-    .unwrap();
-    for doc in [&xls, &ppt] {
+    let mut cut = ParseOptions::default();
+    cut.limits.text_chars = 2_000;
+    let open = |bytes: Vec<u8>, format, options: &ParseOptions| {
+        Document::from_reader_with(Cursor::new(bytes), format, options).unwrap()
+    };
+    let xls = common::xls_with_cells(200, 20, &["alpha", "beta"]);
+    let ppt = ppt_builder::build_ppt(&["one", "two"], &[]);
+    // A deck cut short: its stream is shorter than it says.
+    let mut short_ppt = ppt_builder::build_ppt(&["one", "two", "three", "four"], &[]);
+    short_ppt.truncate(short_ppt.len() - 600);
+    let docs = [
+        ("cut xls", open(xls.clone(), DocumentFormat::Xls, &cut), true),
+        ("whole xls", open(xls, DocumentFormat::Xls, &ParseOptions::default()), false),
+        ("whole ppt", open(ppt, DocumentFormat::Ppt, &cut), false),
+        (
+            "short ppt",
+            open(short_ppt, DocumentFormat::Ppt, &ParseOptions::default()),
+            true,
+        ),
+    ];
+    for (what, doc, lost) in &docs {
         let ir = doc.to_ir();
-        let reported: Vec<String> = doc
-            .damage()
-            .iter()
-            .filter(|d| d.kind == DamageKind::Recovered)
-            .map(|d| d.detail.clone())
-            .collect();
+        let damage = doc.damage();
         for w in &ir.metadata.warnings {
             assert!(
-                reported.contains(w) || doc.damage().iter().any(|d| &d.detail == w),
-                "IR warning {w:?} missing from {:?}",
-                doc.damage()
+                damage.iter().any(|d| &d.detail == w),
+                "{what}: IR warning {w:?} not in {damage:?}"
             );
         }
-        assert_eq!(
-            doc.damage().iter().any(|d| d.is_loss()),
-            ir.metadata.text_truncated,
-            "{:?}",
-            doc.damage()
-        );
+        let text = doc.plain_text();
+        for d in &damage {
+            assert!(
+                d.detail == "the text is incomplete"
+                    || ir.metadata.warnings.contains(&d.detail)
+                    || text.contains(&d.detail),
+                "{what}: {d:?} is not an IR warning of {:?}",
+                ir.metadata.warnings
+            );
+        }
+        let loss = damage.iter().any(|d| d.is_loss());
+        assert_eq!(loss, ir.metadata.text_truncated, "{what}: {damage:?}");
+        assert_eq!(loss, *lost, "{what}: {damage:?}");
     }
 }
 

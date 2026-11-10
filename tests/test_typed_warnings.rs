@@ -54,19 +54,80 @@ fn test_metadata_warnings_are_written_only_with_their_kind() {
                 bad.push(format!("{rel}: metadata.warnings assigned without notice::report"));
             }
         }
-        // Inside a `Metadata { .. }` literal of a converter.
-        if rel.starts_with("convert_") {
-            for line in text.lines() {
-                let t = line.trim_start();
-                if t.starts_with("warnings:")
-                    && !t.contains("notice::report(")
-                    && !t.contains("Notices")
-                    && t != "warnings: {"
-                {
-                    bad.push(format!("{rel}: `{t}`"));
-                }
+        // The `warnings` field of every `Metadata { .. }` literal, written out
+        // or in shorthand, whatever the layout: its value must be built by
+        // `notice::report`.
+        for value in metadata_warnings_fields(&compact) {
+            if !value.contains("notice::report(") {
+                bad.push(format!("{rel}: Metadata {{ warnings: {value} }}"));
             }
         }
     }
     assert!(bad.is_empty(), "warnings written without a kind:\n{}", bad.join("\n"));
+}
+
+/// The value of the `warnings` field in each `Metadata { .. }` struct literal
+/// of `code` (whitespace already collapsed): the expression after `warnings:`,
+/// or `warnings` itself for the shorthand. The struct's own definition is
+/// not a literal and is skipped.
+fn metadata_warnings_fields(code: &str) -> Vec<String> {
+    let bytes = code.as_bytes();
+    let mut out = Vec::new();
+    for (at, _) in code.match_indices("Metadata {") {
+        let before = &code[..at];
+        let whole_word = !before.ends_with(|c: char| c.is_alphanumeric() || c == '_');
+        if !whole_word || before.ends_with("struct ") || before.ends_with("for ") {
+            continue;
+        }
+        // The literal's body, to its matching brace.
+        let start = at + "Metadata {".len();
+        let (mut depth, mut end) = (1i32, start);
+        while end < bytes.len() && depth > 0 {
+            match bytes[end] {
+                b'{' | b'(' | b'[' => depth += 1,
+                b'}' | b')' | b']' => depth -= 1,
+                _ => {},
+            }
+            end += 1;
+        }
+        let body = &code[start..end.saturating_sub(1)];
+        // Its fields, split at the commas outside any bracket.
+        let (mut depth, mut from) = (0i32, 0);
+        let mut fields = Vec::new();
+        for (i, b) in body.bytes().enumerate() {
+            match b {
+                b'{' | b'(' | b'[' => depth += 1,
+                b'}' | b')' | b']' => depth -= 1,
+                b',' if depth == 0 => {
+                    fields.push(&body[from..i]);
+                    from = i + 1;
+                },
+                _ => {},
+            }
+        }
+        fields.push(&body[from..]);
+        for field in fields {
+            let field = field.trim();
+            if field == "warnings" {
+                out.push("warnings".to_string());
+            } else if let Some(value) = field.strip_prefix("warnings:") {
+                out.push(value.trim().to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The scan finds the field however it is written, and only in a literal.
+#[test]
+fn test_the_scan_finds_the_warnings_field_of_a_metadata_literal() {
+    let found = |code: &str| metadata_warnings_fields(code);
+    assert_eq!(found("Metadata { title: None, warnings: w.clone(), ..x }"), ["w.clone()"]);
+    assert_eq!(found("Metadata { warnings, title }"), ["warnings"]);
+    assert_eq!(
+        found("Metadata { warnings: { let n = f(a, b); crate::core::notice::report(n) }, x }"),
+        ["{ let n = f(a, b); crate::core::notice::report(n) }"]
+    );
+    assert!(found("pub struct Metadata { pub warnings: Vec<String> }").is_empty());
+    assert!(found("SheetIr { warnings, x }").is_empty());
 }
