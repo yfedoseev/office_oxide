@@ -226,6 +226,9 @@ fn test_a_large_xls_reads_in_linear_time() {
     );
 }
 
+/// The text of each paragraph of the long legacy document.
+static PARAGRAPH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// A long legacy Word document.
 #[test]
 fn test_a_long_doc_reads_in_linear_time() {
@@ -234,9 +237,15 @@ fn test_a_long_doc_reads_in_linear_time() {
         "doc paragraphs",
         200,
         |n| {
+            // Long paragraphs: each one costs a 512-byte page of properties
+            // besides its text, so short ones reach a container too large for
+            // the builder (past 7 MB) before a run takes 20 ms on a slow
+            // machine.
+            let text: &'static str =
+                PARAGRAPH.get_or_init(|| "A paragraph of legacy text. ".repeat(36));
             let paras: Vec<common::Para> = (0..n)
                 .map(|_| common::Para {
-                    text: "A paragraph of legacy text.",
+                    text,
                     terminator: '\r',
                     grpprl: common::prose_grpprl(),
                 })
