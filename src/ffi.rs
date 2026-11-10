@@ -197,6 +197,15 @@ fn into_ffi_bytes(bytes: Vec<u8>, out_len: *mut usize) -> *mut u8 {
     let boxed = bytes.into_boxed_slice();
     let len = boxed.len();
     unsafe { *out_len = len };
+    if len == 0 {
+        // An empty box's pointer is dangling (it is 1), which a garbage
+        // collector scanning the caller's stack (Go's) refuses as a
+        // pointer. Empty output points at a real byte instead, never
+        // written and never freed: `office_oxide_free_bytes` ignores a
+        // length of 0.
+        static EMPTY: u8 = 0;
+        return (&raw const EMPTY).cast_mut();
+    }
     Box::into_raw(boxed) as *mut u8
 }
 
@@ -1817,9 +1826,15 @@ mod options_tests {
     /// Plane (four bytes in UTF-8, two UTF-16 units, four bytes per character
     /// in a Python string).
     fn astral_docx() -> Vec<u8> {
+        docx_with_body("<w:p><w:r><w:t>omega \u{1D74E} and \u{e9}</w:t></w:r></w:p>")
+    }
+
+    fn docx_with_body(body: &str) -> Vec<u8> {
         use crate::core::opc::{OpcWriter, PartName};
         use crate::core::relationships::rel_types;
-        let xml = "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r><w:t>omega \u{1D74E} and \u{e9}</w:t></w:r></w:p></w:body></w:document>";
+        let xml = format!(
+            "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>{body}</w:body></w:document>"
+        );
         let mut w = OpcWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
         w.add_part(
             &PartName::new("/word/document.xml").unwrap(),
@@ -1829,6 +1844,28 @@ mod options_tests {
         .unwrap();
         w.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
         w.finish().unwrap().into_inner()
+    }
+
+    /// Empty output is a length of 0 and a pointer that is neither NULL (an
+    /// error) nor dangling: the pointer of an empty allocation is 1, which
+    /// Go's stack scanner refuses as a pointer and aborts on.
+    #[test]
+    fn test_empty_output_is_a_real_pointer_and_a_length_of_zero() {
+        let bytes = docx_with_body("");
+        let mut code = -1;
+        let doc = office_document_open_from_bytes(
+            bytes.as_ptr(),
+            bytes.len(),
+            cstr("docx").as_ptr(),
+            &mut code,
+        );
+        assert_eq!(code, OFFICE_OK);
+        let mut len = usize::MAX;
+        let ptr = office_document_render_bytes(doc, cstr("text").as_ptr(), &mut len, &mut code);
+        assert_eq!((code, len), (OFFICE_OK, 0));
+        assert!(ptr as usize >= 4096, "{ptr:?}");
+        unsafe { office_oxide_free_bytes(ptr, len) };
+        unsafe { office_document_free(doc) };
     }
 
     /// Every output as bytes and as a file is the string form, byte for byte.
