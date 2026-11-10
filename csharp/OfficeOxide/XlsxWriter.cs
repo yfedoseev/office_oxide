@@ -23,6 +23,7 @@ public sealed class XlsxWriter : IDisposable
         _handle = NativeMethods.OfficeXlsxWriterNew();
         if (_handle == IntPtr.Zero)
             throw new OfficeOxideException(5, "XlsxWriter.new");
+        GC.KeepAlive(this);
     }
 
     private void EnsureHandle()
@@ -34,7 +35,9 @@ public sealed class XlsxWriter : IDisposable
     public uint AddSheet(string name)
     {
         EnsureHandle();
-        return NativeMethods.OfficeXlsxWriterAddSheet(_handle, name);
+        var result = NativeMethods.OfficeXlsxWriterAddSheet(_handle, name);
+        GC.KeepAlive(this);
+        return result;
     }
 
     /// <summary>
@@ -54,6 +57,7 @@ public sealed class XlsxWriter : IDisposable
         // row/column or a bad sheet index. Ignoring it silently discarded the
         // caller's data while reporting success.
         int rc = NativeMethods.OfficeXlsxSheetSetCell(_handle, sheet, row, col, t, s, n);
+        GC.KeepAlive(this);
         if (rc != 0)
         {
             throw new InvalidOperationException(
@@ -131,6 +135,7 @@ public sealed class XlsxWriter : IDisposable
     {
         EnsureHandle();
         NativeMethods.OfficeXlsxSheetMergeCells(_handle, sheet, row, col, rowSpan, colSpan);
+        GC.KeepAlive(this);
     }
 
     /// <summary>Set column width in Excel character units (e.g. 20.0).</summary>
@@ -138,6 +143,7 @@ public sealed class XlsxWriter : IDisposable
     {
         EnsureHandle();
         NativeMethods.OfficeXlsxSheetSetColumnWidth(_handle, sheet, col, width);
+        GC.KeepAlive(this);
     }
 
     /// <summary>Save the workbook to a file.</summary>
@@ -145,6 +151,7 @@ public sealed class XlsxWriter : IDisposable
     {
         EnsureHandle();
         int rc = NativeMethods.OfficeXlsxWriterSave(_handle, path, out int errorCode);
+        GC.KeepAlive(this);
         if (rc != NativeMethods.OfficeOk)
             throw new OfficeOxideException(errorCode, "XlsxWriter.Save");
     }
@@ -154,6 +161,7 @@ public sealed class XlsxWriter : IDisposable
     {
         EnsureHandle();
         IntPtr ptr = NativeMethods.OfficeXlsxWriterToBytes(_handle, out nuint len, out int errorCode);
+        GC.KeepAlive(this);
         if (ptr == IntPtr.Zero)
             throw new OfficeOxideException(errorCode, "XlsxWriter.ToBytes");
         try

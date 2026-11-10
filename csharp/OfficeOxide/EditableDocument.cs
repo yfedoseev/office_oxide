@@ -41,6 +41,7 @@ public sealed class EditableDocument : IDisposable
     {
         EnsureOpen();
         var n = NativeMethods.OfficeEditableReplaceText(_handle, find, replace, out var err);
+        GC.KeepAlive(this);
         if (n < 0) throw new OfficeOxideException(err, nameof(ReplaceText));
         return n;
     }
@@ -82,6 +83,7 @@ public sealed class EditableDocument : IDisposable
     {
         EnsureOpen();
         var rc = NativeMethods.OfficeEditableSave(_handle, path, out var err);
+        GC.KeepAlive(this);
         if (rc != 0) throw new OfficeOxideException(err, nameof(Save));
     }
 
@@ -90,6 +92,7 @@ public sealed class EditableDocument : IDisposable
     {
         EnsureOpen();
         var ptr = NativeMethods.OfficeEditableSaveToBytes(_handle, out var len, out var err);
+        GC.KeepAlive(this);
         if (ptr == IntPtr.Zero) throw new OfficeOxideException(err, nameof(SaveToBytes));
         try
         {

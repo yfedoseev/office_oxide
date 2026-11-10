@@ -21,6 +21,7 @@ public sealed class ParseOptions : IDisposable
     {
         _handle = strict ? NativeMethods.OfficeOptionsStrict() : NativeMethods.OfficeOptionsNew();
         if (_handle == IntPtr.Zero) throw new OfficeOxideException(OfficeOxideErrorCode.Internal, nameof(ParseOptions));
+        GC.KeepAlive(this);
     }
 
     /// <summary>
@@ -32,6 +33,7 @@ public sealed class ParseOptions : IDisposable
     public ParseOptions Set(string name, ulong value)
     {
         var rc = NativeMethods.OfficeOptionsSet(Handle, name, value);
+        GC.KeepAlive(this);
         if (rc != 0)
             throw new ArgumentException($"unknown option '{name}'; the options are: {string.Join(", ", Names())}", nameof(name));
         return this;
@@ -61,6 +63,7 @@ public sealed class ParseOptions : IDisposable
     {
         var json = NativeMethods.PtrToStringAndFree(NativeMethods.OfficeOptionsLimitsJson(Handle))
             ?? throw new OfficeOxideException(OfficeOxideErrorCode.Internal, nameof(Limits));
+        GC.KeepAlive(this);
         using var doc = JsonDocument.Parse(json);
         static Dictionary<string, ulong> Read(JsonElement e) =>
             e.EnumerateObject().ToDictionary(p => p.Name, p => p.Value.GetUInt64());

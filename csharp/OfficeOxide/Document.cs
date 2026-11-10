@@ -50,6 +50,7 @@ public sealed class Document : IDisposable
     public static Document Open(string path, ParseOptions? options)
     {
         var h = NativeMethods.OfficeDocumentOpenWith(path, options?.Handle ?? IntPtr.Zero, out var err);
+        GC.KeepAlive(options);
         if (h == IntPtr.Zero) throw new OfficeOxideException(err, "Open");
         return new Document(h, path);
     }
@@ -60,6 +61,7 @@ public sealed class Document : IDisposable
         ArgumentNullException.ThrowIfNull(data);
         var h = NativeMethods.OfficeDocumentOpenFromBytesWith(
             data, (nuint)data.Length, format, options?.Handle ?? IntPtr.Zero, out var err);
+        GC.KeepAlive(options);
         if (h == IntPtr.Zero) throw new OfficeOxideException(err, "FromBytes");
         return new Document(h, null);
     }
@@ -73,6 +75,7 @@ public sealed class Document : IDisposable
     {
         EnsureOpen();
         var ptr = NativeMethods.OfficeDocumentDamageJson(_handle, out var err);
+        GC.KeepAlive(this);
         if (ptr == IntPtr.Zero) throw new OfficeOxideException(err, nameof(Damage));
         return DocumentDamage.Parse(NativeMethods.PtrToStringAndFree(ptr) ?? "[]");
     }
@@ -97,6 +100,7 @@ public sealed class Document : IDisposable
         {
             EnsureOpen();
             var ptr = NativeMethods.OfficeDocumentFormat(_handle);
+            GC.KeepAlive(this);
             return NativeMethods.PtrToStaticString(ptr)
                    ?? throw new OfficeOxideException(OfficeOxideErrorCode.Internal, "Format");
         }
@@ -142,6 +146,7 @@ public sealed class Document : IDisposable
         ArgumentNullException.ThrowIfNull(destination);
         EnsureOpen();
         var ptr = NativeMethods.OfficeDocumentRenderBytes(_handle, kind, out var len, out var err);
+        GC.KeepAlive(this);
         if (ptr == IntPtr.Zero) throw new OfficeOxideException(err, $"WriteTo({kind})");
         try
         {
@@ -159,6 +164,7 @@ public sealed class Document : IDisposable
     {
         EnsureOpen();
         var rc = NativeMethods.OfficeDocumentWriteToPath(_handle, kind, path, out _);
+        GC.KeepAlive(this);
         if (rc != 0) throw new OfficeOxideException(rc, $"WriteTo({kind})");
     }
 
@@ -167,6 +173,7 @@ public sealed class Document : IDisposable
     {
         EnsureOpen();
         var rc = NativeMethods.OfficeDocumentSaveAs(_handle, path, out var err);
+        GC.KeepAlive(this);
         if (rc != 0) throw new OfficeOxideException(err, nameof(SaveAs));
     }
 
@@ -188,6 +195,7 @@ public sealed class Document : IDisposable
     {
         EnsureOpen();
         var ptr = call(_handle, out var err);
+        GC.KeepAlive(this);
         if (ptr == IntPtr.Zero) throw new OfficeOxideException(err, op);
         return NativeMethods.PtrToStringAndFree(ptr) ?? string.Empty;
     }
