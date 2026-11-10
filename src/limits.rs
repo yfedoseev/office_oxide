@@ -353,8 +353,10 @@ fn configured_package_bytes() -> u64 {
 
 static MAX_TEXT_CHARS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_TEXT_CHARS);
 
-/// The per-document text budget in characters, the amount of cell text a
-/// spreadsheet may render before output is truncated with a notice.
+/// The per-document text budget in characters: the cell text a spreadsheet
+/// may render, and the text a document may copy out of shared storage
+/// (hyperlink targets, shared headers, speaker notes), before output is
+/// truncated with a notice.
 ///
 /// For a package embedded in a document this is what the document's
 /// other embedded packages leave of it, if that is less.
@@ -1401,9 +1403,12 @@ pub struct Limits {
     pub embedded_depth: usize,
     /// Embedded packages opened for one document. See [`max_embedded_packages`].
     pub embedded_packages: usize,
-    /// Characters of text one document may produce, with a floor of 64 Mi
-    /// characters for a small input (the budget scales down with the size of
-    /// the input, never below that). See [`max_text_chars`].
+    /// Characters of text one document may multiply: the cell text a
+    /// workbook renders, and the text a document copies out of shared
+    /// storage (hyperlink targets, shared headers, speaker notes). Text that
+    /// grows with the file, such as a document's own paragraphs, is bounded
+    /// by the size limits instead. The budget scales down with the size of
+    /// the input, never below 64 Mi characters. See [`max_text_chars`].
     pub text_chars: usize,
     /// Memory the conversion of one document may spend on what a small file can multiply: pictures copied or inflated, the empty cells that pad a sparse grid, and what a writer builds. Every such bound is a fixed fraction of it. See [`max_memory_bytes`].
     pub memory_bytes: u64,

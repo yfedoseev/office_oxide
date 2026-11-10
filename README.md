@@ -293,7 +293,7 @@ and a document that hits one is still read, with what was cut reported in
 | `inflate_ratio` | 1,000 | inflated-to-stored ratio of a part over 64 MiB |
 | `embedded_depth` | 3 | how deep embedded packages are opened |
 | `embedded_packages` | 256 | embedded packages opened per document |
-| `text_chars` | 256 Mi | characters of text per document (scaled down for small files) |
+| `text_chars` | 256 Mi | characters of text a document can multiply: a workbook's cell text, and text copied out of shared storage (hyperlink targets, shared headers, notes); scaled down for small files |
 | `memory_bytes` | 1 GiB | what a file can multiply: padding, picture copies, the write estimate |
 
 `memory_bytes`, `package_bytes` and `part_bytes` also set bounds derived from
