@@ -788,6 +788,8 @@ impl Document {
     }
 
     /// The output kinds [`Self::write_output`] takes.
+    // The C interface and Python, its only callers, are not built for wasm.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) const OUTPUT_KINDS: [&'static str; 5] =
         ["text", "markdown", "markdown_images", "html", "ir_json"];
 
@@ -796,6 +798,7 @@ impl Document {
     /// `None` for any other kind. Every kind streams through the writers, so
     /// the output is never built whole as one string. For the C interface and
     /// the language bindings, which take the kind by name.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn write_output(
         &self,
         kind: &str,
