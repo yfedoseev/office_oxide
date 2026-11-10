@@ -431,22 +431,8 @@ pub extern "C" fn office_options_limits_json(
         } else {
             unsafe { &*options }.opts.limits.clone()
         };
-        to_c_string(&limits_json(&limits))
+        to_c_string(&limits.introspection_json())
     })
-}
-
-/// `{"limits": {..}, "derived": {..}}` for `limits`.
-pub(crate) fn limits_json(limits: &crate::limits::Limits) -> String {
-    let named: serde_json::Map<String, serde_json::Value> = crate::limits::Limits::NAMES
-        .iter()
-        .map(|name| {
-            (
-                (*name).to_string(),
-                serde_json::Value::from(limits.get(name).unwrap_or(u64::MAX)),
-            )
-        })
-        .collect();
-    serde_json::json!({ "limits": named, "derived": limits.derived() }).to_string()
 }
 
 /// Open a document from a file path under `options` (NULL for the

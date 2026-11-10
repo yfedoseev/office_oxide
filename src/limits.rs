@@ -1683,6 +1683,20 @@ pub struct DerivedLimits {
 }
 
 impl Limits {
+    /// `{"limits": {..}, "derived": {..}}`: every limit by name and every
+    /// bound derived from them, `u64::MAX` for no bound. What the bindings
+    /// show for an options object.
+    #[cfg(any(not(target_family = "wasm"), feature = "wasm"))]
+    pub(crate) fn introspection_json(&self) -> String {
+        let named: serde_json::Map<String, serde_json::Value> = Self::NAMES
+            .iter()
+            .map(|name| {
+                ((*name).to_string(), serde_json::Value::from(self.get(name).unwrap_or(u64::MAX)))
+            })
+            .collect();
+        serde_json::json!({ "limits": named, "derived": self.derived() }).to_string()
+    }
+
     /// The bounds the library derives from these limits; see
     /// [`DerivedLimits`]. What `derived()` reports for the limits in force is
     /// what the reading and writing code enforces.

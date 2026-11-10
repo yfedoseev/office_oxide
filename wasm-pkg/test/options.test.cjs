@@ -81,3 +81,30 @@ test('strict options make an incomplete result throw', () => {
   sound.free();
   strict.free();
 });
+
+test('the options report their limits and the bounds derived from them', () => {
+  const options = new WasmParseOptions();
+  options.set('memory_bytes', 1000);
+  options.set('part_bytes', Infinity);
+  options.set('package_bytes', 2 ** 60);
+  const { limits, derived } = options.limits();
+  assert.equal(limits.memory_bytes, 1000);
+  assert.equal(limits.part_bytes, Infinity);
+  assert.equal(limits.package_bytes, 2n ** 60n);
+  assert.equal(derived.write_bytes, 500);
+  assert.deepEqual(Object.keys(limits).sort(),
+    NAMES.filter((n) => !n.startsWith('include_') && n !== 'on_incomplete' && n !== 'lazy_pictures').sort());
+  options.free();
+});
+
+test('a document as UTF-8 bytes is its string form', () => {
+  const doc = new WasmDocument(docxWithBody('<w:p><w:r><w:t>café \u{1D74E}</w:t></w:r></w:p>'), 'docx');
+  const utf8 = (s) => new Uint8Array(Buffer.from(s, 'utf8'));
+  assert.deepEqual(doc.toBuffer('text'), utf8(doc.plainText()));
+  assert.deepEqual(doc.toBuffer('markdown'), utf8(doc.toMarkdown()));
+  assert.deepEqual(doc.toBuffer('markdown_images'), utf8(doc.toMarkdownWithImages()));
+  assert.deepEqual(doc.toBuffer('html'), utf8(doc.toHtml()));
+  assert.deepEqual(JSON.parse(Buffer.from(doc.toBuffer('ir_json')).toString('utf8')), doc.toIr());
+  assert.throws(() => doc.toBuffer('pdf'), /ir_json/);
+  doc.free();
+});
