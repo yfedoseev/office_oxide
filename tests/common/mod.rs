@@ -19,6 +19,7 @@ use office_oxide::cfb::{CFB_SIGNATURE, END_OF_CHAIN, FAT_SECT, FREE_SECT};
 use office_oxide::{Document, DocumentFormat};
 use std::io::Cursor;
 
+pub mod ooxml;
 pub mod ppt;
 
 /// Serialises the tests of one binary that change a process-wide limit
@@ -1140,6 +1141,13 @@ fn build_cfb(word_doc: &[u8], table: &[u8]) -> Vec<u8> {
     let wd_sectors = word_doc.len() / 512;
     let zero_table_sectors = table.len().div_ceil(512);
     let total_sectors = 2 + wd_sectors + zero_table_sectors; // dir + FAT + streams
+    // One FAT sector addresses 128 sectors; past that the FAT would run into
+    // the stream data and the document come out silently cut short.
+    assert!(
+        total_sectors <= 128,
+        "{total_sectors} sectors need more than one FAT sector: build the streams with \
+         build_doc_streams and the container with cfb_with_streams"
+    );
     let mut file = vec![0u8; 512 + total_sectors * 512];
 
     write_header(&mut file);
@@ -2021,6 +2029,17 @@ pub fn ppt_stream_without_persist(
 /// `rows` × `cols` cells alternating `LABELSST` and `NUMBER`.
 #[allow(dead_code)]
 pub fn xls_with_cells(rows: u16, cols: u16, strings: &[&str]) -> Vec<u8> {
+    let cells: Vec<(u16, u16)> = (0..rows)
+        .flat_map(|r| (0..cols).map(move |c| (r, c)))
+        .collect();
+    xls_with_cells_at(&cells, strings)
+}
+
+/// A BIFF8 workbook with `strings` shared strings and one sheet with a cell
+/// at each `(row, col)` of `cells`: a `LABELSST` in even columns, a `NUMBER`
+/// in odd ones.
+#[allow(dead_code)]
+pub fn xls_with_cells_at(cells: &[(u16, u16)], strings: &[&str]) -> Vec<u8> {
     let mut s = Vec::new();
     let mut bof = 0x0600u16.to_le_bytes().to_vec();
     bof.extend_from_slice(&0x0005u16.to_le_bytes());
@@ -2029,7 +2048,7 @@ pub fn xls_with_cells(rows: u16, cols: u16, strings: &[&str]) -> Vec<u8> {
     let mut bs = 0u32.to_le_bytes().to_vec();
     bs.extend_from_slice(&[0, 0, 1, 0, b'S']);
     s.extend(biff(0x0085, &bs));
-    let mut sst = ((rows as u32) * (cols as u32)).to_le_bytes().to_vec();
+    let mut sst = (cells.len() as u32).to_le_bytes().to_vec();
     sst.extend_from_slice(&(strings.len() as u32).to_le_bytes());
     for t in strings {
         sst.extend_from_slice(&(t.len() as u16).to_le_bytes());
@@ -2042,20 +2061,18 @@ pub fn xls_with_cells(rows: u16, cols: u16, strings: &[&str]) -> Vec<u8> {
     bof.extend_from_slice(&0x0010u16.to_le_bytes());
     bof.extend_from_slice(&[0u8; 12]);
     s.extend(biff(0x0809, &bof));
-    for r in 0..rows {
-        for c in 0..cols {
-            let mut d = r.to_le_bytes().to_vec();
-            d.extend_from_slice(&c.to_le_bytes());
-            d.extend_from_slice(&0u16.to_le_bytes());
-            if c % 2 == 0 {
-                d.extend_from_slice(
-                    &(((r as usize + c as usize) % strings.len()) as u32).to_le_bytes(),
-                );
-                s.extend(biff(0x00FD, &d));
-            } else {
-                d.extend_from_slice(&((r as f64) * 10.0 + c as f64 + 0.5).to_le_bytes());
-                s.extend(biff(0x0203, &d));
-            }
+    for &(r, c) in cells {
+        let mut d = r.to_le_bytes().to_vec();
+        d.extend_from_slice(&c.to_le_bytes());
+        d.extend_from_slice(&0u16.to_le_bytes());
+        if c % 2 == 0 {
+            d.extend_from_slice(
+                &(((r as usize + c as usize) % strings.len()) as u32).to_le_bytes(),
+            );
+            s.extend(biff(0x00FD, &d));
+        } else {
+            d.extend_from_slice(&((r as f64) * 10.0 + c as f64 + 0.5).to_le_bytes());
+            s.extend(biff(0x0203, &d));
         }
     }
     s.extend(biff(0x000A, &[]));

@@ -1088,6 +1088,46 @@ pub(crate) fn entry_size<R: Read + Seek>(
     archive.by_index_raw(index).ok().map(|f| f.size())
 }
 
+/// `read_to_end` into `buf`, growing it toward `declared` bytes rather than
+/// by doubling. The declared size is the file's to state, so the buffer
+/// starts small and grows only as bytes arrive, but never by more than it
+/// holds: an entry of the size it declares ends in a buffer of exactly that
+/// size, where doubling past a capacity of 1 MiB left up to twice the entry
+/// allocated, and one that declares more than it holds costs no more than
+/// doubling did. On an error `buf` holds every byte read before it, as with
+/// `read_to_end`.
+fn read_to_end_toward(r: &mut impl Read, buf: &mut Vec<u8>, declared: u64) -> std::io::Result<()> {
+    let declared = usize::try_from(declared).unwrap_or(usize::MAX);
+    let mut probe = [0u8; 64];
+    loop {
+        // Fill what is allocated, and no more.
+        let spare = (buf.capacity() - buf.len()) as u64;
+        (&mut *r).take(spare).read_to_end(buf)?;
+        if buf.len() < buf.capacity() {
+            return Ok(());
+        }
+        // Full: a small read tells whether anything is left before the
+        // buffer grows.
+        let n = loop {
+            match r.read(&mut probe) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {},
+                read => break read?,
+            }
+        };
+        if n == 0 {
+            return Ok(());
+        }
+        let toward = declared.saturating_sub(buf.len());
+        let grow = if toward >= n {
+            toward.min(buf.len().max(n))
+        } else {
+            buf.len().max(n)
+        };
+        buf.reserve_exact(grow);
+        buf.extend_from_slice(&probe[..n]);
+    }
+}
+
 pub(crate) fn read_zip_entry<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &ZipEntryIndex,
@@ -1100,7 +1140,7 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
     })?;
     let mut buf = Vec::with_capacity((declared as usize).min(1 << 20));
     let mut capped = (&mut file).take(cap.saturating_add(1));
-    let read = capped.read_to_end(&mut buf);
+    let read = read_to_end_toward(&mut capped, &mut buf, declared);
     drop(file);
     match read {
         Ok(_) => {},
@@ -1318,6 +1358,56 @@ impl<W: Write + Seek> OpcWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader of `data` that fails after giving it all, as a zip entry
+    /// whose checksum is wrong does.
+    struct FailingAtEnd<'a>(&'a [u8]);
+    impl Read for FailingAtEnd<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "checksum"));
+            }
+            let n = out.len().min(self.0.len()).min(7_000);
+            out[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    /// An entry read into a buffer started at 1 MiB ends in a buffer of its
+    /// declared size when it holds that much, at most twice what it holds
+    /// when it declares more or less, and keeps what it read on an error.
+    #[test]
+    fn test_an_entry_is_read_into_a_buffer_of_its_declared_size() {
+        let read = |len: usize, declared: u64| {
+            let data: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let mut buf = Vec::with_capacity((declared as usize).min(1 << 20));
+            read_to_end_toward(&mut &data[..], &mut buf, declared).unwrap();
+            assert_eq!(buf, data, "{len} declared {declared}");
+            buf.capacity()
+        };
+        for len in [
+            0,
+            1,
+            64,
+            65,
+            (1 << 20) - 1,
+            1 << 20,
+            (1 << 20) + 1,
+            5 << 20,
+            (5 << 20) + 3,
+        ] {
+            assert_eq!(read(len, len as u64), len, "an honest entry of {len}");
+        }
+        for (len, declared) in [(3 << 20, 100 << 20), (3 << 20, 1 << 10), (3 << 20, 0)] {
+            assert!(read(len, declared) <= 2 * len + 64, "{len} declared {declared}");
+        }
+        let data = vec![7u8; (2 << 20) + 5];
+        let mut buf = Vec::with_capacity(1 << 20);
+        let err = read_to_end_toward(&mut FailingAtEnd(&data), &mut buf, data.len() as u64);
+        assert!(err.is_err());
+        assert_eq!(buf, data);
+    }
 
     fn archive_of(names: &[&str]) -> ZipArchive<std::io::Cursor<Vec<u8>>> {
         use std::io::Write;
