@@ -302,6 +302,32 @@ fn test_every_named_limit_can_be_set_by_name_and_unknown_names_are_refused() {
     assert!(Limits::default().set("no_such_limit", 1).is_err());
 }
 
+/// `ParseOptions::names` is every option `set_option` takes, once each, and
+/// each one it lists changes what it names: the list the bindings hand their
+/// callers cannot leave one out.
+#[test]
+fn test_the_option_names_are_every_option_once() {
+    let names = ParseOptions::names();
+    let mut unique = names.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), names.len(), "{names:?}");
+    for limit in Limits::NAMES {
+        assert!(names.contains(limit), "{limit}");
+    }
+    for name in &names {
+        let mut options = ParseOptions::default();
+        let before = options.clone();
+        options
+            .set_option(name, 1)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_ne!(options, before, "{name} changed nothing");
+    }
+    // The four settings besides the limits: hidden text, deleted text, what
+    // an incomplete result does, and lazy pictures.
+    assert_eq!(names.len(), Limits::NAMES.len() + 4, "{names:?}");
+}
+
 /// A `.xls` cut by a limit says which limit, from the reader's own notice:
 /// its conversion carries no warning of the cut, so the report used to be a
 /// bare "the text is incomplete".

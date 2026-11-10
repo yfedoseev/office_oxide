@@ -22,6 +22,25 @@ test('a limit in the options applies to that document only', () => {
   const plain = Document.fromBytes(bytes, 'xlsx');
   assert.ok(small.plainText().length < plain.plainText().length);
   small.close(); plain.close(); opts.close();
+  // The process-wide limit, which new options start from, is untouched.
+  const fresh = new ParseOptions();
+  assert.equal(fresh.limits().limits.text_chars, 256 * 2 ** 20);
+  fresh.close();
+});
+
+// Every option, as every binding names it.
+const OPTION_NAMES = [
+  'include_hidden_text', 'include_deleted_text', 'on_incomplete', 'lazy_pictures',
+  'package_entries', 'package_bytes', 'part_bytes', 'inflate_ratio',
+  'embedded_depth', 'embedded_packages', 'text_chars', 'memory_bytes',
+];
+
+test('the options name every option', () => {
+  assert.deepEqual([...ParseOptions.names()].sort(), [...OPTION_NAMES].sort());
+  for (const name of OPTION_NAMES) {
+    const opts = new ParseOptions({ [name]: name === 'on_incomplete' ? 'report' : 1 });
+    opts.close();
+  }
 });
 
 test('damage lists a cut and strict options refuse it with code 7', () => {

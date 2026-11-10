@@ -63,17 +63,10 @@ impl WasmParseOptions {
 
     /// The names of every option.
     pub fn names() -> Vec<String> {
-        let mut names = vec![
-            "include_hidden_text".to_string(),
-            "include_deleted_text".to_string(),
-            "on_incomplete".to_string(),
-        ];
-        names.extend(
-            crate::limits::Limits::NAMES
-                .iter()
-                .map(|n| (*n).to_string()),
-        );
-        names
+        crate::options::ParseOptions::names()
+            .into_iter()
+            .map(str::to_string)
+            .collect()
     }
 }
 

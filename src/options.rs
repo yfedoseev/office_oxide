@@ -77,12 +77,33 @@ impl ParseOptions {
         }
     }
 
+    /// The options that are not limits, by the names [`Self::set_option`]
+    /// takes.
+    const SETTING_NAMES: &'static [&'static str] = &[
+        "include_hidden_text",
+        "include_deleted_text",
+        "on_incomplete",
+        "lazy_pictures",
+    ];
+
+    /// Every name [`Self::set_option`] accepts: the settings, then the
+    /// limits ([`Limits::NAMES`]). The one list every binding gives its
+    /// callers, so none of them can miss an option.
+    pub fn names() -> Vec<&'static str> {
+        Self::SETTING_NAMES
+            .iter()
+            .chain(Limits::NAMES)
+            .copied()
+            .collect()
+    }
+
     /// Set an option by name, for callers that cannot name a Rust field (the
     /// command line, the C interface, the language bindings).
     ///
     /// `name` is a limit (see [`Limits::NAMES`]) with a number as its value, or
-    /// one of `include_hidden_text` and `include_deleted_text` (0 or 1), or
-    /// `on_incomplete` (0 reports, 1 is an error).
+    /// one of `include_hidden_text`, `include_deleted_text` and
+    /// `lazy_pictures` (0 or 1), or `on_incomplete` (0 reports, 1 is an error).
+    /// [`Self::names`] lists them all.
     pub fn set_option(&mut self, name: &str, value: u64) -> Result<(), OptionError> {
         match name {
             "include_hidden_text" => self.include_hidden_text = value != 0,

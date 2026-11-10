@@ -412,14 +412,7 @@ pub extern "C" fn office_options_set(
 #[unsafe(no_mangle)]
 pub extern "C" fn office_options_names() -> *mut c_char {
     guard(ptr::null_mut(), ptr::null_mut(), || {
-        let mut names = vec![
-            "include_hidden_text",
-            "include_deleted_text",
-            "on_incomplete",
-            "lazy_pictures",
-        ];
-        names.extend_from_slice(crate::limits::Limits::NAMES);
-        to_c_string(&names.join(","))
+        to_c_string(&crate::options::ParseOptions::names().join(","))
     })
 }
 

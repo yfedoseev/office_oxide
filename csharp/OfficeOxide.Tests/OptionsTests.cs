@@ -24,6 +24,25 @@ public class OptionsTests
         Assert.True(small.PlainText().Length < plain.PlainText().Length);
     }
 
+    // Every option, as every binding names it.
+    private static readonly string[] OptionNames =
+    {
+        "include_hidden_text", "include_deleted_text", "on_incomplete", "lazy_pictures",
+        "package_entries", "package_bytes", "part_bytes", "inflate_ratio",
+        "embedded_depth", "embedded_packages", "text_chars", "memory_bytes",
+    };
+
+    [Fact]
+    public void TheOptionNamesListEveryOptionAndSetTakesEach()
+    {
+        Assert.Equal(OptionNames.OrderBy(n => n, StringComparer.Ordinal),
+            ParseOptions.Names().OrderBy(n => n, StringComparer.Ordinal));
+        foreach (var name in OptionNames)
+        {
+            using var options = new ParseOptions().Set(name, 1UL);
+        }
+    }
+
     [Fact]
     public void DamageListsACutAndStrictOptionsRefuseIt()
     {

@@ -204,14 +204,7 @@ impl PyParseOptions {
     /// The names of every option.
     #[staticmethod]
     fn names() -> Vec<&'static str> {
-        let mut names = vec![
-            "include_hidden_text",
-            "include_deleted_text",
-            "on_incomplete",
-            "lazy_pictures",
-        ];
-        names.extend_from_slice(crate::limits::Limits::NAMES);
-        names
+        crate::options::ParseOptions::names()
     }
 }
 

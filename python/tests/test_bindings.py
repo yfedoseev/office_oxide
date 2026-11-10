@@ -163,6 +163,22 @@ def test_a_limit_in_the_options_applies_to_that_document_only():
     )
     plain = Document.from_bytes(data, "xlsx")
     assert len(small.plain_text()) < len(plain.plain_text())
+    # The process-wide limit, which new options start from, is untouched.
+    assert office_oxide.ParseOptions().limits()["text_chars"] == 256 * 2**20
+
+
+# Every option, as every binding names it.
+OPTION_NAMES = [
+    "include_hidden_text", "include_deleted_text", "on_incomplete", "lazy_pictures",
+    "package_entries", "package_bytes", "part_bytes", "inflate_ratio",
+    "embedded_depth", "embedded_packages", "text_chars", "memory_bytes",
+]
+
+
+def test_the_options_name_every_option():
+    assert sorted(office_oxide.ParseOptions.names()) == sorted(OPTION_NAMES)
+    for name in OPTION_NAMES:
+        office_oxide.ParseOptions().set(name, "report" if name == "on_incomplete" else 1)
 
 
 @functools.lru_cache(maxsize=1)

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -441,5 +442,32 @@ func TestDocumentBytesAndFilesEqualTheStringForms(t *testing.T) {
 	}
 	if _, err := doc.Bytes("pdf"); err == nil {
 		t.Fatal("an unknown kind was accepted")
+	}
+}
+
+// Every option, as every binding names it.
+var optionNames = []string{
+	"include_hidden_text", "include_deleted_text", "on_incomplete", "lazy_pictures",
+	"package_entries", "package_bytes", "part_bytes", "inflate_ratio",
+	"embedded_depth", "embedded_packages", "text_chars", "memory_bytes",
+}
+
+func TestOptionNamesListEveryOptionAndSetTakesEach(t *testing.T) {
+	got := append([]string(nil), OptionNames()...)
+	want := append([]string(nil), optionNames...)
+	sort.Strings(got)
+	sort.Strings(want)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("OptionNames() = %v, want %v", got, want)
+	}
+	for _, name := range optionNames {
+		opts, err := NewParseOptions()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := opts.Set(name, 1); err != nil {
+			t.Errorf("Set(%q): %v", name, err)
+		}
+		opts.Close()
 	}
 }
