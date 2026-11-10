@@ -1053,22 +1053,29 @@ pub(crate) fn stream_zip_entry<R: Read + Seek>(
     let mut capped = (&mut file).take(cap.saturating_add(1));
     let mut chunk = vec![0u8; 1 << 20];
     let mut total = 0u64;
+    // A refused stream is read again whole by the caller: what it inflated
+    // counts as a failed read, as for a whole read that fails, so the package
+    // budget sees both inflations.
+    let refused = |total: u64| {
+        entries.note_failed_read(index, total);
+        Ok(false)
+    };
     loop {
         match capped.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
                 total = total.saturating_add(n as u64);
                 if total > cap || !sink(&chunk[..n]) {
-                    return Ok(false);
+                    return refused(total);
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {},
-            Err(_) => return Ok(false),
+            Err(_) => return refused(total),
         }
     }
     drop(file);
     if total != declared {
-        return Ok(false);
+        return refused(total);
     }
     entries.charge(index, total, name, declared)?;
     entries.commit(index, total);
@@ -1779,6 +1786,27 @@ mod tests {
         assert!(matches!(err, Error::PackageLimit(_)), "{err:?}");
         // The refusal is sticky: the limit is spent for every entry.
         assert!(read_zip_entry(&mut archive, &entries, "a.bin").is_err());
+    }
+
+    /// A part that streaming gives up on after inflating it is read whole by
+    /// the caller, so what it inflated counts as a failed read.
+    #[test]
+    fn test_a_refused_stream_counts_its_bytes_as_a_failed_read() {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts: zip::write::FileOptions<'_, '_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("a.xml", opts).unwrap();
+        zip.write_all(&vec![b'x'; 3 << 20]).unwrap();
+        let mut archive = ZipArchive::new(zip.finish().unwrap()).unwrap();
+        let entries = ZipEntryIndex::new(&archive);
+        let mut seen = 0u64;
+        let streamed = stream_zip_entry(&mut archive, &entries, "a.xml", |c| {
+            seen += c.len() as u64;
+            seen < (2 << 20)
+        });
+        assert!(matches!(streamed, Ok(false)));
+        assert_eq!(entries.failed.get(), seen);
     }
 
     /// A part that fails after inflating is not committed, so it would be
