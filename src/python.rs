@@ -320,14 +320,23 @@ impl PyFileWriter {
         let chunk = std::mem::take(&mut self.buf);
         let file = &self.file;
         let handed = Python::attach(|py| -> PyResult<()> {
-            // A raw or non-blocking object may take less than it is given;
-            // the rest is handed over again. One that returns no count
-            // (`None`) took it all, as `shutil.copyfileobj` assumes.
+            // A raw object may take less than it is given; the rest is
+            // handed over again. An object that returns no count (`None`)
+            // took it all, as `shutil.copyfileobj` assumes, except a raw
+            // stream, whose `None` means a non-blocking write took nothing.
+            let raw = file
+                .bind(py)
+                .is_instance(&py.import("io")?.getattr("RawIOBase")?)?;
             let mut rest = &chunk[..];
             while !rest.is_empty() {
                 let bytes = pyo3::types::PyBytes::new(py, rest);
                 let n = file.call_method1(py, "write", (bytes,))?;
                 let taken = if n.is_none(py) {
+                    if raw {
+                        return Err(pyo3::exceptions::PyBlockingIOError::new_err(
+                            "the non-blocking stream took none of the output",
+                        ));
+                    }
                     rest.len()
                 } else {
                     n.extract::<usize>(py)?.min(rest.len())
@@ -640,14 +649,36 @@ impl PyEditable {
         }
     }
 
-    /// Run `f` on the open document. Called without the GIL for anything
-    /// long, so a thread waiting for the lock never holds the GIL the holder
-    /// may need.
+    /// Run `f` on the open document, from code that has released the GIL
+    /// (anything long holds the lock that way).
     fn with<T>(&self, f: impl FnOnce(&mut EditableDocument) -> PyResult<T>) -> PyResult<T> {
-        let mut guard = self
+        let guard = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::on_open(guard, f)
+    }
+
+    /// [`Self::with`] from code holding the GIL: it is released while the
+    /// lock is waited for, so a thread waiting behind a long save does not
+    /// stop every other Python thread.
+    fn with_attached<T>(
+        &self,
+        py: Python<'_>,
+        f: impl FnOnce(&mut EditableDocument) -> PyResult<T>,
+    ) -> PyResult<T> {
+        use pyo3::sync::MutexExt;
+        let guard = self
+            .inner
+            .lock_py_attached(py)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::on_open(guard, f)
+    }
+
+    fn on_open<T>(
+        mut guard: std::sync::MutexGuard<'_, Option<EditableDocument>>,
+        f: impl FnOnce(&mut EditableDocument) -> PyResult<T>,
+    ) -> PyResult<T> {
         let doc = guard.as_mut().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("EditableDocument is closed")
         })?;
@@ -695,6 +726,7 @@ impl PyEditable {
     #[pyo3(signature = (sheet_index, cell_ref, value, /))]
     fn set_cell(
         &self,
+        py: Python<'_>,
         sheet_index: usize,
         cell_ref: &str,
         value: &Bound<'_, PyAny>,
@@ -711,7 +743,7 @@ impl PyEditable {
                 ));
             },
         };
-        self.with(|doc| Ok(doc.set_cell(sheet_index, cell_ref, cv)?))
+        self.with_attached(py, |doc| Ok(doc.set_cell(sheet_index, cell_ref, cv)?))
     }
 
     /// Save the edited document to a file.
@@ -732,11 +764,12 @@ impl PyEditable {
     }
 
     /// Release the document; an edit running on another thread finishes
-    /// first.
-    fn close(&self) {
+    /// first (waited for without the GIL).
+    fn close(&self, py: Python<'_>) {
+        use pyo3::sync::MutexExt;
         *self
             .inner
-            .lock()
+            .lock_py_attached(py)
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
@@ -746,11 +779,12 @@ impl PyEditable {
 
     fn __exit__(
         &self,
+        py: Python<'_>,
         _exc_type: Option<Py<PyAny>>,
         _exc_val: Option<Py<PyAny>>,
         _exc_tb: Option<Py<PyAny>>,
     ) -> bool {
-        self.close();
+        self.close(py);
         false
     }
 }
@@ -814,9 +848,23 @@ struct PyXlsxWriter {
 }
 
 impl PyXlsxWriter {
+    /// The writer, from code that has released the GIL.
     fn w(&self) -> std::sync::MutexGuard<'_, crate::xlsx::write::XlsxWriter> {
         self.writer
             .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The writer, from code holding the GIL: released while the lock is
+    /// waited for, so a call behind a long save does not stop every other
+    /// Python thread.
+    fn w_attached(
+        &self,
+        py: Python<'_>,
+    ) -> std::sync::MutexGuard<'_, crate::xlsx::write::XlsxWriter> {
+        use pyo3::sync::MutexExt;
+        self.writer
+            .lock_py_attached(py)
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
@@ -831,8 +879,8 @@ impl PyXlsxWriter {
     }
 
     /// Add a worksheet; returns its 0-based index.
-    fn add_sheet(&self, name: &str) -> usize {
-        self.w().add_sheet_get_index(name)
+    fn add_sheet(&self, py: Python<'_>, name: &str) -> usize {
+        self.w_attached(py).add_sheet_get_index(name)
     }
 
     /// Set a cell value (str, float, int, bool, or None).
@@ -842,20 +890,28 @@ impl PyXlsxWriter {
     /// `ValueError`: Excel stores numbers as doubles and would change it.
     fn set_cell(
         &self,
+        py: Python<'_>,
         sheet: usize,
         row: usize,
         col: usize,
         value: &pyo3::Bound<'_, pyo3::PyAny>,
     ) -> PyResult<()> {
         let data = writer_cell_data(value)?;
-        require_written(self.w().sheet_set_cell(sheet, row, col, data), "set_cell")
+        require_written(self.w_attached(py).sheet_set_cell(sheet, row, col, data), "set_cell")
     }
 
     /// Set a formula cell, e.g. `set_formula(0, 3, 1, "SUM(B1:B3)")`. A
     /// leading `=` is accepted and dropped.
-    fn set_formula(&self, sheet: usize, row: usize, col: usize, formula: &str) -> PyResult<()> {
+    fn set_formula(
+        &self,
+        py: Python<'_>,
+        sheet: usize,
+        row: usize,
+        col: usize,
+        formula: &str,
+    ) -> PyResult<()> {
         let data = crate::xlsx::write::CellData::Formula(formula.to_string());
-        require_written(self.w().sheet_set_cell(sheet, row, col, data), "set_formula")
+        require_written(self.w_attached(py).sheet_set_cell(sheet, row, col, data), "set_formula")
     }
 
     /// Set a cell with styling. bg_color is a 6-char hex string or None
@@ -863,6 +919,7 @@ impl PyXlsxWriter {
     #[pyo3(signature = (sheet, row, col, value, bold, bg_color=None))]
     fn set_cell_styled(
         &self,
+        py: Python<'_>,
         sheet: usize,
         row: usize,
         col: usize,
@@ -881,20 +938,30 @@ impl PyXlsxWriter {
             style = style.background(bg.to_string());
         }
         require_written(
-            self.w().sheet_set_cell_styled(sheet, row, col, data, style),
+            self.w_attached(py)
+                .sheet_set_cell_styled(sheet, row, col, data, style),
             "set_cell_styled",
         )
     }
 
     /// Merge a rectangular range. row_span and col_span must be >= 1.
-    fn merge_cells(&self, sheet: usize, row: usize, col: usize, row_span: usize, col_span: usize) {
-        self.w()
+    fn merge_cells(
+        &self,
+        py: Python<'_>,
+        sheet: usize,
+        row: usize,
+        col: usize,
+        row_span: usize,
+        col_span: usize,
+    ) {
+        self.w_attached(py)
             .sheet_merge_cells(sheet, row, col, row_span, col_span);
     }
 
     /// Set column width in Excel character units (e.g. 20.0).
-    fn set_column_width(&self, sheet: usize, col: usize, width: f64) {
-        self.w().sheet_set_column_width(sheet, col, width);
+    fn set_column_width(&self, py: Python<'_>, sheet: usize, col: usize, width: f64) {
+        self.w_attached(py)
+            .sheet_set_column_width(sheet, col, width);
     }
 
     /// Save to file.
@@ -929,9 +996,23 @@ struct PyPptxWriter {
 }
 
 impl PyPptxWriter {
+    /// The writer, from code that has released the GIL.
     fn w(&self) -> std::sync::MutexGuard<'_, crate::pptx::write::PptxWriter> {
         self.writer
             .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The writer, from code holding the GIL: released while the lock is
+    /// waited for, so a call behind a long save does not stop every other
+    /// Python thread.
+    fn w_attached(
+        &self,
+        py: Python<'_>,
+    ) -> std::sync::MutexGuard<'_, crate::pptx::write::PptxWriter> {
+        use pyo3::sync::MutexExt;
+        self.writer
+            .lock_py_attached(py)
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
@@ -946,28 +1027,29 @@ impl PyPptxWriter {
     }
 
     /// Override canvas size. 914400 EMU = 1 inch.
-    fn set_presentation_size(&self, cx: u64, cy: u64) {
-        self.w().set_presentation_size(cx, cy);
+    fn set_presentation_size(&self, py: Python<'_>, cx: u64, cy: u64) {
+        self.w_attached(py).set_presentation_size(cx, cy);
     }
 
     /// Add a slide; returns its 0-based index.
-    fn add_slide(&self) -> usize {
-        self.w().add_slide_get_index()
+    fn add_slide(&self, py: Python<'_>) -> usize {
+        self.w_attached(py).add_slide_get_index()
     }
 
     /// Set the slide title.
-    fn set_slide_title(&self, slide: usize, title: &str) -> PyResult<()> {
-        require_written(self.w().slide_set_title(slide, title), "set_slide_title")
+    fn set_slide_title(&self, py: Python<'_>, slide: usize, title: &str) -> PyResult<()> {
+        require_written(self.w_attached(py).slide_set_title(slide, title), "set_slide_title")
     }
 
     /// Add a plain text paragraph to the slide body.
-    fn add_slide_text(&self, slide: usize, text: &str) -> PyResult<()> {
-        require_written(self.w().slide_add_text(slide, text), "add_slide_text")
+    fn add_slide_text(&self, py: Python<'_>, slide: usize, text: &str) -> PyResult<()> {
+        require_written(self.w_attached(py).slide_add_text(slide, text), "add_slide_text")
     }
 
     /// Embed an image. format: "png" | "jpeg" | "gif". x,y,cx,cy in EMU.
     fn add_slide_image(
         &self,
+        py: Python<'_>,
         slide: usize,
         data: &[u8],
         format: &str,
@@ -987,7 +1069,7 @@ impl PyPptxWriter {
             },
         };
         require_written(
-            self.w()
+            self.w_attached(py)
                 .slide_add_image(slide, data.to_vec(), fmt, x, y, cx, cy),
             "add_slide_image",
         )

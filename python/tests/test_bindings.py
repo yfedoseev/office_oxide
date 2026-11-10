@@ -441,3 +441,93 @@ def test_a_file_object_that_takes_part_of_each_write_gets_all_of_it():
     sink = Trickle()
     doc.write_text(sink)
     assert b"".join(sink.parts) == doc.plain_text().encode("utf-8")
+
+
+def test_writing_to_a_non_blocking_raw_stream_that_takes_nothing_raises():
+    """A raw stream's `write` returns None when a non-blocking write took
+    nothing; the output was dropped and the call reported success."""
+    import os
+
+    r, w = os.pipe()
+    os.set_blocking(w, False)
+    doc = Document.from_bytes(_big_workbook(), "xlsx")
+    try:
+        with open(w, "wb", buffering=0) as raw, pytest.raises(BlockingIOError):
+            doc.write_text(raw)
+    finally:
+        os.close(r)
+
+
+def test_a_call_waiting_behind_a_long_one_does_not_hold_the_gil():
+    """A writer call waiting for another thread's long `to_bytes` waits
+    without the GIL, so the other Python threads keep running."""
+    import threading
+    import time
+
+    w = XlsxWriter()
+    w.add_sheet("S")
+    for r in range(150000):
+        w.set_cell(0, r, 0, f"cell {r}")
+    window = {}
+    ticks = []
+    stop = threading.Event()
+
+    def spin():
+        while not stop.is_set():
+            ticks.append(time.monotonic())
+            time.sleep(0.001)
+
+    def save():
+        window["start"] = time.monotonic()
+        w.to_bytes()
+        window["end"] = time.monotonic()
+
+    spinner = threading.Thread(target=spin)
+    saver = threading.Thread(target=save)
+    spinner.start()
+    saver.start()
+    while "start" not in window:
+        time.sleep(0.001)
+    time.sleep(0.02)
+    waiter = threading.Thread(target=lambda: w.set_cell(0, 0, 1, "late"))
+    waiter.start()
+    saver.join()
+    waiter.join()
+    stop.set()
+    spinner.join()
+    start, end = window["start"] + 0.05, window["end"] - 0.01
+    assert end - start > 0.05, "the save is too short to measure"
+    during = [t for t in ticks if start < t < end]
+    assert len(during) > 5, f"{len(during)} ticks in {end - start:.3f}s of save"
+
+
+def test_edits_and_close_from_many_threads_wait_for_each_other():
+    """replace_text, set_cell and close from several threads take turns: the
+    edits apply or the document reports itself closed, never "Already
+    borrowed"."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    w = XlsxWriter()
+    w.add_sheet("S")
+    for r in range(3000):
+        w.set_cell(0, r, 0, f"word{r % 7}")
+    ed = EditableDocument.from_bytes(w.to_bytes(), "xlsx")
+
+    def edit(i):
+        try:
+            if i == 40:
+                ed.close()
+            elif i % 2:
+                ed.set_cell(0, f"B{i + 1}", f"v{i}")
+            else:
+                ed.to_bytes()
+            return "ok"
+        except RuntimeError as e:
+            assert "closed" in str(e), e
+            return "closed"
+
+    with ThreadPoolExecutor(8) as pool:
+        outcomes = list(pool.map(edit, range(60)))
+    assert outcomes.count("ok") >= 1
+    with pytest.raises(RuntimeError, match="closed"):
+        ed.to_bytes()
