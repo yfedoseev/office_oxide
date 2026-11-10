@@ -582,7 +582,7 @@ jobs:
           node-version: '20'
 
       - name: WASM smoke test
-        run: node --test wasm-pkg/test/smoke.test.cjs
+        run: node --test wasm-pkg/test/smoke.test.cjs wasm-pkg/test/options.test.cjs
 
   # Code coverage with enforcement
   coverage:
