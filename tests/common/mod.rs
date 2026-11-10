@@ -1311,7 +1311,14 @@ pub fn cfb_with_stream(name: &str, data: &[u8]) -> Vec<u8> {
     const FREE_SECT: u32 = 0xFFFF_FFFF;
     const NO_ENTRY: u32 = 0xFFFF_FFFF;
     let data_sectors = data.len().div_ceil(512).max(1);
-    let fat_sectors = (2 + data_sectors).div_ceil(128);
+    // The FAT must address its own sectors too.
+    let mut fat_sectors = 1;
+    while fat_sectors * 128 < 1 + fat_sectors + data_sectors {
+        fat_sectors += 1;
+    }
+    // Past 109 FAT sectors (about 7 MB) the header's DIFAT cannot list them,
+    // and the stream would come out silently cut.
+    assert!(fat_sectors <= 109, "a {}-byte stream needs a DIFAT chain", data.len());
     let total = 1 + fat_sectors + data_sectors; // directory + FAT + data
     let mut file = vec![0u8; 512 * (1 + total)];
     file[0..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);

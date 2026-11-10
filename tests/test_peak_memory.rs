@@ -1,9 +1,11 @@
 //! Peak heap of reading and converting a fixed set of documents, each built
 //! in code, held under a ceiling.
 //!
-//! The memory work of a release (pictures kept as stored streams, sheets
-//! parsed in bounded pieces, the `.xls` grid built without a second copy of
-//! its cells) is only kept if a regression fails a test. Each document here
+//! The memory work of a release (pictures kept as stored streams and shared,
+//! parts read into buffers of their own size, the `.xls` grid built without
+//! a second copy of its cells) is only kept if a regression fails a test;
+//! sheets parsed in bounded pieces, which need parts of 32 and 64 MiB, are
+//! held in `test_allocation_budget.rs`. Each document here
 //! is dominated by one thing a real file has many of: cells, sheets,
 //! paragraphs, slides or picture bytes. Each is opened and then converted
 //! every way the library converts, and two peaks are checked against a
@@ -17,7 +19,8 @@
 //!
 //! A counted heap peak is deterministic where resident memory is not, and the
 //! ceilings sit about a third above what this source measures, so growth of
-//! a third fails while allocator and layout noise does not. Run with
+//! a third fails while allocator and layout noise does not; tighter where a
+//! fix's whole saving is less than a third. Run with
 //! `--nocapture` for the table of every measured peak.
 //!
 //! The counter is a global allocator, so this file is its own test binary,
@@ -90,6 +93,8 @@ struct Case {
     /// add to an `.xlsx` open), and the costliest conversion's.
     open_now: f64,
     convert_now: f64,
+    /// How far above `*_now` a peak may go before the test fails.
+    margin: f64,
 }
 
 /// Pictures in the picture documents, and how often each is drawn.
@@ -119,6 +124,7 @@ fn cases() -> Vec<Case> {
         unit: "grid cell",
         open_now: 0.33,
         convert_now: 75.82,
+        margin: LOOSE,
     });
 
     // Many small sheets: per-sheet costs, not per-cell ones.
@@ -143,6 +149,7 @@ fn cases() -> Vec<Case> {
         unit: "sheet",
         open_now: 8337.7,
         convert_now: 22255.34,
+        margin: LOOSE,
     });
 
     // A long document of plain paragraphs.
@@ -163,6 +170,7 @@ fn cases() -> Vec<Case> {
         unit: "paragraph",
         open_now: 1100.18,
         convert_now: 982.57,
+        margin: LOOSE,
     });
 
     // Pictures, each drawn many times, read eagerly and lazily.
@@ -186,6 +194,7 @@ fn cases() -> Vec<Case> {
                     (true, DocumentFormat::Docx) => 10.19,
                     (true, _) => 8.0,
                 },
+                margin: LOOSE,
             });
         }
     }
@@ -201,6 +210,9 @@ fn cases() -> Vec<Case> {
         unit: "cell",
         open_now: 87.23,
         convert_now: 998.65,
+        // The open of a sheet that held its cell list and its grid at
+        // once peaked a third higher, inside the usual margin.
+        margin: 1.15,
     });
     // As for the sparse sheet, the unit is a cell of the spanned grid.
     let far: Vec<(u16, u16)> = (0..200u16).map(|i| (i * 10, (i * 7) % 200)).collect();
@@ -213,6 +225,7 @@ fn cases() -> Vec<Case> {
         unit: "grid cell",
         open_now: 1.6,
         convert_now: 38.29,
+        margin: LOOSE,
     });
 
     // A long legacy document, and a deck of many slides.
@@ -240,6 +253,7 @@ fn cases() -> Vec<Case> {
         unit: "paragraph",
         open_now: 2437.04,
         convert_now: 1006.09,
+        margin: LOOSE,
     });
     let slides = 1_000;
     let deck = common::ppt::PptBuilder {
@@ -260,6 +274,7 @@ fn cases() -> Vec<Case> {
         unit: "slide",
         open_now: 1203.39,
         convert_now: 2162.1,
+        margin: LOOSE,
     });
     cases
 }
@@ -305,10 +320,8 @@ fn measure(case: &Case) -> (usize, usize, Vec<(&'static str, usize)>) {
     (open, kept, stages)
 }
 
-/// A third above what this source measures.
-fn ceiling(now: f64) -> f64 {
-    now * 4.0 / 3.0
-}
+/// The usual margin: a third above what this source measures.
+const LOOSE: f64 = 4.0 / 3.0;
 
 #[test]
 fn test_reading_and_converting_each_document_stays_under_its_peak_heap_ceiling() {
@@ -334,24 +347,24 @@ fn test_reading_and_converting_each_document_stays_under_its_peak_heap_ceiling()
             per(convert),
             case.unit
         );
-        if per(open) > ceiling(case.open_now) {
+        if per(open) > case.open_now * case.margin {
             failures.push(format!(
                 "{} (lazy {}): open peaked at {:.2} bytes per {}, ceiling {:.2}",
                 case.name,
                 case.lazy_pictures,
                 per(open),
                 case.unit,
-                ceiling(case.open_now)
+                case.open_now * case.margin
             ));
         }
-        if per(convert) > ceiling(case.convert_now) {
+        if per(convert) > case.convert_now * case.margin {
             failures.push(format!(
                 "{} (lazy {}): {stage} peaked at {:.2} bytes per {}, ceiling {:.2} ({stages:?})",
                 case.name,
                 case.lazy_pictures,
                 per(convert),
                 case.unit,
-                ceiling(case.convert_now)
+                case.convert_now * case.margin
             ));
         }
     }

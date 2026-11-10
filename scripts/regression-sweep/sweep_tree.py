@@ -45,9 +45,18 @@ def run_one(args):
                     err = p.stderr.read()
                     # Reap the child ourselves to get its resource usage: peak
                     # resident memory and CPU time are regression axes too.
-                    _, status, ru = os.wait4(p.pid, 0)
+                    # Within the same deadline: a child that closed its
+                    # stdout but kept running is a timeout, not a hang.
+                    while True:
+                        pid, status, ru = os.wait4(p.pid, os.WNOHANG)
+                        if pid:
+                            break
+                        if time.perf_counter() - t0 > TIMEOUT:
+                            raise subprocess.TimeoutExpired(bin_, TIMEOUT)
+                        time.sleep(0.005)
                     p.returncode = os.waitstatus_to_exitcode(status)
-                    rec["rss_kb"] = ru.ru_maxrss
+                    # ru_maxrss is in KiB on Linux, in bytes on macOS.
+                    rec["rss_kb"] = ru.ru_maxrss // 1024 if sys.platform == "darwin" else ru.ru_maxrss
                     rec["cpu_ms"] = round((ru.ru_utime + ru.ru_stime) * 1000, 1)
                 except subprocess.TimeoutExpired:
                     p.kill(); p.wait(); raise

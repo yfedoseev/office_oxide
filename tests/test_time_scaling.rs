@@ -27,17 +27,26 @@ fn fastest_of_three(run: &dyn Fn()) -> Duration {
         .unwrap()
 }
 
+/// The tests time one at a time: run alongside each other, one test's small
+/// input would be timed while the others were busy and its large one after,
+/// which hides a quadratic path.
+static TIMING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Assert that `run(make(4n))` takes under 10x `run(make(n))`, for an `n` at
 /// least `start` at which one run takes 20 ms or more.
 fn assert_linear<T>(what: &str, start: usize, make: impl Fn(usize) -> T, run: impl Fn(&T)) {
+    let _one_at_a_time = TIMING.lock().unwrap_or_else(|e| e.into_inner());
     let mut n = start;
     let mut base;
     loop {
         let input = make(n);
         base = fastest_of_three(&|| run(&input));
-        if base >= Duration::from_millis(20) || n >= start << 10 {
+        if base >= Duration::from_millis(20) {
             break;
         }
+        // Sub-millisecond runs measure nothing: a shape that never takes
+        // 20 ms needs a larger start, not a pass.
+        assert!(n < start << 10, "{what}: {n} took only {base:?}; start larger");
         n *= 2;
     }
     let input = make(4 * n);
@@ -205,7 +214,10 @@ fn test_a_large_xls_reads_in_linear_time() {
     assert_linear(
         "xls cells",
         100,
-        |rows| common::xls_with_cells(rows as u16, 20, &["alpha", "beta", "gamma"]),
+        |rows| {
+            let rows = u16::try_from(rows).expect("a BIFF8 sheet has at most 65,536 rows");
+            common::xls_with_cells(rows, 20, &["alpha", "beta", "gamma"])
+        },
         |bytes| {
             let doc = open(bytes, DocumentFormat::Xls);
             let _ = doc.plain_text();
@@ -229,7 +241,14 @@ fn test_a_long_doc_reads_in_linear_time() {
                     grpprl: common::prose_grpprl(),
                 })
                 .collect();
-            common::build_doc(&paras)
+            // Past one FAT sector's 64 KB: the streams in a container of
+            // their own size.
+            let (word, table) = common::build_doc_streams(
+                &paras,
+                &common::Subdocs::default(),
+                common::FibTweaks::default(),
+            );
+            common::cfb_with_streams(&[("WordDocument", &word), ("0Table", &table)])
         },
         |bytes| {
             let doc = open(bytes, DocumentFormat::Doc);
