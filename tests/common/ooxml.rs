@@ -316,3 +316,40 @@ pub fn xlsx_with_picture_sheets(sheets: usize, pictures: usize) -> Vec<u8> {
     }
     zip_of(parts)
 }
+
+/// A one-slide `.pptx` of `frames` OLE objects, each previewed by picture 0.
+#[allow(dead_code)]
+pub fn pptx_with_ole_previews(frames: usize) -> Vec<u8> {
+    let mut shapes = String::new();
+    for i in 0..frames {
+        shapes.push_str(&format!(
+            r#"<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="{}" name="O{i}"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="0" y="0"/><a:ext cx="100" cy="100"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/presentationml/2006/ole"><p:oleObj name="W" progId="Excel.Sheet.12"><p:embed/><p:pic><p:nvPicPr><p:cNvPr id="0" name=""/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rIdP0"/></p:blipFill><p:spPr/></p:pic></p:oleObj></a:graphicData></a:graphic></p:graphicFrame>"#,
+            i + 2
+        ));
+    }
+    let slide = format!(
+        r#"<p:sld xmlns:p="{PML}" xmlns:a="{DML}" xmlns:r="{REL}"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>{shapes}</p:spTree></p:cSld></p:sld>"#
+    );
+    zip_of(vec![
+        ("[Content_Types].xml".to_string(), CT.as_bytes().to_vec()),
+        (
+            "_rels/.rels".to_string(),
+            rels(&[("rId1".into(), "officeDocument", "ppt/presentation.xml".into())]),
+        ),
+        (
+            "ppt/presentation.xml".to_string(),
+            format!(r#"<p:presentation xmlns:p="{PML}" xmlns:r="{REL}"><p:sldIdLst><p:sldId id="256" r:id="rId2"/></p:sldIdLst><p:sldSz cx="9144000" cy="6858000"/></p:presentation>"#)
+                .into_bytes(),
+        ),
+        (
+            "ppt/_rels/presentation.xml.rels".to_string(),
+            rels(&[("rId2".into(), "slide", "slides/slide1.xml".into())]),
+        ),
+        ("ppt/slides/slide1.xml".to_string(), slide.into_bytes()),
+        (
+            "ppt/slides/_rels/slide1.xml.rels".to_string(),
+            rels(&[("rIdP0".into(), "image", "../media/img0.png".into())]),
+        ),
+        ("ppt/media/img0.png".to_string(), picture(0)),
+    ])
+}

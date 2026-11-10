@@ -69,7 +69,7 @@ fn measure<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
     (out, live, PEAK.load(Ordering::SeqCst).saturating_sub(start))
 }
 
-use common::ooxml::{PICTURE_LEN, docx, picture, pptx, xlsx};
+use common::ooxml::{PICTURE_LEN, docx, picture, pptx, pptx_with_ole_previews, xlsx};
 
 /// Pictures per document.
 const PICTURES: usize = 4;
@@ -231,4 +231,23 @@ fn test_a_picture_over_a_limit_is_reported_the_same_lazy_or_not() {
         assert!(!eager.0.is_empty(), "{format:?}: the oversized pictures are reported");
         assert_eq!(eager, lazy, "{format:?}");
     }
+}
+
+/// An OLE object's preview is held inflated, but a picture that previews
+/// many objects is inflated once, as an eager open shares it: a lazy picture
+/// inflates afresh on every read, and a frame each held a copy each.
+#[test]
+fn test_a_picture_previewing_many_ole_objects_is_inflated_once() {
+    let _serial = serial();
+    const FRAMES: usize = 50;
+    let bytes = pptx_with_ole_previews(FRAMES);
+    let (lazy, live, _) = measure(|| open(&bytes, DocumentFormat::Pptx, true));
+    assert!(
+        live < 2 * PICTURE_LEN,
+        "a lazy open of {FRAMES} previews of one picture held {live} bytes (one is {PICTURE_LEN})"
+    );
+    let eager = open(&bytes, DocumentFormat::Pptx, false);
+    assert_eq!(lazy.plain_text(), eager.plain_text());
+    assert_eq!(lazy.to_html(), eager.to_html());
+    assert_eq!(lazy.to_ir().to_json_string().unwrap(), eager.to_ir().to_json_string().unwrap());
 }

@@ -858,6 +858,14 @@ struct MasterEntry {
     text_styles: std::sync::Arc<master::MasterTextStyles>,
 }
 
+/// A picture part as the slides share it: the picture, its extension, and
+/// its bytes inflated once for the OLE objects that preview it.
+type SharedPicture = (
+    crate::core::picture::PictureBytes,
+    String,
+    std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<[u8]>>>>,
+);
+
 /// Parts shared between slides, each read, decompressed and parsed once:
 /// layouts and their relationships, masters, images and chart/SmartArt
 /// text. A logo on every slide, or thousands of slides sharing one layout,
@@ -869,11 +877,9 @@ struct PartCache {
     layout_index: std::collections::HashMap<crate::core::opc::PartName, Option<usize>>,
     masters: Vec<MasterEntry>,
     master_index: std::collections::HashMap<crate::core::opc::PartName, Option<usize>>,
-    /// Target part → (picture, extension); `None` when unreadable.
-    images: std::collections::HashMap<
-        crate::core::opc::PartName,
-        Option<(crate::core::picture::PictureBytes, String)>,
-    >,
+    /// Target part → (picture, extension, its preview inflated once);
+    /// `None` when unreadable.
+    images: std::collections::HashMap<crate::core::opc::PartName, Option<SharedPicture>>,
     /// (target part, is-chart) → text lines.
     part_text:
         std::collections::HashMap<(crate::core::opc::PartName, bool), std::sync::Arc<[String]>>,
@@ -1095,15 +1101,16 @@ impl PartCache {
                             .map_or("png", |b| guess_format_from_bytes(&b))
                             .to_string()
                     });
-                Some((pic, ext))
+                Some((pic, ext, Default::default()))
             });
-            if let Some((pic, ext)) = entry {
+            if let Some((pic, ext, preview)) = entry {
                 media.insert(
                     rel.id.clone(),
                     slide::MediaEntry {
                         pic: pic.clone(),
                         ext: ext.clone(),
                         eager,
+                        preview: preview.clone(),
                     },
                 );
             }

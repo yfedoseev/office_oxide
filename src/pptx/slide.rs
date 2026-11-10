@@ -69,6 +69,18 @@ pub(crate) struct MediaEntry {
     /// pictures are read lazily, which is decided before the (possibly
     /// parallel) parse, on the thread that knows the document's settings.
     pub(crate) eager: bool,
+    /// The picture inflated once for every OLE object that previews it,
+    /// shared by all the slides naming the part: a lazy picture inflates
+    /// afresh on every `bytes()`, so a frame each would hold a copy each.
+    pub(crate) preview: std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<[u8]>>>>,
+}
+
+impl MediaEntry {
+    /// The picture's bytes for an OLE object's preview, inflated at most
+    /// once per part.
+    pub(crate) fn preview_bytes(&self) -> Option<std::sync::Arc<[u8]>> {
+        self.preview.get_or_init(|| self.pic.bytes()).clone()
+    }
 }
 
 /// A parsed PPTX slide.
@@ -806,9 +818,9 @@ fn parse_ole_graphic_data(
                     },
                     "blip" if ole.preview_data.is_none() => {
                         if let Some(m) = read_blip_embed_attr(e)?.and_then(|rid| media.get(&rid)) {
-                            // A preview is small and its object has nowhere
-                            // else to keep it, so it is held inflated.
-                            ole.preview_data = m.pic.bytes();
+                            // The object has nowhere else to keep its preview,
+                            // so it is held inflated, once per part.
+                            ole.preview_data = m.preview_bytes();
                             ole.preview_format = Some(m.ext.clone());
                         }
                     },
@@ -3431,6 +3443,7 @@ mod tests {
                 pic: vec![0xDEu8, 0xADu8, 0xBEu8, 0xEFu8].into(),
                 ext: "png".to_string(),
                 eager: true,
+                preview: Default::default(),
             },
         );
 
