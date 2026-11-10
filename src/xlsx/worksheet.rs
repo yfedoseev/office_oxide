@@ -1162,8 +1162,17 @@ fn open_elements_after(xml: &[u8]) -> Option<Vec<Vec<u8>>> {
         let first = *xml.get(at + 1)?;
         match first {
             b'/' => {
-                open.pop()?;
-                i = at + 2 + memchr::memchr(b'>', &xml[at + 2..])? + 1;
+                // An end tag must close the element it names. The reader
+                // pops whatever is open (it does not check end names), but
+                // the walker stops a row or a cell only at its own end tag,
+                // so after `<row></z>` the two disagree on where they are.
+                let (start, end) = open.pop()?;
+                let close = at + 2 + memchr::memchr(b'>', &xml[at + 2..])?;
+                let name = xml[at + 2..close].trim_ascii_end();
+                if name != &xml[start..end] {
+                    return None;
+                }
+                i = close + 1;
             },
             b'!' => {
                 let rest = &xml[at + 2..];
@@ -2372,8 +2381,15 @@ mod tests {
                 "{xml:?}"
             );
         }
-        // A document type declaration is refused, not scanned.
+        // A document type declaration is refused, not scanned, and so is an
+        // end tag that closes an element it does not name, which the reader
+        // takes but the walker does not.
         assert_eq!(open_elements_after(b"<!DOCTYPE d><a>"), None);
+        assert_eq!(open_elements_after(b"<a><row></z><c>"), None);
+        assert_eq!(
+            open_elements_after(b"<a><b></b ><c>"),
+            Some(vec![b"a".to_vec(), b"c".to_vec()])
+        );
     }
 
     #[test]
@@ -2473,6 +2489,17 @@ mod tests {
                 &format!(
                     r#"<headerFooter differentFirst="1"><oddHeader>A</oddHeader><row></row>{fill}<firstHeader>F</firstHeader></headerFooter>"#
                 ),
+            ),
+            // End tags that close what they do not name: the walker is still
+            // in the cell where a scan that pops on any end tag is between
+            // rows.
+            sheet(
+                &(1..=40)
+                    .map(|r| {
+                        format!(r#"<row r="{r}"></z><c r="A{r}"><v>{r}</v></c><c r="B{r}"></row>"#)
+                    })
+                    .collect::<String>(),
+                "",
             ),
             // Document type declarations with a quoted `>` or a subset.
             sheet(&format!(r#"{rows}<!DOCTYPE x SYSTEM "a>b<row>">{rows}"#), ""),

@@ -1036,9 +1036,9 @@ fn checked_entry<R: Read + Seek>(
 /// [`read_zip_entry`]; for a part too large to hold whole. `Ok(false)` when
 /// it could not be read this way cleanly (a checksum or length that
 /// `read_zip_entry` reads past with a warning, a failed sink): the caller
-/// then reads it whole, which reports what is wrong as it always has, so
-/// nothing is charged here for a read that did not complete. An error is
-/// what `read_zip_entry` would have refused before reading.
+/// then reads it whole, which reports what is wrong as it always has, and
+/// what this read inflated is counted as a failed read. An error is what
+/// `read_zip_entry` would have refused before reading.
 pub(crate) fn stream_zip_entry<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &ZipEntryIndex,
