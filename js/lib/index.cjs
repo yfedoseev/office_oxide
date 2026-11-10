@@ -246,7 +246,9 @@ class ParseOptions {
     const exact = (v) => {
       if (typeof v !== 'string') return v;
       const b = BigInt(v);
-      return b === MAX ? Infinity : b;
+      if (b === MAX) return Infinity;
+      // A number while a double holds it exactly, as WASM gives it.
+      return b <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(b) : b;
     };
     const { limits, derived } = JSON.parse(text);
     const map = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, exact(v)]));

@@ -85,6 +85,17 @@ test('the CommonJS entry point exports ParseOptions too', () => {
   opts.close();
 });
 
+test('a limit is a number while a double holds it exactly, then a bigint', () => {
+  const opts = new ParseOptions({ memory_bytes: 2 ** 50, package_bytes: 2n ** 60n });
+  try {
+    const { limits } = opts.limits();
+    assert.equal(limits.memory_bytes, 2 ** 50);
+    assert.equal(limits.package_bytes, 2n ** 60n);
+  } finally {
+    opts.close();
+  }
+});
+
 test('the options report their limits and the bounds derived from them', () => {
   const opts = new ParseOptions({ memory_bytes: 1000, part_bytes: Infinity });
   try {
@@ -92,8 +103,10 @@ test('the options report their limits and the bounds derived from them', () => {
     assert.equal(limits.memory_bytes, 1000);
     assert.equal(limits.part_bytes, Infinity);
     assert.equal(derived.write_bytes, 500);
-    for (const name of ParseOptions.names().filter((n) => n in limits)) assert.ok(name in limits);
-    assert.ok(Object.keys(limits).length >= 8);
+    // Every limit, by name: the options' names less the four settings.
+    const settings = ['include_hidden_text', 'include_deleted_text', 'on_incomplete', 'lazy_pictures'];
+    assert.deepEqual(Object.keys(limits).sort(),
+      ParseOptions.names().filter((n) => !settings.includes(n)).sort());
   } finally {
     opts.close();
   }
