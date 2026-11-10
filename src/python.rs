@@ -223,12 +223,17 @@ impl PyDocument {
     /// mismatched extensions. Raises OfficeOxideError on parse failure.
     #[staticmethod]
     #[pyo3(signature = (path, /, *, options=None))]
-    fn open(path: PathBuf, options: Option<PyRef<'_, PyParseOptions>>) -> PyResult<Self> {
+    fn open(
+        py: Python<'_>,
+        path: PathBuf,
+        options: Option<PyRef<'_, PyParseOptions>>,
+    ) -> PyResult<Self> {
         let source = path.display().to_string();
-        let inner = match &options {
-            Some(o) => Document::open_with(&path, &o.inner)?,
-            None => Document::open(&path)?,
-        };
+        let options = options.map(|o| o.inner.clone());
+        let inner = py.detach(|| match &options {
+            Some(o) => Document::open_with(&path, o),
+            None => Document::open(&path),
+        })?;
         Ok(PyDocument {
             inner: Some(inner),
             source: Some(source),
@@ -241,6 +246,7 @@ impl PyDocument {
     #[staticmethod]
     #[pyo3(signature = (data, format, /, *, options=None))]
     fn from_bytes(
+        py: Python<'_>,
         data: &[u8],
         format: &str,
         options: Option<PyRef<'_, PyParseOptions>>,
@@ -248,10 +254,11 @@ impl PyDocument {
         let fmt = DocumentFormat::from_extension(format)
             .ok_or_else(|| OfficeOxideError::new_err(format!("unsupported format: {format}")))?;
         let cursor = Cursor::new(data.to_vec());
-        let inner = match &options {
-            Some(o) => Document::from_reader_with(cursor, fmt, &o.inner)?,
-            None => Document::from_reader(cursor, fmt)?,
-        };
+        let options = options.map(|o| o.inner.clone());
+        let inner = py.detach(|| match &options {
+            Some(o) => Document::from_reader_with(cursor, fmt, o),
+            None => Document::from_reader(cursor, fmt),
+        })?;
         Ok(PyDocument {
             inner: Some(inner),
             source: None,
@@ -281,8 +288,10 @@ impl PyDocument {
     /// `None`) and `detail`. Empty for a sound document. Converts the
     /// document once.
     fn damage<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, pyo3::types::PyDict>>> {
+        let doc = self.get()?;
+        let found = py.detach(|| doc.damage());
         let mut out = Vec::new();
-        for d in self.get()?.damage() {
+        for d in found {
             let item = pyo3::types::PyDict::new(py);
             let kind = match d.kind {
                 crate::options::DamageKind::UnreadablePart => "unreadable_part",
@@ -299,13 +308,15 @@ impl PyDocument {
     }
 
     /// Extract plain text from the document.
-    fn plain_text(&self) -> PyResult<String> {
-        Ok(self.get()?.plain_text())
+    fn plain_text(&self, py: Python<'_>) -> PyResult<String> {
+        let doc = self.get()?;
+        Ok(py.detach(|| doc.plain_text()))
     }
 
     /// Convert the document to Markdown.
-    fn to_markdown(&self) -> PyResult<String> {
-        Ok(self.get()?.to_markdown())
+    fn to_markdown(&self, py: Python<'_>) -> PyResult<String> {
+        let doc = self.get()?;
+        Ok(py.detach(|| doc.to_markdown()))
     }
 
     /// Convert to markdown, embedding each image inline as
@@ -313,24 +324,28 @@ impl PyDocument {
     ///
     /// Images are otherwise dropped from markdown entirely, which loses
     /// both their content and their position.
-    fn to_markdown_with_images(&self) -> PyResult<String> {
+    fn to_markdown_with_images(&self, py: Python<'_>) -> PyResult<String> {
         use crate::ir_render::{ImageEmbed, MarkdownOptions};
-        Ok(self.get()?.to_markdown_with(MarkdownOptions {
-            image_embed: ImageEmbed::Base64,
+        let doc = self.get()?;
+        Ok(py.detach(|| {
+            doc.to_markdown_with(MarkdownOptions {
+                image_embed: ImageEmbed::Base64,
+            })
         }))
     }
 
     /// Convert the document to an HTML fragment.
-    fn to_html(&self) -> PyResult<String> {
-        Ok(self.get()?.to_html())
+    fn to_html(&self, py: Python<'_>) -> PyResult<String> {
+        let doc = self.get()?;
+        Ok(py.detach(|| doc.to_html()))
     }
 
     /// Convert the document to a format-agnostic intermediate representation
     /// (nested dicts/lists).
     fn to_ir<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        let doc_ir = self.get()?.to_ir();
-        let json_str = doc_ir
-            .to_json_string()
+        let doc = self.get()?;
+        let json_str = py
+            .detach(|| doc.to_ir().to_json_string())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         let json_module = py.import("json")?;
         let result = json_module.call_method1("loads", (json_str,))?;
@@ -338,10 +353,9 @@ impl PyDocument {
     }
 
     /// Convert the document to a format-agnostic intermediate representation as a JSON string.
-    fn to_ir_json(&self) -> PyResult<String> {
-        let doc_ir = self.get()?.to_ir();
-        doc_ir
-            .to_json_string()
+    fn to_ir_json(&self, py: Python<'_>) -> PyResult<String> {
+        let doc = self.get()?;
+        py.detach(|| doc.to_ir().to_json_string())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -349,9 +363,9 @@ impl PyDocument {
     ///
     /// Example: doc.save_as("output.docx") converts DOC → DOCX.
     #[pyo3(signature = (path, /))]
-    fn save_as(&self, path: PathBuf) -> PyResult<()> {
-        self.get()?
-            .save_as(&path)
+    fn save_as(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        let doc = self.get()?;
+        py.detach(|| doc.save_as(&path))
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
     }
 
@@ -410,8 +424,8 @@ impl PyEditable {
     /// Open a document for editing. Supports DOCX, XLSX, PPTX.
     #[staticmethod]
     #[pyo3(signature = (path, /))]
-    fn open(path: PathBuf) -> PyResult<Self> {
-        let inner = EditableDocument::open(&path)?;
+    fn open(py: Python<'_>, path: PathBuf) -> PyResult<Self> {
+        let inner = py.detach(|| EditableDocument::open(&path))?;
         Ok(PyEditable { inner: Some(inner) })
     }
 
@@ -419,19 +433,20 @@ impl PyEditable {
     /// ("docx", "xlsx" or "pptx"), without a temporary file.
     #[staticmethod]
     #[pyo3(signature = (data, format, /))]
-    fn from_bytes(data: &[u8], format: &str) -> PyResult<Self> {
+    fn from_bytes(py: Python<'_>, data: &[u8], format: &str) -> PyResult<Self> {
         let fmt = DocumentFormat::from_extension(format)
             .ok_or_else(|| OfficeOxideError::new_err(format!("unsupported format: {format}")))?;
-        let inner = EditableDocument::from_reader(Cursor::new(data.to_vec()), fmt)?;
+        let cursor = Cursor::new(data.to_vec());
+        let inner = py.detach(|| EditableDocument::from_reader(cursor, fmt))?;
         Ok(PyEditable { inner: Some(inner) })
     }
 
     /// Replace every occurrence of `find` with `replace` in text content.
     /// Returns the number of replacements.
     #[pyo3(signature = (find, replace, /))]
-    fn replace_text(&mut self, find: &str, replace: &str) -> PyResult<usize> {
-        self.get_mut()?
-            .replace_text(find, replace)
+    fn replace_text(&mut self, py: Python<'_>, find: &str, replace: &str) -> PyResult<usize> {
+        let doc = self.get_mut()?;
+        py.detach(|| doc.replace_text(find, replace))
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
@@ -463,16 +478,20 @@ impl PyEditable {
 
     /// Save the edited document to a file.
     #[pyo3(signature = (path, /))]
-    fn save(&self, path: PathBuf) -> PyResult<()> {
-        self.get()?.save(&path)?;
+    fn save(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        let doc = self.get()?;
+        py.detach(|| doc.save(&path))?;
         Ok(())
     }
 
     /// Serialize the edited document to bytes.
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-        let mut cursor = Cursor::new(Vec::new());
-        self.get()?.write_to(&mut cursor)?;
-        Ok(pyo3::types::PyBytes::new(py, &cursor.into_inner()))
+        let doc = self.get()?;
+        let bytes = py.detach(|| {
+            let mut cursor = Cursor::new(Vec::new());
+            doc.write_to(&mut cursor).map(|()| cursor.into_inner())
+        })?;
+        Ok(pyo3::types::PyBytes::new(py, &bytes))
     }
 
     fn close(&mut self) {
@@ -501,22 +520,22 @@ impl PyEditable {
 /// Extract plain text from a file path.
 #[pyfunction]
 #[pyo3(signature = (path, /))]
-fn extract_text(path: PathBuf) -> PyResult<String> {
-    Ok(crate::extract_text(&path)?)
+fn extract_text(py: Python<'_>, path: PathBuf) -> PyResult<String> {
+    Ok(py.detach(|| crate::extract_text(&path))?)
 }
 
 /// Convert a file to markdown.
 #[pyfunction]
 #[pyo3(signature = (path, /))]
-fn to_markdown(path: PathBuf) -> PyResult<String> {
-    Ok(crate::to_markdown(&path)?)
+fn to_markdown(py: Python<'_>, path: PathBuf) -> PyResult<String> {
+    Ok(py.detach(|| crate::to_markdown(&path))?)
 }
 
 /// Convert a file to HTML.
 #[pyfunction]
 #[pyo3(signature = (path, /))]
-fn to_html(path: PathBuf) -> PyResult<String> {
-    Ok(crate::to_html(&path)?)
+fn to_html(py: Python<'_>, path: PathBuf) -> PyResult<String> {
+    Ok(py.detach(|| crate::to_html(&path))?)
 }
 
 /// Create an Office document from Markdown text.
@@ -524,10 +543,15 @@ fn to_html(path: PathBuf) -> PyResult<String> {
 /// `format` must be one of `"docx"`, `"xlsx"`, or `"pptx"`.
 #[pyfunction]
 #[pyo3(signature = (markdown, format, path, /))]
-fn create_from_markdown(markdown: &str, format: &str, path: PathBuf) -> PyResult<()> {
+fn create_from_markdown(
+    py: Python<'_>,
+    markdown: &str,
+    format: &str,
+    path: PathBuf,
+) -> PyResult<()> {
     let fmt = crate::format::DocumentFormat::from_extension(format)
         .ok_or_else(|| OfficeOxideError::new_err(format!("unsupported format: {format}")))?;
-    crate::create::create_from_markdown(markdown, fmt, &path)?;
+    py.detach(|| crate::create::create_from_markdown(markdown, fmt, &path))?;
     Ok(())
 }
 
@@ -629,9 +653,9 @@ impl PyXlsxWriter {
     }
 
     /// Save to file.
-    fn save(&self, path: PathBuf) -> PyResult<()> {
-        self.writer
-            .save(&path)
+    fn save(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        let writer = &self.writer;
+        py.detach(|| writer.save(&path))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -640,11 +664,14 @@ impl PyXlsxWriter {
         &self,
         py: pyo3::Python<'py>,
     ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyBytes>> {
-        let mut cursor = std::io::Cursor::new(Vec::new());
-        self.writer
-            .write_to(&mut cursor)
+        let writer = &self.writer;
+        let bytes = py
+            .detach(|| {
+                let mut cursor = std::io::Cursor::new(Vec::new());
+                writer.write_to(&mut cursor).map(|_| cursor.into_inner())
+            })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        Ok(pyo3::types::PyBytes::new(py, &cursor.into_inner()))
+        Ok(pyo3::types::PyBytes::new(py, &bytes))
     }
 }
 
@@ -713,9 +740,9 @@ impl PyPptxWriter {
     }
 
     /// Save to file.
-    fn save(&self, path: PathBuf) -> PyResult<()> {
-        self.writer
-            .save(&path)
+    fn save(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        let writer = &self.writer;
+        py.detach(|| writer.save(&path))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -724,11 +751,14 @@ impl PyPptxWriter {
         &self,
         py: pyo3::Python<'py>,
     ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyBytes>> {
-        let mut cursor = std::io::Cursor::new(Vec::new());
-        self.writer
-            .write_to(&mut cursor)
+        let writer = &self.writer;
+        let bytes = py
+            .detach(|| {
+                let mut cursor = std::io::Cursor::new(Vec::new());
+                writer.write_to(&mut cursor).map(|_| cursor.into_inner())
+            })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        Ok(pyo3::types::PyBytes::new(py, &cursor.into_inner()))
+        Ok(pyo3::types::PyBytes::new(py, &bytes))
     }
 }
 

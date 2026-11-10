@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 """Behavioural tests for the Python binding's writer and editing surface."""
 
+import functools
+
 import office_oxide
 import pytest
 from office_oxide import Document, EditableDocument, XlsxWriter
@@ -161,3 +163,93 @@ def test_a_limit_in_the_options_applies_to_that_document_only():
     )
     plain = Document.from_bytes(data, "xlsx")
     assert len(small.plain_text()) < len(plain.plain_text())
+
+
+@functools.lru_cache(maxsize=1)
+def _big_workbook() -> bytes:
+    w = XlsxWriter()
+    w.add_sheet("S")
+    for r in range(60000):
+        for c in range(8):
+            w.set_cell(0, r, c, f"cell {r} {c}")
+    return w.to_bytes()
+
+
+def _python_ticks_inside(work) -> tuple[int, int]:
+    """How many times a pure-Python thread ran while `work()` was inside the
+    library, over repeated calls for about 0.3 s, and how many calls that was.
+    A call that keeps the GIL starves every other Python thread for its whole
+    length. The interpreter can still switch threads in the few bytecodes
+    between taking a timestamp and entering the library, so only ticks well
+    inside a call count, with a short switch interval to keep that edge small.
+    """
+    import sys
+    import threading
+    import time
+
+    margin = 0.002
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(0.0001)
+
+    ticks: list[float] = []
+    stop = threading.Event()
+
+    def spin():
+        while not stop.is_set():
+            ticks.append(time.perf_counter())
+            time.sleep(0.0005)
+
+    t = threading.Thread(target=spin)
+    t.start()
+    time.sleep(0.02)
+    calls: list[tuple[float, float]] = []
+    deadline = time.perf_counter() + 0.3
+    while time.perf_counter() < deadline:
+        start = time.perf_counter()
+        work()
+        calls.append((start, time.perf_counter()))
+    stop.set()
+    t.join()
+    sys.setswitchinterval(old_interval)
+    inside = sum(1 for x in ticks for a, b in calls if a + margin < x < b - margin)
+    return inside, len(calls)
+
+
+@pytest.mark.parametrize(
+    "call",
+    ["open", "plain_text", "to_markdown", "to_html", "to_ir_json", "damage"],
+)
+def test_library_calls_release_the_gil(call):
+    # A parse that keeps the GIL starves every other Python thread, and a host
+    # whose logging handler needs the GIL deadlocks against the parse thread.
+    data = _big_workbook()
+    doc = Document.from_bytes(data, "xlsx")
+    work = {
+        "open": lambda: Document.from_bytes(data, "xlsx"),
+        "plain_text": doc.plain_text,
+        "to_markdown": doc.to_markdown,
+        "to_html": doc.to_html,
+        "to_ir_json": doc.to_ir_json,
+        "damage": doc.damage,
+    }[call]
+    inside, calls = _python_ticks_inside(work)
+    assert inside >= 3, f"{call}: another Python thread ran {inside} times inside {calls} calls"
+
+
+def test_a_logging_handler_that_needs_the_gil_does_not_hang_a_parse():
+    # The parse runs on a helper thread; if the calling thread keeps the GIL
+    # while it waits, a log record the helper emits through a handler that
+    # takes the GIL never completes. Run the parse from several threads with
+    # logging at DEBUG and a timeout, so a hang fails instead of sitting.
+    import logging
+    from concurrent.futures import ThreadPoolExecutor
+
+    logging.basicConfig(level=logging.DEBUG)
+    data = _big_workbook()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [
+            pool.submit(lambda: len(Document.from_bytes(data, "xlsx").plain_text()))
+            for _ in range(8)
+        ]
+        for f in futures:
+            assert f.result(timeout=120) > 0

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Python: the binding releases the GIL while it parses, converts and writes.** Every call into the library kept the GIL for its whole length, waiting for the parse thread while holding it, so no other Python thread ran meanwhile, and a host whose logging handler needed the GIL could block against that thread. Opening, every conversion (`plain_text`, `to_markdown`, `to_markdown_with_images`, `to_html`, `to_ir`, `to_ir_json`, `damage`), `save_as`, editing and saving an `EditableDocument`, the `XlsxWriter`/`PptxWriter` `save` and `to_bytes` methods, and the module-level functions now run without it, so several Python threads read documents in parallel. Python objects are built after the call returns; behaviour is otherwise unchanged.
+
 - **Legacy `.ppt`: slide text kept in `metroBlob` packages is now read.** A shape can hold its text in an embedded package (`drs/shapexml.xml`) with the legacy text atoms left nearly empty, as WPS writes an OOXML-origin deck, and such a deck came out almost empty with `Ok`. A package is used only for a shape with no legacy text of its own, so PowerPoint files that write both don't repeat their text. Titles in packages render as titles, and cached slide-number and date values are left out. Reading is bounded per file and per slide, and text a limit or a damaged package kept back is reported in `warnings()` and `text_complete()`. Reported and first implemented by @xugangqiang.
 
 ## [0.1.16] - 2026-10-30
