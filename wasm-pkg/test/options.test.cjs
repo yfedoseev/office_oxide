@@ -92,6 +92,13 @@ test('the options report their limits and the bounds derived from them', () => {
   assert.equal(limits.part_bytes, Infinity);
   assert.equal(limits.package_bytes, 2n ** 60n);
   assert.equal(derived.write_bytes, 500);
+  // A count with no bound reads as Infinity on wasm32, whose usize is 32 bits.
+  options.set('text_chars', Infinity);
+  options.set('memory_bytes', Infinity);
+  const unbounded = options.limits();
+  assert.equal(unbounded.limits.text_chars, Infinity);
+  assert.equal(unbounded.derived.grid_padding_cells, Infinity);
+  assert.equal(unbounded.derived.image_bytes, Infinity);
   assert.deepEqual(Object.keys(limits).sort(),
     NAMES.filter((n) => !n.startsWith('include_') && n !== 'on_incomplete' && n !== 'lazy_pictures').sort());
   options.free();

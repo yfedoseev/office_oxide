@@ -1551,7 +1551,7 @@ impl Limits {
     /// count wider than 64 bits reads as `u64::MAX`, which means no bound.
     /// `None` for a name that is not a limit.
     pub fn get(&self, name: &str) -> Option<u64> {
-        let wide = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        let wide = wide_count;
         Some(match name {
             "package_entries" => wide(self.package_entries),
             "package_bytes" => self.package_bytes,
@@ -1564,6 +1564,18 @@ impl Limits {
             _ => return None,
         })
     }
+}
+
+/// A count as the `u64` the limits are named in: `usize::MAX`, no bound, is
+/// `u64::MAX` on every target (on a 32-bit one it would otherwise read as
+/// the finite 4,294,967,295).
+fn wide_count(n: usize) -> u64 {
+    if n == usize::MAX { u64::MAX } else { n as u64 }
+}
+
+/// [`wide_count`] for serde.
+fn serialize_count<S: serde::Serializer>(n: &usize, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_u64(wide_count(*n))
 }
 
 /// Why [`Limits::set`] refused a limit.
@@ -1652,16 +1664,21 @@ mod derive {
 pub struct DerivedLimits {
     /// Empty cells a legacy spreadsheet's rows may be padded with, for the
     /// whole document (`memory_bytes / 64`).
+    #[serde(serialize_with = "serialize_count")]
     pub grid_padding_cells: usize,
     /// The same, for one sheet (`memory_bytes / 128`).
+    #[serde(serialize_with = "serialize_count")]
     pub sheet_grid_padding_cells: usize,
     /// Bytes of empty table cells padding a spreadsheet's IR rows, for the
     /// whole document (`memory_bytes / 2`).
+    #[serde(serialize_with = "serialize_count")]
     pub ir_padding_bytes: usize,
     /// The same, for one sheet converted on its own (`memory_bytes`).
+    #[serde(serialize_with = "serialize_count")]
     pub sheet_ir_padding_bytes: usize,
     /// Picture bytes one IR may hold, a picture counted once per reference
     /// (`memory_bytes / 2`).
+    #[serde(serialize_with = "serialize_count")]
     pub image_bytes: usize,
     /// Picture bytes a sheet-by-sheet conversion may copy in all
     /// (`memory_bytes * 4`).
@@ -1673,6 +1690,7 @@ pub struct DerivedLimits {
     /// or `.xlsx` before the write is refused (`memory_bytes / 2`).
     pub write_bytes: u64,
     /// The most worksheets an IR written as `.xlsx` may hold.
+    #[serde(serialize_with = "serialize_count")]
     pub write_sheets: usize,
     /// Bytes all the packages embedded in one document may take together
     /// (`package_bytes / 4`); they also share its `text_chars`.
