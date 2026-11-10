@@ -1042,10 +1042,24 @@ pub(crate) const STREAMED_SHEET_BYTES: u64 = 64 << 20;
 /// Raw XML gathered before it is parsed, when a part is read in pieces.
 const STREAM_PIECE_BYTES: usize = 4 << 20;
 
-/// Where the last complete `</row>` (or `</prefix:row>`) in `data` ends.
-fn end_of_last_row(data: &[u8]) -> Option<usize> {
+/// Pending XML without a row end beyond which a part is read whole instead:
+/// a row this long is not one a piece can end after, and searching an
+/// ever-growing buffer for one is work without bound.
+const MAX_PENDING_BYTES: usize = 4 * STREAM_PIECE_BYTES;
+
+/// The most open elements a piece may leave for the next to carry, and the
+/// most bytes of open tags they may take: every piece is parsed after them,
+/// so a deep or long-named stack would be parsed again with every piece. A
+/// worksheet row ends two elements deep (`worksheet`, `sheetData`).
+const MAX_CARRIED_DEPTH: usize = 64;
+const MAX_CARRIED_PREFIX_BYTES: usize = 4096;
+
+/// Where the last complete `</row>` (or `</prefix:row>`) in `data` ends,
+/// looking only at a `row>` that starts at `from` or later.
+fn end_of_last_row(data: &[u8], from: usize) -> Option<usize> {
     let mut search = data.len();
-    while let Some(i) = data[..search].windows(4).rposition(|w| w == b"row>") {
+    while let Some(at) = memchr::memmem::rfind(&data[from.min(search)..search], b"row>") {
+        let i = from + at;
         // The whole local name: right after `</`, or after `</prefix:`.
         let before = &data[i.saturating_sub(24)..i];
         let closes = before.iter().rposition(|&b| b == b'<').is_some_and(|lt| {
@@ -1105,6 +1119,12 @@ struct RowFeeder<'r> {
     /// them, so the reader is in the state a whole-part parse would be in at
     /// that point.
     prefix: usize,
+    /// How many bytes at the front of `pending` are known to hold no row
+    /// end, so each chunk is searched once rather than the whole buffer
+    /// again with every chunk.
+    searched: usize,
+    /// [`MAX_PENDING_BYTES`], raised by tests that time long rows.
+    max_pending: usize,
 }
 
 /// The elements left open after `xml`, given those open before it (which
@@ -1235,6 +1255,10 @@ impl<'r> RowFeeder<'r> {
         let Some(open) = open else {
             return false;
         };
+        let carried: usize = open.iter().map(|name| name.len() + 2).sum();
+        if open.len() > MAX_CARRIED_DEPTH || carried > MAX_CARRIED_PREFIX_BYTES {
+            return false;
+        }
         let keep = (end - self.prefix).min(Self::TAIL);
         self.fed_tail.clear();
         self.fed_tail
@@ -1247,6 +1271,9 @@ impl<'r> RowFeeder<'r> {
         }
         self.prefix = tags.len();
         self.pending.splice(..end, tags);
+        // What is left followed the last row end, and the open tags in front
+        // of it are not end tags: none of it holds a row end.
+        self.searched = self.pending.len();
         true
     }
 
@@ -1260,6 +1287,8 @@ impl<'r> RowFeeder<'r> {
             fed_tail: Vec::new(),
             first: true,
             prefix: 0,
+            searched: 0,
+            max_pending: MAX_PENDING_BYTES,
         }
     }
 
@@ -1281,10 +1310,16 @@ impl<'r> RowFeeder<'r> {
         if self.pending.len() < self.piece {
             return true;
         }
-        let Some(end) = end_of_last_row(&self.pending) else {
-            return true;
-        };
-        self.feed(end, false)
+        // A `row>` that ends past what was searched may start up to three
+        // bytes before it.
+        match end_of_last_row(&self.pending, self.searched.saturating_sub(3)) {
+            Some(end) => self.feed(end, false),
+            None if self.pending.len() > self.max_pending => false,
+            None => {
+                self.searched = self.pending.len();
+                true
+            },
+        }
     }
 
     /// Parse what is left, which ends the part, after the truncation check
@@ -2330,11 +2365,97 @@ mod tests {
 
     #[test]
     fn test_the_last_row_end_is_found_for_plain_and_prefixed_rows_only() {
-        assert_eq!(end_of_last_row(b"<row></row><row></row>x"), Some(22));
-        assert_eq!(end_of_last_row(b"<x:row></x:row>"), Some(15));
-        assert_eq!(end_of_last_row(b"<arrow></arrow>"), None);
-        assert_eq!(end_of_last_row(b"<row/>"), None);
-        assert_eq!(end_of_last_row(b"</throw>"), None);
+        assert_eq!(end_of_last_row(b"<row></row><row></row>x", 0), Some(22));
+        assert_eq!(end_of_last_row(b"<x:row></x:row>", 0), Some(15));
+        assert_eq!(end_of_last_row(b"<arrow></arrow>", 0), None);
+        assert_eq!(end_of_last_row(b"<row/>", 0), None);
+        assert_eq!(end_of_last_row(b"</throw>", 0), None);
+        // Only a `row>` starting at `from` or later counts; the `</` before
+        // it may lie earlier.
+        assert_eq!(end_of_last_row(b"</row>xx", 2), Some(6));
+        assert_eq!(end_of_last_row(b"</row>xx", 3), None);
+    }
+
+    /// A sheet whose second row holds one `len`-byte inline string.
+    fn sheet_with_a_long_row(len: usize) -> String {
+        format!(
+            r#"<worksheet {STREAM_NS}><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>{}</t></is></c></row><row r="3"><c r="A3"><v>3</v></c></row></sheetData></worksheet>"#,
+            "a".repeat(len)
+        )
+    }
+
+    /// A long stretch without a row end is searched once, not again with
+    /// every chunk that extends it: four times the stretch must cost well
+    /// under sixteen times the time.
+    #[test]
+    fn test_a_long_row_is_searched_for_its_end_in_linear_time() {
+        use std::time::{Duration, Instant};
+        let rels = crate::core::relationships::Relationships::empty();
+        let run = |xml: &str| {
+            let t = Instant::now();
+            // Pieces of a quarter of the sheet, so most of the row arrives
+            // in chunks with no row end yet.
+            let mut feeder = RowFeeder::new(SheetParse::new("S".into(), &rels), xml.len() / 4);
+            feeder.max_pending = usize::MAX;
+            let pushed = xml.as_bytes().chunks(256).all(|c| feeder.push(c));
+            assert!(pushed && feeder.finish("worksheet").is_some());
+            t.elapsed()
+        };
+        let fastest = |xml: &str| (0..3).map(|_| run(xml)).min().unwrap();
+        let mut n = 64 << 10;
+        let base = loop {
+            let base = fastest(&sheet_with_a_long_row(n));
+            if base >= Duration::from_millis(20) || n >= 64 << 20 {
+                break base;
+            }
+            n *= 2;
+        };
+        let big = fastest(&sheet_with_a_long_row(4 * n));
+        let ratio = big.as_secs_f64() / base.as_secs_f64().max(1e-9);
+        assert!(ratio < 10.0, "{n}: {base:?}, {}: {big:?} ({ratio:.1}x)", 4 * n);
+    }
+
+    /// A row longer than [`MAX_PENDING_BYTES`] is not gathered whole: the
+    /// part is read whole instead, as it would be without streaming.
+    #[test]
+    fn test_a_row_too_long_to_end_a_piece_is_read_whole() {
+        // Past the cap by more than the chunk that holds its end.
+        let xml = sheet_with_a_long_row(MAX_PENDING_BYTES + (2 << 20));
+        let rels = crate::core::relationships::Relationships::empty();
+        let mut feeder = RowFeeder::new(SheetParse::new("S".into(), &rels), 1 << 20);
+        assert!(!xml.as_bytes().chunks(1 << 20).all(|c| feeder.push(c)));
+        // One just under the cap still streams.
+        let xml = sheet_with_a_long_row(MAX_PENDING_BYTES / 2);
+        assert!(streamed(&xml, 1 << 20, 1 << 20).is_some());
+    }
+
+    /// Open elements are carried into the next piece only while they are
+    /// few and short; a deep or long-named stack would be parsed again with
+    /// every piece, so the part is read whole instead.
+    #[test]
+    fn test_a_deep_or_long_named_stack_is_not_carried_between_pieces() {
+        let rows: String = (1..=20)
+            .map(|r| format!(r#"<row r="{r}"><c r="A{r}"><v>{r}</v></c></row>"#))
+            .collect();
+        let wrapped = |names: &[String]| {
+            let open: String = names.iter().map(|n| format!("<{n}>")).collect();
+            let close: String = names.iter().rev().map(|n| format!("</{n}>")).collect();
+            format!(
+                r#"<worksheet {STREAM_NS}><sheetData>{open}{rows}{close}</sheetData></worksheet>"#
+            )
+        };
+        // Within the bounds (with `worksheet` and `sheetData`): streams.
+        let shallow: Vec<String> = (0..MAX_CARRIED_DEPTH - 2)
+            .map(|i| format!("g{i}"))
+            .collect();
+        assert!(streamed(&wrapped(&shallow), 7, 40).is_some());
+        // One deeper, or one name too long: read whole.
+        let deep: Vec<String> = (0..MAX_CARRIED_DEPTH - 1)
+            .map(|i| format!("g{i}"))
+            .collect();
+        assert!(streamed(&wrapped(&deep), 7, 40).is_none());
+        let long = vec!["n".repeat(MAX_CARRIED_PREFIX_BYTES)];
+        assert!(streamed(&wrapped(&long), 7, 40).is_none());
     }
     use crate::core::relationships::Relationships;
 
