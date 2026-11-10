@@ -1251,6 +1251,39 @@ mod tests {
         assert!(notices[0].contains("sheet 'B'") && notices[0].contains("set_max_memory_bytes"));
     }
 
+    /// A grid notice names the allowance that cut, by its size; a sheet cut
+    /// once is named once however often its rows ask again; and exactly as
+    /// many sheets as a notice names are listed with no count of more.
+    #[test]
+    fn test_grid_notices_state_the_allowance_and_name_each_cut_once() {
+        let mut b = GridBudget::with_limits(1_000, 37);
+        b.begin_sheet("A");
+        assert!(!b.charge(38));
+        // The sheet is spent: every later charge fails, and is not a cut of
+        // its own.
+        assert!(!b.charge(1));
+        assert!(!b.charge(1));
+        let notices = b.notices();
+        assert!(notices[0].contains("more than 37 empty cells"), "{notices:?}");
+        assert_eq!(notices[0].matches("'A'").count(), 1, "{notices:?}");
+        assert_eq!(b.cuts.len(), 1, "{:?}", b.cuts);
+
+        let mut b = GridBudget::with_limits(41, 1_000);
+        b.begin_sheet("A");
+        assert!(!b.charge(42));
+        assert!(b.notices()[0].contains("more than 41 empty cells"), "{:?}", b.notices());
+
+        let mut b = GridBudget::with_limits(1_000, 1);
+        let names: Vec<String> = (0..GRID_CUTS_NAMED).map(|i| format!("S{i}")).collect();
+        for name in &names {
+            b.begin_sheet(name);
+            assert!(!b.charge(2));
+        }
+        let notice = &b.notices()[0];
+        assert!(!notice.contains(" and "), "no count of more: {notice}");
+        assert!(names.iter().all(|n| notice.contains(&format!("'{n}'"))), "{notice}");
+    }
+
     #[test]
     fn test_take_grants_what_is_left_then_nothing() {
         let mut b = TextBudget::with_limit(10);
