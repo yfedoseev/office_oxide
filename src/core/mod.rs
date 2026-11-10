@@ -29,6 +29,8 @@ pub mod embedded_fonts;
 pub mod error;
 /// Markdown escaping shared by every renderer.
 pub mod markdown;
+/// Warnings recorded with their kind (loss, unreadable part, repair).
+pub(crate) mod notice;
 /// Decrypting a document protected with Office's default password.
 #[cfg(feature = "default-password")]
 pub(crate) mod offcrypto;

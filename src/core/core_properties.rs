@@ -131,8 +131,9 @@ pub fn add_property_parts<W: std::io::Write + std::io::Seek>(
 
 /// The `Metadata` fields an OOXML converter does not fill itself: the
 /// remaining core properties, the app.xml company/manager, and the
-/// package-level custom properties, signature flag and thumbnail. Meant
-/// for struct-update syntax: `Metadata { title, .., ..ooxml_metadata_extras(..) }`.
+/// package-level custom properties, signature flag and thumbnail; the
+/// package's warnings are [`package_warnings`], which each converter records
+/// with their kind. Meant for struct-update syntax: `Metadata { title, .., ..ooxml_metadata_extras(..) }`.
 pub(crate) fn ooxml_metadata_extras(
     core: Option<&crate::core::properties::CoreProperties>,
     app: Option<&crate::core::properties::AppProperties>,
@@ -149,7 +150,6 @@ pub(crate) fn ooxml_metadata_extras(
         custom_properties: package.map(|p| p.custom.clone()).unwrap_or_default(),
         has_digital_signature: package.is_some_and(|p| p.has_digital_signature),
         thumbnail: package.and_then(|p| p.thumbnail.clone()),
-        warnings: package_warnings(package),
         ..Default::default()
     }
 }

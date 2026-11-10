@@ -197,7 +197,6 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
     // The parts that could not be read end the last section, one paragraph
     // each, as a spreadsheet's report does; charged to the text budget before
     // the budget's notice is read below.
-    let unreadable_warnings = doc.unreadable_warnings();
     let unreadable_lines =
         crate::core::unreadable::report_ir_lines(&doc.unreadable_text_warnings());
     if !unreadable_lines.is_empty() {
@@ -242,13 +241,20 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         },
         sections,
     };
-    // Every part the reader skipped, by name and reason, as the DOCX
-    // conversion lists them.
-    ir.metadata.warnings.extend(unreadable_warnings);
-    ir.metadata.warnings.extend(copied_text_notice);
-    ir.metadata
-        .warnings
-        .extend(crate::limits::image_budget_warning());
+    // The package's own warnings, then every part the reader skipped, by
+    // name and reason, as the DOCX conversion lists them, then the cuts.
+    {
+        use crate::options::DamageKind::{Recovered, Truncated};
+        let mut warnings = crate::core::notice::Notices::new();
+        warnings.push_all(
+            Recovered,
+            crate::core::core_properties::package_warnings(Some(&doc.package_properties)),
+        );
+        warnings.append(doc.unreadable_notices());
+        warnings.push_all(Truncated, copied_text_notice);
+        warnings.push_all(Truncated, crate::limits::image_budget_warning());
+        ir.metadata.warnings = crate::core::notice::report(warnings);
+    }
     ir
 }
 

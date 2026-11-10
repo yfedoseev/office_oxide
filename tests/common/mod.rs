@@ -2016,3 +2016,48 @@ pub fn ppt_stream_without_persist(
     stream.extend_from_slice(&ppt_container(RT_MAIN_MASTER, 0, master_groups));
     stream
 }
+
+/// A BIFF8 workbook with `strings` shared strings and one sheet of
+/// `rows` × `cols` cells alternating `LABELSST` and `NUMBER`.
+#[allow(dead_code)]
+pub fn xls_with_cells(rows: u16, cols: u16, strings: &[&str]) -> Vec<u8> {
+    let mut s = Vec::new();
+    let mut bof = 0x0600u16.to_le_bytes().to_vec();
+    bof.extend_from_slice(&0x0005u16.to_le_bytes());
+    bof.extend_from_slice(&[0u8; 12]);
+    s.extend(biff(0x0809, &bof));
+    let mut bs = 0u32.to_le_bytes().to_vec();
+    bs.extend_from_slice(&[0, 0, 1, 0, b'S']);
+    s.extend(biff(0x0085, &bs));
+    let mut sst = ((rows as u32) * (cols as u32)).to_le_bytes().to_vec();
+    sst.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+    for t in strings {
+        sst.extend_from_slice(&(t.len() as u16).to_le_bytes());
+        sst.push(0);
+        sst.extend_from_slice(t.as_bytes());
+    }
+    s.extend(biff(0x00FC, &sst));
+    s.extend(biff(0x000A, &[]));
+    let mut bof = 0x0600u16.to_le_bytes().to_vec();
+    bof.extend_from_slice(&0x0010u16.to_le_bytes());
+    bof.extend_from_slice(&[0u8; 12]);
+    s.extend(biff(0x0809, &bof));
+    for r in 0..rows {
+        for c in 0..cols {
+            let mut d = r.to_le_bytes().to_vec();
+            d.extend_from_slice(&c.to_le_bytes());
+            d.extend_from_slice(&0u16.to_le_bytes());
+            if c % 2 == 0 {
+                d.extend_from_slice(
+                    &(((r as usize + c as usize) % strings.len()) as u32).to_le_bytes(),
+                );
+                s.extend(biff(0x00FD, &d));
+            } else {
+                d.extend_from_slice(&((r as f64) * 10.0 + c as f64 + 0.5).to_le_bytes());
+                s.extend(biff(0x0203, &d));
+            }
+        }
+    }
+    s.extend(biff(0x000A, &[]));
+    cfb_with_stream("Workbook", &s)
+}

@@ -33,7 +33,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             })
         )
     });
-    let mut warnings = doc.warnings().to_vec();
+    let mut warnings = doc.notices().clone();
 
     // One IR `Section` per document section. `build_paragraphs` ends a
     // section's last paragraph at its section mark (terminator 0x0C, only
@@ -107,7 +107,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             last.extend(anchored_boxes.map(|(_, tb)| tb));
         }
         if depth_anomalies > 0 {
-            warnings.push(format!(
+            warnings.push(crate::options::DamageKind::Recovered, format!(
                 "{depth_anomalies} table paragraph(s) had a nesting depth beyond {MAX_TABLE_DEPTH} \
                  and were folded into the deepest supported level"
             ));
@@ -198,7 +198,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
         })
         .collect();
     if headers_cut {
-        warnings.push(hf_budget.notice());
+        warnings.push(crate::options::DamageKind::Truncated, hf_budget.notice());
     }
     let header_footer_structured = hfs.iter().any(|hf| !hf.is_empty());
 
@@ -308,7 +308,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // document was silently dropped on conversion even though the bytes
     // were already in hand.
     crate::convert_xls::append_legacy_images(&mut sections, doc.images());
-    warnings.extend(doc.image_warnings());
+    warnings.append(doc.image_warnings());
 
     // Embedded OLE objects — at minimum, recognize each
     // object exists and surface its identity, even without extracting
@@ -360,7 +360,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             modified: summary.and_then(|s| s.modified.clone()),
             has_macros: doc.has_macros(),
             text_truncated: !doc.text_complete() || headers_cut || doc.images_left_out(),
-            warnings,
+            warnings: crate::core::notice::report(warnings),
             ..crate::core::core_properties::legacy_metadata_extras(summary)
         },
         sections,

@@ -36,7 +36,7 @@ pub struct PptDocument {
     /// Structural problems the reader worked around: the container's own
     /// (header counts that disagree with its chains) and every stream read
     /// short of its declared size. Reach `Metadata::warnings`.
-    warnings: Vec<String>,
+    warnings: crate::core::notice::Notices,
     /// `false` when a stream the deck's text comes from ("PowerPoint
     /// Document", "Current User") was read short of its declared size.
     text_complete: bool,
@@ -95,13 +95,19 @@ impl PptDocument {
         });
         // Slides or text the deck reader left out to stay within its bounds.
         let text_complete = text_complete && deck.notices.is_empty();
-        let mut warnings = cfb.warnings().to_vec();
-        warnings.extend(deck.notices);
-        warnings.extend(
-            truncated
-                .iter()
-                .map(|name| format!("stream {name:?} is shorter than its declared size")),
-        );
+        let mut warnings = cfb.notices().clone();
+        // Slides or text left out are a loss; so is a text stream read short.
+        warnings.push_all(crate::options::DamageKind::Truncated, deck.notices);
+        for name in truncated {
+            let text_stream = name.eq_ignore_ascii_case("PowerPoint Document")
+                || name.eq_ignore_ascii_case("Current User");
+            let kind = if text_stream {
+                crate::options::DamageKind::Truncated
+            } else {
+                crate::options::DamageKind::Recovered
+            };
+            warnings.push(kind, format!("stream {name:?} is shorter than its declared size"));
+        }
 
         Ok(Self {
             slides: deck.slides,
@@ -118,6 +124,11 @@ impl PptDocument {
     /// Structural problems the reader worked around rather than failing
     /// on; see `Metadata::warnings`.
     pub fn warnings(&self) -> &[String] {
+        self.warnings.texts()
+    }
+
+    /// [`Self::warnings`] with the kind of each.
+    pub(crate) fn notices(&self) -> &crate::core::notice::Notices {
         &self.warnings
     }
 
@@ -155,7 +166,7 @@ impl PptDocument {
     /// Warnings about pictures left out because of a limit, if any; see
     /// `Metadata::warnings`. Pictures are decoded on first use, so this
     /// decodes them if nothing has yet.
-    pub(crate) fn image_warnings(&self) -> Vec<String> {
+    pub(crate) fn image_warnings(&self) -> crate::core::notice::Notices {
         self.decoded_images().1.warnings()
     }
 
@@ -581,7 +592,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: Vec::new(),
@@ -605,7 +616,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![
@@ -650,7 +661,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![SlideText {
@@ -684,7 +695,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![SlideText {
@@ -733,7 +744,7 @@ mod tests {
             slides: Vec::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
         };
@@ -753,7 +764,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![make_slide(vec![(
@@ -792,7 +803,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![make_slide(vec![(
@@ -817,7 +828,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![make_slide(vec![(
@@ -852,7 +863,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![make_slide(vec![(
@@ -873,7 +884,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![make_slide(vec![(TextType::Title, "My Slide")])],
@@ -895,7 +906,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![make_slide(vec![
@@ -941,7 +952,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![SlideText {
@@ -971,7 +982,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![make_slide(vec![(TextType::CenterTitle, "Centered")])],
@@ -993,7 +1004,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![make_slide(vec![
@@ -1031,7 +1042,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![make_slide(vec![(TextType::Body, "Just body text")])],
@@ -1049,7 +1060,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![make_slide(vec![
@@ -1089,7 +1100,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![make_slide(vec![
@@ -1114,7 +1125,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![make_slide(vec![(TextType::Notes, "Speaker note")])],
@@ -1135,7 +1146,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![make_slide(vec![(TextType::Other, "misc text")])],
@@ -1151,7 +1162,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![make_slide(vec![(TextType::Body, "content")])],
@@ -1168,7 +1179,7 @@ mod tests {
             slides: Vec::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
         };
@@ -1184,7 +1195,7 @@ mod tests {
             pictures_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             has_macros: false,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             summary_properties: Some(crate::cfb::SummaryProperties {
@@ -1217,7 +1228,7 @@ mod tests {
             pictures_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             has_macros: false,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             summary_properties: Some(crate::cfb::SummaryProperties {
@@ -1245,7 +1256,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![SlideText {
@@ -1295,7 +1306,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![SlideText {
@@ -1358,7 +1369,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![SlideText {
@@ -1399,7 +1410,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![SlideText {
@@ -1436,7 +1447,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![SlideText {
@@ -1488,7 +1499,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![SlideText {
@@ -1550,7 +1561,7 @@ mod tests {
             )),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![
@@ -1604,7 +1615,7 @@ mod tests {
             )),
             has_macros: false,
             summary_properties: None,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             text_complete: true,
             master_text: Vec::new(),
             slides: vec![SlideText {

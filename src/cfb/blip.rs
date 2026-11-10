@@ -186,23 +186,30 @@ impl BlipDiagnostics {
         self.implausible > 0 || self.over_budget > 0
     }
 
-    /// One warning per kind of skip, with the number skipped.
-    pub(crate) fn warnings(&self) -> Vec<String> {
-        let mut out = Vec::new();
+    /// One warning per kind of skip, with the number skipped. Each is a
+    /// picture a limit kept out.
+    pub(crate) fn warnings(&self) -> crate::core::notice::Notices {
+        let mut out = crate::core::notice::Notices::new();
         if self.implausible > 0 {
-            out.push(format!(
-                "{} compressed picture(s) left out: the declared uncompressed size is more \
+            out.push(
+                crate::options::DamageKind::Truncated,
+                format!(
+                    "{} compressed picture(s) left out: the declared uncompressed size is more \
                  than a deflate stream of the stored length can hold",
-                self.implausible
-            ));
+                    self.implausible
+                ),
+            );
         }
         if self.over_budget > 0 {
-            out.push(format!(
-                "{} compressed picture(s) left out: the document's pictures exceed the {} byte \
+            out.push(
+                crate::options::DamageKind::Truncated,
+                format!(
+                    "{} compressed picture(s) left out: the document's pictures exceed the {} byte \
                  inflation allowance (office_oxide::limits::set_max_memory_bytes)",
-                self.over_budget,
-                crate::limits::max_inflated_image_bytes()
-            ));
+                    self.over_budget,
+                    crate::limits::max_inflated_image_bytes()
+                ),
+            );
         }
         out
     }
@@ -780,7 +787,7 @@ pub(crate) mod tests {
         assert!(extract_blip_images_within(&stream, &mut budget, &mut diag).is_empty());
         assert!(budget.reserve(u64::MAX), "a refused picture reserves nothing");
         assert!(diag.limit_hit());
-        assert_eq!(diag.warnings().len(), 1);
+        assert_eq!(diag.warnings().texts().len(), 1);
     }
 
     /// A flat-colour 1920 x 1080 x 32 bpp bitmap is 8.3 MB stored in about
@@ -809,7 +816,7 @@ pub(crate) mod tests {
             extract_blip_images_within(&stream, &mut InflateBudget::with_limit(5 << 19), &mut diag);
         assert_eq!(images.len(), 2);
         assert!(diag.limit_hit());
-        let warnings = diag.warnings();
+        let warnings = diag.warnings().into_texts();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].starts_with("2 compressed picture(s) left out"), "{warnings:?}");
         assert!(warnings[0].contains("set_max_memory_bytes"));

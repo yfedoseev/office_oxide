@@ -6,6 +6,8 @@
 //! process-wide settings other documents read.
 
 mod common;
+#[path = "common/ppt_builder.rs"]
+mod ppt_builder;
 
 use std::io::Cursor;
 
@@ -298,4 +300,75 @@ fn test_every_named_limit_can_be_set_by_name_and_unknown_names_are_refused() {
     let err = options.set_option("no_such_option", 1).unwrap_err();
     assert!(err.to_string().contains("text_chars"), "{err}");
     assert!(Limits::default().set("no_such_limit", 1).is_err());
+}
+
+/// A `.xls` cut by a limit says which limit, from the reader's own notice:
+/// its conversion carries no warning of the cut, so the report used to be a
+/// bare "the text is incomplete".
+#[test]
+fn test_a_cut_xls_names_its_cut_in_the_damage_report() {
+    let _scope = LimitScope::new();
+    let bytes = common::xls_with_cells(200, 20, &["alpha", "beta"]);
+    let mut options = ParseOptions::default();
+    options.limits.text_chars = 2_000;
+    let doc = Document::from_reader_with(Cursor::new(bytes.clone()), DocumentFormat::Xls, &options)
+        .unwrap();
+    let damage = doc.damage();
+    let cut: Vec<_> = damage
+        .iter()
+        .filter(|d| d.kind == DamageKind::Truncated)
+        .collect();
+    assert!(!cut.is_empty(), "{damage:?}");
+    assert!(cut.iter().all(|d| d.detail != "the text is incomplete"), "{damage:?}");
+    assert!(cut.iter().any(|d| d.detail.contains("set_max_text_chars")), "{damage:?}");
+    // The same cut refuses a strict open.
+    options.on_incomplete = OnIncomplete::Error;
+    assert!(matches!(
+        Document::from_reader_with(Cursor::new(bytes), DocumentFormat::Xls, &options),
+        Err(OfficeError::Incomplete(_))
+    ));
+}
+
+/// What `damage()` reports for a `.xls` and a `.ppt`, read from the reader
+/// alone, is what their IR carries: the same warnings in the same order and
+/// the same verdict.
+#[test]
+fn test_a_legacy_damage_report_matches_its_ir() {
+    let _scope = LimitScope::new();
+    let mut options = ParseOptions::default();
+    options.limits.text_chars = 2_000;
+    let xls = Document::from_reader_with(
+        Cursor::new(common::xls_with_cells(200, 20, &["alpha", "beta"])),
+        DocumentFormat::Xls,
+        &options,
+    )
+    .unwrap();
+    let ppt = Document::from_reader_with(
+        Cursor::new(ppt_builder::build_ppt(&["one", "two"], &[])),
+        DocumentFormat::Ppt,
+        &options,
+    )
+    .unwrap();
+    for doc in [&xls, &ppt] {
+        let ir = doc.to_ir();
+        let reported: Vec<String> = doc
+            .damage()
+            .iter()
+            .filter(|d| d.kind == DamageKind::Recovered)
+            .map(|d| d.detail.clone())
+            .collect();
+        for w in &ir.metadata.warnings {
+            assert!(
+                reported.contains(w) || doc.damage().iter().any(|d| &d.detail == w),
+                "IR warning {w:?} missing from {:?}",
+                doc.damage()
+            );
+        }
+        assert_eq!(
+            doc.damage().iter().any(|d| d.is_loss()),
+            ir.metadata.text_truncated,
+            "{:?}",
+            doc.damage()
+        );
+    }
 }

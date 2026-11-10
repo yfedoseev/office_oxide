@@ -252,51 +252,7 @@ fn test_empty_styled_cells_parse_without_a_heap_allocation_per_cell() {
 
 // ---------------------------------------------------------------- XLS
 
-use common::{biff, cfb_with_stream};
-
-/// A BIFF8 workbook with `strings` shared strings and one sheet of
-/// `rows` × `cols` cells alternating `LABELSST` and `NUMBER`.
-fn xls_with_cells(rows: u16, cols: u16, strings: &[&str]) -> Vec<u8> {
-    let mut s = Vec::new();
-    let mut bof = 0x0600u16.to_le_bytes().to_vec();
-    bof.extend_from_slice(&0x0005u16.to_le_bytes());
-    bof.extend_from_slice(&[0u8; 12]);
-    s.extend(biff(0x0809, &bof));
-    let mut bs = 0u32.to_le_bytes().to_vec();
-    bs.extend_from_slice(&[0, 0, 1, 0, b'S']);
-    s.extend(biff(0x0085, &bs));
-    let mut sst = ((rows as u32) * (cols as u32)).to_le_bytes().to_vec();
-    sst.extend_from_slice(&(strings.len() as u32).to_le_bytes());
-    for t in strings {
-        sst.extend_from_slice(&(t.len() as u16).to_le_bytes());
-        sst.push(0);
-        sst.extend_from_slice(t.as_bytes());
-    }
-    s.extend(biff(0x00FC, &sst));
-    s.extend(biff(0x000A, &[]));
-    let mut bof = 0x0600u16.to_le_bytes().to_vec();
-    bof.extend_from_slice(&0x0010u16.to_le_bytes());
-    bof.extend_from_slice(&[0u8; 12]);
-    s.extend(biff(0x0809, &bof));
-    for r in 0..rows {
-        for c in 0..cols {
-            let mut d = r.to_le_bytes().to_vec();
-            d.extend_from_slice(&c.to_le_bytes());
-            d.extend_from_slice(&0u16.to_le_bytes());
-            if c % 2 == 0 {
-                d.extend_from_slice(
-                    &(((r as usize + c as usize) % strings.len()) as u32).to_le_bytes(),
-                );
-                s.extend(biff(0x00FD, &d));
-            } else {
-                d.extend_from_slice(&((r as f64) * 10.0 + c as f64 + 0.5).to_le_bytes());
-                s.extend(biff(0x0203, &d));
-            }
-        }
-    }
-    s.extend(biff(0x000A, &[]));
-    cfb_with_stream("Workbook", &s)
-}
+use common::xls_with_cells;
 
 /// Every BIFF record was copied into its own `Vec`, every cell's text
 /// was rendered into a `display` grid at `open()`, and `plain_text()`
@@ -364,6 +320,31 @@ fn test_xls_open_does_not_hold_the_cell_list_and_the_grid_at_once() {
         "open peaked at {peak} bytes for {cells} cells: {kept} kept, {input} input, \
          {transient} transient ({} per cell)",
         transient / cells
+    );
+}
+
+/// A strict open decides whether the document is complete. For a `.xls` the
+/// reader alone knows, so the check must not build the IR, which costs many
+/// times what the open does (hundreds of bytes per cell).
+#[test]
+fn test_a_strict_xls_open_does_not_build_the_ir() {
+    let _serial = serial();
+    let bytes = xls_with_cells(2_000, 50, &["a", "b"]);
+    let open = |options: &office_oxide::options::ParseOptions| {
+        office_oxide::Document::from_reader_with(
+            Cursor::new(bytes.clone()),
+            office_oxide::DocumentFormat::Xls,
+            options,
+        )
+        .unwrap()
+    };
+    let (_, plain) = peak_during(|| open(&office_oxide::options::ParseOptions::default()));
+    let mut strict = office_oxide::options::ParseOptions::default();
+    strict.on_incomplete = office_oxide::options::OnIncomplete::Error;
+    let (_, checked) = peak_during(|| open(&strict));
+    assert!(
+        checked < plain + plain / 4,
+        "a strict open peaked at {checked} bytes, a plain one at {plain}"
     );
 }
 

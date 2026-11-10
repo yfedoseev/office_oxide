@@ -46,7 +46,7 @@ pub struct XlsDocument {
     /// Structural problems in the compound-file container the reader
     /// worked around (header sector counts that disagree with the chains,
     /// streams shorter than their declared size); see `Metadata::warnings`.
-    warnings: Vec<String>,
+    warnings: crate::core::notice::Notices,
     /// Title/author/subject/keywords/comments/dates from the
     /// `\x05SummaryInformation` OLE property-set stream every real `.xls`
     /// carries by default — parsed and then never read anywhere in the
@@ -93,7 +93,7 @@ impl XlsDocument {
             has_macros: false,
             truncated: false,
             notices: Vec::new(),
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             summary_properties: None,
             chart_text: Vec::new(),
         }
@@ -246,12 +246,18 @@ impl XlsDocument {
             .truncated_streams()
             .iter()
             .any(|n| n.eq_ignore_ascii_case("Workbook") || n.eq_ignore_ascii_case("Book"));
-        let mut warnings = cfb.warnings().to_vec();
-        warnings.extend(
-            cfb.truncated_streams()
-                .iter()
-                .map(|name| format!("stream {name:?} is shorter than its declared size")),
-        );
+        let mut warnings = cfb.notices().clone();
+        // A short Workbook stream lost what followed the cut; another stream
+        // read short leaves the cells intact.
+        for name in cfb.truncated_streams() {
+            let kind = if name.eq_ignore_ascii_case("Workbook") || name.eq_ignore_ascii_case("Book")
+            {
+                crate::options::DamageKind::Truncated
+            } else {
+                crate::options::DamageKind::Recovered
+            };
+            warnings.push(kind, format!("stream {name:?} is shorter than its declared size"));
+        }
         // Drop CFB early to free file handle and memory.
         drop(cfb);
 
@@ -284,8 +290,8 @@ impl XlsDocument {
         #[cfg(feature = "default-password")]
         if default_password {
             warnings.push(
-                "the workbook is encrypted with the default password and was decrypted with it"
-                    .to_string(),
+                crate::options::DamageKind::Recovered,
+                "the workbook is encrypted with the default password and was decrypted with it",
             );
         }
         doc.has_macros = has_macros;
@@ -890,7 +896,7 @@ impl XlsDocument {
             has_macros: false,
             truncated: !notices.is_empty(),
             notices,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             summary_properties: None,
             chart_text,
         })
@@ -925,6 +931,11 @@ impl XlsDocument {
     /// Structural problems in the compound-file container the reader
     /// worked around rather than failing on; see `Metadata::warnings`.
     pub fn warnings(&self) -> &[String] {
+        self.warnings.texts()
+    }
+
+    /// [`Self::warnings`] with the kind of each.
+    pub(crate) fn notices_typed(&self) -> &crate::core::notice::Notices {
         &self.warnings
     }
 
@@ -2656,7 +2667,7 @@ mod tests {
             defined_names: Vec::new(),
             truncated: false,
             notices: Vec::new(),
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             summary_properties: None,
             chart_text: Vec::new(),
             sheets: vec![Sheet {
@@ -2686,7 +2697,7 @@ mod tests {
             defined_names: Vec::new(),
             truncated: false,
             notices: Vec::new(),
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             summary_properties: None,
             chart_text: Vec::new(),
             sheets: vec![Sheet {
@@ -2750,7 +2761,7 @@ mod tests {
             defined_names: Vec::new(),
             truncated: false,
             notices: Vec::new(),
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             summary_properties: None,
             chart_text: Vec::new(),
             sheets,

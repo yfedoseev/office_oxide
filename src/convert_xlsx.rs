@@ -90,7 +90,7 @@ pub(crate) struct SheetConverter<'d> {
     omitted: bool,
     // Whether the section just built was cut for any reason of its own.
     item_truncated: bool,
-    warnings: Vec<String>,
+    warnings: crate::core::notice::Notices,
     // The reports of what could not be read, once first asked for.
     reports: Option<Vec<crate::xlsx::text::ReportNotice>>,
 }
@@ -126,7 +126,7 @@ impl<'d> SheetConverter<'d> {
             unreadable: false,
             omitted: false,
             item_truncated: false,
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             reports: None,
         }
     }
@@ -167,7 +167,8 @@ impl<'d> SheetConverter<'d> {
             left.len(),
             names.join(", ")
         );
-        self.warnings.push(notice.clone());
+        self.warnings
+            .push(crate::options::DamageKind::Truncated, notice.clone());
         self.item_truncated = true;
         self.omitted = true;
         Some(Section {
@@ -182,7 +183,7 @@ impl<'d> SheetConverter<'d> {
 
     /// The warnings the sections built so far have raised.
     pub(crate) fn warnings(&self) -> &[String] {
-        &self.warnings
+        self.warnings.texts()
     }
 
     /// Whether anything built so far was cut, for `Metadata::text_truncated`.
@@ -211,18 +212,19 @@ impl<'d> SheetConverter<'d> {
 
     /// The warnings that describe the state of the run's budgets rather than
     /// one event: the same text however many sheets noticed it.
-    pub(crate) fn end_warnings(&self) -> Vec<String> {
-        let mut warnings = Vec::new();
+    pub(crate) fn end_warnings(&self) -> crate::core::notice::Notices {
+        use crate::options::DamageKind::{Recovered, Truncated};
+        let mut warnings = crate::core::notice::Notices::new();
         if self.budget.exhausted() {
-            warnings.push(self.budget.notice());
+            warnings.push(Truncated, self.budget.notice());
         }
         match self.scope {
             IrScope::Document => {
                 if self.padding_chars.exhausted() {
-                    warnings.push(self.padding_chars.notice());
+                    warnings.push(Truncated, self.padding_chars.notice());
                 }
                 if self.image_budget.exhausted() {
-                    warnings.push(format!(
+                    warnings.push(Truncated, format!(
                         "some pictures were left out: the document's pictures exceed the {} byte budget \
                          (office_oxide::limits::set_max_memory_bytes)",
                         self.image_budget.limit()
@@ -231,15 +233,15 @@ impl<'d> SheetConverter<'d> {
             },
             IrScope::Sheet => {
                 if self.padding_chars.exhausted() {
-                    warnings.push(self.padding_chars.notice());
+                    warnings.push(Truncated, self.padding_chars.notice());
                 }
                 if self.total_image_budget.exhausted() {
-                    warnings.push(total_image_notice(&self.total_image_budget));
+                    warnings.push(Truncated, total_image_notice(&self.total_image_budget));
                 }
             },
         }
         if self.format_code_omitted {
-            warnings.push(format!(
+            warnings.push(Recovered, format!(
                 "some cells' number format code is longer than {} characters and is not listed on \
                  them (they keep their format id and values)",
                 crate::limits::MAX_NUMBER_FORMAT_CHARS
@@ -268,11 +270,12 @@ impl<'d> SheetConverter<'d> {
             } else {
                 self.padding_chars.notice()
             };
-            self.warnings.push(format!("sheet {name:?}: {notice}"));
+            self.warnings
+                .push(crate::options::DamageKind::Truncated, format!("sheet {name:?}: {notice}"));
         }
         if self.scope == IrScope::Sheet {
             if self.image_budget.exhausted() {
-                self.warnings.push(format!(
+                self.warnings.push(crate::options::DamageKind::Truncated, format!(
                     "sheet {name:?}: some pictures were left out: the sheet's pictures exceed the {} \
                      byte budget (office_oxide::limits::set_max_memory_bytes)",
                     self.image_budget.limit()
@@ -824,13 +827,16 @@ impl<'d> SheetConverter<'d> {
                 ))],
                 ..Default::default()
             }));
-            warnings.push(format!("sheet {:?} cut short: {damage}", ws.name));
+            warnings.push(
+                crate::options::DamageKind::Truncated,
+                format!("sheet {:?} cut short: {damage}", ws.name),
+            );
             // The sheet lost rows: the document's text is truncated.
             *formulas_truncated = true;
         }
         if ws.formulas_dropped > 0 {
             *formulas_truncated = true;
-            warnings.push(format!(
+            warnings.push(crate::options::DamageKind::Truncated, format!(
                 "sheet {:?}: {} shared formula(s) left out: a master longer than {} characters, or \
                  copies past the character budget (office_oxide::limits::set_max_text_chars); \
                  the cells keep their values",
@@ -1051,7 +1057,7 @@ impl<'d> SheetConverter<'d> {
                 })],
                 ..Default::default()
             });
-            return Some((section, notice.warnings.clone()));
+            return Some((section, notice.warnings.texts().to_vec()));
         }
         let section = Section {
             title: Some(notice.title.clone()),
@@ -1067,7 +1073,7 @@ impl<'d> SheetConverter<'d> {
                 .collect(),
             ..Default::default()
         };
-        Some((Some(section), notice.warnings.clone()))
+        Some((Some(section), notice.warnings.texts().to_vec()))
     }
 
     /// The document's metadata as of the sections built so far: the
@@ -1119,17 +1125,24 @@ impl<'d> SheetConverter<'d> {
         // pivot they belong to lacks what they name.
         let notices = doc.report_notices();
         metadata.text_truncated |= !notices.is_empty();
-        metadata
-            .warnings
-            .extend(notices.into_iter().flat_map(|n| n.warnings));
-        metadata.warnings.extend(
+        let mut warnings = crate::core::notice::Notices::new();
+        warnings.push_all(
+            crate::options::DamageKind::Recovered,
+            crate::core::core_properties::package_warnings(Some(&doc.package_properties)),
+        );
+        for notice in notices {
+            warnings.append(notice.warnings);
+        }
+        warnings.push_all(
+            crate::options::DamageKind::Recovered,
             self.doc
                 .cosmetic_parts
                 .iter()
                 .map(|(part, err)| format!("skipped unreadable part {part}: {err}")),
         );
-        metadata.warnings.extend(self.warnings.iter().cloned());
-        metadata.warnings.extend(self.end_warnings());
+        warnings.append(self.warnings.clone());
+        warnings.append(self.end_warnings());
+        metadata.warnings = crate::core::notice::report(warnings);
         metadata
     }
 }
@@ -1273,7 +1286,7 @@ impl<'d> SheetIrs<'d> {
         let mut warnings = self.converter.warnings()[self.warnings_reported..].to_vec();
         warnings.extend(extra);
         self.warnings_reported = self.converter.warnings().len();
-        for w in self.converter.end_warnings() {
+        for w in self.converter.end_warnings().into_texts() {
             if !end_before.contains(&w) {
                 warnings.push(w);
             }
@@ -1291,7 +1304,7 @@ impl Iterator for SheetIrs<'_> {
 
     fn next(&mut self) -> Option<SheetIr> {
         loop {
-            let end_before = self.converter.end_warnings();
+            let end_before = self.converter.end_warnings().into_texts();
             match self.stage {
                 Stage::Sheets(i) => {
                     if i >= self.converter.doc.worksheets.len() {
@@ -1352,12 +1365,13 @@ pub(crate) fn sheet_to_ir(doc: &crate::xlsx::XlsxDocument, index: usize) -> Opti
         return None;
     }
     let mut converter = SheetConverter::new(doc, IrScope::Sheet);
-    let end_before = converter.end_warnings();
+    let end_before = converter.end_warnings().into_texts();
     let section = converter.convert_sheet(index);
     let mut warnings = converter.warnings().to_vec();
     warnings.extend(
         converter
             .end_warnings()
+            .into_texts()
             .into_iter()
             .filter(|w| !end_before.contains(w)),
     );

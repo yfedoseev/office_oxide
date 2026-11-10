@@ -23,7 +23,7 @@ pub struct CfbReader<R> {
     truncated: Vec<String>,
     /// Structural disagreements found while opening the container (see
     /// [`warnings`](Self::warnings)).
-    warnings: Vec<String>,
+    warnings: crate::core::notice::Notices,
 }
 
 impl<R: Read + Seek> CfbReader<R> {
@@ -41,9 +41,9 @@ impl<R: Read + Seek> CfbReader<R> {
         }
         let header = CfbHeader::parse(&header_buf)?;
 
-        let mut warnings = Vec::new();
+        let mut warnings = crate::core::notice::Notices::new();
         if header.byte_order != 0xFFFE {
-            warnings.push(format!(
+            warnings.push(crate::options::DamageKind::Recovered, format!(
                 "header byte-order field is 0x{:04X}, not 0xFFFE; the file was read as little-endian",
                 header.byte_order
             ));
@@ -52,10 +52,13 @@ impl<R: Read + Seek> CfbReader<R> {
         // Build the FAT.
         let (fat, difat_sectors_walked) = Self::read_fat(&mut reader, &header)?;
         if difat_sectors_walked != u64::from(header.difat_sector_count) {
-            warnings.push(format!(
-                "header declares {} DIFAT sectors; the DIFAT chain has {difat_sectors_walked}",
-                header.difat_sector_count
-            ));
+            warnings.push(
+                crate::options::DamageKind::Recovered,
+                format!(
+                    "header declares {} DIFAT sectors; the DIFAT chain has {difat_sectors_walked}",
+                    header.difat_sector_count
+                ),
+            );
         }
 
         // Read directory entries.
@@ -68,10 +71,13 @@ impl<R: Read + Seek> CfbReader<R> {
                 Self::read_chain(&mut reader, &header, &fat, header.first_mini_fat_sector)?;
             let walked = mini_fat_data.len().div_ceil(header.sector_size);
             if walked != header.mini_fat_sector_count as usize {
-                warnings.push(format!(
-                    "header declares {} mini FAT sectors; the mini FAT chain has {walked}",
-                    header.mini_fat_sector_count
-                ));
+                warnings.push(
+                    crate::options::DamageKind::Recovered,
+                    format!(
+                        "header declares {} mini FAT sectors; the mini FAT chain has {walked}",
+                        header.mini_fat_sector_count
+                    ),
+                );
             }
             let (quads, _rest) = mini_fat_data.as_chunks::<4>();
             quads.iter().copied().map(u32::from_le_bytes).collect()
@@ -95,7 +101,7 @@ impl<R: Read + Seek> CfbReader<R> {
             Vec::new()
         };
 
-        for w in &warnings {
+        for w in warnings.texts() {
             log::warn!("cfb: {w}");
         }
         Ok(Self {
@@ -124,6 +130,11 @@ impl<R: Read + Seek> CfbReader<R> {
     /// `Number of DIFAT Sectors` / `Number of Mini FAT Sectors`) that do
     /// not match the chains actually present.
     pub fn warnings(&self) -> &[String] {
+        self.warnings.texts()
+    }
+
+    /// [`Self::warnings`] with the kind of each.
+    pub(crate) fn notices(&self) -> &crate::core::notice::Notices {
         &self.warnings
     }
 
