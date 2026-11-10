@@ -71,11 +71,15 @@ pub struct PptxDocument {
     /// The size of the file this document was read from (0 when unknown): small
     /// inputs get a text budget scaled to them (see [`crate::limits`]).
     pub(crate) input_bytes: u64,
-    /// The pictures of each slide (in `slides` order), by the relationship
-    /// id a picture shape's `embed_rid` holds; filled only when pictures are
-    /// read lazily, when `PictureShape::data` is left empty.
+    /// The pictures of each slide (in the order `slides` had when the deck
+    /// was read), by relationship id: every image relationship of the
+    /// slide, whether or not pictures are read lazily.
     pub(crate) slide_pictures:
         Vec<std::collections::HashMap<String, crate::core::picture::PictureBytes>>,
+    /// Whether pictures were read lazily, leaving `PictureShape::data` empty
+    /// and the IR to share `slide_pictures`; otherwise the IR copies
+    /// `PictureShape::data` as 0.1.x callers expect.
+    pub(crate) lazy_pictures: bool,
     /// Metadata from `ppt/presentation.xml` (slide list, dimensions).
     pub presentation: PresentationInfo,
     /// Parsed slides, in presentation order.
@@ -122,10 +126,11 @@ pub struct PptxDocument {
 }
 
 impl PptxDocument {
-    /// The picture the relationship `rel_id` (a picture shape's
-    /// `embed_rid`) names on slide `slide` (an index into `slides`). Works
-    /// whether or not pictures are read lazily; when they are not, it is
-    /// the picture `PictureShape::data` holds.
+    /// The picture the image relationship `rel_id` (a picture shape's
+    /// `embed_rid`, an OLE preview's or a fill's blip) names on slide `slide`
+    /// (its index in `slides` as the deck was read). The same answer whether
+    /// or not pictures are read lazily; when they are not, a picture shape's
+    /// is the picture its `PictureShape::data` holds.
     pub fn slide_picture(
         &self,
         slide: usize,
@@ -592,19 +597,16 @@ impl PptxDocument {
         // kept here, slide by slide, for the converter and `slide_picture`.
         let slide_pictures: Vec<
             std::collections::HashMap<String, crate::core::picture::PictureBytes>,
-        > = if crate::read_options::lazy_pictures() {
-            bundles
-                .iter()
-                .map(|b| {
-                    b.media
-                        .iter()
-                        .map(|(rid, m)| (rid.clone(), m.pic.clone()))
-                        .collect()
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        > = bundles
+            .iter()
+            .map(|b| {
+                b.media
+                    .iter()
+                    .map(|(rid, m)| (rid.clone(), m.pic.clone()))
+                    .collect()
+            })
+            .collect();
+        let lazy_pictures = crate::read_options::lazy_pictures();
         // A comments part several slides name is parsed once.
         let mut parsed_comments: std::collections::HashMap<
             String,
@@ -776,6 +778,7 @@ impl PptxDocument {
             unreadable_parts.finish_with_cosmetic();
         Ok(PptxDocument {
             slide_pictures,
+            lazy_pictures,
             input_bytes: 0,
             presentation,
             slides,

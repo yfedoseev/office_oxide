@@ -25,8 +25,11 @@ use office_oxide::{Document, DocumentFormat};
 struct Counting;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+/// Every byte requested, freed or not.
+static TOTAL: AtomicUsize = AtomicUsize::new(0);
 
 fn grow(by: usize) {
+    TOTAL.fetch_add(by, Ordering::Relaxed);
     let now = LIVE.fetch_add(by, Ordering::Relaxed) + by;
     PEAK.fetch_max(now, Ordering::Relaxed);
 }
@@ -69,7 +72,9 @@ fn measure<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
     (out, live, PEAK.load(Ordering::SeqCst).saturating_sub(start))
 }
 
-use common::ooxml::{PICTURE_LEN, docx, picture, pptx, pptx_with_ole_previews, xlsx};
+use common::ooxml::{
+    PICTURE_LEN, docx, docx_with_media_names, picture, pptx, pptx_with_ole_previews, xlsx,
+};
 
 /// Pictures per document.
 const PICTURES: usize = 4;
@@ -124,28 +129,113 @@ fn test_a_lazy_open_holds_the_stored_pictures_not_the_inflated_ones() {
 fn test_every_output_is_the_same_with_lazy_pictures() {
     let _serial = serial();
     for (format, bytes) in formats() {
-        let eager = open(&bytes, format, false);
-        let lazy = open(&bytes, format, true);
-        let md = |d: &Document| {
-            d.to_markdown_with(MarkdownOptions {
-                image_embed: ImageEmbed::Base64,
-            })
-        };
-        let html = |d: &Document| {
-            d.to_html_with(HtmlOptions {
-                image_embed: ImageEmbed::Base64,
-            })
-        };
-        assert_eq!(eager.plain_text(), lazy.plain_text(), "{format:?} text");
-        assert_eq!(eager.to_markdown(), lazy.to_markdown(), "{format:?} markdown");
-        assert_eq!(md(&eager), md(&lazy), "{format:?} markdown with images");
-        assert!(md(&lazy).contains("[image-base64:iVBORw0KGgo"), "{format:?}: images embedded");
-        assert_eq!(eager.to_html(), lazy.to_html(), "{format:?} html");
-        assert_eq!(html(&eager), html(&lazy), "{format:?} html with images");
-        let (e, l) = (eager.to_ir(), lazy.to_ir());
-        assert_eq!(e.to_json_string().unwrap(), l.to_json_string().unwrap(), "{format:?} IR JSON");
-        assert_eq!(eager.damage(), lazy.damage(), "{format:?} damage");
+        assert_same_outputs(format, &bytes, &ParseOptions::default(), "plain");
+        let md = open(&bytes, format, true).to_markdown_with(MarkdownOptions {
+            image_embed: ImageEmbed::Base64,
+        });
+        assert!(md.contains("[image-base64:iVBORw0KGgo"), "{format:?}: images embedded");
     }
+    use common::ooxml::{pptx_with_slides, xlsx_with_picture_sheets};
+    assert_same_outputs(
+        DocumentFormat::Pptx,
+        &pptx_with_slides(5, 2),
+        &ParseOptions::default(),
+        "slides",
+    );
+    assert_same_outputs(
+        DocumentFormat::Xlsx,
+        &xlsx_with_picture_sheets(5, 2),
+        &ParseOptions::default(),
+        "sheets",
+    );
+    assert_same_outputs(
+        DocumentFormat::Pptx,
+        &pptx_with_ole_previews(3),
+        &ParseOptions::default(),
+        "ole",
+    );
+}
+
+/// Every output of `bytes` read under `base` with lazy pictures off and on.
+fn assert_same_outputs(format: DocumentFormat, bytes: &[u8], base: &ParseOptions, what: &str) {
+    let read = |lazy: bool| {
+        let mut o = base.clone();
+        o.lazy_pictures = lazy;
+        Document::from_reader_with(Cursor::new(bytes.to_vec()), format, &o).unwrap()
+    };
+    let (eager, lazy) = (read(false), read(true));
+    let md = |d: &Document| {
+        d.to_markdown_with(MarkdownOptions {
+            image_embed: ImageEmbed::Base64,
+        })
+    };
+    let html = |d: &Document| {
+        d.to_html_with(HtmlOptions {
+            image_embed: ImageEmbed::Base64,
+        })
+    };
+    assert_eq!(eager.plain_text(), lazy.plain_text(), "{what} {format:?} text");
+    assert_eq!(eager.to_markdown(), lazy.to_markdown(), "{what} {format:?} markdown");
+    assert_eq!(md(&eager), md(&lazy), "{what} {format:?} markdown with images");
+    assert_eq!(eager.to_html(), lazy.to_html(), "{what} {format:?} html");
+    assert_eq!(html(&eager), html(&lazy), "{what} {format:?} html with images");
+    let (e, l) = (eager.to_ir(), lazy.to_ir());
+    assert_eq!(
+        e.to_json_string().unwrap(),
+        l.to_json_string().unwrap(),
+        "{what} {format:?} IR JSON"
+    );
+    assert_eq!(eager.damage(), lazy.damage(), "{what} {format:?} damage");
+}
+
+/// The budget for picture bytes copied into one IR is charged the same in
+/// both modes, so a budget too small for every picture keeps the same ones
+/// and reports the same cut.
+#[test]
+fn test_an_image_budget_too_small_for_every_picture_cuts_the_same_lazy_or_not() {
+    let _serial = serial();
+    let mut small = ParseOptions::default();
+    // Half of `memory_bytes` is the IR's picture budget: room for two of
+    // the four 2 MiB pictures.
+    small.limits.memory_bytes = (5 * PICTURE_LEN) as u64;
+    for (format, bytes) in formats() {
+        assert_same_outputs(format, &bytes, &small, "budget");
+        let mut o = small.clone();
+        o.lazy_pictures = true;
+        let doc = Document::from_reader_with(Cursor::new(bytes.clone()), format, &o).unwrap();
+        let mut found = Vec::new();
+        for section in &doc.to_ir().sections {
+            images(&section.elements, &mut found);
+        }
+        let kept = found.iter().filter(|i| i.has_bytes()).count();
+        assert!(kept < PICTURES, "{format:?}: the budget kept all {kept} pictures");
+    }
+}
+
+/// A picture whose zip entry fails its checksum is read as stored and
+/// reported, the same lazy or not, and its bytes are the bytes stored.
+#[test]
+fn test_a_picture_failing_its_checksum_reads_the_same_lazy_or_not() {
+    let _serial = serial();
+    let mut bytes = docx(1, 1);
+    // Flip the CRC-32 of the picture's entry in its local header and in the
+    // central directory.
+    let name = b"word/media/img0.png";
+    let mut at = 0;
+    while let Some(i) = bytes[at..].windows(name.len()).position(|w| w == name) {
+        let i = at + i;
+        if i >= 30 && bytes[i - 30..i - 26] == [0x50, 0x4b, 0x03, 0x04] {
+            bytes[i - 30 + 14] ^= 0xFF;
+        } else if i >= 46 && bytes[i - 46..i - 42] == [0x50, 0x4b, 0x01, 0x02] {
+            bytes[i - 46 + 16] ^= 0xFF;
+        }
+        at = i + 1;
+    }
+    assert_same_outputs(DocumentFormat::Docx, &bytes, &ParseOptions::default(), "crc");
+    let lazy = open(&bytes, DocumentFormat::Docx, true);
+    assert!(!lazy.damage().is_empty(), "the checksum is reported");
+    let (pic, _) = lazy.as_docx().unwrap().picture("rIdP0").unwrap();
+    assert_eq!(&pic.bytes().unwrap()[..], &picture(0)[..]);
 }
 
 fn images(elements: &[Element], out: &mut Vec<office_oxide::ir::Image>) {
@@ -250,4 +340,51 @@ fn test_a_picture_previewing_many_ole_objects_is_inflated_once() {
     assert_eq!(lazy.plain_text(), eager.plain_text());
     assert_eq!(lazy.to_html(), eager.to_html());
     assert_eq!(lazy.to_ir().to_json_string().unwrap(), eager.to_ir().to_json_string().unwrap());
+}
+
+/// HTML with images inline tells an image's type from its bytes when its
+/// part has no extension, and reads the bytes once for both: a lazy picture
+/// inflates on every read, so sniffing the type inflated it a second time.
+#[test]
+fn test_html_with_images_reads_a_picture_of_unknown_type_once() {
+    let _serial = serial();
+    let bytes = docx_with_media_names(1, 1, "");
+    let options = HtmlOptions {
+        image_embed: ImageEmbed::Base64,
+    };
+    let allocated = |doc: &Document| {
+        let before = TOTAL.load(Ordering::SeqCst);
+        let html = doc.to_html_with(options);
+        (html, TOTAL.load(Ordering::SeqCst) - before)
+    };
+    let (lazy_html, lazy) = allocated(&open(&bytes, DocumentFormat::Docx, true));
+    let (eager_html, eager) = allocated(&open(&bytes, DocumentFormat::Docx, false));
+    assert!(lazy_html.contains("data:image/png;base64,"), "the type is told from the bytes");
+    assert_eq!(lazy_html, eager_html);
+    // A lazy render inflates the picture once more than an eager one.
+    let extra = lazy.saturating_sub(eager);
+    assert!(
+        extra < PICTURE_LEN + PICTURE_LEN / 2,
+        "a lazy render allocated {extra} bytes more than an eager one (one picture is {PICTURE_LEN})"
+    );
+}
+
+/// `slide_picture` answers the same whether pictures are read lazily or
+/// not, for any image relationship of the slide: eagerly it found only a
+/// picture shape's, so a picture only an OLE object previews was `None`.
+#[test]
+fn test_slide_picture_answers_the_same_lazy_or_not() {
+    let _serial = serial();
+    let bytes = pptx_with_ole_previews(1);
+    let want = picture(0);
+    for lazy in [false, true] {
+        let doc = open(&bytes, DocumentFormat::Pptx, lazy);
+        let deck = doc.as_pptx().unwrap();
+        let pic = deck
+            .slide_picture(0, "rIdP0")
+            .expect("the preview's picture");
+        assert_eq!(&pic.bytes().unwrap()[..], &want[..], "lazy {lazy}");
+        assert!(deck.slide_picture(0, "rIdNone").is_none());
+        assert!(deck.slide_picture(1, "rIdP0").is_none());
+    }
 }

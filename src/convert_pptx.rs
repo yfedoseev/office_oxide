@@ -20,7 +20,10 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         std::collections::HashMap::new();
 
     for (slide_index, slide) in doc.slides.iter().enumerate() {
-        let pictures = doc.slide_pictures.get(slide_index);
+        let pictures = doc
+            .lazy_pictures
+            .then(|| doc.slide_pictures.get(slide_index))
+            .flatten();
         if let Some(ref err) = slide.parse_error {
             // An unreadable slide keeps its place as a notice, so the loss
             // is visible in every projection of the IR.

@@ -2320,6 +2320,7 @@ mod tests {
         );
         let doc = crate::pptx::PptxDocument {
             slide_pictures: Vec::new(),
+            lazy_pictures: false,
             input_bytes: 0,
             presentation: crate::pptx::PresentationInfo {
                 slides: Vec::new(),
@@ -2371,6 +2372,7 @@ mod tests {
         );
         let doc = crate::pptx::PptxDocument {
             slide_pictures: Vec::new(),
+            lazy_pictures: false,
             input_bytes: 0,
             presentation: crate::pptx::PresentationInfo {
                 slides: Vec::new(),

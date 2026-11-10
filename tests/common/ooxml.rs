@@ -57,6 +57,13 @@ pub const CT: &str = r#"<Types xmlns="http://schemas.openxmlformats.org/package/
 /// paragraphs, between lines of text.
 #[allow(dead_code)]
 pub fn docx(pictures: usize, draws: usize) -> Vec<u8> {
+    docx_with_media_names(pictures, draws, ".png")
+}
+
+/// [`docx`] with the media parts named `img{n}{suffix}` (`""` for parts
+/// with no extension, whose format is told from their bytes).
+#[allow(dead_code)]
+pub fn docx_with_media_names(pictures: usize, draws: usize, suffix: &str) -> Vec<u8> {
     let mut body = String::new();
     for i in 0..draws {
         body.push_str(&format!(
@@ -66,7 +73,7 @@ pub fn docx(pictures: usize, draws: usize) -> Vec<u8> {
         ));
     }
     let doc_rels: Vec<_> = (0..pictures)
-        .map(|n| (format!("rIdP{n}"), "image", format!("media/img{n}.png")))
+        .map(|n| (format!("rIdP{n}"), "image", format!("media/img{n}{suffix}")))
         .collect();
     let mut parts = vec![
         ("[Content_Types].xml".to_string(), CT.as_bytes().to_vec()),
@@ -82,7 +89,7 @@ pub fn docx(pictures: usize, draws: usize) -> Vec<u8> {
         ("word/_rels/document.xml.rels".to_string(), rels(&doc_rels)),
     ];
     for n in 0..pictures {
-        parts.push((format!("word/media/img{n}.png"), picture(n)));
+        parts.push((format!("word/media/img{n}{suffix}"), picture(n)));
     }
     zip_of(parts)
 }
