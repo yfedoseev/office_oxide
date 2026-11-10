@@ -63,8 +63,8 @@ pub fn set_include_deleted_text(include: bool) {
 /// into every image that draws it: picture bytes are then reached through
 /// [`Image::bytes`](crate::ir::Image::bytes),
 /// [`DocxDocument::picture`](crate::docx::DocxDocument::picture),
-/// [`PictureShape::bytes`](crate::pptx::shape::PictureShape::bytes) and
-/// [`WorksheetPicture::bytes`](crate::xlsx::worksheet::WorksheetPicture::bytes),
+/// [`PptxDocument::slide_picture`](crate::pptx::PptxDocument::slide_picture) and
+/// [`XlsxDocument::picture`](crate::xlsx::XlsxDocument::picture),
 /// and the fields that held them eagerly (`Image::data`,
 /// `DocxDocument::images`, `PictureShape::data`, `WorksheetPicture::data`)
 /// are left empty. Every output is the same either way.

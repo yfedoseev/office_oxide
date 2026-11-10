@@ -38,7 +38,7 @@ pub(crate) mod offcrypto;
 pub mod opc;
 /// Parallel processing helpers (Rayon-based, feature-gated).
 pub mod parallel;
-/// Picture bytes that are shared, and optionally inflated only when used.
+// Documented by its own module comment, whose links resolve in it.
 pub mod picture;
 /// Core and extended document properties (`docProps/core.xml`, `docProps/app.xml`).
 pub mod properties;
