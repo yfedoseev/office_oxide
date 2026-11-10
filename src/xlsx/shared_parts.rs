@@ -353,6 +353,8 @@ pub(super) fn read_parsed<R: Read + Seek, T>(
 
 /// Read and parse the drawing part at `drawing_path`: its `<xdr:pic>` and
 /// `<xdr:sp>` anchors, and each picture's underlying media bytes.
+// Reads or fills the eager picture field kept for 0.1.x callers.
+#[allow(deprecated)]
 fn read_drawing<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &opc::ZipEntryIndex,
@@ -385,7 +387,8 @@ fn read_drawing<R: Read + Seek>(
         if rel.target_mode == crate::core::relationships::TargetMode::External {
             continue;
         }
-        let Some(bytes) = read_media_cached(archive, entries, &media_path, media, unreadable)
+        let Some((pic, bytes)) =
+            read_media_cached(archive, entries, &media_path, media, unreadable)
         else {
             continue;
         };
@@ -393,7 +396,11 @@ fn read_drawing<R: Read + Seek>(
             .extension()
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_else(|| guess_image_format_from_bytes(&bytes).to_string());
+            .unwrap_or_else(|| {
+                pic.bytes()
+                    .map_or("png", |b| guess_image_format_from_bytes(&b))
+                    .to_string()
+            });
 
         pictures.push(WorksheetPicture {
             data: bytes,

@@ -897,6 +897,15 @@ pub struct WorksheetTextShape {
 #[derive(Debug, Clone)]
 pub struct WorksheetPicture {
     /// Image bytes, shared by every picture that names the same media part.
+    ///
+    /// Empty when the workbook was read with
+    /// [`read_options::lazy_pictures`](crate::read_options::lazy_pictures)
+    /// on; [`XlsxDocument::picture`](super::XlsxDocument::picture) gives the
+    /// picture either way.
+    #[deprecated(
+        since = "0.1.17",
+        note = "use XlsxDocument::picture, which also works when pictures are read lazily; removed in 0.2.0"
+    )]
     pub data: std::sync::Arc<[u8]>,
     /// Lowercase file extension (`"png"`, `"jpeg"`, ...).
     pub format: String,

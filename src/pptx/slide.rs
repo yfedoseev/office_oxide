@@ -54,6 +54,23 @@ fn run_props_from_attrs(e: &quick_xml::events::BytesStart) -> CoreResult<RunProp
     })
 }
 
+/// The pictures a part's relationships name, by relationship id, for the
+/// shape parser: shared and read once per media part.
+pub(crate) type Media = std::collections::HashMap<String, MediaEntry>;
+
+/// One picture a part names.
+#[derive(Debug, Clone)]
+pub(crate) struct MediaEntry {
+    /// The picture.
+    pub(crate) pic: crate::core::picture::PictureBytes,
+    /// Its part's lower-cased extension.
+    pub(crate) ext: String,
+    /// Whether a picture shape's `data` holds the bytes: `false` when
+    /// pictures are read lazily, which is decided before the (possibly
+    /// parallel) parse, on the thread that knows the document's settings.
+    pub(crate) eager: bool,
+}
+
 /// A parsed PPTX slide.
 #[derive(Debug, Clone, Default)]
 pub struct Slide {
@@ -130,7 +147,7 @@ impl Slide {
         xml_data: &[u8],
         name: String,
         rels: &Relationships,
-        media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
+        media: &Media,
         part_text: &PartText,
     ) -> CoreResult<Self> {
         let mut reader = make_content_reader(xml_data);
@@ -247,7 +264,7 @@ fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
 fn parse_shape_tree(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
+    media: &Media,
     part_text: &PartText,
 ) -> CoreResult<Vec<Shape>> {
     parse_shape_tree_until(reader, rels, media, part_text, "spTree")
@@ -259,7 +276,7 @@ fn parse_shape_tree(
 fn parse_shape_tree_until(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
+    media: &Media,
     part_text: &PartText,
     end_local: &str,
 ) -> CoreResult<Vec<Shape>> {
@@ -302,7 +319,7 @@ fn parse_shape_tree_until(
 fn parse_alternate_content(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
+    media: &Media,
     part_text: &PartText,
 ) -> CoreResult<Vec<Shape>> {
     let mut shapes: Vec<Shape> = Vec::new();
@@ -399,10 +416,12 @@ fn parse_auto_shape(
 // PictureShape (p:pic)
 // ---------------------------------------------------------------------------
 
+// Reads or fills the eager picture field kept for 0.1.x callers.
+#[allow(deprecated)]
 fn parse_picture(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
+    media: &Media,
 ) -> CoreResult<Shape> {
     let mut props = NvPicProps::default();
     let mut position = None;
@@ -433,7 +452,7 @@ fn parse_picture(
     }
 
     let (data, format) = match blip.embed.as_deref().and_then(|rid| media.get(rid)) {
-        Some((bytes, ext)) => (Some(bytes.clone()), Some(ext.clone())),
+        Some(m) => (m.eager.then(|| m.pic.bytes()).flatten(), Some(m.ext.clone())),
         None => (None, None),
     };
     // A linked picture's bytes live outside the package; its relationship
@@ -539,7 +558,7 @@ fn read_rel_attr(e: &quick_xml::events::BytesStart, local: &str) -> CoreResult<O
 fn parse_group_shape(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
+    media: &Media,
     part_text: &PartText,
 ) -> CoreResult<Shape> {
     // Groups nest, so this is the recursion an adversarial deck drives.
@@ -762,7 +781,7 @@ fn find_part_rid(
 /// resolved against the slide's pre-read images.
 fn parse_ole_graphic_data(
     reader: &mut quick_xml::Reader<&[u8]>,
-    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
+    media: &Media,
 ) -> CoreResult<GraphicContent> {
     let mut ole = OleObject {
         prog_id: None,
@@ -786,11 +805,11 @@ fn parse_ole_graphic_data(
                         ole.rel_id = read_rel_attr(e, "id")?;
                     },
                     "blip" if ole.preview_data.is_none() => {
-                        if let Some((bytes, ext)) =
-                            read_blip_embed_attr(e)?.and_then(|rid| media.get(&rid))
-                        {
-                            ole.preview_data = Some(std::sync::Arc::clone(bytes));
-                            ole.preview_format = Some(ext.clone());
+                        if let Some(m) = read_blip_embed_attr(e)?.and_then(|rid| media.get(&rid)) {
+                            // A preview is small and its object has nowhere
+                            // else to keep it, so it is held inflated.
+                            ole.preview_data = m.pic.bytes();
+                            ole.preview_format = Some(m.ext.clone());
                         }
                     },
                     _ => {},
@@ -819,7 +838,7 @@ fn parse_ole_graphic_data(
 fn parse_graphic_frame(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
+    media: &Media,
     part_text: &PartText,
 ) -> CoreResult<Shape> {
     let mut id = 0u32;
@@ -2288,6 +2307,7 @@ mod tests {
             None,
         );
         let doc = crate::pptx::PptxDocument {
+            slide_pictures: Vec::new(),
             input_bytes: 0,
             presentation: crate::pptx::PresentationInfo {
                 slides: Vec::new(),
@@ -2338,6 +2358,7 @@ mod tests {
             None,
         );
         let doc = crate::pptx::PptxDocument {
+            slide_pictures: Vec::new(),
             input_bytes: 0,
             presentation: crate::pptx::PresentationInfo {
                 slides: Vec::new(),
@@ -3382,6 +3403,8 @@ mod tests {
     }
 
     #[test]
+    // Reads or fills the eager picture field kept for 0.1.x callers.
+    #[allow(deprecated)]
     fn test_picture_embed_resolves_via_media_map() {
         // Build a media map keyed by the rId used in the slide xml so
         // parse_picture can resolve the embed → bytes.
@@ -3404,7 +3427,11 @@ mod tests {
         let mut media = std::collections::HashMap::new();
         media.insert(
             "rId7".to_string(),
-            (vec![0xDEu8, 0xADu8, 0xBEu8, 0xEFu8].into(), "png".to_string()),
+            MediaEntry {
+                pic: vec![0xDEu8, 0xADu8, 0xBEu8, 0xEFu8].into(),
+                ext: "png".to_string(),
+                eager: true,
+            },
         );
 
         let slide = Slide::parse(
@@ -3425,6 +3452,8 @@ mod tests {
     }
 
     #[test]
+    // Reads or fills the eager picture field kept for 0.1.x callers.
+    #[allow(deprecated)]
     fn test_picture_embed_without_media_still_carries_rid() {
         // Empty media map: rId is captured but data/format are None.
         let xml = make_slide_xml(

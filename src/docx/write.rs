@@ -1973,8 +1973,8 @@ fn convert_ir_table(
 fn register_ir_image(image: &crate::ir::Image, images: &mut Vec<DocxImage>) -> Option<usize> {
     // Embedded bytes win; a picture with none but a `source_url` is a
     // linked picture, written as one rather than dropped.
-    let (data, linked) = match (&image.data, &image.source_url) {
-        (Some(data), _) => (data.clone(), None),
+    let (data, linked) = match (image.bytes(), &image.source_url) {
+        (Some(data), _) => (data.to_vec(), None),
         (None, Some(url)) => (Vec::new(), Some(url.clone())),
         (None, None) => return None,
     };

@@ -278,7 +278,7 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
                     // form (base64).
                     let (mut image_bytes, mut image_base64) = (0usize, 0usize);
                     crate::ir::for_each_image_mut(&mut tmp, |i| {
-                        let n = i.data.as_ref().map_or(0, Vec::len);
+                        let n = i.byte_len().unwrap_or(0);
                         image_bytes = image_bytes.saturating_add(n);
                         image_base64 = image_base64.saturating_add(n.div_ceil(3) * 4);
                     });
@@ -304,7 +304,10 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
                 // its text, and its pictures their place without bytes.
                 let (stripped, chars) = story.without_images.get_or_insert_with(|| {
                     let mut part = story.part.clone();
-                    crate::ir::for_each_image_mut(&mut part.content, |i| i.data = None);
+                    crate::ir::for_each_image_mut(&mut part.content, |i| {
+                        i.data = None;
+                        i.shared_data = None;
+                    });
                     let chars = serde_json::to_vec(&part.content).map_or(usize::MAX, |v| v.len());
                     (part, chars)
                 });
@@ -1170,7 +1173,7 @@ fn collect_paragraph_inline_images(
                     // its target; it used to be dropped without trace.
                     let (data, ext) = match embedded_image(d, doc) {
                         Some((data, ext)) => (data, ext),
-                        None if d.linked_image.is_some() => (None, None),
+                        None if d.linked_image.is_some() => (ImageData::default(), None),
                         None => continue,
                     };
                     let format =
@@ -1184,7 +1187,8 @@ fn collect_paragraph_inline_images(
                     out.push(Element::Image(Image {
                         alt_text: d.description.clone(),
                         decorative: d.decorative,
-                        data,
+                        data: data.data,
+                        shared_data: data.shared,
                         source_url: linked_image_url(d),
                         format,
                         display_width_emu: Some(d.width.0.max(0) as u64),
@@ -1326,7 +1330,7 @@ fn drawing_to_float_element(
 
     let (data, ext) = match embedded_image(d, doc) {
         Some((data, ext)) => (data, ext),
-        None if d.linked_image.is_some() => (None, None),
+        None if d.linked_image.is_some() => (ImageData::default(), None),
         None => return None,
     };
     let format = ext.as_deref().and_then(|e| match e {
@@ -1337,7 +1341,8 @@ fn drawing_to_float_element(
     Some(Element::Image(Image {
         alt_text: d.description.clone(),
         decorative: d.decorative,
-        data,
+        data: data.data,
+        shared_data: data.shared,
         source_url: linked_image_url(d),
         format,
         display_width_emu: Some(width_emu),
@@ -1374,13 +1379,42 @@ fn linked_image_url(d: &crate::docx::DrawingInfo) -> Option<String> {
 fn embedded_image(
     d: &crate::docx::DrawingInfo,
     doc: &crate::docx::DocxDocument,
-) -> Option<(Option<Vec<u8>>, Option<String>)> {
+) -> Option<(ImageData, Option<String>)> {
     if d.relationship_id.is_empty() {
         return None;
     }
-    let (data, ext) = doc.images.get(&d.relationship_id)?;
-    let copy = crate::limits::charge_image_bytes(data.len()).then(|| data.to_vec());
-    Some((copy, ext.clone()))
+    let (pic, ext) = doc.picture(&d.relationship_id)?;
+    let data = if crate::limits::charge_image_bytes(pic.len()) {
+        ImageData::of(pic)
+    } else {
+        ImageData::default()
+    };
+    Some((data, ext.map(str::to_string)))
+}
+
+/// The bytes an IR image carries: a copy in `Image::data`, or, when pictures
+/// are held lazily, the picture shared in `Image::shared_data`. The budget is
+/// charged the same either way, so both modes keep the same pictures.
+#[derive(Default)]
+pub(crate) struct ImageData {
+    pub(crate) data: Option<Vec<u8>>,
+    pub(crate) shared: Option<crate::core::picture::PictureBytes>,
+}
+
+impl ImageData {
+    pub(crate) fn of(pic: &crate::core::picture::PictureBytes) -> Self {
+        if crate::read_options::lazy_pictures() {
+            Self {
+                data: None,
+                shared: Some(pic.clone()),
+            }
+        } else {
+            Self {
+                data: pic.bytes().map(|b| b.to_vec()),
+                shared: None,
+            }
+        }
+    }
 }
 
 /// Translate a paragraph's `<w:jc>` justification into the IR's

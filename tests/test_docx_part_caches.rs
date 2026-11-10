@@ -128,7 +128,7 @@ fn test_an_image_part_many_relationships_name_is_read_once() {
         vec![("word/media/image1.png".into(), vec![7u8; PART_BYTES])],
     );
     let (doc, read) = open_counting(bytes.clone());
-    assert_eq!(doc.images.len(), COPIES);
+    assert_eq!(doc.pictures().count(), COPIES);
     assert_read_once(&bytes, read);
 }
 
@@ -268,6 +268,6 @@ fn test_an_image_part_named_by_different_spellings_is_read_once() {
         vec![("word/media/image1.png".into(), vec![7u8; PART_BYTES])],
     );
     let (doc, read) = open_counting(bytes.clone());
-    assert_eq!(doc.images.len(), COPIES);
+    assert_eq!(doc.pictures().count(), COPIES);
     assert_read_once(&bytes, read);
 }

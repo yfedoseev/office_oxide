@@ -72,6 +72,9 @@ pub struct XlsxDocument {
     /// The size of the file this document was read from (0 when unknown): small
     /// inputs get a text budget scaled to them (see [`crate::limits`]).
     pub(crate) input_bytes: u64,
+    /// The pictures, when read lazily, by the token their
+    /// `WorksheetPicture::data` holds (see [`Self::picture`]).
+    pub(crate) lazy_pictures: LazyPictures,
     /// Workbook-level metadata (name, sheets list, date system).
     pub workbook: WorkbookInfo,
     /// Parsed worksheets in sheet-order.
@@ -149,6 +152,18 @@ pub struct XlsxDocument {
 }
 
 impl XlsxDocument {
+    /// The bytes of `pic`, one of this workbook's pictures (`Worksheet::images`
+    /// or `cell_images`): shared, whether or not pictures are read lazily
+    /// (when they are, `pic.data` is empty).
+    // Reads or fills the eager picture field kept for 0.1.x callers.
+    #[allow(deprecated)]
+    pub fn picture(&self, pic: &worksheet::WorksheetPicture) -> crate::core::picture::PictureBytes {
+        self.lazy_pictures
+            .get(&(pic.data.as_ptr() as usize))
+            .cloned()
+            .unwrap_or_else(|| pic.data.clone().into())
+    }
+
     /// Parse and cache styles on demand. Returns the stylesheet if available.
     pub fn ensure_styles(&mut self) -> Option<&StyleSheet> {
         if self.styles.is_none() {
@@ -773,7 +788,9 @@ impl XlsxDocument {
         let (unreadable_sheets, unreadable_sheets_omitted, _) = unreadable_sheets.finish();
         let (unreadable_parts, unreadable_parts_omitted, cosmetic_parts) =
             shared.unreadable.finish();
+        let lazy_pictures = lazy_pictures_of(&media);
         Ok(XlsxDocument {
+            lazy_pictures,
             input_bytes: 0,
             workbook,
             worksheets,
@@ -1435,7 +1452,30 @@ fn part_key(entries: &opc::ZipEntryIndex, path: &str) -> String {
 /// Media parts already read, by part name. A picture's bytes are shared by
 /// every anchor and rich value that names the part, where each used to get a
 /// copy (and a decompression) of its own.
-type MediaCache = std::collections::HashMap<String, Option<std::sync::Arc<[u8]>>>;
+///
+/// Each entry is the picture and what a `WorksheetPicture::data` that draws
+/// it holds: the bytes, or, when pictures are read lazily, an empty token
+/// whose allocation names the picture (see `XlsxDocument::picture`).
+type MediaCache = std::collections::HashMap<
+    String,
+    Option<(crate::core::picture::PictureBytes, std::sync::Arc<[u8]>)>,
+>;
+
+/// The pictures of a workbook read lazily, by the address of the token a
+/// `WorksheetPicture::data` holds in their place.
+pub(crate) type LazyPictures = std::collections::HashMap<usize, crate::core::picture::PictureBytes>;
+
+/// The table [`LazyPictures`] for the pictures `cache` read.
+fn lazy_pictures_of(cache: &MediaCache) -> LazyPictures {
+    if !crate::read_options::lazy_pictures() {
+        return LazyPictures::new();
+    }
+    cache
+        .values()
+        .flatten()
+        .map(|(pic, token)| (token.as_ptr() as usize, pic.clone()))
+        .collect()
+}
 
 fn read_media_cached<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
@@ -1443,15 +1483,24 @@ fn read_media_cached<R: Read + Seek>(
     path: &str,
     cache: &mut MediaCache,
     unreadable: &mut shared_parts::ReportList,
-) -> Option<std::sync::Arc<[u8]>> {
+) -> Option<(crate::core::picture::PictureBytes, std::sync::Arc<[u8]>)> {
     let key = part_key(entries, path);
     if let Some(hit) = cache.get(&key) {
         return hit.clone();
     }
     // A part that cannot be read is remembered, and reported once: each
     // anchor naming it would otherwise inflate it again.
-    let bytes: Option<std::sync::Arc<[u8]>> = match opc::read_zip_entry(archive, entries, path) {
-        Ok(bytes) => Some(bytes.into()),
+    let bytes = match opc::read_zip_picture(archive, entries, path) {
+        Ok(pic) => {
+            // Held lazily, the picture's anchors hold a token of their own
+            // allocation, never a copy of the bytes.
+            let held: std::sync::Arc<[u8]> = if crate::read_options::lazy_pictures() {
+                std::sync::Arc::from(Vec::new())
+            } else {
+                pic.bytes()?
+            };
+            Some((pic, held))
+        },
         Err(e) => {
             log::warn!("xlsx: picture part {path} unreadable: {e}");
             unreadable.record(entries, path, &e.to_string());
@@ -1512,6 +1561,8 @@ fn read_optional_cosmetic<R: Read + Seek>(
 /// `richValueRel.xml` (+ its own `.rels`) -> `xl/media/*`. Any missing or
 /// malformed part along the way yields an empty map — this is a
 /// best-effort recovery, not a hard requirement for opening the file.
+// Reads or fills the eager picture field kept for 0.1.x callers.
+#[allow(deprecated)]
 fn read_rich_value_images<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &opc::ZipEntryIndex,
@@ -1582,7 +1633,8 @@ fn read_rich_value_images<R: Read + Seek>(
             continue;
         };
         let media_path = resolve_relative_zip_path(rel_path, &rel.target);
-        let Some(bytes) = read_media_cached(archive, entries, &media_path, media, unreadable)
+        let Some((pic, bytes)) =
+            read_media_cached(archive, entries, &media_path, media, unreadable)
         else {
             continue;
         };
@@ -1590,7 +1642,11 @@ fn read_rich_value_images<R: Read + Seek>(
             .extension()
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_else(|| guess_image_format_from_bytes(&bytes).to_string());
+            .unwrap_or_else(|| {
+                pic.bytes()
+                    .map_or("png", |b| guess_image_format_from_bytes(&b))
+                    .to_string()
+            });
 
         // No anchor coordinates exist for an in-cell rich value — it has
         // no `<xdr:from>`/`<xdr:to>` at all, unlike a drawing-anchored
@@ -2876,6 +2932,8 @@ mod tests {
     /// empty-cell path parsed and then dropped the `vm`, so such a cell's
     /// rich-value image was lost.
     #[test]
+    // Reads or fills the eager picture field kept for 0.1.x callers.
+    #[allow(deprecated)]
     fn test_a_self_closing_vm_cell_keeps_its_value_metadata_link() {
         let doc = open_bytes(rich_value_image_package(r#"<c r="B2" vm="1"/>"#));
         let ws = &doc.worksheets[0];
@@ -2894,6 +2952,8 @@ mod tests {
     /// fixture mirrors the exact shape of the real-corpus reproducer
     /// (`phpspreadsheet_drawing_in_cell.xlsx`) byte for byte.
     #[test]
+    // Reads or fills the eager picture field kept for 0.1.x callers.
+    #[allow(deprecated)]
     fn test_a_rich_value_image_cell_resolves_to_a_real_image_not_a_value_error() {
         let doc =
             open_bytes(rich_value_image_package(r#"<c r="B2" t="e" vm="1"><v>#VALUE!</v></c>"#));

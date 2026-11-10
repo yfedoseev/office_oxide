@@ -514,13 +514,16 @@ impl<'d> SheetConverter<'d> {
             // Its alternative text and the elements around it are paid for
             // as text.
             let total = (*scope == IrScope::Sheet).then_some(&mut *total_image_budget);
-            if !charge_picture(budget, image_budget, total, picture_chars(pic), pic.data.len()) {
+            let picture = doc.picture(pic);
+            if !charge_picture(budget, image_budget, total, picture_chars(pic), picture.len()) {
                 break;
             }
             let format = image_format_from_ext(&pic.format);
+            let data = crate::convert_docx::ImageData::of(&picture);
             let img = Image {
                 alt_text: pic.alt_text.clone(),
-                data: Some(pic.data.to_vec()),
+                data: data.data,
+                shared_data: data.shared,
                 format,
                 display_width_emu: Some(pic.cx_emu.max(0) as u64),
                 display_height_emu: Some(pic.cy_emu.max(0) as u64),

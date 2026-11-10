@@ -92,8 +92,8 @@ fn image_mime(img: &Image) -> Option<&'static str> {
     if let Some(ref fmt) = img.format {
         return Some(fmt.content_type());
     }
-    let data = img.data.as_deref()?;
-    Some(match data {
+    let data = img.bytes()?;
+    Some(match &data[..] {
         [0x89, b'P', b'N', b'G', ..] => "image/png",
         [0xFF, 0xD8, 0xFF, ..] => "image/jpeg",
         [b'G', b'I', b'F', b'8', ..] => "image/gif",
@@ -200,8 +200,8 @@ mod block_default {
                 // With `ImageEmbed::Base64` the bytes go inline at the
                 // image's position in the flow.
                 if super::MARKDOWN_OPTIONS.with(|o| o.get().image_embed) == ImageEmbed::Base64 {
-                    if let Some(ref data) = img.data {
-                        return format!("[image-base64:{}]", crate::core::base64::Display(data));
+                    if let Some(data) = img.bytes() {
+                        return format!("[image-base64:{}]", crate::core::base64::Display(&data));
                     }
                 }
                 // A linked image has a real, addressable source.
@@ -250,13 +250,13 @@ mod block_default {
                 // URI, so the HTML is self-contained — `to_html` otherwise
                 // has no way at all to show an image.
                 if super::HTML_OPTIONS.with(|o| o.get().image_embed) == ImageEmbed::Base64 {
-                    if let (Some(data), Some(mime)) = (img.data.as_ref(), super::image_mime(img)) {
+                    if let (Some(data), Some(mime)) = (img.bytes(), super::image_mime(img)) {
                         let alt = img.alt_text.as_deref().unwrap_or("");
                         let mut out = String::new();
                         let _ = write!(
                             out,
                             "<img src=\"data:{mime};base64,{}\" alt=\"{}\" />",
-                            crate::core::base64::Display(data),
+                            crate::core::base64::Display(&data),
                             super::escape_html(alt)
                         );
                         return out;

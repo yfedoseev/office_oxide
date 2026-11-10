@@ -665,6 +665,7 @@ mod tests {
 
     fn make_doc(slides: Vec<Slide>) -> PptxDocument {
         PptxDocument {
+            slide_pictures: Vec::new(),
             input_bytes: 0,
             core_properties: None,
             app_properties: None,

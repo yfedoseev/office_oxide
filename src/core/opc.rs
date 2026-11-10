@@ -394,6 +394,13 @@ impl<R: Read + Seek> OpcReader<R> {
         Ok(data)
     }
 
+    /// Read a picture part as [`read_zip_picture`] does: the same checks as
+    /// [`Self::read_part`], kept as its stored stream when pictures are held
+    /// lazily.
+    pub(crate) fn read_picture(&mut self, name: &PartName) -> Result<super::picture::PictureBytes> {
+        read_zip_picture(&mut self.archive, &self.entries, &name.as_str()[1..])
+    }
+
     /// Read and parse the relationships for a given part.
     pub fn read_rels_for(&mut self, part: &PartName) -> Result<Relationships> {
         let rels_zip_path = part.rels_path();
@@ -918,6 +925,42 @@ fn inflate_despite_declared_size<R: Read + Seek>(
         Ok(_) if out.len() as u64 <= bound => Ok(out),
         _ => Err(out.len() as u64),
     }
+}
+
+/// Read the picture part `name` as [`read_zip_entry`] does, with the same
+/// limits, checks and errors. With [`read_options::lazy_pictures`] on, a
+/// deflated entry that inflated to at least twice its stored size is then
+/// kept as its stored stream, to inflate on use, and the bytes just read are
+/// dropped; anything else is kept as read.
+///
+/// [`read_options::lazy_pictures`]: crate::read_options::lazy_pictures
+pub(crate) fn read_zip_picture<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &ZipEntryIndex,
+    name: &str,
+) -> Result<super::picture::PictureBytes> {
+    let data = read_zip_entry(archive, entries, name)?;
+    if !crate::read_options::lazy_pictures() {
+        return Ok(data.into());
+    }
+    let stored = archive
+        .index_for_name(name)
+        .or_else(|| entries.lookup(name))
+        .and_then(|index| archive.by_index_raw(index).ok())
+        .filter(|raw| {
+            raw.compression() == zip::CompressionMethod::Deflated
+                && raw.compressed_size().saturating_mul(2) <= data.len() as u64
+        })
+        .and_then(|raw| {
+            let size = raw.compressed_size();
+            let mut stored = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+            raw.take(size).read_to_end(&mut stored).ok()?;
+            Some(stored)
+        });
+    Ok(match stored {
+        Some(stored) => super::picture::PictureBytes::deflated(stored, &data),
+        None => data.into(),
+    })
 }
 
 pub(crate) fn read_zip_entry<R: Read + Seek>(

@@ -968,8 +968,7 @@ pub(crate) fn image_bytes_in(elements: &[Element]) -> u64 {
                 for e in els {
                     match e {
                         Element::Image(i) => {
-                            total =
-                                total.saturating_add(i.data.as_ref().map_or(0, |d| d.len() as u64));
+                            total = total.saturating_add(i.byte_len().map_or(0, |n| n as u64));
                         },
                         Element::TextBox(tb) => stack.push(Work::Elems(&tb.content)),
                         Element::Footnote(n) | Element::Endnote(n) => {
@@ -1892,6 +1891,21 @@ mod image_bytes {
     use serde::de::{self, Deserializer, SeqAccess, Visitor};
     use serde::ser::Serializer;
 
+    /// [`serialize`] for bytes shared with the document: inflated (when they
+    /// are held as a stored stream) only while they are written.
+    pub fn serialize_shared<S: Serializer>(
+        data: &Option<crate::core::picture::PictureBytes>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        match data
+            .as_ref()
+            .and_then(crate::core::picture::PictureBytes::bytes)
+        {
+            Some(bytes) => s.serialize_some(&Base64(&bytes)),
+            None => s.serialize_none(),
+        }
+    }
+
     pub fn serialize<S: Serializer>(data: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
         match data {
             Some(bytes) => s.serialize_some(&Base64(bytes)),
@@ -1943,8 +1957,24 @@ pub struct Image {
     /// surfaces turned into one line per byte: a 1.2 MB `.docx` produced a
     /// 140 MB, 8.3-million-line `ir` dump. Deserialisation still accepts
     /// the number array so IR JSON written by earlier releases loads.
+    ///
+    /// A document read with
+    /// [`read_options::lazy_pictures`](crate::read_options::lazy_pictures)
+    /// on leaves this empty and shares the bytes through [`Self::shared_data`];
+    /// [`Self::bytes`] reads either.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "image_bytes")]
     pub data: Option<Vec<u8>>,
+    /// The image bytes shared with the document instead of copied into
+    /// [`Self::data`] (see [`crate::core::picture::PictureBytes`]). Written
+    /// to JSON as `data`, the same base64 string; read back into `data`.
+    #[serde(
+        rename = "data",
+        default,
+        skip_deserializing,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "image_bytes::serialize_shared"
+    )]
+    pub shared_data: Option<crate::core::picture::PictureBytes>,
     /// Pixel format of the image data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<ImageFormat>,
@@ -1977,6 +2007,61 @@ pub struct Image {
     /// (DrawingML `<a:blip r:link>`). Usually a URL; `data` is then `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_url: Option<String>,
+}
+
+/// An image's bytes, as [`Image::bytes`] hands them out: borrowed from
+/// [`Image::data`], or shared with the document. Dereferences to `[u8]`.
+#[derive(Debug, Clone)]
+pub enum ImageBytes<'a> {
+    /// Borrowed from [`Image::data`].
+    Borrowed(&'a [u8]),
+    /// Shared with the document ([`Image::shared_data`]).
+    Shared(std::sync::Arc<[u8]>),
+}
+
+impl std::ops::Deref for ImageBytes<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            ImageBytes::Borrowed(b) => b,
+            ImageBytes::Shared(b) => b,
+        }
+    }
+}
+
+impl AsRef<[u8]> for ImageBytes<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl Image {
+    /// The image bytes, from [`Self::shared_data`] when the document shares
+    /// them, otherwise from [`Self::data`]. Borrowed from `data`; shared (or,
+    /// for a picture held as its stored stream, inflated for this call and
+    /// not kept) from `shared_data`.
+    pub fn bytes(&self) -> Option<ImageBytes<'_>> {
+        match (&self.shared_data, &self.data) {
+            (Some(shared), _) => shared.bytes().map(ImageBytes::Shared),
+            (None, Some(data)) => Some(ImageBytes::Borrowed(data)),
+            (None, None) => None,
+        }
+    }
+
+    /// The number of image bytes, without inflating a picture held as its
+    /// stored stream.
+    pub fn byte_len(&self) -> Option<usize> {
+        match (&self.shared_data, &self.data) {
+            (Some(shared), _) => Some(shared.len()),
+            (None, Some(data)) => Some(data.len()),
+            (None, None) => None,
+        }
+    }
+
+    /// Whether the image has bytes, from either field.
+    pub fn has_bytes(&self) -> bool {
+        self.shared_data.is_some() || self.data.is_some()
+    }
 }
 
 impl DocumentIR {

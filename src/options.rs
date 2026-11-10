@@ -46,6 +46,10 @@ pub struct ParseOptions {
     pub include_deleted_text: bool,
     /// What to do when the result is known to be incomplete.
     pub on_incomplete: OnIncomplete,
+    /// Keep deflated pictures as their stored streams and inflate them only
+    /// when used (see
+    /// [`read_options::lazy_pictures`](crate::read_options::lazy_pictures)).
+    pub lazy_pictures: bool,
 }
 
 impl Default for ParseOptions {
@@ -57,6 +61,7 @@ impl Default for ParseOptions {
             include_hidden_text: crate::read_options::include_hidden_text(),
             include_deleted_text: crate::read_options::include_deleted_text(),
             on_incomplete: OnIncomplete::Report,
+            lazy_pictures: crate::read_options::lazy_pictures(),
         }
     }
 }
@@ -82,6 +87,7 @@ impl ParseOptions {
         match name {
             "include_hidden_text" => self.include_hidden_text = value != 0,
             "include_deleted_text" => self.include_deleted_text = value != 0,
+            "lazy_pictures" => self.lazy_pictures = value != 0,
             "on_incomplete" => {
                 self.on_incomplete = if value == 0 {
                     OnIncomplete::Report
@@ -97,8 +103,12 @@ impl ParseOptions {
         Ok(())
     }
 
-    pub(crate) fn read_settings(&self) -> (bool, bool) {
-        (self.include_hidden_text, self.include_deleted_text)
+    pub(crate) fn read_settings(&self) -> crate::read_options::Settings {
+        crate::read_options::Settings {
+            hidden: self.include_hidden_text,
+            deleted: self.include_deleted_text,
+            lazy_pictures: self.lazy_pictures,
+        }
     }
 }
 

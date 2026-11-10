@@ -329,3 +329,23 @@ def test_markdown_with_images_can_be_written_and_bad_targets_are_refused(tmp_pat
         doc.write_text(42)
     with pytest.raises(OSError):
         doc.write_text(tmp_path / "missing-dir" / "out")
+
+
+def test_lazy_pictures_change_no_output():
+    from office_oxide import PptxWriter
+
+    w = PptxWriter()
+    w.add_slide()
+    w.set_slide_title(0, "Pictures")
+    png = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+        + b"\x00" * 200_000
+    )
+    w.add_slide_image(0, png, "png", 0, 0, 100, 100)
+    data = w.to_bytes()
+    assert "lazy_pictures" in office_oxide.ParseOptions.names()
+    eager = Document.from_bytes(data, "pptx")
+    lazy = Document.from_bytes(data, "pptx", options=office_oxide.ParseOptions(lazy_pictures=True))
+    assert lazy.to_markdown_with_images() == eager.to_markdown_with_images()
+    assert lazy.to_ir_json() == eager.to_ir_json()
+    assert lazy.plain_text() == eager.plain_text()

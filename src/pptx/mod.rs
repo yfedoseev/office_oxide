@@ -71,6 +71,11 @@ pub struct PptxDocument {
     /// The size of the file this document was read from (0 when unknown): small
     /// inputs get a text budget scaled to them (see [`crate::limits`]).
     pub(crate) input_bytes: u64,
+    /// The pictures of each slide (in `slides` order), by the relationship
+    /// id a picture shape's `embed_rid` holds; filled only when pictures are
+    /// read lazily, when `PictureShape::data` is left empty.
+    pub(crate) slide_pictures:
+        Vec<std::collections::HashMap<String, crate::core::picture::PictureBytes>>,
     /// Metadata from `ppt/presentation.xml` (slide list, dimensions).
     pub presentation: PresentationInfo,
     /// Parsed slides, in presentation order.
@@ -117,6 +122,30 @@ pub struct PptxDocument {
 }
 
 impl PptxDocument {
+    /// The picture the relationship `rel_id` (a picture shape's
+    /// `embed_rid`) names on slide `slide` (an index into `slides`). Works
+    /// whether or not pictures are read lazily; when they are not, it is
+    /// the picture `PictureShape::data` holds.
+    pub fn slide_picture(
+        &self,
+        slide: usize,
+        rel_id: &str,
+    ) -> Option<crate::core::picture::PictureBytes> {
+        if let Some(found) = self.slide_pictures.get(slide).and_then(|m| m.get(rel_id)) {
+            return Some(found.clone());
+        }
+        // Reads or fills the eager picture field kept for 0.1.x callers.
+        #[allow(deprecated)]
+        fn find(shapes: &[Shape], rel_id: &str) -> Option<std::sync::Arc<[u8]>> {
+            shapes.iter().find_map(|shape| match shape {
+                Shape::Picture(p) if p.embed_rid.as_deref() == Some(rel_id) => p.data.clone(),
+                Shape::Group(g) => find(&g.children, rel_id),
+                _ => None,
+            })
+        }
+        find(&self.slides.get(slide)?.shapes, rel_id).map(Into::into)
+    }
+
     /// Open a PPTX file from a file path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let bytes = std::fs::metadata(path.as_ref()).map_or(0, |m| m.len());
@@ -298,7 +327,7 @@ impl PptxDocument {
             /// rId → (raw bytes, format-extension lowercase like "png" / "jpeg").
             /// Pre-resolved here in Phase 1 so the parallel slide parser
             /// (Phase 2) doesn't need access to the OPC reader.
-            media: std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
+            media: slide::Media,
             /// rId → text lines of a chart part (`ppt/charts/chartN.xml`)
             /// or SmartArt data part (`ppt/diagrams/dataN.xml`). The slide
             /// XML holds only the reference; the text lives in the part.
@@ -559,6 +588,23 @@ impl PptxDocument {
         // Phase 2: parse slides (parallel when feature enabled). Each slide
         // yields its parts that could not be used, merged in order below.
         type ParsedSlide = (Slide, Vec<(String, String)>);
+        // With pictures read lazily a picture shape holds no bytes; they are
+        // kept here, slide by slide, for the converter and `slide_picture`.
+        let slide_pictures: Vec<
+            std::collections::HashMap<String, crate::core::picture::PictureBytes>,
+        > = if crate::read_options::lazy_pictures() {
+            bundles
+                .iter()
+                .map(|b| {
+                    b.media
+                        .iter()
+                        .map(|(rid, m)| (rid.clone(), m.pic.clone()))
+                        .collect()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         // A comments part several slides name is parsed once.
         let mut parsed_comments: std::collections::HashMap<
             String,
@@ -729,6 +775,7 @@ impl PptxDocument {
         let (unreadable_parts, unreadable_parts_omitted, cosmetic_parts) =
             unreadable_parts.finish_with_cosmetic();
         Ok(PptxDocument {
+            slide_pictures,
             input_bytes: 0,
             presentation,
             slides,
@@ -822,10 +869,10 @@ struct PartCache {
     layout_index: std::collections::HashMap<crate::core::opc::PartName, Option<usize>>,
     masters: Vec<MasterEntry>,
     master_index: std::collections::HashMap<crate::core::opc::PartName, Option<usize>>,
-    /// Target part → (bytes, extension); `None` when unreadable.
+    /// Target part → (picture, extension); `None` when unreadable.
     images: std::collections::HashMap<
         crate::core::opc::PartName,
-        Option<(std::sync::Arc<[u8]>, String)>,
+        Option<(crate::core::picture::PictureBytes, String)>,
     >,
     /// (target part, is-chart) → text lines.
     part_text:
@@ -1010,7 +1057,8 @@ impl PartCache {
         opc: &mut OpcReader<R>,
         source: &crate::core::opc::PartName,
         rels: &Relationships,
-    ) -> std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)> {
+    ) -> slide::Media {
+        let eager = !crate::read_options::lazy_pictures();
         let mut media = std::collections::HashMap::new();
         for rel in rels.all() {
             if rel.rel_type != rel_types::IMAGE
@@ -1029,8 +1077,8 @@ impl PartCache {
                 if !opc.has_part(target) {
                     return None;
                 }
-                let bytes = match opc.read_part(target) {
-                    Ok(bytes) => bytes,
+                let pic = match opc.read_picture(target) {
+                    Ok(pic) => pic,
                     Err(e) => {
                         self.unreadable.record(target.as_str(), &e);
                         return None;
@@ -1042,11 +1090,22 @@ impl PartCache {
                     .extension()
                     .and_then(|s| s.to_str())
                     .map(|s| s.to_ascii_lowercase())
-                    .unwrap_or_else(|| guess_format_from_bytes(&bytes).to_string());
-                Some((bytes.into(), ext))
+                    .unwrap_or_else(|| {
+                        pic.bytes()
+                            .map_or("png", |b| guess_format_from_bytes(&b))
+                            .to_string()
+                    });
+                Some((pic, ext))
             });
-            if let Some(found) = entry {
-                media.insert(rel.id.clone(), found.clone());
+            if let Some((pic, ext)) = entry {
+                media.insert(
+                    rel.id.clone(),
+                    slide::MediaEntry {
+                        pic: pic.clone(),
+                        ext: ext.clone(),
+                        eager,
+                    },
+                );
             }
         }
         media
@@ -1387,7 +1446,7 @@ mod part_cache_tests {
                 .unwrap();
             assert_eq!(parts.layout(&mut opc, &layout), Some(0));
             let media = parts.media_for(&mut opc, &slide, &rels);
-            assert_eq!(media["rId2"].1, "png");
+            assert_eq!(media["rId2"].ext, "png");
             let text = parts.part_text_for(&mut opc, &slide, &rels);
             assert_eq!(&*text["rId3"], &["Title: Revenue".to_string()][..]);
         }

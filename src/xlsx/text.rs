@@ -1248,6 +1248,7 @@ mod tests {
 </styleSheet>"#;
         let ss = super::super::styles::StyleSheet::parse(styles).expect("styles parse");
         let doc = XlsxDocument {
+            lazy_pictures: Default::default(),
             input_bytes: 0,
             workbook: super::super::WorkbookInfo {
                 sheets: Vec::new(),
@@ -1321,6 +1322,7 @@ mod tests {
             chart_text: Vec::new(),
         };
         let doc = XlsxDocument {
+            lazy_pictures: Default::default(),
             input_bytes: 0,
             workbook: super::super::WorkbookInfo {
                 sheets: Vec::new(),
@@ -1393,6 +1395,7 @@ mod tests {
             chart_text: Vec::new(),
         };
         let doc = XlsxDocument {
+            lazy_pictures: Default::default(),
             input_bytes: 0,
             workbook: super::super::WorkbookInfo {
                 sheets: Vec::new(),
@@ -1432,6 +1435,7 @@ mod tests {
     #[test]
     fn test_plain_text_includes_chart_text() {
         let doc = XlsxDocument {
+            lazy_pictures: Default::default(),
             input_bytes: 0,
             workbook: super::super::WorkbookInfo {
                 sheets: Vec::new(),

@@ -416,6 +416,7 @@ pub extern "C" fn office_options_names() -> *mut c_char {
             "include_hidden_text",
             "include_deleted_text",
             "on_incomplete",
+            "lazy_pictures",
         ];
         names.extend_from_slice(crate::limits::Limits::NAMES);
         to_c_string(&names.join(","))
