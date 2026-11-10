@@ -418,6 +418,9 @@ impl XlsxDocument {
             text_shapes: std::sync::Arc<[crate::xlsx::worksheet::WorksheetTextShape]>,
             comments: std::sync::Arc<[crate::xlsx::worksheet::SheetComment]>,
             comments_truncated: bool,
+            /// The sheet already parsed, when its part was large enough to
+            /// be read and parsed a piece at a time (`data` is then empty).
+            streamed: Option<(Worksheet, shared_formula::SharedFormulas)>,
         }
         let mut bundles = Vec::with_capacity(workbook.sheets.len());
         // Pivot cache records materialised for sources outside the
@@ -457,8 +460,11 @@ impl XlsxDocument {
             } else {
                 "worksheet"
             };
-            let whole = crate::core::xml::check_root_closed(&b.data, &b.name, root)
-                .and_then(|()| Worksheet::parse_unresolved(&b.data, b.name.clone(), &b.rels));
+            let whole = match b.streamed {
+                Some(done) => Ok(done),
+                None => crate::core::xml::check_root_closed(&b.data, &b.name, root)
+                    .and_then(|()| Worksheet::parse_unresolved(&b.data, b.name.clone(), &b.rels)),
+            };
             let parsed = match whole {
                 Ok(done) => Ok((done, None)),
                 // Malformed XML part-way through: the rows before the damage
@@ -514,10 +520,8 @@ impl XlsxDocument {
                      parsed: &mut Vec<ParsedSheet>|
          -> Result<()> {
             *batch_bytes = 0;
-            parsed.extend(crate::core::parallel::map_collect(
-                std::mem::take(bundles),
-                parse_bundle,
-            )?);
+            parsed
+                .extend(crate::core::parallel::map_collect(std::mem::take(bundles), parse_bundle)?);
             Ok(())
         };
         for sheet in &workbook.sheets {
@@ -578,6 +582,7 @@ impl XlsxDocument {
                     text_shapes: std::sync::Arc::from([]),
                     comments: std::sync::Arc::from([]),
                     comments_truncated: false,
+                    streamed: None,
                 });
                 continue;
             }
@@ -587,28 +592,63 @@ impl XlsxDocument {
             // cannot be read is that sheet's error, never a cue to read a
             // different sheet's cells under this sheet's name. Only a
             // worksheet has a conventional name to fall back to.
-            let read = match Self::read_xml_entry(&mut archive, &entries, &sheet_path) {
-                Err(crate::core::Error::MissingPart(_))
-                    if kind == crate::ir::SheetKind::Worksheet =>
-                {
-                    let idx = bundles
-                        .iter()
-                        .filter(|b| b.kind == crate::ir::SheetKind::Worksheet)
-                        .count()
-                        + 1;
-                    let alt = format!("xl/worksheets/sheet{}.xml", idx);
-                    // The fallback part is a sheet's content like any other.
-                    sheet_parts
-                        .claim(&entries, &alt, &sheet.name)
-                        .and_then(|()| {
-                            Self::read_xml_entry(&mut archive, &entries, &alt)
-                                .map_err(|_| format!("worksheet part {sheet_path} not found"))
-                        })
-                },
-                Err(crate::core::Error::MissingPart(_)) => {
-                    Err(format!("sheet part {sheet_path} not found"))
-                },
-                other => other.map_err(|e| format!("worksheet part {sheet_path}: {e}")),
+            // A very large part is parsed as it is inflated, so its XML is
+            // never held whole; anything that part cannot be read that way
+            // is read whole below, as before. The parser needs the sheet's
+            // relationships (for its hyperlinks), so they are read first.
+            let root = if kind == crate::ir::SheetKind::Macro {
+                "macrosheet"
+            } else {
+                "worksheet"
+            };
+            let mut early_rels = None;
+            let mut streamed = None;
+            if matches!(kind, crate::ir::SheetKind::Worksheet | crate::ir::SheetKind::Macro)
+                && opc::entry_size(&mut archive, &entries, &sheet_path)
+                    .is_some_and(|n| n >= worksheet::STREAMED_SHEET_BYTES)
+            {
+                let rels = read_rels_reporting(
+                    &mut archive,
+                    &entries,
+                    &sheet_rels_path(&sheet_path),
+                    &mut shared.unreadable,
+                );
+                streamed = worksheet::parse_streamed(
+                    &mut archive,
+                    &entries,
+                    &sheet_path,
+                    sheet.name.clone(),
+                    &rels,
+                    root,
+                );
+                early_rels = Some(rels);
+            }
+            let read = if streamed.is_some() {
+                Ok(Vec::new())
+            } else {
+                match Self::read_xml_entry(&mut archive, &entries, &sheet_path) {
+                    Err(crate::core::Error::MissingPart(_))
+                        if kind == crate::ir::SheetKind::Worksheet =>
+                    {
+                        let idx = bundles
+                            .iter()
+                            .filter(|b| b.kind == crate::ir::SheetKind::Worksheet)
+                            .count()
+                            + 1;
+                        let alt = format!("xl/worksheets/sheet{}.xml", idx);
+                        // The fallback part is a sheet's content like any other.
+                        sheet_parts
+                            .claim(&entries, &alt, &sheet.name)
+                            .and_then(|()| {
+                                Self::read_xml_entry(&mut archive, &entries, &alt)
+                                    .map_err(|_| format!("worksheet part {sheet_path} not found"))
+                            })
+                    },
+                    Err(crate::core::Error::MissingPart(_)) => {
+                        Err(format!("sheet part {sheet_path} not found"))
+                    },
+                    other => other.map_err(|e| format!("worksheet part {sheet_path}: {e}")),
+                }
             };
             let ws_data = match read {
                 Ok(data) => data,
@@ -622,9 +662,14 @@ impl XlsxDocument {
             };
 
             // Read worksheet relationships (for hyperlinks)
-            let rels_path = sheet_rels_path(&sheet_path);
-            let ws_rels =
-                read_rels_reporting(&mut archive, &entries, &rels_path, &mut shared.unreadable);
+            let ws_rels = early_rels.unwrap_or_else(|| {
+                read_rels_reporting(
+                    &mut archive,
+                    &entries,
+                    &sheet_rels_path(&sheet_path),
+                    &mut shared.unreadable,
+                )
+            });
 
             // Resolve the worksheet's DRAWING rel up-front (Phase 1
             // has access to &mut archive). Each entry decodes
@@ -675,6 +720,7 @@ impl XlsxDocument {
                 text_shapes,
                 comments,
                 comments_truncated,
+                streamed,
             });
             batch_bytes = batch_bytes.saturating_add(bundles.last().map_or(0, |b| b.data.len()));
             if batch_bytes >= BATCH_XML_BYTES {

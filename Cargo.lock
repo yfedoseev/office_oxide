@@ -445,6 +445,7 @@ dependencies = [
  "flate2",
  "log",
  "md-5",
+ "memchr",
  "memmap2",
  "pyo3",
  "quick-xml",

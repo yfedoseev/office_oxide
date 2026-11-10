@@ -1029,90 +1029,400 @@ impl Worksheet {
         name: String,
         rels: &crate::core::relationships::Relationships,
     ) -> crate::core::Result<(Self, SharedFormulas)> {
+        let mut parse = SheetParse::new(name, rels);
+        parse.feed(xml_data)?;
+        Ok(parse.finish())
+    }
+}
+
+/// Parts at least this large are read and parsed a piece at a time (see
+/// [`parse_streamed`]); smaller ones whole, in parallel with other sheets.
+pub(crate) const STREAMED_SHEET_BYTES: u64 = 64 << 20;
+
+/// Raw XML gathered before it is parsed, when a part is read in pieces.
+const STREAM_PIECE_BYTES: usize = 4 << 20;
+
+/// Where the last complete `</row>` (or `</prefix:row>`) in `data` ends.
+fn end_of_last_row(data: &[u8]) -> Option<usize> {
+    let mut search = data.len();
+    while let Some(i) = data[..search].windows(4).rposition(|w| w == b"row>") {
+        // The whole local name: right after `</`, or after `</prefix:`.
+        let before = &data[i.saturating_sub(24)..i];
+        let closes = before.iter().rposition(|&b| b == b'<').is_some_and(|lt| {
+            before[lt..].strip_prefix(b"</").is_some_and(|between| {
+                between.is_empty()
+                    || (between.last() == Some(&b':')
+                        && between[..between.len() - 1]
+                            .iter()
+                            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')))
+            })
+        });
+        if closes {
+            return Some(i + 4);
+        }
+        search = i;
+    }
+    None
+}
+
+/// Parse the worksheet part `part` of `archive` as it is inflated, a few
+/// megabytes of rows at a time, so the part's XML is never held whole. The
+/// result is the one [`Worksheet::parse_unresolved`] gives for the whole
+/// part, with the same truncation check. `None` when the part cannot be read
+/// this way (not UTF-8, damaged, a limit, an XML error, a split that did not
+/// fall between rows): the caller then reads it whole, which reports what is
+/// wrong, and salvages what it can, exactly as before.
+pub(crate) fn parse_streamed<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    entries: &crate::core::opc::ZipEntryIndex,
+    part: &str,
+    name: String,
+    rels: &crate::core::relationships::Relationships,
+    root: &str,
+) -> Option<(Worksheet, SharedFormulas)> {
+    let mut feeder = RowFeeder::new(SheetParse::new(name, rels), STREAM_PIECE_BYTES);
+    let streamed =
+        crate::core::opc::stream_zip_entry(archive, entries, part, |chunk| feeder.push(chunk));
+    if !matches!(streamed, Ok(true)) {
+        return None;
+    }
+    feeder.finish(root)
+}
+
+/// Hands a part's XML, as it arrives in arbitrary chunks, to a [`SheetParse`]
+/// in pieces of at least `piece` bytes that each end after a complete
+/// `</row>`.
+struct RowFeeder<'r> {
+    parse: SheetParse<'r>,
+    piece: usize,
+    pending: Vec<u8>,
+    /// The last bytes already parsed: the truncation check looks at the
+    /// part's last 64 KiB, which may begin in them.
+    fed_tail: Vec<u8>,
+    first: bool,
+    /// How many bytes at the front of `pending` are open tags for the
+    /// elements open where the last piece ended: each piece is parsed after
+    /// them, so the reader is in the state a whole-part parse would be in at
+    /// that point.
+    prefix: usize,
+}
+
+/// The elements left open after `xml`, given those open before it (which
+/// `xml` begins with as synthetic open tags): what the reader's own stack
+/// holds, which pops on any end tag and refuses one with nothing open.
+/// `None` where the reader would refuse the XML (markup cut off, an end tag
+/// with nothing open). A byte scan that tokenizes as the reader does —
+/// comments, CDATA, processing instructions and declarations skipped, a tag
+/// ended by the first `>` outside quotes, `/>` an empty element — without
+/// building events; a second full parse of every piece cost a third of the
+/// time of reading a large sheet.
+fn open_elements_after(xml: &[u8]) -> Option<Vec<Vec<u8>>> {
+    fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        memchr::memmem::find(hay, needle)
+    }
+    // Where each open element's name lies in `xml`, copied out at the end.
+    let mut open: Vec<(usize, usize)> = Vec::new();
+    let n = xml.len();
+    let mut i = 0;
+    while i < n {
+        // Text runs are long and tags short: search for the next tag, then
+        // step through the tag byte by byte.
+        let Some(lt) = memchr::memchr(b'<', &xml[i..]) else {
+            break;
+        };
+        let at = i + lt;
+        let first = *xml.get(at + 1)?;
+        match first {
+            b'/' => {
+                open.pop()?;
+                i = at + 2 + memchr::memchr(b'>', &xml[at + 2..])? + 1;
+            },
+            b'!' => {
+                let rest = &xml[at + 2..];
+                i = if rest.starts_with(b"--") {
+                    at + 4 + find(&rest[2..], b"-->")? + 3
+                } else if rest.starts_with(b"[CDATA[") {
+                    at + 9 + find(&rest[7..], b"]]>")? + 3
+                } else {
+                    at + 2 + memchr::memchr(b'>', rest)? + 1
+                };
+            },
+            b'?' => i = at + 2 + find(&xml[at + 2..], b"?>")? + 2,
+            _ => {
+                // The name, then the first `>` outside a quoted value.
+                let mut k = at + 1;
+                while k < n && !matches!(xml[k], b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>') {
+                    k += 1;
+                }
+                let name_end = k;
+                let mut quote = 0u8;
+                loop {
+                    let b = *xml.get(k)?;
+                    if quote != 0 {
+                        if b == quote {
+                            quote = 0;
+                        }
+                    } else if b == b'"' || b == b'\'' {
+                        quote = b;
+                    } else if b == b'>' {
+                        break;
+                    }
+                    k += 1;
+                }
+                if xml[k - 1] != b'/' {
+                    open.push((at + 1, name_end));
+                }
+                i = k + 1;
+            },
+        }
+    }
+    Some(open.into_iter().map(|(a, b)| xml[a..b].to_vec()).collect())
+}
+
+/// [`open_elements_after`] by the reader itself, which the scan must agree
+/// with.
+#[cfg(test)]
+fn open_elements_by_the_reader(xml: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut reader = xml::make_fast_reader(xml);
+    let mut open = Vec::new();
+    loop {
+        match reader.read_event().ok()? {
+            quick_xml::events::Event::Start(e) => open.push(e.name().as_ref().as_bytes().to_vec()),
+            quick_xml::events::Event::End(_) => {
+                open.pop()?;
+            },
+            quick_xml::events::Event::Eof => return Some(open),
+            _ => {},
+        }
+    }
+}
+
+impl<'r> RowFeeder<'r> {
+    /// Parse `pending[..end]`, which begins with open tags for the elements
+    /// still open (`self.prefix` bytes), and, unless it ends the part, put
+    /// open tags for the elements it leaves open in front of what remains.
+    fn feed(&mut self, end: usize, whole: bool) -> bool {
+        // Not UTF-8: transcoded by the whole-part path.
+        if std::str::from_utf8(&self.pending[self.prefix..end]).is_err() {
+            return false;
+        }
+        let piece = &self.pending[..end];
+        let parse = &mut self.parse;
+        // The elements the piece leaves open are found on a second thread
+        // while the piece is parsed: a pass over the bytes of its own, it
+        // would otherwise add a tenth to the time of reading the sheet.
+        // A thread that cannot be started is not an error: the scan then runs
+        // here, after the parse.
+        let (parsed, open) = std::thread::scope(|scope| {
+            let scan = (!whole).then(|| {
+                std::thread::Builder::new()
+                    .name("office_oxide sheet scan".into())
+                    .spawn_scoped(scope, || open_elements_after(piece))
+            });
+            let parsed = parse.feed(piece).is_ok();
+            let open = scan.map(|started| match started {
+                Ok(handle) => handle.join().ok().flatten(),
+                Err(_) => open_elements_after(piece),
+            });
+            (parsed, open)
+        });
+        if !parsed {
+            return false;
+        }
+        let Some(open) = open else {
+            return true;
+        };
+        let Some(open) = open else {
+            return false;
+        };
+        let keep = (end - self.prefix).min(Self::TAIL);
+        self.fed_tail.clear();
+        self.fed_tail
+            .extend_from_slice(&self.pending[end - keep..end]);
+        let mut tags = Vec::new();
+        for name in &open {
+            tags.push(b'<');
+            tags.extend_from_slice(name);
+            tags.push(b'>');
+        }
+        self.prefix = tags.len();
+        self.pending.splice(..end, tags);
+        true
+    }
+
+    const TAIL: usize = 64 * 1024;
+
+    fn new(parse: SheetParse<'r>, piece: usize) -> Self {
+        Self {
+            parse,
+            piece,
+            pending: Vec::with_capacity(piece.saturating_mul(2).min(STREAM_PIECE_BYTES * 2)),
+            fed_tail: Vec::new(),
+            first: true,
+            prefix: 0,
+        }
+    }
+
+    /// Take the next chunk; `false` when the part cannot be read this way.
+    fn push(&mut self, chunk: &[u8]) -> bool {
+        if self.first {
+            self.first = false;
+            // UTF-16 (a byte-order mark, or NULs among the first bytes) is
+            // transcoded by the whole-part path.
+            let head = &chunk[..chunk.len().min(4)];
+            if head.starts_with(&[0xFE, 0xFF])
+                || head.starts_with(&[0xFF, 0xFE])
+                || head.contains(&0)
+            {
+                return false;
+            }
+        }
+        self.pending.extend_from_slice(chunk);
+        if self.pending.len() < self.piece {
+            return true;
+        }
+        let Some(end) = end_of_last_row(&self.pending) else {
+            return true;
+        };
+        self.feed(end, false)
+    }
+
+    /// Parse what is left, which ends the part, after the truncation check
+    /// the whole-part path makes on the part's last 64 KiB.
+    fn finish(mut self, root: &str) -> Option<(Worksheet, SharedFormulas)> {
+        let mut last = std::mem::take(&mut self.fed_tail);
+        last.extend_from_slice(&self.pending[self.prefix..]);
+        let last = &last[last.len().saturating_sub(Self::TAIL)..];
+        if self.first || crate::core::xml::check_root_closed(last, &self.parse.name, root).is_err()
+        {
+            return None;
+        }
+        let end = self.pending.len();
+        if !self.feed(end, true) {
+            return None;
+        }
+        Some(self.parse.finish())
+    }
+}
+
+/// A worksheet part read in pieces. The parser is a flat walk over the
+/// part's elements whose only state across rows is what it has built (the
+/// rows, for the index a `<row>` without `r=` implies, and the shared-formula
+/// positions), so feeding the part as consecutive pieces that each end after
+/// a complete element gives the same result as feeding it whole; a part far
+/// larger than its parsed form need never be held whole.
+pub(crate) struct SheetParse<'r> {
+    name: String,
+    rels: &'r crate::core::relationships::Relationships,
+    dimension: Option<String>,
+    rows: Vec<Row>,
+    merged_cells: Vec<String>,
+    hyperlinks: Vec<HyperlinkInfo>,
+    // Page setup is collected lazily because <pageMargins> and
+    // <pageSetup> arrive as separate sibling elements and either may
+    // appear without the other. We materialize the IR value at the
+    // end iff at least one was seen.
+    margins_in: Option<PageMarginsIn>,
+    page_setup_raw: Option<PageSetupRaw>,
+    shared: SharedFormulas,
+    conditional_formats: Vec<crate::ir::ConditionalFormat>,
+    data_validations: Vec<crate::ir::DataValidation>,
+    header_footer: SheetHeaderFooter,
+}
+
+impl<'r> SheetParse<'r> {
+    pub(crate) fn new(name: String, rels: &'r crate::core::relationships::Relationships) -> Self {
+        Self {
+            name,
+            rels,
+            dimension: None,
+            rows: Vec::new(),
+            merged_cells: Vec::new(),
+            hyperlinks: Vec::new(),
+            margins_in: None,
+            page_setup_raw: None,
+            shared: SharedFormulas::default(),
+            conditional_formats: Vec::new(),
+            data_validations: Vec::new(),
+            header_footer: SheetHeaderFooter::default(),
+        }
+    }
+
+    /// Parse the next piece of the part: the pieces fed must be the part in
+    /// order, each ending after a complete element.
+    pub(crate) fn feed(&mut self, data: &[u8]) -> crate::core::Result<()> {
         // Use plain Reader (not NsReader) for performance — worksheet XML is always
         // in the SML namespace, so namespace resolution is unnecessary overhead.
         // This is the hot path: worksheets can have thousands of cells.
-        let mut reader = xml::make_fast_reader(xml_data);
-        let mut dimension = None;
-        let mut rows = Vec::new();
-        let mut merged_cells = Vec::new();
-        let mut hyperlinks = Vec::new();
-        // Page setup is collected lazily because <pageMargins> and
-        // <pageSetup> arrive as separate sibling elements and either may
-        // appear without the other. We materialize the IR value at the
-        // end iff at least one was seen.
-        let mut margins_in: Option<PageMarginsIn> = None;
-        let mut page_setup_raw: Option<PageSetupRaw> = None;
-        let mut shared = SharedFormulas::default();
-        let mut conditional_formats = Vec::new();
-        let mut data_validations = Vec::new();
-        let mut header_footer = SheetHeaderFooter::default();
-
+        let mut reader = xml::make_fast_reader(data);
         loop {
             match reader.read_event()? {
                 Event::Start(ref e) => match e.local_name().as_ref() {
                     "dimension" => {
-                        dimension = xml::optional_attr_str(e, "ref")?.map(|v| v.into_owned());
+                        self.dimension = xml::optional_attr_str(e, "ref")?.map(|v| v.into_owned());
                         reader.read_to_end(e.to_end().name())?;
                     },
                     "row" => {
                         // A <row> without r= is implicitly the one after the
                         // previous row (ECMA-376 18.3.1.73); some writers omit
                         // it throughout the sheet.
-                        let implied = rows.last().map_or(1, |r: &Row| r.index + 1);
-                        shared.at_position(rows.len(), 0);
-                        rows.push(parse_row_fast(&mut reader, e, implied, &mut shared)?);
+                        let implied = self.rows.last().map_or(1, |r: &Row| r.index + 1);
+                        self.shared.at_position(self.rows.len(), 0);
+                        self.rows
+                            .push(parse_row_fast(&mut reader, e, implied, &mut self.shared)?);
                     },
                     "mergeCell" => {
                         if let Some(range) = xml::optional_attr_str(e, "ref")? {
-                            merged_cells.push(range.into_owned());
+                            self.merged_cells.push(range.into_owned());
                         }
                         reader.read_to_end(e.to_end().name())?;
                     },
                     "hyperlink" => {
-                        if let Some(hl) = parse_hyperlink(e, rels)? {
-                            hyperlinks.push(hl);
+                        if let Some(hl) = parse_hyperlink(e, self.rels)? {
+                            self.hyperlinks.push(hl);
                         }
                         reader.read_to_end(e.to_end().name())?;
                     },
                     "pageMargins" => {
-                        margins_in = parse_page_margins(e)?;
+                        self.margins_in = parse_page_margins(e)?;
                         reader.read_to_end(e.to_end().name())?;
                     },
                     "pageSetup" => {
-                        page_setup_raw = parse_page_setup_attrs(e)?;
+                        self.page_setup_raw = parse_page_setup_attrs(e)?;
                         reader.read_to_end(e.to_end().name())?;
                     },
                     "conditionalFormatting" => {
-                        conditional_formats.extend(parse_conditional_formatting(&mut reader, e)?);
+                        self.conditional_formats
+                            .extend(parse_conditional_formatting(&mut reader, e)?);
                     },
                     "dataValidations" => {
-                        data_validations.extend(parse_data_validations(&mut reader)?);
+                        self.data_validations
+                            .extend(parse_data_validations(&mut reader)?);
                     },
                     "headerFooter" => {
-                        header_footer = parse_header_footer(&mut reader, e)?;
+                        self.header_footer = parse_header_footer(&mut reader, e)?;
                     },
                     _ => {},
                 },
                 Event::Empty(ref e) => match e.local_name().as_ref() {
                     "dimension" => {
-                        dimension = xml::optional_attr_str(e, "ref")?.map(|v| v.into_owned());
+                        self.dimension = xml::optional_attr_str(e, "ref")?.map(|v| v.into_owned());
                     },
                     "mergeCell" => {
                         if let Some(range) = xml::optional_attr_str(e, "ref")? {
-                            merged_cells.push(range.into_owned());
+                            self.merged_cells.push(range.into_owned());
                         }
                     },
                     "hyperlink" => {
-                        if let Some(hl) = parse_hyperlink(e, rels)? {
-                            hyperlinks.push(hl);
+                        if let Some(hl) = parse_hyperlink(e, self.rels)? {
+                            self.hyperlinks.push(hl);
                         }
                     },
                     "pageMargins" => {
-                        margins_in = parse_page_margins(e)?;
+                        self.margins_in = parse_page_margins(e)?;
                     },
                     "pageSetup" => {
-                        page_setup_raw = parse_page_setup_attrs(e)?;
+                        self.page_setup_raw = parse_page_setup_attrs(e)?;
                     },
                     _ => {},
                 },
@@ -1121,32 +1431,37 @@ impl Worksheet {
             }
         }
 
-        let page_setup = build_page_setup(margins_in, page_setup_raw);
+        Ok(())
+    }
+
+    /// The sheet, and its shared formulas still to be written.
+    pub(crate) fn finish(self) -> (Worksheet, SharedFormulas) {
+        let page_setup = build_page_setup(self.margins_in, self.page_setup_raw);
 
         let ws = Worksheet {
             kind: crate::ir::SheetKind::Worksheet,
             chart_text: Vec::new(),
             state: super::SheetState::Visible,
-            header_footer,
+            header_footer: self.header_footer,
             tables: Vec::new(),
             pivot_tables: Vec::new(),
             comments: std::sync::Arc::from([]),
             comments_truncated: false,
-            name,
-            dimension,
-            rows,
-            merged_cells,
-            hyperlinks,
+            name: self.name,
+            dimension: self.dimension,
+            rows: self.rows,
+            merged_cells: self.merged_cells,
+            hyperlinks: self.hyperlinks,
             formulas_dropped: 0,
             damage: None,
             page_setup,
             images: std::sync::Arc::from([]),
             cell_images: Vec::new(),
             text_shapes: std::sync::Arc::from([]),
-            conditional_formats,
-            data_validations,
+            conditional_formats: self.conditional_formats,
+            data_validations: self.data_validations,
         };
-        Ok((ws, shared))
+        (ws, self.shared)
     }
 }
 
@@ -1873,6 +2188,154 @@ fn read_inline_string_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feed `xml` to a [`RowFeeder`] in `chunk`-byte chunks with pieces of
+    /// `piece` bytes, as a part streamed from the package is fed.
+    fn streamed(xml: &str, chunk: usize, piece: usize) -> Option<(Worksheet, SharedFormulas)> {
+        let rels = crate::core::relationships::Relationships::empty();
+        let mut feeder = RowFeeder::new(SheetParse::new("S".into(), &rels), piece);
+        for c in xml.as_bytes().chunks(chunk.max(1)) {
+            if !feeder.push(c) {
+                return None;
+            }
+        }
+        feeder.finish("worksheet")
+    }
+
+    fn resolved((mut ws, shared): (Worksheet, SharedFormulas)) -> String {
+        ws.formulas_dropped = shared
+            .resolve(&mut ws.rows, &mut crate::limits::TextBudget::new())
+            .dropped;
+        format!("{ws:?}")
+    }
+
+    const STREAM_NS: &str = r#"xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
+
+    /// A sheet parsed in pieces is the sheet parsed whole, wherever the
+    /// pieces fall: shared formulas whose followers are in later pieces,
+    /// rows and cells without references, rows out of order, empty rows,
+    /// inline and rich strings, and everything after the rows.
+    #[test]
+    fn test_a_sheet_parsed_in_pieces_equals_the_sheet_parsed_whole() {
+        let mut rows = String::new();
+        rows.push_str(r#"<row r="1"><c r="A1"><f t="shared" ref="A1:A40" si="0">B1*2</f><v>2</v></c><c r="B1" t="inlineStr"><is><t>inline &amp; text</t></is></c></row>"#);
+        for r in 2..=40 {
+            rows.push_str(&format!(r#"<row r="{r}"><c r="A{r}"><f t="shared" si="0"/><v>{r}</v></c><c t="s"><v>0</v></c></row>"#));
+        }
+        rows.push_str(r#"<row><c><v>7</v></c></row><row r="60"/><row r="50"><c r="C50" t="inlineStr"><is><r><rPr><b/></rPr><t>rich</t></r><r><t> text</t></r></is></c></row><row><c r="D51"><v>1.5</v></c></row>"#);
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><worksheet {STREAM_NS}><dimension ref="A1:D60"/><sheetData>{rows}</sheetData><mergeCells count="1"><mergeCell ref="A1:B2"/></mergeCells><conditionalFormatting sqref="A1:A9"><cfRule type="cellIs" operator="greaterThan" priority="1"><formula>3</formula></cfRule></conditionalFormatting><dataValidations count="1"><dataValidation type="list" sqref="B1"><formula1>"a,b"</formula1></dataValidation></dataValidations><pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/><headerFooter><oddHeader>&amp;CTitle</oddHeader></headerFooter></worksheet>"#
+        );
+        let rels = crate::core::relationships::Relationships::empty();
+        let whole =
+            resolved(Worksheet::parse_unresolved(xml.as_bytes(), "S".into(), &rels).unwrap());
+        for (chunk, piece) in [
+            (1, 1),
+            (3, 50),
+            (7, 200),
+            (13, 1),
+            (64, 64),
+            (xml.len(), 1),
+            (100_000, 100_000),
+        ] {
+            let pieces = streamed(&xml, chunk, piece).expect("a sound sheet streams");
+            assert_eq!(resolved(pieces), whole, "chunk {chunk}, piece {piece}");
+        }
+    }
+
+    /// Namespace-prefixed elements split the same way.
+    #[test]
+    fn test_a_prefixed_sheet_parsed_in_pieces_equals_the_sheet_parsed_whole() {
+        let mut rows = String::new();
+        for r in 1..=30 {
+            rows.push_str(&format!(r#"<x:row r="{r}"><x:c r="A{r}"><x:v>{r}</x:v></x:c></x:row>"#));
+        }
+        let xml = format!(
+            r#"<x:worksheet xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><x:sheetData>{rows}</x:sheetData></x:worksheet>"#
+        );
+        let rels = crate::core::relationships::Relationships::empty();
+        let whole =
+            resolved(Worksheet::parse_unresolved(xml.as_bytes(), "S".into(), &rels).unwrap());
+        for piece in [1, 40, 300] {
+            assert_eq!(resolved(streamed(&xml, 5, piece).unwrap()), whole, "piece {piece}");
+        }
+    }
+
+    /// A part that cannot be split between rows, or that the whole-part path
+    /// treats specially, is refused, so the caller reads it whole.
+    #[test]
+    fn test_a_part_that_cannot_be_split_between_rows_is_read_whole() {
+        let row = |r: usize| format!(r#"<row r="{r}"><c r="A{r}"><v>{r}</v></c></row>"#);
+        let rows: String = (1..=10).map(row).collect();
+        let sheet = |middle: &str| {
+            format!(
+                r#"<worksheet {STREAM_NS}><sheetData>{rows}{middle}{}</sheetData></worksheet>"#,
+                row(11)
+            )
+        };
+        // `</row>` inside a comment or CDATA: a split there ends a piece
+        // inside markup.
+        assert!(streamed(&sheet("<!-- </row> -->"), 1, 1).is_none());
+        assert!(streamed(&sheet("<x><![CDATA[ </row> ]]></x>"), 1, 1).is_none());
+        // Cut off before the root closes: the truncation the whole-part path
+        // reports and salvages.
+        let cut = format!(r#"<worksheet {STREAM_NS}><sheetData>{rows}"#);
+        assert!(streamed(&cut, 4, 16).is_none());
+        // Not UTF-8, or UTF-16: transcoded by the whole-part path.
+        let mut latin = sheet("").into_bytes();
+        latin.splice(30..30, [0xE9]);
+        let rels = crate::core::relationships::Relationships::empty();
+        let mut feeder = RowFeeder::new(SheetParse::new("S".into(), &rels), 1);
+        let pushed = latin.chunks(8).all(|c| feeder.push(c));
+        assert!(!pushed || feeder.finish("worksheet").is_none());
+        let mut feeder = RowFeeder::new(SheetParse::new("S".into(), &rels), 1);
+        assert!(!feeder.push(&[0xFF, 0xFE, b'<', 0]));
+        // A stray end tag part-way: the whole-part parse refuses it (once
+        // the stack it unbalances runs out), and so does the streamed one,
+        // whose pieces carry the same open elements.
+        let stray = sheet(r#"<row r="12"><c r="A12"><v>1</v></c></bad></row>"#);
+        assert!(Worksheet::parse_unresolved(stray.as_bytes(), "S".into(), &rels).is_err());
+        for (chunk, piece) in [(3, 1), (1, 40), (stray.len(), 1)] {
+            assert!(streamed(&stray, chunk, piece).is_none(), "chunk {chunk}, piece {piece}");
+        }
+    }
+
+    /// The byte scan of open elements agrees with the reader on the shapes a
+    /// worksheet piece takes, sound and damaged.
+    #[test]
+    fn test_the_open_element_scan_agrees_with_the_reader() {
+        let cases: &[&str] = &[
+            "<worksheet><sheetData><row r=\"1\"><c><v>1</v></c></row>",
+            "<a><b/><c x=\"1\" y='a>b'/><d>text &amp; more</d>",
+            "<a><!-- <b> </c> --><![CDATA[ <x></y> ]]><?pi <z> ?><e>",
+            "<x:a><x:b k=\"v\"></x:b><x:c>",
+            "<a></a></b>",
+            "<a><b",
+            "<a><!-- open",
+            "<a><![CDATA[ open",
+            "<a x=\"unterminated>",
+            "<!DOCTYPE d><a>",
+            "plain text",
+            "",
+            "<a\n  b=\"1\"\t/><c\r\n>",
+        ];
+        for xml in cases {
+            assert_eq!(
+                open_elements_after(xml.as_bytes()),
+                open_elements_by_the_reader(xml.as_bytes()),
+                "{xml:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_last_row_end_is_found_for_plain_and_prefixed_rows_only() {
+        assert_eq!(end_of_last_row(b"<row></row><row></row>x"), Some(22));
+        assert_eq!(end_of_last_row(b"<x:row></x:row>"), Some(15));
+        assert_eq!(end_of_last_row(b"<arrow></arrow>"), None);
+        assert_eq!(end_of_last_row(b"<row/>"), None);
+        assert_eq!(end_of_last_row(b"</throw>"), None);
+    }
     use crate::core::relationships::Relationships;
 
     fn empty_rels() -> Relationships {

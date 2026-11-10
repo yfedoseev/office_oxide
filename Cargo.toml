@@ -79,6 +79,9 @@ fast-float2 = "0.2"
 # zlib inflate for compressed OfficeArt metafile BLIPs ([MS-ODRAW]); the
 # same flate2/zlib-rs build `zip`'s deflate feature already pulls in.
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+# Byte search for the tags of a worksheet streamed in pieces (already used by
+# quick-xml).
+memchr = "2.8"
 
 # Optional
 memmap2 = { version = "0.9", optional = true }

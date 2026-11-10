@@ -411,6 +411,51 @@ fn test_a_many_sheet_workbook_does_not_hold_every_sheets_xml_at_once() {
     );
 }
 
+/// One sheet whose part is larger than any part should be held whole was
+/// read into memory and parsed from there, so the open held all of its XML.
+/// Such a part is now parsed as it is inflated, a few megabytes at a time.
+#[test]
+fn test_a_very_large_sheet_is_not_held_whole_while_it_is_parsed() {
+    let _serial = serial();
+    const ROWS: usize = 72;
+    const FILLER: usize = 1 << 20;
+    let filler = format!("<!--{}-->", "x".repeat(FILLER));
+    let mut rows = String::new();
+    for r in 1..=ROWS {
+        rows.push_str(&format!(r#"<row r="{r}"><c r="A{r}"><v>{r}</v></c></row>"#));
+        rows.push_str(&filler);
+    }
+    let sheet = format!(
+        r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{rows}</sheetData><mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells></worksheet>"#
+    );
+    let xml_len = sheet.len();
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, data) in [
+        ("[Content_Types].xml", &br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#[..]),
+        ("_rels/.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#),
+        ("xl/_rels/workbook.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#),
+        ("xl/workbook.xml", br#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#),
+        ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+    ] {
+        zip.start_file(name, stored).unwrap();
+        zip.write_all(data).unwrap();
+    }
+    drop(sheet);
+    let bytes = zip.finish().unwrap().into_inner();
+    let input = bytes.len();
+    let (doc, peak) = peak_during(|| open_xlsx(bytes));
+    let book = doc.as_xlsx().unwrap();
+    assert_eq!(book.worksheets[0].rows.len(), ROWS);
+    assert_eq!(book.worksheets[0].merged_cells, ["A1:B1"]);
+    let transient = peak.saturating_sub(input);
+    assert!(
+        transient < xml_len / 3,
+        "opening a sheet of {xml_len} bytes of XML peaked {transient} bytes above the input"
+    );
+}
+
 // ---------------------------------------------------------------- DOCX
 
 /// A table whose widest row is wide (here, ten cells spanning 1,000 grid

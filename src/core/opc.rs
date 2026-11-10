@@ -963,11 +963,14 @@ pub(crate) fn read_zip_picture<R: Read + Seek>(
     })
 }
 
-pub(crate) fn read_zip_entry<R: Read + Seek>(
+/// The checks [`read_zip_entry`] makes before inflating `name`, for a reader
+/// that inflates it in pieces: its index and the most it may inflate to, or
+/// the same error `read_zip_entry` would give.
+fn checked_entry<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &ZipEntryIndex,
     name: &str,
-) -> Result<Vec<u8>> {
+) -> Result<(usize, u64, u64)> {
     // Exact match first, then the case-insensitive + backslash-normalised
     // index: `[Content_Types].xml` case variants and Windows-created ZIPs
     // that use backslash separators (e.g., `_rels\.rels`).
@@ -999,7 +1002,7 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
     } else {
         claimed
     };
-    let mut file = archive.by_index(index).map_err(|e| match e {
+    let file = archive.by_index(index).map_err(|e| match e {
         zip::result::ZipError::FileNotFound => Error::MissingPart(name.to_string()),
         e => Error::Zip(e),
     })?;
@@ -1024,6 +1027,77 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
     // reading and against the actual size after.
     entries.charge(index, file.size(), name, 0)?;
     let declared = file.size();
+    drop(file);
+    Ok((index, cap, declared))
+}
+
+/// Inflate the part `name` in pieces of about a megabyte, handing each to
+/// `sink`, under the limits, checks and package account of
+/// [`read_zip_entry`]; for a part too large to hold whole. `Ok(false)` when
+/// it could not be read this way cleanly (a checksum or length that
+/// `read_zip_entry` reads past with a warning, a failed sink): the caller
+/// then reads it whole, which reports what is wrong as it always has, so
+/// nothing is charged here for a read that did not complete. An error is
+/// what `read_zip_entry` would have refused before reading.
+pub(crate) fn stream_zip_entry<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &ZipEntryIndex,
+    name: &str,
+    mut sink: impl FnMut(&[u8]) -> bool,
+) -> Result<bool> {
+    let (index, cap, declared) = checked_entry(archive, entries, name)?;
+    let mut file = archive.by_index(index).map_err(|e| match e {
+        zip::result::ZipError::FileNotFound => Error::MissingPart(name.to_string()),
+        e => Error::Zip(e),
+    })?;
+    let mut capped = (&mut file).take(cap.saturating_add(1));
+    let mut chunk = vec![0u8; 1 << 20];
+    let mut total = 0u64;
+    loop {
+        match capped.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                total = total.saturating_add(n as u64);
+                if total > cap || !sink(&chunk[..n]) {
+                    return Ok(false);
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {},
+            Err(_) => return Ok(false),
+        }
+    }
+    drop(file);
+    if total != declared {
+        return Ok(false);
+    }
+    entries.charge(index, total, name, declared)?;
+    entries.commit(index, total);
+    Ok(true)
+}
+
+/// The declared (uncompressed) size of the entry `name`, if the package
+/// holds it.
+pub(crate) fn entry_size<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &ZipEntryIndex,
+    name: &str,
+) -> Option<u64> {
+    let index = archive
+        .index_for_name(name)
+        .or_else(|| entries.lookup(name))?;
+    archive.by_index_raw(index).ok().map(|f| f.size())
+}
+
+pub(crate) fn read_zip_entry<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &ZipEntryIndex,
+    name: &str,
+) -> Result<Vec<u8>> {
+    let (index, cap, declared) = checked_entry(archive, entries, name)?;
+    let mut file = archive.by_index(index).map_err(|e| match e {
+        zip::result::ZipError::FileNotFound => Error::MissingPart(name.to_string()),
+        e => Error::Zip(e),
+    })?;
     let mut buf = Vec::with_capacity((declared as usize).min(1 << 20));
     let mut capped = (&mut file).take(cap.saturating_add(1));
     let read = capped.read_to_end(&mut buf);
