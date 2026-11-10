@@ -1,10 +1,10 @@
-//! 02_create_rich — Rich DOCX creation demo.
+//! create_rich: Rich DOCX creation demo.
 //!
 //! Creates a DOCX with a heading, rich paragraph (bold + italic + colored runs),
 //! a centred paragraph, a page break, and a table. Saves to a temp file and
 //! reads it back to verify the content.
 //!
-//! Run: `cargo run --example 02_create_rich`
+//! Run: `cargo run --example create_rich`
 
 use office_oxide::Document;
 use office_oxide::docx::write::{Alignment, DocxWriter, Run};
@@ -59,4 +59,6 @@ fn main() {
 
     println!("DOCX created and verified: {}", out.display());
     println!("Plain text snippet: {}", text.lines().next().unwrap_or(""));
+    std::fs::remove_file(&out).expect("remove temp file");
+    println!("OK create_rich");
 }

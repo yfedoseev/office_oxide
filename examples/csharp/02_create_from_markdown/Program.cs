@@ -1,66 +1,66 @@
-// 02_create_from_markdown — Convert Markdown to DOCX, XLSX, and PPTX.
-//
-// For each format: calls Document.CreateFromMarkdown, opens with Document.Open,
-// prints a summary. Exit 0 on success.
+// 02_create_from_markdown: turn one Markdown source into a DOCX, an XLSX and a PPTX.
 //
 // Run: dotnet run --project examples/csharp/02_create_from_markdown/02_create_from_markdown.csproj
-//      (set LD_LIBRARY_PATH to the directory containing liboffice_oxide.so)
 using OfficeOxide;
 
-const string markdown = """
+const string Markdown = """
     # Quarterly Report
 
-    Generated automatically from Markdown using Office Oxide.
+    Revenue grew in every region.
 
-    ## Highlights
+    | Region | Q1  | Q2  |
+    |--------|-----|-----|
+    | North  | 120 | 135 |
+    | South  | 95  | 110 |
 
-    - Revenue grew by **32%** year-over-year
-    - Customer satisfaction: 4.8 / 5.0
-    - New products launched: Widget Pro, Widget Lite
-
-    ## Financial Summary
-
-    | Category   | Q3 2025 | Q4 2025 |
-    |------------|---------|---------|
-    | Revenue    | $1.2M   | $1.6M   |
-    | Expenses   | $0.8M   | $0.9M   |
-    | Net Profit | $0.4M   | $0.7M   |
     """;
 
+static void Check(bool condition, string message)
+{
+    if (condition) return;
+    Console.Error.WriteLine($"FAIL: {message}");
+    Environment.Exit(1);
+}
+
+static void Has(string text, string expected) =>
+    Check(text.Contains(expected), $"\"{expected}\" is missing from the text");
+
+// CreateFromMarkdown writes to a path, so the file lives in a private temp
+// file just long enough to read its bytes back.
+static byte[] MarkdownToBytes(string markdown, string format)
+{
+    var path = Path.Combine(Path.GetTempPath(), $"oo_example_{Guid.NewGuid():N}.{format}");
+    try
+    {
+        Document.CreateFromMarkdown(markdown, format, path);
+        return File.ReadAllBytes(path);
+    }
+    finally
+    {
+        File.Delete(path);
+    }
+}
+
+// Opens bytes as the given format and returns the plain text.
+static string TextOf(byte[] data, string format)
+{
+    using var doc = Document.FromBytes(data, format);
+    return doc.PlainText();
+}
+
+Console.WriteLine("step 1: write the Markdown source");
+
+Console.WriteLine("step 2: create a DOCX, an XLSX and a PPTX from it");
 string[] formats = ["docx", "xlsx", "pptx"];
-var tmps = new Dictionary<string, string>();
+var created = formats.ToDictionary(f => f, f => MarkdownToBytes(Markdown, f));
 
-try
+Console.WriteLine("step 3: open each and check the text");
+foreach (var format in formats)
 {
-    foreach (var fmt in formats)
-    {
-        tmps[fmt] = Path.Combine(Path.GetTempPath(), $"oo_02_create_{Environment.TickCount64}_{fmt}.{fmt}");
-    }
-
-    foreach (var fmt in formats)
-    {
-        var path = tmps[fmt];
-        Document.CreateFromMarkdown(markdown, fmt, path);
-
-        using var doc = Document.Open(path);
-        var text = doc.PlainText();
-        var md = doc.ToMarkdown();
-
-        if (string.IsNullOrEmpty(text)) throw new Exception($"{fmt}: plain text is empty");
-
-        Console.WriteLine($"\n=== {fmt.ToUpper()} ===");
-        Console.WriteLine($"plain text length: {text.Length} chars");
-        Console.WriteLine($"markdown length:   {md.Length} chars");
-        var preview = text.Length > 100 ? text[..100] : text;
-        Console.WriteLine($"first 100 chars: {preview!.ReplaceLineEndings(" ")}");
-    }
-
-    Console.WriteLine("\nAll formats created and verified.");
+    var text = TextOf(created[format], format);
+    Console.WriteLine($"  format: {format}");
+    Console.WriteLine($"  chars: {text.Length}");
+    Has(text, "North");
 }
-finally
-{
-    foreach (var p in tmps.Values)
-    {
-        if (File.Exists(p)) File.Delete(p);
-    }
-}
+
+Console.WriteLine("OK 02_create_from_markdown");

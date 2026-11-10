@@ -1,49 +1,67 @@
-// 01_extract — Self-contained extract demo using the C# bindings.
-//
-// Creates a DOCX from Markdown (written to a temp file), opens it with
-// Document.Open, and prints the format, plain text, and Markdown output.
-// Exit 0 on success.
+// 01_extract: read a document as plain text, Markdown and IR JSON.
 //
 // Run: dotnet run --project examples/csharp/01_extract/01_extract.csproj
-//      (set LD_LIBRARY_PATH to the directory containing liboffice_oxide.so)
+using System.Text.Json;
 using OfficeOxide;
 
-const string markdown = """
-    # Office Oxide Extract Demo
+const string Markdown = """
+    # Quarterly Report
 
-    This document was created from Markdown and parsed back via C# bindings.
+    Revenue grew in every region.
 
-    ## Features
+    | Region | Q1  | Q2  |
+    |--------|-----|-----|
+    | North  | 120 | 135 |
+    | South  | 95  | 110 |
 
-    - Plain text extraction
-    - Markdown conversion
-    - IR (intermediate representation) access
     """;
 
-var tmpPath = Path.Combine(Path.GetTempPath(), $"oo_01_extract_{Environment.TickCount64}.docx");
-
-try
+static void Check(bool condition, string message)
 {
-    Document.CreateFromMarkdown(markdown, "docx", tmpPath);
-
-    using var doc = Document.Open(tmpPath);
-
-    var format = doc.Format;
-    var text = doc.PlainText();
-    var md = doc.ToMarkdown();
-
-    Console.WriteLine($"format: {format}");
-    Console.WriteLine("--- plain text (first 200 chars) ---");
-    Console.WriteLine(text.Length > 200 ? text[..200] : text);
-    Console.WriteLine($"--- markdown length: {md.Length} chars ---");
-
-    if (format != "docx") throw new Exception($"expected format=docx, got {format}");
-    if (string.IsNullOrEmpty(text)) throw new Exception("plain text is empty");
-    if (!text.Contains("Office Oxide Extract Demo")) throw new Exception("heading missing");
-
-    Console.WriteLine("\nAll checks passed.");
+    if (condition) return;
+    Console.Error.WriteLine($"FAIL: {message}");
+    Environment.Exit(1);
 }
-finally
+
+static void Has(string text, string expected) =>
+    Check(text.Contains(expected), $"\"{expected}\" is missing from the text");
+
+// CreateFromMarkdown writes to a path, so the file lives in a private temp
+// file just long enough to read its bytes back.
+static byte[] MarkdownToBytes(string markdown, string format)
 {
-    if (File.Exists(tmpPath)) File.Delete(tmpPath);
+    var path = Path.Combine(Path.GetTempPath(), $"oo_example_{Guid.NewGuid():N}.{format}");
+    try
+    {
+        Document.CreateFromMarkdown(markdown, format, path);
+        return File.ReadAllBytes(path);
+    }
+    finally
+    {
+        File.Delete(path);
+    }
 }
+
+static byte[] BuildDocxBytes(string title = "Quarterly Report") =>
+    MarkdownToBytes(Markdown.Replace("Quarterly Report", title), "docx");
+
+Console.WriteLine("step 1: build a DOCX in memory");
+var data = BuildDocxBytes();
+
+Console.WriteLine("step 2: open it from bytes");
+using var doc = Document.FromBytes(data, "docx");
+Console.WriteLine($"  format: {doc.Format}");
+Check(doc.Format == "docx", "the opened format differs from the requested one");
+
+Console.WriteLine("step 3: extract plain text, Markdown and IR JSON");
+var text = doc.PlainText();
+var markdown = doc.ToMarkdown();
+var irJson = doc.ToIrJson();
+Console.WriteLine($"  chars: {text.Length}");
+
+Console.WriteLine("step 4: check the output");
+Has(text, "Revenue grew in every region.");
+Has(markdown, "Quarterly Report");
+Check(JsonDocument.Parse(irJson).RootElement.ValueKind == JsonValueKind.Object, "the IR JSON is not an object");
+
+Console.WriteLine("OK 01_extract");

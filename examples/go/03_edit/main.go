@@ -1,109 +1,134 @@
 //go:build office_oxide_dev
 
-// 03_edit — Edit a document by replacing placeholder text.
-//
-// Creates a DOCX from Markdown with {{NAME}} and {{DATE}} placeholders,
-// opens with oo.OpenEditable, replaces both, saves to a second temp file,
-// then reads back and verifies. Exit 0 on success.
-//
-// Build and run (inside the monorepo, after `cargo build --release --lib`):
-//
-//	go run -tags office_oxide_dev ./examples/go/03_edit/
+// 03_edit: replace text in a DOCX and set cells in an XLSX, in memory.
+// Run: (cd examples/go/03_edit && go run -tags office_oxide_dev .)
 package main
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"strings"
 
 	oo "github.com/yfedoseev/office_oxide/go"
 )
 
-const markdown = `# Invoice
+const markdown = `# Quarterly Report
 
-Dear {{NAME}},
+Revenue grew in every region.
 
-Please find attached your invoice for services rendered on {{DATE}}.
-
-## Summary
-
-- Service: Office Oxide Pro License
-- Amount: $499.00
-- Due date: 30 days from {{DATE}}
-
-Thank you for your business!
+| Region | Q1  | Q2  |
+|--------|-----|-----|
+| North  | 120 | 135 |
+| South  | 95  | 110 |
 `
 
-func main() {
-	// Create temp files
-	tpl, err := os.CreateTemp("", "oo_03_template_*.docx")
-	if err != nil {
-		log.Fatal(err)
+// check fails the example loudly: it prints msg and exits non-zero.
+func check(ok bool, msg string) {
+	if !ok {
+		fmt.Fprintln(os.Stderr, "FAIL:", msg)
+		os.Exit(1)
 	}
-	tplPath := tpl.Name()
-	tpl.Close()
-	defer os.Remove(tplPath)
+}
 
-	out, err := os.CreateTemp("", "oo_03_output_*.docx")
+// must fails the example on an unexpected error.
+func must[T any](v T, err error) T {
 	if err != nil {
-		log.Fatal(err)
+		fmt.Fprintln(os.Stderr, "FAIL:", err)
+		os.Exit(1)
 	}
-	outPath := out.Name()
-	out.Close()
-	defer os.Remove(outPath)
+	return v
+}
 
-	// Create template
-	if err := oo.CreateFromMarkdown(markdown, "docx", tplPath); err != nil {
-		log.Fatalf("CreateFromMarkdown: %v", err)
-	}
+// must0 fails the example on an unexpected error from a call with no result.
+func must0(err error) { must(0, err) }
 
-	// Edit
-	ed, err := oo.OpenEditable(tplPath)
-	if err != nil {
-		log.Fatalf("OpenEditable: %v", err)
-	}
-	n1, err := ed.ReplaceText("{{NAME}}", "Alice Smith")
-	if err != nil {
-		log.Fatalf("ReplaceText NAME: %v", err)
-	}
-	n2, err := ed.ReplaceText("{{DATE}}", "2026-04-26")
-	if err != nil {
-		log.Fatalf("ReplaceText DATE: %v", err)
-	}
-	if err := ed.Save(outPath); err != nil {
-		log.Fatalf("Save: %v", err)
-	}
-	ed.Close()
+func has(text, expected string) {
+	check(strings.Contains(text, expected), `"`+expected+`" is missing from the text`)
+}
 
-	fmt.Printf("Replacements: {{NAME}} x%d, {{DATE}} x%d\n", n1, n2)
+// markdownToBytes creates a document from Markdown. The library writes to a
+// path, so the file lives in a private temp file just long enough to read its
+// bytes back.
+func markdownToBytes(md, format string) []byte {
+	f := must(os.CreateTemp("", "oo_example_*."+format))
+	path := f.Name()
+	f.Close()
+	defer os.Remove(path)
+	must0(oo.CreateFromMarkdown(md, format, path))
+	return must(os.ReadFile(path))
+}
 
-	// Verify
-	doc, err := oo.Open(outPath)
-	if err != nil {
-		log.Fatalf("Open output: %v", err)
-	}
+func buildDocxBytes(title string) []byte {
+	return markdownToBytes(strings.ReplaceAll(markdown, "Quarterly Report", title), "docx")
+}
+
+func openBytes(data []byte, format string) *oo.Document {
+	return must(oo.OpenFromBytes(data, format))
+}
+
+// textOf opens bytes as the given format and returns the plain text.
+func textOf(data []byte, format string) string {
+	doc := openBytes(data, format)
 	defer doc.Close()
+	return must(doc.PlainText())
+}
 
-	text, err := doc.PlainText()
-	if err != nil {
-		log.Fatalf("PlainText: %v", err)
+func buildXlsxBytes() []byte {
+	w := oo.NewXlsxWriter()
+	defer w.Close()
+	s := w.AddSheet("Sales")
+	for c, h := range []string{"Region", "Q1", "Q2", "Growth"} {
+		must0(w.SetCellStyled(s, 0, uint32(c), h, true, "")) // bold header row
 	}
+	cells := []struct {
+		row, col uint32
+		v        any
+	}{
+		{1, 0, "North"}, {1, 1, 120}, {1, 2, 135}, {1, 3, true}, // D2
+		{2, 0, "South"}, {2, 1, 95}, {2, 2, 110},
+		{3, 0, "Total"}, {3, 1, oo.Formula("SUM(B2:B3)")}, {3, 2, oo.Formula("SUM(C2:C3)")},
+		{5, 0, "Notes"},
+	}
+	for _, c := range cells {
+		must0(w.SetCell(s, c.row, c.col, c.v))
+	}
+	w.MergeCells(s, 5, 0, 1, 3) // A6:C6
+	w.SetColumnWidth(s, 0, 18)
+	return must(w.ToBytes())
+}
 
-	if !strings.Contains(text, "Alice Smith") {
-		log.Fatal("name replacement failed: 'Alice Smith' not found")
-	}
-	if !strings.Contains(text, "2026-04-26") {
-		log.Fatal("date replacement failed: '2026-04-26' not found")
-	}
-	if strings.Contains(text, "{{NAME}}") {
-		log.Fatal("placeholder {{NAME}} still present")
-	}
-	if strings.Contains(text, "{{DATE}}") {
-		log.Fatal("placeholder {{DATE}} still present")
-	}
+func main() {
+	fmt.Println("step 1: build a DOCX in memory")
+	docx := buildDocxBytes("Quarterly Report")
 
-	fmt.Println("Edit verified successfully.")
-	fmt.Println("--- final text ---")
-	fmt.Println(text)
+	fmt.Println("step 2: replace text")
+	ed := must(oo.OpenEditableFromBytes(docx, "docx"))
+	replaced := must(ed.ReplaceText("Quarterly Report", "Annual Report"))
+	fmt.Println("  replacements:", replaced)
+	check(replaced == 1, "replace_text did not make exactly one replacement")
+
+	fmt.Println("step 3: save to bytes and check the text")
+	edited := must(ed.SaveToBytes())
+	ed.Close()
+	text := textOf(edited, "docx")
+	has(text, "Annual Report")
+	check(!strings.Contains(text, "Quarterly Report"), "the old title is still present")
+
+	fmt.Println("step 4: build an XLSX in memory")
+	xlsx := buildXlsxBytes()
+
+	fmt.Println("step 5: set cells")
+	ed = must(oo.OpenEditableFromBytes(xlsx, "xlsx"))
+	must0(ed.SetCell(0, "B2", oo.NewNumberCell(999)))
+	must0(ed.SetCell(0, "A2", oo.NewStringCell("Central")))
+
+	fmt.Println("step 6: save to bytes and check the cells")
+	edited = must(ed.SaveToBytes())
+	ed.Close()
+	text = textOf(edited, "xlsx")
+	has(text, "Central")
+	has(text, "999")
+	check(!strings.Contains(text, "North"), "the old A2 value is still present")
+
+	fmt.Println("OK 03_edit")
 }

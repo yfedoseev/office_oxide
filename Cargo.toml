@@ -146,24 +146,44 @@ name = "01_extract"
 path = "examples/rust/01_extract.rs"
 
 [[example]]
-name = "02_create_rich"
-path = "examples/rust/02_create_rich.rs"
+name = "create_rich"
+path = "examples/rust/create_rich.rs"
 
 [[example]]
-name = "03_create_xlsx"
-path = "examples/rust/03_create_xlsx.rs"
+name = "05_xlsx_writer"
+path = "examples/rust/05_xlsx_writer.rs"
 
 [[example]]
-name = "04_create_pptx"
-path = "examples/rust/04_create_pptx.rs"
+name = "06_pptx_writer"
+path = "examples/rust/06_pptx_writer.rs"
 
 [[example]]
-name = "05_edit"
-path = "examples/rust/05_edit.rs"
+name = "03_edit"
+path = "examples/rust/03_edit.rs"
 
 [[example]]
-name = "06_from_markdown"
-path = "examples/rust/06_from_markdown.rs"
+name = "02_create_from_markdown"
+path = "examples/rust/02_create_from_markdown.rs"
+
+[[example]]
+name = "04_open_from_bytes"
+path = "examples/rust/04_open_from_bytes.rs"
+
+[[example]]
+name = "07_all_outputs"
+path = "examples/rust/07_all_outputs.rs"
+
+[[example]]
+name = "08_limits_strict_damage"
+path = "examples/rust/08_limits_strict_damage.rs"
+
+[[example]]
+name = "09_concurrency"
+path = "examples/rust/09_concurrency.rs"
+
+[[example]]
+name = "10_detect_and_batch"
+path = "examples/rust/10_detect_and_batch.rs"
 
 [profile.release]
 lto = true
