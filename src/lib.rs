@@ -605,7 +605,8 @@ impl Document {
             })
             .collect();
         let (notices, truncated) = self.loss_report();
-        found.extend(classify_notices(&notices, truncated));
+        // A part that could not be read says why the text is incomplete.
+        found.extend(classify_notices(&notices, truncated && found.is_empty()));
         found
     }
 

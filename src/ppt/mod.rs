@@ -26,3 +26,10 @@ pub use images::{ImageFormat, PptImage};
 pub use style::{CharFormat, CharFormatSpan, ParaFormat, ParaFormatSpan};
 pub use table::TableBlock;
 pub use text::{LinkRange, OleObjectInfo, SlideText, TextRun, TextType};
+
+/// The per-element types of this reader, for the size table in
+/// `type_sizes`.
+#[cfg(test)]
+pub(crate) mod element_types {
+    pub(crate) use super::table::TableCellData;
+}
