@@ -75,6 +75,7 @@ public sealed class EditableDocument : IDisposable
         EnsureOpen();
         var rc = NativeMethods.OfficeEditableSetCell(
             _handle, sheetIndex, cellRef, valueType, valueStr ?? string.Empty, valueNum, out var err);
+        GC.KeepAlive(this);
         if (rc != 0) throw new OfficeOxideException(err, nameof(SetCell));
     }
 

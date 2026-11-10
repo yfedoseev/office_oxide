@@ -472,9 +472,11 @@ func TestOptionNamesListEveryOptionAndSetTakesEach(t *testing.T) {
 	}
 }
 
-// Empty output comes back as an empty slice. The library handed out the
-// dangling pointer of an empty allocation, which Go's stack scanner aborts on
-// when a goroutine's stack moves while it is held.
+// Empty output comes back as an empty slice, call after call. (The library
+// once handed out the dangling pointer of an empty allocation, which Go's
+// stack scanner aborts on if the stack moves while Bytes holds it; that is
+// checked in the library's own tests, since a test here cannot move the
+// stack inside Bytes.)
 func TestEmptyOutputAsBytesIsAnEmptySlice(t *testing.T) {
 	w := NewPptxWriter()
 	defer w.Close()
@@ -495,7 +497,7 @@ func TestEmptyOutputAsBytesIsAnEmptySlice(t *testing.T) {
 		if len(out) != 0 {
 			t.Fatalf("an empty deck's text is %q", out)
 		}
-		// Grow the stack while the next call's pointer is live.
+		// Grow the stack between calls, so later calls run on moved stacks.
 		var grow func(int) int
 		grow = func(n int) int {
 			var pad [256]byte

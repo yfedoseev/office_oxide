@@ -74,6 +74,7 @@ public sealed class XlsxWriter : IDisposable
         var (t, s, n) = Encode(value);
         int rc = NativeMethods.OfficeXlsxSheetSetCellStyled(
             _handle, sheet, row, col, t, s, n, bold, bgColor);
+        GC.KeepAlive(this);
         if (rc != 0)
         {
             throw new InvalidOperationException(
