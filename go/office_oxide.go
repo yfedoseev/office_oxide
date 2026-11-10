@@ -246,6 +246,28 @@ func OptionNames() []string {
 	return strings.Split(C.GoString(out), ",")
 }
 
+// Limits returns the limits these options hold and the bounds the library
+// derives from them, by name. NoLimit means no bound.
+func (o *ParseOptions) Limits() (limits, derived map[string]uint64, err error) {
+	if o == nil || o.handle == nil {
+		return nil, nil, ErrClosed
+	}
+	out := C.office_options_limits_json(o.handle)
+	runtime.KeepAlive(o)
+	if out == nil {
+		return nil, nil, &Error{Code: int(C.OFFICE_ERR_INTERNAL), Op: "ParseOptions.Limits"}
+	}
+	defer C.office_oxide_free_string(out)
+	var v struct {
+		Limits  map[string]uint64 `json:"limits"`
+		Derived map[string]uint64 `json:"derived"`
+	}
+	if err := json.Unmarshal([]byte(C.GoString(out)), &v); err != nil {
+		return nil, nil, err
+	}
+	return v.Limits, v.Derived, nil
+}
+
 // Close releases the options. Safe to call multiple times.
 func (o *ParseOptions) Close() {
 	if o == nil || o.handle == nil {

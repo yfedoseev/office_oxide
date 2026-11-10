@@ -51,4 +51,15 @@ public class OptionsTests
         Assert.Throws<ArgumentException>(() => strict.Set("no_such_limit", 1UL));
         Assert.Contains("part_bytes", ParseOptions.Names());
     }
+
+    [Fact]
+    public void OptionsReportTheirLimitsAndTheBoundsDerivedFromThem()
+    {
+        using var options = new ParseOptions().Set("memory_bytes", 1000UL).Set("part_bytes", ParseOptions.NoLimit);
+        var (limits, derived) = options.Limits();
+        Assert.Equal(1000UL, limits["memory_bytes"]);
+        Assert.Equal(ParseOptions.NoLimit, limits["part_bytes"]);
+        Assert.Equal(500UL, derived["write_bytes"]);
+        Assert.Equal(8, limits.Count);
+    }
 }

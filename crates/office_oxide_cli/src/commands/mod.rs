@@ -1,6 +1,7 @@
 mod html;
 mod info;
 mod ir;
+mod limits;
 mod markdown;
 mod replace;
 mod text;
@@ -39,6 +40,9 @@ pub enum Command {
         /// Path to the document file
         file: String,
     },
+    /// Show the limits documents are read under and the bounds derived from
+    /// them (with `--strict` and `--limit` applied)
+    Limits,
     /// Replace text in a document, preserving every other part of the file
     Replace {
         /// Path to the document file
@@ -93,6 +97,7 @@ pub fn run(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Html { file } => html::run(&file),
         Command::Info { file } => info::run(&file),
         Command::Ir { file } => ir::run(&file),
+        Command::Limits => limits::run(OPTIONS.get()),
         Command::Replace {
             file,
             find,

@@ -53,6 +53,20 @@ public sealed class ParseOptions : IDisposable
         return (NativeMethods.PtrToStringAndFree(ptr) ?? string.Empty).Split(',');
     }
 
+    /// <summary>
+    /// The limits these options hold and the bounds the library derives from
+    /// them, by name. <see cref="NoLimit"/> means no bound.
+    /// </summary>
+    public (IReadOnlyDictionary<string, ulong> Limits, IReadOnlyDictionary<string, ulong> Derived) Limits()
+    {
+        var json = NativeMethods.PtrToStringAndFree(NativeMethods.OfficeOptionsLimitsJson(Handle))
+            ?? throw new OfficeOxideException(OfficeOxideErrorCode.Internal, nameof(Limits));
+        using var doc = JsonDocument.Parse(json);
+        static Dictionary<string, ulong> Read(JsonElement e) =>
+            e.EnumerateObject().ToDictionary(p => p.Name, p => p.Value.GetUInt64());
+        return (Read(doc.RootElement.GetProperty("limits")), Read(doc.RootElement.GetProperty("derived")));
+    }
+
     internal IntPtr Handle
     {
         get

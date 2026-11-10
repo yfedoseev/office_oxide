@@ -140,6 +140,14 @@ int32_t office_options_set(OfficeParseOptionsHandle* handle, const char* name, u
 /** The names office_options_set accepts, comma-separated. Free with office_oxide_free_string. */
 char* office_options_names(void);
 
+/**
+ * The limits `options` hold (NULL: the process-wide ones in force) and the
+ * bounds derived from them, as JSON: {"limits": {name: value}, "derived":
+ * {name: value}}. 18446744073709551615 means no bound. Free with
+ * office_oxide_free_string.
+ */
+char* office_options_limits_json(const OfficeParseOptionsHandle* options);
+
 /** Open a document from a path under `options` (NULL: the process-wide settings). */
 OfficeDocumentHandle* office_document_open_with(
     const char* path,

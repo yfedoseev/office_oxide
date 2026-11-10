@@ -370,3 +370,27 @@ func TestStrictOptionsAcceptASoundDocumentAndBadNamesAreRefused(t *testing.T) {
 		t.Fatal("part_bytes is not listed")
 	}
 }
+
+func TestParseOptionsReportTheirLimitsAndTheBoundsDerivedFromThem(t *testing.T) {
+	o, err := NewParseOptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+	if err := o.Set("memory_bytes", 1000); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Set("part_bytes", NoLimit); err != nil {
+		t.Fatal(err)
+	}
+	limits, derived, err := o.Limits()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limits["memory_bytes"] != 1000 || limits["part_bytes"] != NoLimit || derived["write_bytes"] != 500 {
+		t.Fatalf("limits %v derived %v", limits, derived)
+	}
+	if len(limits) != 8 {
+		t.Fatalf("expected the eight limits, got %v", limits)
+	}
+}

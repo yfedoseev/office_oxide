@@ -65,3 +65,23 @@ test('the CommonJS entry point exports ParseOptions too', () => {
   const opts = new cjs.ParseOptions({ text_chars: 10 });
   opts.close();
 });
+
+test('the options report their limits and the bounds derived from them', () => {
+  const opts = new ParseOptions({ memory_bytes: 1000, part_bytes: Infinity });
+  try {
+    const { limits, derived } = opts.limits();
+    assert.equal(limits.memory_bytes, 1000);
+    assert.equal(limits.part_bytes, Infinity);
+    assert.equal(derived.write_bytes, 500);
+    for (const name of ParseOptions.names().filter((n) => n in limits)) assert.ok(name in limits);
+    assert.ok(Object.keys(limits).length >= 8);
+  } finally {
+    opts.close();
+  }
+  const big = new ParseOptions({ memory_bytes: 2n ** 62n });
+  try {
+    assert.equal(big.limits().limits.memory_bytes, 2n ** 62n, 'a large limit is exact');
+  } finally {
+    big.close();
+  }
+});

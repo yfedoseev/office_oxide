@@ -422,6 +422,39 @@ pub extern "C" fn office_options_names() -> *mut c_char {
     })
 }
 
+/// The limits `options` hold (NULL: the process-wide ones in force) and the
+/// bounds the library derives from them, as a JSON object
+/// `{"limits": {name: value}, "derived": {name: value}}`; a value of
+/// 18446744073709551615 (`u64::MAX`) means no bound. Free with
+/// `office_oxide_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn office_options_limits_json(
+    options: *const OfficeParseOptionsHandle,
+) -> *mut c_char {
+    guard(ptr::null_mut(), ptr::null_mut(), || {
+        let limits = if options.is_null() {
+            crate::limits::Limits::current()
+        } else {
+            unsafe { &*options }.opts.limits.clone()
+        };
+        to_c_string(&limits_json(&limits))
+    })
+}
+
+/// `{"limits": {..}, "derived": {..}}` for `limits`.
+pub(crate) fn limits_json(limits: &crate::limits::Limits) -> String {
+    let named: serde_json::Map<String, serde_json::Value> = crate::limits::Limits::NAMES
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_string(),
+                serde_json::Value::from(limits.get(name).unwrap_or(u64::MAX)),
+            )
+        })
+        .collect();
+    serde_json::json!({ "limits": named, "derived": limits.derived() }).to_string()
+}
+
 /// Open a document from a file path under `options` (NULL for the
 /// process-wide settings, as `office_document_open`).
 #[unsafe(no_mangle)]
@@ -1744,6 +1777,25 @@ mod options_tests {
             OFFICE_ERR_INVALID_ARG
         );
         assert!(take_string(office_options_names()).contains("part_bytes"));
+        unsafe { office_options_free(o) };
+    }
+
+    /// The options' limits and their derived bounds come back as JSON, every
+    /// named limit included.
+    #[test]
+    fn test_options_report_their_limits_and_derived_bounds_as_json() {
+        let o = office_options_new();
+        assert_eq!(office_options_set(o, cstr("memory_bytes").as_ptr(), 1000), OFFICE_OK);
+        let json: serde_json::Value =
+            serde_json::from_str(&take_string(office_options_limits_json(o))).unwrap();
+        assert_eq!(json["limits"]["memory_bytes"], 1000);
+        assert_eq!(json["derived"]["write_bytes"], 500);
+        for name in crate::limits::Limits::NAMES {
+            assert!(json["limits"].get(*name).is_some(), "{name}");
+        }
+        let process: serde_json::Value =
+            serde_json::from_str(&take_string(office_options_limits_json(ptr::null()))).unwrap();
+        assert!(process["derived"]["image_bytes"].is_u64());
         unsafe { office_options_free(o) };
     }
 

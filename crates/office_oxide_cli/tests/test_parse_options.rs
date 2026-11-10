@@ -100,3 +100,38 @@ fn test_replace_refuses_flags_it_would_ignore() {
         assert!(stderr(&out).contains("replace"), "{flag:?}: {}", stderr(&out));
     }
 }
+
+/// `limits` prints the limits a run reads under, with `--strict` and
+/// `--limit` applied, and the bounds derived from them.
+#[test]
+fn test_limits_command_shows_the_limits_in_force_and_what_follows_from_them() {
+    let out = Command::new(env!("CARGO_BIN_EXE_office-oxide"))
+        .args([
+            "limits",
+            "--limit",
+            "memory_bytes=1000",
+            "--limit",
+            "part_bytes=max",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8(out.stdout).unwrap();
+    for line in [
+        "memory_bytes = 1000",
+        "part_bytes = max",
+        "write_bytes = 500",
+        "image_bytes = 500",
+    ] {
+        assert!(text.lines().any(|l| l == line), "no `{line}` in:\n{text}");
+    }
+    for name in office_oxide::limits::Limits::NAMES {
+        assert!(text.lines().any(|l| l.starts_with(&format!("{name} = "))), "{name} missing");
+    }
+    let strict = Command::new(env!("CARGO_BIN_EXE_office-oxide"))
+        .args(["limits", "--strict"])
+        .output()
+        .unwrap();
+    let strict = String::from_utf8(strict.stdout).unwrap();
+    assert!(strict.lines().any(|l| l == "embedded_depth = 1"), "{strict}");
+}

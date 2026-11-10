@@ -176,6 +176,31 @@ impl PyParseOptions {
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
+    /// The limits these options hold, by name (`None` for no bound).
+    fn limits(&self) -> std::collections::BTreeMap<&'static str, Option<u64>> {
+        crate::limits::Limits::NAMES
+            .iter()
+            .map(|name| (*name, self.inner.limits.get(name).filter(|v| *v != u64::MAX)))
+            .collect()
+    }
+
+    /// The bounds the library derives from these limits (picture, padding,
+    /// write and embedded-package budgets), by name (`None` for no bound).
+    fn derived(&self) -> PyResult<std::collections::BTreeMap<String, Option<u64>>> {
+        let value = serde_json::to_value(self.inner.limits.derived())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let map = value.as_object().cloned().unwrap_or_default();
+        Ok(map
+            .into_iter()
+            .map(|(k, v)| {
+                let v = v
+                    .as_u64()
+                    .filter(|n| *n != u64::MAX && *n != usize::MAX as u64);
+                (k, v)
+            })
+            .collect())
+    }
+
     /// The names of every option.
     #[staticmethod]
     fn names() -> Vec<&'static str> {

@@ -253,3 +253,14 @@ def test_a_logging_handler_that_needs_the_gil_does_not_hang_a_parse():
         ]
         for f in futures:
             assert f.result(timeout=120) > 0
+
+
+def test_options_report_their_limits_and_the_bounds_derived_from_them():
+    opts = office_oxide.ParseOptions(memory_bytes=1000, part_bytes=2**64 - 1)
+    limits = opts.limits()
+    assert set(limits) == set(n for n in office_oxide.ParseOptions.names() if n in limits)
+    assert limits["memory_bytes"] == 1000
+    assert limits["part_bytes"] is None
+    derived = opts.derived()
+    assert derived["write_bytes"] == 500 and derived["image_bytes"] == 500
+    assert office_oxide.ParseOptions(strict=True).limits()["embedded_depth"] == 1

@@ -88,6 +88,7 @@ export const native = {
   optionsFree: lib.func('void office_options_free(void* handle)'),
   optionsSet: lib.func('int32_t office_options_set(void* handle, const char* name, uint64_t value)'),
   optionsNames: lib.func('HeapStr office_options_names()'),
+  optionsLimitsJson: lib.func('HeapStr office_options_limits_json(void* options)'),
   documentFree: lib.func('void office_document_free(void* handle)'),
   documentFormat: lib.func('const char* office_document_format(void* handle)'),
   documentPlainText: lib.func('HeapStr office_document_plain_text(void* handle, _Out_ int* error_code)'),

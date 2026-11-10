@@ -187,7 +187,7 @@ pub(crate) fn part_inflate_cap(compressed: u64) -> u64 {
 /// eighth of the part limit when that is lower, so that a tightened part limit
 /// (`Limits::strict` has 64 MiB) still has a ratio check above it.
 pub(crate) fn inflate_ratio_floor() -> u64 {
-    INFLATE_RATIO_FLOOR_BYTES.min(max_part_bytes() / 8)
+    derive::inflate_ratio_floor(max_part_bytes())
 }
 
 /// The default depth to which embedded packages are opened: 3.
@@ -236,7 +236,7 @@ pub fn set_max_embedded_packages(packages: usize) {
 /// The total bytes the embedded packages of one document may take, counting
 /// their sizes and what reading them inflates.
 pub(crate) fn max_embedded_bytes() -> u64 {
-    configured_package_bytes() / 4
+    derive::embedded_bytes(configured_package_bytes())
 }
 
 /// The default per-document text budget: 256 Mi characters.
@@ -377,18 +377,18 @@ pub fn set_max_text_chars(chars: usize) {
 
 /// The per-document allowance of empty slots padding spreadsheet rows.
 pub(crate) fn max_grid_padding_cells() -> usize {
-    usize::try_from(max_memory_bytes() / 64).unwrap_or(usize::MAX)
+    derive::grid_padding_cells(max_memory_bytes())
 }
 
 /// The per-sheet allowance of empty slots padding spreadsheet rows.
 pub(crate) fn max_sheet_grid_padding_cells() -> usize {
-    usize::try_from(max_memory_bytes() / 128).unwrap_or(usize::MAX)
+    derive::sheet_grid_padding_cells(max_memory_bytes())
 }
 
 /// The per-document allowance of bytes a legacy file's compressed metafile
 /// pictures may inflate to.
 pub(crate) fn max_inflated_image_bytes() -> u64 {
-    max_memory_bytes() / 4
+    derive::inflated_image_bytes(max_memory_bytes())
 }
 
 /// A document's remaining allowance of inflated image bytes.
@@ -621,13 +621,13 @@ impl GridBudget {
 /// The per-document allowance of bytes for the empty cells padding the rows
 /// of a spreadsheet's IR.
 pub(crate) fn max_ir_padding_bytes() -> usize {
-    usize::try_from(max_memory_bytes() / 2).unwrap_or(usize::MAX)
+    derive::ir_padding_bytes(max_memory_bytes())
 }
 
 /// The per-sheet allowance of bytes for the empty cells padding the rows of
 /// a spreadsheet sheet in the IR, when sheets are converted one at a time.
 pub(crate) fn max_sheet_ir_padding_bytes() -> usize {
-    usize::try_from(max_memory_bytes()).unwrap_or(usize::MAX)
+    derive::sheet_ir_padding_bytes(max_memory_bytes())
 }
 
 /// A remaining allowance of bytes for IR padding cells: the document's, or
@@ -709,13 +709,13 @@ impl IrPaddingBudget {
 /// once for every anchor that draws it: the workbook stores a media part once,
 /// and the IR gives each image its own copy.
 pub(crate) fn max_image_bytes() -> usize {
-    usize::try_from(max_memory_bytes() / 2).unwrap_or(usize::MAX)
+    derive::image_bytes(max_memory_bytes())
 }
 
 /// The most picture bytes all the sheets of one workbook may copy into the IR
 /// in a sheet-by-sheet conversion.
 pub(crate) fn max_total_image_bytes() -> u64 {
-    max_memory_bytes().saturating_mul(4)
+    derive::total_image_bytes(max_memory_bytes())
 }
 
 thread_local! {
@@ -870,7 +870,7 @@ pub const WRITE_BYTES_PER_XLSX_CELL: u64 = 170;
 /// padded to its widest row) of an IR written to `.docx`, `.pptx` or `.xlsx`
 /// may be estimated to need before the write is refused.
 pub(crate) fn max_write_bytes() -> u64 {
-    max_memory_bytes() / 2
+    derive::write_bytes(max_memory_bytes())
 }
 
 /// The default most worksheets an IR written to `.xlsx` may hold: 32,767.
@@ -1086,6 +1086,63 @@ mod tests {
         assert_eq!(text_limit_for_input(usize::MAX, Some(u64::MAX)), usize::MAX);
         // No bound is no bound, even for a tiny input.
         assert_eq!(text_limit_for_input(usize::MAX, Some(1)), usize::MAX);
+    }
+
+    /// Every bound [`Limits::derived`] reports equals the one the reading and
+    /// writing code enforces under those limits.
+    #[test]
+    fn test_derived_limits_are_the_enforced_ones() {
+        // The process-wide limits are read below; no other test may change
+        // them meanwhile.
+        let _lock = super::test_support::LimitScope::new();
+        let custom = Limits {
+            memory_bytes: 10_000_000,
+            package_bytes: 3_000_000,
+            part_bytes: 80 << 20,
+            ..Limits::default()
+        };
+        let tiny = Limits {
+            part_bytes: 1_000,
+            memory_bytes: 1,
+            ..Limits::default()
+        };
+        for limits in [
+            Limits::default(),
+            Limits::strict(),
+            Limits::unlimited(),
+            custom,
+            tiny,
+        ] {
+            let d = limits.derived();
+            let _scope = LimitsScope::new(Some(&limits));
+            assert_eq!(Limits::in_force(), limits);
+            assert_eq!(d.grid_padding_cells, max_grid_padding_cells(), "{limits:?}");
+            assert_eq!(d.sheet_grid_padding_cells, max_sheet_grid_padding_cells());
+            assert_eq!(d.ir_padding_bytes, max_ir_padding_bytes());
+            assert_eq!(d.sheet_ir_padding_bytes, max_sheet_ir_padding_bytes());
+            assert_eq!(d.image_bytes, max_image_bytes());
+            assert_eq!(d.total_image_bytes, max_total_image_bytes());
+            assert_eq!(d.inflated_image_bytes, max_inflated_image_bytes());
+            assert_eq!(d.write_bytes, max_write_bytes());
+            assert_eq!(d.write_sheets, max_write_sheets());
+            assert_eq!(d.embedded_bytes, max_embedded_bytes());
+            assert_eq!(d.inflate_ratio_floor_bytes, inflate_ratio_floor());
+        }
+        // The process-wide limits are in force outside a document's call.
+        assert_eq!(Limits::in_force(), Limits::current());
+    }
+
+    /// Every named limit reads back what was set under that name.
+    #[test]
+    fn test_every_named_limit_reads_back_what_was_set() {
+        let mut limits = Limits::default();
+        for (i, name) in Limits::NAMES.iter().enumerate() {
+            let value = 1_000 + i as u64;
+            limits.set(name, value).unwrap();
+            assert_eq!(limits.get(name), Some(value), "{name}");
+        }
+        assert_eq!(Limits::unlimited().get("text_chars"), Some(u64::MAX));
+        assert_eq!(limits.get("no_such_limit"), None);
     }
 
     #[test]
@@ -1484,6 +1541,24 @@ impl Limits {
         }
         Ok(())
     }
+
+    /// The limit called `name` (see [`Limits::NAMES`]), as `set` takes it: a
+    /// count wider than 64 bits reads as `u64::MAX`, which means no bound.
+    /// `None` for a name that is not a limit.
+    pub fn get(&self, name: &str) -> Option<u64> {
+        let wide = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        Some(match name {
+            "package_entries" => wide(self.package_entries),
+            "package_bytes" => self.package_bytes,
+            "part_bytes" => self.part_bytes,
+            "inflate_ratio" => self.inflate_ratio,
+            "embedded_depth" => wide(self.embedded_depth),
+            "embedded_packages" => wide(self.embedded_packages),
+            "text_chars" => wide(self.text_chars),
+            "memory_bytes" => self.memory_bytes,
+            _ => return None,
+        })
+    }
 }
 
 /// Why [`Limits::set`] refused a limit.
@@ -1518,6 +1593,116 @@ thread_local! {
     /// The limits of the call running on this thread (see [`LimitsScope`]).
     static SCOPED: std::cell::RefCell<Option<std::rc::Rc<Limits>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// The bounds the library derives from the limits, each a pure function of
+/// the limit it follows from. The `max_*` functions the reading and writing
+/// code calls and [`Limits::derived`] both compute through these, so what
+/// `derived()` reports is what is enforced.
+mod derive {
+    use super::INFLATE_RATIO_FLOOR_BYTES;
+
+    fn to_usize(n: u64) -> usize {
+        usize::try_from(n).unwrap_or(usize::MAX)
+    }
+
+    pub(super) fn inflate_ratio_floor(part_bytes: u64) -> u64 {
+        INFLATE_RATIO_FLOOR_BYTES.min(part_bytes / 8)
+    }
+    pub(super) fn embedded_bytes(package_bytes: u64) -> u64 {
+        package_bytes / 4
+    }
+    pub(super) fn grid_padding_cells(memory_bytes: u64) -> usize {
+        to_usize(memory_bytes / 64)
+    }
+    pub(super) fn sheet_grid_padding_cells(memory_bytes: u64) -> usize {
+        to_usize(memory_bytes / 128)
+    }
+    pub(super) fn inflated_image_bytes(memory_bytes: u64) -> u64 {
+        memory_bytes / 4
+    }
+    pub(super) fn ir_padding_bytes(memory_bytes: u64) -> usize {
+        to_usize(memory_bytes / 2)
+    }
+    pub(super) fn sheet_ir_padding_bytes(memory_bytes: u64) -> usize {
+        to_usize(memory_bytes)
+    }
+    pub(super) fn image_bytes(memory_bytes: u64) -> usize {
+        to_usize(memory_bytes / 2)
+    }
+    pub(super) fn total_image_bytes(memory_bytes: u64) -> u64 {
+        memory_bytes.saturating_mul(4)
+    }
+    pub(super) fn write_bytes(memory_bytes: u64) -> u64 {
+        memory_bytes / 2
+    }
+}
+
+/// The bounds that follow from a [`Limits`] value: what lowering
+/// `memory_bytes`, `package_bytes` or `part_bytes` does to the pictures,
+/// padding, writing and embedded packages of one document. Read-only; see
+/// [`Limits::derived`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
+pub struct DerivedLimits {
+    /// Empty cells a legacy spreadsheet's rows may be padded with, for the
+    /// whole document (`memory_bytes / 64`).
+    pub grid_padding_cells: usize,
+    /// The same, for one sheet (`memory_bytes / 128`).
+    pub sheet_grid_padding_cells: usize,
+    /// Bytes of empty table cells padding a spreadsheet's IR rows, for the
+    /// whole document (`memory_bytes / 2`).
+    pub ir_padding_bytes: usize,
+    /// The same, for one sheet converted on its own (`memory_bytes`).
+    pub sheet_ir_padding_bytes: usize,
+    /// Picture bytes one IR may hold, a picture counted once per reference
+    /// (`memory_bytes / 2`).
+    pub image_bytes: usize,
+    /// Picture bytes a sheet-by-sheet conversion may copy in all
+    /// (`memory_bytes * 4`).
+    pub total_image_bytes: u64,
+    /// Bytes a legacy file's compressed pictures may inflate to
+    /// (`memory_bytes / 4`).
+    pub inflated_image_bytes: u64,
+    /// The memory estimate an IR may need to be written as `.docx`, `.pptx`
+    /// or `.xlsx` before the write is refused (`memory_bytes / 2`).
+    pub write_bytes: u64,
+    /// The most worksheets an IR written as `.xlsx` may hold.
+    pub write_sheets: usize,
+    /// Bytes all the packages embedded in one document may take together
+    /// (`package_bytes / 4`); they also share its `text_chars`.
+    pub embedded_bytes: u64,
+    /// The size below which a part is never refused for its inflate ratio
+    /// (64 MiB, or `part_bytes / 8` when that is lower).
+    pub inflate_ratio_floor_bytes: u64,
+}
+
+impl Limits {
+    /// The bounds the library derives from these limits; see
+    /// [`DerivedLimits`]. What `derived()` reports for the limits in force is
+    /// what the reading and writing code enforces.
+    pub fn derived(&self) -> DerivedLimits {
+        let m = self.memory_bytes;
+        DerivedLimits {
+            grid_padding_cells: derive::grid_padding_cells(m),
+            sheet_grid_padding_cells: derive::sheet_grid_padding_cells(m),
+            ir_padding_bytes: derive::ir_padding_bytes(m),
+            sheet_ir_padding_bytes: derive::sheet_ir_padding_bytes(m),
+            image_bytes: derive::image_bytes(m),
+            total_image_bytes: derive::total_image_bytes(m),
+            inflated_image_bytes: derive::inflated_image_bytes(m),
+            write_bytes: derive::write_bytes(m),
+            write_sheets: DEFAULT_MAX_WRITE_SHEETS,
+            embedded_bytes: derive::embedded_bytes(self.package_bytes),
+            inflate_ratio_floor_bytes: derive::inflate_ratio_floor(self.part_bytes),
+        }
+    }
+
+    /// The limits in force on this thread: a document's own while one of
+    /// its calls runs, otherwise the process-wide ones.
+    pub fn in_force() -> Self {
+        scope_snapshot().unwrap_or_else(Self::current)
+    }
 }
 
 /// Read one field of the limits set for this call, if one is set.

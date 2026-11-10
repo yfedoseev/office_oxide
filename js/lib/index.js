@@ -129,6 +129,25 @@ class ParseOptions {
 
   static names() { return n.optionsNames().split(','); }
 
+  /**
+   * The limits these options hold and the bounds the library derives from
+   * them: `{ limits: { name: value }, derived: { name: value } }`. A value
+   * beyond `Number.MAX_SAFE_INTEGER` is a `bigint`, and no bound is `Infinity`.
+   */
+  limits() {
+    const MAX = 2n ** 64n - 1n;
+    // Quote every integer too large for a double before parsing, so none is rounded.
+    const text = n.optionsLimitsJson(this._handle()).replace(/:(\d{16,})/g, ':"$1"');
+    const exact = (v) => {
+      if (typeof v !== 'string') return v;
+      const b = BigInt(v);
+      return b === MAX ? Infinity : b;
+    };
+    const { limits, derived } = JSON.parse(text);
+    const map = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, exact(v)]));
+    return { limits: map(limits), derived: map(derived) };
+  }
+
   _handle() { if (!this._h) throw new Error('ParseOptions is closed'); return this._h; }
   close() { if (this._h) { n.optionsFree(this._h); this._h = null; } }
   [Symbol.dispose]() { this.close(); }

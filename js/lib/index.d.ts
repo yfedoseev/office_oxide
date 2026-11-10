@@ -38,6 +38,8 @@ export class ParseOptions implements Disposable {
   constructor(options?: { strict?: boolean } & Record<string, OptionValue | undefined>);
   set(name: string, value: OptionValue): this;
   static names(): string[];
+  /** The limits these options hold and the bounds derived from them; `Infinity` is no bound. */
+  limits(): { limits: Record<string, number | bigint>; derived: Record<string, number | bigint> };
   close(): void;
   [Symbol.dispose](): void;
 }

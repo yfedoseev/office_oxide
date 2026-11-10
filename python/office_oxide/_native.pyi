@@ -29,6 +29,10 @@ class ParseOptions:
         self, *, strict: bool = False, **options: int | bool | str
     ) -> None: ...
     def set(self, name: str, value: int | bool | str) -> None: ...
+    def limits(self) -> dict[str, int | None]:
+        """The limits these options hold, by name (``None``: no bound)."""
+    def derived(self) -> dict[str, int | None]:
+        """The bounds derived from these limits, by name (``None``: no bound)."""
     @staticmethod
     def names() -> list[str]: ...
 

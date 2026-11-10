@@ -151,6 +151,8 @@ The options belong to the document: nothing global changes. `ParseOptions.names(
 lists every option (limits such as `text_chars`, `part_bytes`, `embedded_depth`;
 `include_hidden_text`, `include_deleted_text`; `on_incomplete="error"`).
 
+Options bind to the document opened with them: every conversion of that document runs under them, on any thread. Opening without options reads the process-wide defaults, and so does anything the library does outside a document opened with options. Creating options copies the process-wide values in force at that moment. `opts.limits()` / `opts.derived()` shows the eight limits and the bounds derived from them (picture, padding and write budgets). There is no time limit: read untrusted input under a timeout or in a subprocess.
+
 ## License
 
 Dual-licensed under [MIT](../LICENSE-MIT) or [Apache-2.0](../LICENSE-APACHE) at your option.

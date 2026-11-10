@@ -170,6 +170,8 @@ console.log(doc.damage());                       // [{ kind, part, detail }], em
 The options belong to the document: nothing global changes. `ParseOptions.names()`
 lists every option. Call `close()` on options and documents when done.
 
+Options bind to the document opened with them: every conversion of that document runs under them, on any thread. Opening without options reads the process-wide defaults, and so does anything the library does outside a document opened with options. Creating options copies the process-wide values in force at that moment. `opts.limits()` shows the eight limits and the bounds derived from them (picture, padding and write budgets). There is no time limit: read untrusted input under a timeout or in a subprocess.
+
 ## License
 
 MIT OR Apache-2.0
