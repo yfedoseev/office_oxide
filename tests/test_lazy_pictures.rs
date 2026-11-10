@@ -388,3 +388,44 @@ fn test_slide_picture_answers_the_same_lazy_or_not() {
         assert!(deck.slide_picture(1, "rIdP0").is_none());
     }
 }
+
+/// `XlsxDocument::picture` finds a lazy picture by its anchor's token, and
+/// only that token: a caller who drops a sheet's pictures frees their tokens,
+/// and an allocation reusing a freed token's address used to be handed that
+/// picture's bytes.
+#[test]
+#[allow(deprecated)]
+fn test_a_workbook_picture_is_found_by_its_own_token_only() {
+    let mut scope = serial();
+    scope.set(
+        office_oxide::read_options::lazy_pictures,
+        office_oxide::read_options::set_lazy_pictures,
+        true,
+    );
+    let mut book = office_oxide::xlsx::XlsxDocument::from_reader(Cursor::new(xlsx(1, 4))).unwrap();
+    let freed: Vec<usize> = book.worksheets[0]
+        .images
+        .iter()
+        .map(|p| p.data.as_ptr() as usize)
+        .collect();
+    assert_eq!(book.picture(&book.worksheets[0].images[0]).len(), PICTURE_LEN);
+    // A picture of the caller's own, holding none of the workbook's tokens.
+    let mut stranger = book.worksheets[0].images[0].clone();
+    stranger.data = std::sync::Arc::from(vec![7u8]);
+    book.worksheets[0].images = Vec::new().into();
+    // Allocate empty slices until one lands where a freed token was, or
+    // give up: either way it must not be taken for the picture.
+    let mut kept = Vec::new();
+    for _ in 0..10_000 {
+        let token: std::sync::Arc<[u8]> = std::sync::Arc::from(Vec::new());
+        let reused = freed.contains(&(token.as_ptr() as usize));
+        kept.push(token);
+        if reused {
+            break;
+        }
+    }
+    for token in &kept {
+        stranger.data = token.clone();
+        assert_eq!(book.picture(&stranger).len(), 0, "a stranger's bytes are its own");
+    }
+}

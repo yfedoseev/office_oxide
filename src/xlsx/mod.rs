@@ -160,7 +160,8 @@ impl XlsxDocument {
     pub fn picture(&self, pic: &worksheet::WorksheetPicture) -> crate::core::picture::PictureBytes {
         self.lazy_pictures
             .get(&(pic.data.as_ptr() as usize))
-            .cloned()
+            .filter(|(token, _)| std::sync::Arc::ptr_eq(token, &pic.data))
+            .map(|(_, found)| found.clone())
             .unwrap_or_else(|| pic.data.clone().into())
     }
 
@@ -1536,8 +1537,11 @@ type MediaCache = std::collections::HashMap<
 >;
 
 /// The pictures of a workbook read lazily, by the address of the token a
-/// `WorksheetPicture::data` holds in their place.
-pub(crate) type LazyPictures = std::collections::HashMap<usize, crate::core::picture::PictureBytes>;
+/// `WorksheetPicture::data` holds in their place. The token is kept here
+/// too, so its address cannot be reused for another allocation while the
+/// workbook lives, whatever a caller does with its pictures.
+pub(crate) type LazyPictures =
+    std::collections::HashMap<usize, (std::sync::Arc<[u8]>, crate::core::picture::PictureBytes)>;
 
 /// The table [`LazyPictures`] for the pictures `cache` read.
 fn lazy_pictures_of(cache: &MediaCache) -> LazyPictures {
@@ -1547,7 +1551,7 @@ fn lazy_pictures_of(cache: &MediaCache) -> LazyPictures {
     cache
         .values()
         .flatten()
-        .map(|(pic, token)| (token.as_ptr() as usize, pic.clone()))
+        .map(|(pic, token)| (token.as_ptr() as usize, (token.clone(), pic.clone())))
         .collect()
 }
 
