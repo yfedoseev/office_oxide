@@ -1945,7 +1945,10 @@ mod image_bytes {
 }
 
 /// An embedded image reference.
-#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+///
+/// `Serialize` is written by hand (below) so that the image's bytes are one
+/// `data` key whichever field holds them.
+#[derive(Debug, Clone, PartialEq, Default, serde::Deserialize)]
 pub struct Image {
     /// Optional alt-text description of the image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1967,13 +1970,9 @@ pub struct Image {
     /// The image bytes shared with the document instead of copied into
     /// [`Self::data`] (see [`crate::core::picture::PictureBytes`]). Written
     /// to JSON as `data`, the same base64 string; read back into `data`.
-    #[serde(
-        rename = "data",
-        default,
-        skip_deserializing,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "image_bytes::serialize_shared"
-    )]
+    /// When both are set, [`Self::data`] is the image: it is what a 0.1.x
+    /// caller who edits the bytes sets.
+    #[serde(rename = "data", default, skip_deserializing)]
     pub shared_data: Option<crate::core::picture::PictureBytes>,
     /// Pixel format of the image data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2035,15 +2034,62 @@ impl AsRef<[u8]> for ImageBytes<'_> {
     }
 }
 
+impl serde::Serialize for Image {
+    /// The fields in declaration order, each left out under the same rule
+    /// as before (`None`, and `decorative` when false), with the bytes as one
+    /// `data` key: [`Image::data`] when set, otherwise [`Image::shared_data`].
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        struct Data<'a>(&'a Image);
+        impl serde::Serialize for Data<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                match &self.0.data {
+                    Some(_) => image_bytes::serialize(&self.0.data, s),
+                    None => image_bytes::serialize_shared(&self.0.shared_data, s),
+                }
+            }
+        }
+        let mut st = s.serialize_struct("Image", 11)?;
+        macro_rules! optional {
+            ($key:literal, $field:expr) => {
+                match &$field {
+                    Some(v) => st.serialize_field($key, v)?,
+                    None => st.skip_field($key)?,
+                }
+            };
+        }
+        optional!("alt_text", self.alt_text);
+        if self.data.is_some() || self.shared_data.is_some() {
+            st.serialize_field("data", &Data(self))?;
+        } else {
+            st.skip_field("data")?;
+        }
+        optional!("format", self.format);
+        optional!("display_width_emu", self.display_width_emu);
+        optional!("display_height_emu", self.display_height_emu);
+        optional!("pixel_width", self.pixel_width);
+        optional!("pixel_height", self.pixel_height);
+        if self.decorative {
+            st.serialize_field("decorative", &true)?;
+        } else {
+            st.skip_field("decorative")?;
+        }
+        st.serialize_field("positioning", &self.positioning)?;
+        optional!("hyperlink", self.hyperlink);
+        optional!("source_url", self.source_url);
+        st.end()
+    }
+}
+
 impl Image {
-    /// The image bytes, from [`Self::shared_data`] when the document shares
-    /// them, otherwise from [`Self::data`]. Borrowed from `data`; shared (or,
-    /// for a picture held as its stored stream, inflated for this call and
-    /// not kept) from `shared_data`.
+    /// The image bytes: [`Self::data`] when set (bytes a caller put there
+    /// win), otherwise [`Self::shared_data`]. Borrowed from `data`; shared
+    /// (or, for a picture held as its stored stream, inflated for this call
+    /// and not kept) from `shared_data`.
     pub fn bytes(&self) -> Option<ImageBytes<'_>> {
-        match (&self.shared_data, &self.data) {
-            (Some(shared), _) => shared.bytes().map(ImageBytes::Shared),
-            (None, Some(data)) => Some(ImageBytes::Borrowed(data)),
+        match (&self.data, &self.shared_data) {
+            (Some(data), _) => Some(ImageBytes::Borrowed(data)),
+            (None, Some(shared)) => shared.bytes().map(ImageBytes::Shared),
             (None, None) => None,
         }
     }
@@ -2051,9 +2097,9 @@ impl Image {
     /// The number of image bytes, without inflating a picture held as its
     /// stored stream.
     pub fn byte_len(&self) -> Option<usize> {
-        match (&self.shared_data, &self.data) {
-            (Some(shared), _) => Some(shared.len()),
-            (None, Some(data)) => Some(data.len()),
+        match (&self.data, &self.shared_data) {
+            (Some(data), _) => Some(data.len()),
+            (None, Some(shared)) => Some(shared.len()),
             (None, None) => None,
         }
     }
@@ -2436,6 +2482,44 @@ mod serde_shape_tests {
         let null: Image = serde_json::from_str(r#"{"data":null}"#).unwrap();
         assert_eq!(null.data, None);
         assert!(serde_json::from_str::<Image>(r#"{"data":"not base64!"}"#).is_err());
+    }
+
+    /// Bytes a caller puts in `data` are the image even when the document
+    /// shares its own through `shared_data`: they were ignored by every
+    /// renderer and writer, and the JSON carried two `data` keys that it
+    /// refused to read back.
+    #[test]
+    fn test_an_image_with_both_byte_fields_is_its_data() {
+        let shared: crate::core::picture::PictureBytes = vec![1u8, 2, 3].into();
+        let image = Image {
+            data: Some(vec![9, 9]),
+            shared_data: Some(shared.clone()),
+            alt_text: Some("a".into()),
+            ..Image::default()
+        };
+        assert_eq!(&image.bytes().unwrap()[..], &[9, 9]);
+        assert_eq!(image.byte_len(), Some(2));
+        let json = serde_json::to_string(&image).unwrap();
+        assert_eq!(json.matches(r#""data""#).count(), 1, "{json}");
+        let back: Image = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.data, Some(vec![9, 9]));
+        // Shared alone: the same JSON as the bytes in `data`.
+        let only_shared = Image {
+            shared_data: Some(shared),
+            ..Image::default()
+        };
+        let as_data = Image {
+            data: Some(vec![1, 2, 3]),
+            ..Image::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&only_shared).unwrap(),
+            serde_json::to_string(&as_data).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(&Image::default()).unwrap(),
+            r#"{"positioning":"inline"}"#
+        );
     }
 
     /// The JSON form omits fields at their default — every `None` and
