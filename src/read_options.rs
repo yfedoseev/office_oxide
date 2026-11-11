@@ -59,15 +59,15 @@ pub fn set_include_deleted_text(include: bool) {
 /// and inflates it only when it is used. `false` by default.
 ///
 /// With it on, opening costs the pictures' stored size instead of their
-/// inflated size, and the IR shares a picture's bytes instead of copying them
-/// into every image that draws it: picture bytes are then reached through
-/// [`Image::bytes`](crate::ir::Image::bytes),
+/// inflated size, and text, Markdown and HTML without images never inflate
+/// them; the IR still copies each picture into every image that draws it,
+/// as without it. The readers' pictures are then reached through
 /// [`DocxDocument::picture`](crate::docx::DocxDocument::picture),
 /// [`PptxDocument::slide_picture`](crate::pptx::PptxDocument::slide_picture) and
 /// [`XlsxDocument::picture`](crate::xlsx::XlsxDocument::picture),
-/// and the fields that held them eagerly (`Image::data`,
-/// `DocxDocument::images`, `PictureShape::data`, `WorksheetPicture::data`)
-/// are left empty. Every output is the same either way.
+/// and the fields that held them eagerly (`DocxDocument::images`,
+/// `PictureShape::data`, `WorksheetPicture::data`) are left empty. Every
+/// output is the same either way.
 pub fn lazy_pictures() -> bool {
     scoped().map_or_else(|| LAZY_PICTURES.load(Ordering::Relaxed), |s| s.lazy_pictures)
 }

@@ -523,7 +523,6 @@ impl<'d> SheetConverter<'d> {
             let img = Image {
                 alt_text: pic.alt_text.clone(),
                 data: data.data,
-                shared_data: data.shared,
                 format,
                 display_width_emu: Some(pic.cx_emu.max(0) as u64),
                 display_height_emu: Some(pic.cy_emu.max(0) as u64),

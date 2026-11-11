@@ -306,7 +306,6 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
                     let mut part = story.part.clone();
                     crate::ir::for_each_image_mut(&mut part.content, |i| {
                         i.data = None;
-                        i.shared_data = None;
                     });
                     let chars = serde_json::to_vec(&part.content).map_or(usize::MAX, |v| v.len());
                     (part, chars)
@@ -1188,7 +1187,6 @@ fn collect_paragraph_inline_images(
                         alt_text: d.description.clone(),
                         decorative: d.decorative,
                         data: data.data,
-                        shared_data: data.shared,
                         source_url: linked_image_url(d),
                         format,
                         display_width_emu: Some(d.width.0.max(0) as u64),
@@ -1342,7 +1340,6 @@ fn drawing_to_float_element(
         alt_text: d.description.clone(),
         decorative: d.decorative,
         data: data.data,
-        shared_data: data.shared,
         source_url: linked_image_url(d),
         format,
         display_width_emu: Some(width_emu),
@@ -1392,28 +1389,16 @@ fn embedded_image(
     Some((data, ext.map(str::to_string)))
 }
 
-/// The bytes an IR image carries: a copy in `Image::data`, or, when pictures
-/// are held lazily, the picture shared in `Image::shared_data`. The budget is
-/// charged the same either way, so both modes keep the same pictures.
+/// The bytes an IR image carries: a copy of the picture in `Image::data`,
+/// inflated for the copy when the picture is held as its stored stream.
 #[derive(Default)]
 pub(crate) struct ImageData {
     pub(crate) data: Option<Vec<u8>>,
-    pub(crate) shared: Option<crate::core::picture::PictureBytes>,
 }
 
 impl ImageData {
     pub(crate) fn of(pic: &crate::core::picture::PictureBytes) -> Self {
-        if crate::read_options::lazy_pictures() {
-            Self {
-                data: None,
-                shared: Some(pic.clone()),
-            }
-        } else {
-            Self {
-                data: pic.bytes().map(|b| b.to_vec()),
-                shared: None,
-            }
-        }
+        Self { data: pic.to_vec() }
     }
 }
 

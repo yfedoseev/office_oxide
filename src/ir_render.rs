@@ -202,7 +202,7 @@ mod block_default {
                 // image's position in the flow.
                 if super::MARKDOWN_OPTIONS.with(|o| o.get().image_embed) == ImageEmbed::Base64 {
                     if let Some(data) = img.bytes() {
-                        return format!("[image-base64:{}]", crate::core::base64::Display(&data));
+                        return format!("[image-base64:{}]", crate::core::base64::Display(data));
                     }
                 }
                 // A linked image has a real, addressable source.
@@ -253,14 +253,14 @@ mod block_default {
                 if super::HTML_OPTIONS.with(|o| o.get().image_embed) == ImageEmbed::Base64 {
                     if let Some((data, mime)) = img
                         .bytes()
-                        .and_then(|data| super::image_mime(img, &data).map(|mime| (data, mime)))
+                        .and_then(|data| super::image_mime(img, data).map(|mime| (data, mime)))
                     {
                         let alt = img.alt_text.as_deref().unwrap_or("");
                         let mut out = String::new();
                         let _ = write!(
                             out,
                             "<img src=\"data:{mime};base64,{}\" alt=\"{}\" />",
-                            crate::core::base64::Display(&data),
+                            crate::core::base64::Display(data),
                             super::escape_html(alt)
                         );
                         return out;

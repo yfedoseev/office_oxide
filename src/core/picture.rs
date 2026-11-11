@@ -80,24 +80,37 @@ impl PictureBytes {
     pub fn bytes(&self) -> Option<Arc<[u8]>> {
         match &*self.0 {
             Source::Inflated(b) => Some(b.clone()),
-            Source::Deflated { stored, len, crc } => {
-                let mut out = Vec::with_capacity(*len);
-                let mut decoder = flate2::read::DeflateDecoder::new(&stored[..]);
-                (&mut decoder)
-                    .take(*len as u64)
-                    .read_to_end(&mut out)
-                    .ok()?;
-                let mut check = flate2::Crc::new();
-                check.update(&out);
-                if out.len() != *len || check.sum() != *crc {
-                    log::warn!(
-                        "picture: the stored stream no longer inflates to the bytes read at open"
-                    );
-                    return None;
-                }
-                Some(out.into())
-            },
+            Source::Deflated { .. } => self.inflate().map(Into::into),
         }
+    }
+
+    /// The bytes as a `Vec` of their own: copied when held inflated, and
+    /// when not, the inflated buffer itself, with no copy made.
+    pub(crate) fn to_vec(&self) -> Option<Vec<u8>> {
+        match &*self.0 {
+            Source::Inflated(b) => Some(b.to_vec()),
+            Source::Deflated { .. } => self.inflate(),
+        }
+    }
+
+    /// Inflate the stored stream, checking it gives the bytes read at open.
+    fn inflate(&self) -> Option<Vec<u8>> {
+        let Source::Deflated { stored, len, crc } = &*self.0 else {
+            return None;
+        };
+        let mut out = Vec::with_capacity(*len);
+        let mut decoder = flate2::read::DeflateDecoder::new(&stored[..]);
+        (&mut decoder)
+            .take(*len as u64)
+            .read_to_end(&mut out)
+            .ok()?;
+        let mut check = flate2::Crc::new();
+        check.update(&out);
+        if out.len() != *len || check.sum() != *crc {
+            log::warn!("picture: the stored stream no longer inflates to the bytes read at open");
+            return None;
+        }
+        Some(out)
     }
 
     /// Whether `self` and `other` are the same picture (one allocation), not

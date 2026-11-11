@@ -2,10 +2,10 @@
 //!
 //! Opening a document inflated every picture it holds and kept them for its
 //! life, although text, Markdown and HTML without images never read them,
-//! and the IR copied each picture into every image that drew it. With
+//! and the IR copies each picture into every image that draws it. With
 //! `ParseOptions::lazy_pictures` a deflated picture is kept as its stored
-//! stream and inflated only when used, and the IR shares it. Every output
-//! must be the same either way, and a picture that cannot be read must be
+//! stream and inflated only when used (the IR still takes a copy of each).
+//! Every output must be the same either way, and a picture that cannot be read must be
 //! reported the same way.
 //!
 //! The memory checks count the heap with a global allocator, so this file is
@@ -248,37 +248,28 @@ fn images(elements: &[Element], out: &mut Vec<office_oxide::ir::Image>) {
     }
 }
 
-/// One picture drawn many times is one allocation in a lazy IR, where an
-/// eager IR holds a copy per drawing.
+/// The IR is the same in both modes: each image carries its own copy of
+/// the picture in `Image::data`, as 0.1.x callers read it.
 #[test]
-fn test_a_lazy_ir_shares_a_picture_drawn_many_times() {
+fn test_the_ir_carries_each_picture_in_both_modes() {
     let _serial = serial();
     for (format, bytes) in [
         (DocumentFormat::Docx, docx(1, 2)),
         (DocumentFormat::Pptx, pptx(1, 2)),
         (DocumentFormat::Xlsx, xlsx(1, 2)),
     ] {
-        let lazy = open(&bytes, format, true);
-        let mut found = Vec::new();
-        for s in &lazy.to_ir().sections {
-            images(&s.elements, &mut found);
+        for lazy in [false, true] {
+            let doc = open(&bytes, format, lazy);
+            let mut found = Vec::new();
+            for s in &doc.to_ir().sections {
+                images(&s.elements, &mut found);
+            }
+            assert_eq!(found.len(), 2, "{format:?} lazy {lazy}");
+            for image in &found {
+                assert_eq!(image.byte_len(), Some(PICTURE_LEN), "{format:?} lazy {lazy}");
+                assert_eq!(image.data.as_deref(), Some(&picture(0)[..]), "{format:?} lazy {lazy}");
+            }
         }
-        assert_eq!(found.len(), 2, "{format:?}");
-        let (a, b) = (found[0].shared_data.as_ref(), found[1].shared_data.as_ref());
-        assert!(found.iter().all(|i| i.data.is_none()), "{format:?}: no copies");
-        assert!(a.unwrap().ptr_eq(b.unwrap()), "{format:?}: one allocation");
-        assert_eq!(found[0].byte_len(), Some(PICTURE_LEN));
-        assert_eq!(&found[0].bytes().unwrap()[..], &picture(0)[..]);
-        let eager = open(&bytes, format, false);
-        let mut copies = Vec::new();
-        for s in &eager.to_ir().sections {
-            images(&s.elements, &mut copies);
-        }
-        assert!(
-            copies
-                .iter()
-                .all(|i| i.shared_data.is_none() && i.data.is_some())
-        );
     }
 }
 

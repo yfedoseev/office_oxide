@@ -505,16 +505,14 @@ fn convert_shape(
                         .as_deref()
                         .filter(|d| crate::limits::charge_image_bytes(d.len()))
                         .map(<[u8]>::to_vec),
-                    shared: None,
                 },
             };
             let img_el = Element::Image(Image {
                 alt_text: pic.alt_text.clone(),
                 // Pictures share the media bytes; each IR image owns a copy,
-                // charged to the image-byte budget, or, when pictures are read
-                // lazily, shares the picture, charged the same.
+                // charged to the image-byte budget (inflated for the copy
+                // when pictures are read lazily).
                 data: data.data,
-                shared_data: data.shared,
                 format,
                 display_width_emu: display_w,
                 display_height_emu: display_h,

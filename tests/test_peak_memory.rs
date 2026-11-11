@@ -1,7 +1,7 @@
 //! Peak heap of reading and converting a fixed set of documents, each built
 //! in code, held under a ceiling.
 //!
-//! The memory work of a release (pictures kept as stored streams and shared,
+//! The memory work of a release (pictures kept as stored streams,
 //! parts read into buffers of their own size, the `.xls` grid built without
 //! a second copy of its cells) is only kept if a regression fails a test;
 //! sheets parsed in bounded pieces, which need parts of 32 and 64 MiB, are
@@ -188,11 +188,10 @@ fn cases() -> Vec<Case> {
                 units: picture_bytes,
                 unit: "picture byte",
                 open_now: if lazy { 0.52 } else { 1.51 },
-                convert_now: match (lazy, format) {
-                    (false, DocumentFormat::Docx) => 13.19,
-                    (false, _) => 11.0,
-                    (true, DocumentFormat::Docx) => 10.19,
-                    (true, _) => 8.0,
+                // The IR copies each picture in both modes.
+                convert_now: match format {
+                    DocumentFormat::Docx => 13.19,
+                    _ => 11.0,
                 },
                 margin: LOOSE,
             });
