@@ -535,7 +535,7 @@ def test_a_call_waiting_behind_a_long_one_does_not_hold_the_gil(make):
     # An object whose save takes at least 0.3 s on this machine.
     rows = 50000
     while True:
-        obj, long_call, waiter_call = make(rows)
+        _keep, long_call, waiter_call = make(rows)
         began = time.monotonic()
         long_call()
         if time.monotonic() - began >= 0.3 or rows >= 3_200_000:
