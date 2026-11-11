@@ -1184,7 +1184,7 @@ fn open_elements_after(xml: &[u8]) -> Option<Vec<Vec<u8>>> {
                     // A document type declaration, whose quoted literals and
                     // internal subset the reader parses and a scan for `>`
                     // would not. Package XML may not use one (ECMA-376
-                    // Part 2, §8.1.4), so the part is read whole.
+                    // Part 2, XML usage, M1.18), so the part is read whole.
                     return None;
                 };
             },
