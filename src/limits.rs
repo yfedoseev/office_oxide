@@ -1300,6 +1300,27 @@ mod tests {
         assert_eq!(TextBudget::with_limit(4_321).limit(), 4_321);
     }
 
+    /// A refused limit says why: an unknown name lists the limits, a count
+    /// too large for the target names the limit and the way to say none.
+    #[test]
+    fn test_a_limit_error_says_what_was_refused() {
+        let unknown = Limits::default()
+            .set("no_such_limit", 1)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            unknown.contains("'no_such_limit'") && unknown.contains("text_chars"),
+            "{unknown}"
+        );
+        let big = LimitError::TooLarge("text_chars".into(), 1 << 40).to_string();
+        assert!(
+            big.contains("'text_chars'")
+                && big.contains("1099511627776")
+                && big.contains("u64::MAX"),
+            "{big}"
+        );
+    }
+
     #[test]
     fn test_take_grants_what_is_left_then_nothing() {
         let mut b = TextBudget::with_limit(10);

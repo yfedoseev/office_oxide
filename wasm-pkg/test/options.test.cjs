@@ -42,6 +42,10 @@ test('WasmParseOptions names every option, and set takes each', () => {
 
 test('WasmParseOptions refuses bad values and unknown names', () => {
   const options = new WasmParseOptions();
+  // wasm32 counts in 32 bits: a count past that is refused, and Infinity
+  // (no bound) is not.
+  assert.throws(() => options.set('text_chars', 2 ** 40), /more than this target can count/);
+  options.set('text_chars', Infinity);
   for (const bad of [-1, 1.5, NaN, 2 ** 64, 'lots', {}, null]) {
     assert.throws(() => options.set('text_chars', bad), /text_chars/, String(bad));
   }
