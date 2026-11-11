@@ -203,7 +203,10 @@ def _python_ticks_inside(work) -> tuple[int, int]:
     import threading
     import time
 
-    margin = 0.002
+    # A few switch intervals at each edge of a call: enough to keep out a
+    # tick taken between the timestamp and the call, small enough to leave a
+    # window inside a call of a few milliseconds on a fast machine.
+    margin = 0.0005
     old_interval = sys.getswitchinterval()
     sys.setswitchinterval(0.0001)
 
@@ -219,16 +222,24 @@ def _python_ticks_inside(work) -> tuple[int, int]:
     t.start()
     time.sleep(0.02)
     calls: list[tuple[float, float]] = []
-    deadline = time.perf_counter() + 0.3
-    while time.perf_counter() < deadline:
-        start = time.perf_counter()
-        work()
-        calls.append((start, time.perf_counter()))
+
+    def counted():
+        return sum(1 for x in list(ticks) for a, b in calls if a + margin < x < b - margin)
+
+    # Rounds of 0.3 s until three ticks land inside calls, for at most 3 s:
+    # a call that keeps the GIL lets none land however long this runs.
+    for _ in range(10):
+        deadline = time.perf_counter() + 0.3
+        while time.perf_counter() < deadline:
+            start = time.perf_counter()
+            work()
+            calls.append((start, time.perf_counter()))
+        if counted() >= 3:
+            break
     stop.set()
     t.join()
     sys.setswitchinterval(old_interval)
-    inside = sum(1 for x in ticks for a, b in calls if a + margin < x < b - margin)
-    return inside, len(calls)
+    return counted(), len(calls)
 
 
 @pytest.mark.parametrize(
@@ -473,10 +484,18 @@ def test_a_call_waiting_behind_a_long_one_does_not_hold_the_gil():
     import threading
     import time
 
-    w = XlsxWriter()
-    w.add_sheet("S")
-    for r in range(150000):
-        w.set_cell(0, r, 0, f"cell {r}")
+    # A workbook whose to_bytes takes at least 0.3 s on this machine.
+    rows = 50000
+    while True:
+        w = XlsxWriter()
+        w.add_sheet("S")
+        for r in range(rows):
+            w.set_cell(0, r, 0, f"cell {r}")
+        began = time.monotonic()
+        w.to_bytes()
+        if time.monotonic() - began >= 0.3 or rows >= 3_200_000:
+            break
+        rows *= 2
     window = {}
     ticks = []
     stop = threading.Event()
