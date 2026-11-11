@@ -59,9 +59,9 @@ pub fn set_include_deleted_text(include: bool) {
 /// and inflates it only when it is used. `false` by default.
 ///
 /// With it on, opening costs the pictures' stored size instead of their
-/// inflated size, and text, Markdown and HTML without images never inflate
-/// them; the IR still copies each picture into every image that draws it,
-/// as without it. The readers' pictures are then reached through
+/// inflated size, and text and Markdown without images never inflate them.
+/// The IR still copies each picture into every image that draws it, as
+/// without it, and so does HTML, which is rendered from the IR. The readers' pictures are then reached through
 /// [`DocxDocument::picture`](crate::docx::DocxDocument::picture),
 /// [`PptxDocument::slide_picture`](crate::pptx::PptxDocument::slide_picture) and
 /// [`XlsxDocument::picture`](crate::xlsx::XlsxDocument::picture),

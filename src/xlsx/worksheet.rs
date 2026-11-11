@@ -1183,8 +1183,8 @@ fn open_elements_after(xml: &[u8]) -> Option<Vec<Vec<u8>>> {
                 } else {
                     // A document type declaration, whose quoted literals and
                     // internal subset the reader parses and a scan for `>`
-                    // would not. Package XML may not use one (ECMA-376
-                    // Part 2, XML usage, M1.18), so the part is read whole.
+                    // would not: the part is read whole, which handles it as
+                    // it always has. Office does not write one.
                     return None;
                 };
             },
