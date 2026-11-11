@@ -247,6 +247,13 @@ fn test_strict_options_read_an_ordinary_document() {
     let bytes = docx(&paragraphs(200));
     let doc = open_with(&bytes, &ParseOptions::strict()).unwrap();
     assert!(doc.plain_text().contains("paragraph number 199"));
+    // Strict is the strict limits and an incomplete result refused, with
+    // the read settings of the defaults.
+    let (strict, default) = (ParseOptions::strict(), ParseOptions::default());
+    assert_eq!(strict.limits, Limits::strict());
+    assert_eq!(strict.on_incomplete, OnIncomplete::Error);
+    assert_eq!(strict.include_hidden_text, default.include_hidden_text);
+    assert_eq!(strict.lazy_pictures, default.lazy_pictures);
 }
 
 #[test]

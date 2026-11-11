@@ -204,3 +204,22 @@ impl std::fmt::Display for Damage {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A repair that left the content whole is not a loss; every other kind
+    /// is.
+    #[test]
+    fn test_only_a_repair_is_not_a_loss() {
+        let damage = |kind| Damage {
+            kind,
+            part: None,
+            detail: String::new(),
+        };
+        assert!(!damage(DamageKind::Recovered).is_loss());
+        assert!(damage(DamageKind::Truncated).is_loss());
+        assert!(damage(DamageKind::UnreadablePart).is_loss());
+    }
+}
