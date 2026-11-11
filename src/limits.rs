@@ -1284,6 +1284,22 @@ mod tests {
         assert!(names.iter().all(|n| notice.contains(&format!("'{n}'"))), "{notice}");
     }
 
+    /// `Limits::strict` divides each size limit by eight (as the README
+    /// says), opens embedded packages one level deep and refuses a ratio
+    /// past 100; a budget states the size it was made with.
+    #[test]
+    fn test_strict_limits_are_the_defaults_divided_by_eight() {
+        let (d, s) = (Limits::default(), Limits::strict());
+        assert_eq!(s.package_entries, d.package_entries / 8);
+        assert_eq!(s.package_bytes, d.package_bytes / 8);
+        assert_eq!(s.part_bytes, d.part_bytes / 8);
+        assert_eq!(s.embedded_packages, d.embedded_packages / 8);
+        assert_eq!(s.text_chars, d.text_chars / 8);
+        assert_eq!(s.memory_bytes, d.memory_bytes / 8);
+        assert_eq!((s.inflate_ratio, s.embedded_depth), (100, 1));
+        assert_eq!(TextBudget::with_limit(4_321).limit(), 4_321);
+    }
+
     #[test]
     fn test_take_grants_what_is_left_then_nothing() {
         let mut b = TextBudget::with_limit(10);
