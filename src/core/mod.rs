@@ -29,6 +29,8 @@ pub mod embedded_fonts;
 pub mod error;
 /// Markdown escaping shared by every renderer.
 pub mod markdown;
+/// Warnings recorded with their kind (loss, unreadable part, repair).
+pub(crate) mod notice;
 /// Decrypting a document protected with Office's default password.
 #[cfg(feature = "default-password")]
 pub(crate) mod offcrypto;
@@ -36,6 +38,8 @@ pub(crate) mod offcrypto;
 pub mod opc;
 /// Parallel processing helpers (Rayon-based, feature-gated).
 pub mod parallel;
+// Documented by its own module comment, whose links resolve in it.
+pub mod picture;
 /// Core and extended document properties (`docProps/core.xml`, `docProps/app.xml`).
 pub mod properties;
 /// Relationship parsing, lookup, and serialization (`.rels` files).

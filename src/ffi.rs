@@ -197,6 +197,15 @@ fn into_ffi_bytes(bytes: Vec<u8>, out_len: *mut usize) -> *mut u8 {
     let boxed = bytes.into_boxed_slice();
     let len = boxed.len();
     unsafe { *out_len = len };
+    if len == 0 {
+        // An empty box's pointer is dangling (it is 1), which a garbage
+        // collector scanning the caller's stack (Go's) refuses as a
+        // pointer. Empty output points at a real byte instead, never
+        // written and never freed: `office_oxide_free_bytes` ignores a
+        // length of 0.
+        static EMPTY: u8 = 0;
+        return (&raw const EMPTY).cast_mut();
+    }
     Box::into_raw(boxed) as *mut u8
 }
 
@@ -412,13 +421,26 @@ pub extern "C" fn office_options_set(
 #[unsafe(no_mangle)]
 pub extern "C" fn office_options_names() -> *mut c_char {
     guard(ptr::null_mut(), ptr::null_mut(), || {
-        let mut names = vec![
-            "include_hidden_text",
-            "include_deleted_text",
-            "on_incomplete",
-        ];
-        names.extend_from_slice(crate::limits::Limits::NAMES);
-        to_c_string(&names.join(","))
+        to_c_string(&crate::options::ParseOptions::names().join(","))
+    })
+}
+
+/// The limits `options` hold (NULL: the process-wide ones in force) and the
+/// bounds the library derives from them, as a JSON object
+/// `{"limits": {name: value}, "derived": {name: value}}`; a value of
+/// 18446744073709551615 (`u64::MAX`) means no bound. Free with
+/// `office_oxide_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn office_options_limits_json(
+    options: *const OfficeParseOptionsHandle,
+) -> *mut c_char {
+    guard(ptr::null_mut(), ptr::null_mut(), || {
+        let limits = if options.is_null() {
+            crate::limits::Limits::current()
+        } else {
+            unsafe { &*options }.opts.limits.clone()
+        };
+        to_c_string(&limits.introspection_json())
     })
 }
 
@@ -623,6 +645,93 @@ pub extern "C" fn office_document_to_ir_json(
                 ptr::null_mut()
             },
         }
+    })
+}
+
+/// Render the document as `kind` (`text`, `markdown`, `markdown_images`,
+/// `html` or `ir_json`) into UTF-8 bytes, with no terminating NUL; the length
+/// is stored in `out_len`. For output too large to hand over as a
+/// host-language string (a UTF-16 or four-byte-per-character string is two
+/// to four times the bytes). Free with `office_oxide_free_bytes`.
+#[unsafe(no_mangle)]
+pub extern "C" fn office_document_render_bytes(
+    handle: *const OfficeDocumentHandle,
+    kind: *const c_char,
+    out_len: *mut usize,
+    error_code: *mut i32,
+) -> *mut u8 {
+    guard(error_code, ptr::null_mut(), || {
+        let Some(kind) = cstr_to_str(kind) else {
+            set_err(error_code, OFFICE_ERR_INVALID_ARG);
+            return ptr::null_mut();
+        };
+        if handle.is_null() || out_len.is_null() {
+            set_err(error_code, OFFICE_ERR_INVALID_ARG);
+            return ptr::null_mut();
+        }
+        let h = unsafe { &*handle };
+        let mut bytes = Vec::new();
+        match h._doc.write_output(kind, &mut bytes) {
+            None => {
+                set_err(error_code, OFFICE_ERR_INVALID_ARG);
+                ptr::null_mut()
+            },
+            Some(Err(_)) => {
+                set_err(error_code, OFFICE_ERR_EXTRACTION);
+                ptr::null_mut()
+            },
+            Some(Ok(())) => {
+                set_err(error_code, OFFICE_OK);
+                into_ffi_bytes(bytes, out_len)
+            },
+        }
+    })
+}
+
+/// Write the document as `kind` (see `office_document_render_bytes`) to the
+/// file at `path`, through the writers: an `.xlsx` and the IR JSON are written
+/// as they are produced and never held whole; other formats are built once in
+/// the library and written, with no copy for the caller.
+/// Returns OFFICE_OK, OFFICE_ERR_INVALID_ARG for a bad handle, path or kind,
+/// or OFFICE_ERR_IO when the file cannot be written.
+#[unsafe(no_mangle)]
+pub extern "C" fn office_document_write_to_path(
+    handle: *const OfficeDocumentHandle,
+    kind: *const c_char,
+    path: *const c_char,
+    error_code: *mut i32,
+) -> i32 {
+    guard(error_code, OFFICE_ERR_INTERNAL, || {
+        let (Some(kind), Some(path)) = (cstr_to_str(kind), cstr_to_str(path)) else {
+            set_err(error_code, OFFICE_ERR_INVALID_ARG);
+            return OFFICE_ERR_INVALID_ARG;
+        };
+        if handle.is_null() {
+            set_err(error_code, OFFICE_ERR_INVALID_ARG);
+            return OFFICE_ERR_INVALID_ARG;
+        }
+        if !Document::OUTPUT_KINDS.contains(&kind) {
+            set_err(error_code, OFFICE_ERR_INVALID_ARG);
+            return OFFICE_ERR_INVALID_ARG;
+        }
+        let h = unsafe { &*handle };
+        let code = match std::fs::File::create(path) {
+            Err(_) => OFFICE_ERR_IO,
+            Ok(file) => {
+                let mut out = std::io::BufWriter::with_capacity(1 << 16, file);
+                match h
+                    ._doc
+                    .write_output(kind, &mut out)
+                    .unwrap_or_else(|| Err(std::io::Error::other("unknown output kind")))
+                    .and_then(|()| std::io::Write::flush(&mut out))
+                {
+                    Ok(()) => OFFICE_OK,
+                    Err(_) => OFFICE_ERR_IO,
+                }
+            },
+        };
+        set_err(error_code, code);
+        code
     })
 }
 
@@ -1715,6 +1824,112 @@ mod options_tests {
     }
 
     /// A `.docx` whose body is cut off part-way.
+    /// A `.docx` whose text holds a character outside the Basic Multilingual
+    /// Plane (four bytes in UTF-8, two UTF-16 units, four bytes per character
+    /// in a Python string).
+    fn astral_docx() -> Vec<u8> {
+        docx_with_body("<w:p><w:r><w:t>omega \u{1D74E} and \u{e9}</w:t></w:r></w:p>")
+    }
+
+    fn docx_with_body(body: &str) -> Vec<u8> {
+        use crate::core::opc::{OpcWriter, PartName};
+        use crate::core::relationships::rel_types;
+        let xml = format!(
+            "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>{body}</w:body></w:document>"
+        );
+        let mut w = OpcWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+        w.add_part(
+            &PartName::new("/word/document.xml").unwrap(),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+            xml.as_bytes(),
+        )
+        .unwrap();
+        w.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        w.finish().unwrap().into_inner()
+    }
+
+    /// Empty output is a length of 0 and a pointer that is neither NULL (an
+    /// error) nor dangling: the pointer of an empty allocation is 1, which
+    /// Go's stack scanner refuses as a pointer and aborts on.
+    #[test]
+    fn test_empty_output_is_a_real_pointer_and_a_length_of_zero() {
+        let bytes = docx_with_body("");
+        let mut code = -1;
+        let doc = office_document_open_from_bytes(
+            bytes.as_ptr(),
+            bytes.len(),
+            cstr("docx").as_ptr(),
+            &mut code,
+        );
+        assert_eq!(code, OFFICE_OK);
+        let mut len = usize::MAX;
+        let ptr = office_document_render_bytes(doc, cstr("text").as_ptr(), &mut len, &mut code);
+        assert_eq!((code, len), (OFFICE_OK, 0));
+        assert!(ptr as usize >= 4096, "{ptr:?}");
+        unsafe { office_oxide_free_bytes(ptr, len) };
+        unsafe { office_document_free(doc) };
+    }
+
+    /// Every output as bytes and as a file is the string form, byte for byte.
+    #[test]
+    fn test_outputs_as_bytes_and_files_equal_the_strings() {
+        let bytes = astral_docx();
+        let mut code = -1;
+        let doc = office_document_open_from_bytes(
+            bytes.as_ptr(),
+            bytes.len(),
+            cstr("docx").as_ptr(),
+            &mut code,
+        );
+        assert_eq!(code, OFFICE_OK);
+        let dir = std::env::temp_dir().join(format!("office_oxide_ffi_out_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        type Render = extern "C" fn(*const OfficeDocumentHandle, *mut i32) -> *mut c_char;
+        let cases: [(&str, Render); 5] = [
+            ("text", office_document_plain_text),
+            ("markdown", office_document_to_markdown),
+            ("markdown_images", office_document_to_markdown_with_images),
+            ("html", office_document_to_html),
+            ("ir_json", office_document_to_ir_json),
+        ];
+        for (kind, render) in cases {
+            let expected = take_string(render(doc, &mut code));
+            assert!(expected.contains('\u{1D74E}'), "{kind}: {expected}");
+            let mut len = 0usize;
+            let ptr = office_document_render_bytes(doc, cstr(kind).as_ptr(), &mut len, &mut code);
+            assert_eq!(code, OFFICE_OK, "{kind}");
+            let got = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+            unsafe { office_oxide_free_bytes(ptr, len) };
+            assert_eq!(got, expected.as_bytes(), "{kind} as bytes");
+            let path = dir.join(kind);
+            let path_c = cstr(path.to_str().unwrap());
+            assert_eq!(
+                office_document_write_to_path(doc, cstr(kind).as_ptr(), path_c.as_ptr(), &mut code),
+                OFFICE_OK,
+                "{kind}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes(), "{kind} as a file");
+        }
+        let mut len = 0usize;
+        assert!(
+            office_document_render_bytes(doc, cstr("pdf").as_ptr(), &mut len, &mut code).is_null()
+        );
+        assert_eq!(code, OFFICE_ERR_INVALID_ARG);
+        let path_c = cstr(dir.join("x").to_str().unwrap());
+        assert_eq!(
+            office_document_write_to_path(doc, cstr("pdf").as_ptr(), path_c.as_ptr(), &mut code),
+            OFFICE_ERR_INVALID_ARG
+        );
+        assert!(!dir.join("x").exists(), "a refused kind must not create the file");
+        let missing = cstr("/nonexistent-dir/out.txt");
+        assert_eq!(
+            office_document_write_to_path(doc, cstr("text").as_ptr(), missing.as_ptr(), &mut code),
+            OFFICE_ERR_IO
+        );
+        unsafe { office_document_free(doc) };
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn cut_off_docx() -> Vec<u8> {
         use crate::core::opc::{OpcWriter, PartName};
         use crate::core::relationships::rel_types;
@@ -1744,6 +1959,25 @@ mod options_tests {
             OFFICE_ERR_INVALID_ARG
         );
         assert!(take_string(office_options_names()).contains("part_bytes"));
+        unsafe { office_options_free(o) };
+    }
+
+    /// The options' limits and their derived bounds come back as JSON, every
+    /// named limit included.
+    #[test]
+    fn test_options_report_their_limits_and_derived_bounds_as_json() {
+        let o = office_options_new();
+        assert_eq!(office_options_set(o, cstr("memory_bytes").as_ptr(), 1000), OFFICE_OK);
+        let json: serde_json::Value =
+            serde_json::from_str(&take_string(office_options_limits_json(o))).unwrap();
+        assert_eq!(json["limits"]["memory_bytes"], 1000);
+        assert_eq!(json["derived"]["write_bytes"], 500);
+        for name in crate::limits::Limits::NAMES {
+            assert!(json["limits"].get(*name).is_some(), "{name}");
+        }
+        let process: serde_json::Value =
+            serde_json::from_str(&take_string(office_options_limits_json(ptr::null()))).unwrap();
+        assert!(process["derived"]["image_bytes"].is_u64());
         unsafe { office_options_free(o) };
     }
 

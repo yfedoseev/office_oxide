@@ -17,6 +17,7 @@ public sealed class PptxWriter : IDisposable
         _handle = NativeMethods.OfficePptxWriterNew();
         if (_handle == IntPtr.Zero)
             throw new OfficeOxideException(5, "PptxWriter.new");
+        GC.KeepAlive(this);
     }
 
     private void EnsureHandle()
@@ -32,13 +33,16 @@ public sealed class PptxWriter : IDisposable
     {
         EnsureHandle();
         NativeMethods.OfficePptxWriterSetPresentationSize(_handle, cx, cy);
+        GC.KeepAlive(this);
     }
 
     /// <summary>Add a slide; returns its 0-based index.</summary>
     public uint AddSlide()
     {
         EnsureHandle();
-        return NativeMethods.OfficePptxWriterAddSlide(_handle);
+        var result = NativeMethods.OfficePptxWriterAddSlide(_handle);
+        GC.KeepAlive(this);
+        return result;
     }
 
     /// <summary>Set the title of a slide.</summary>
@@ -48,6 +52,7 @@ public sealed class PptxWriter : IDisposable
         EnsureHandle();
         NativeMethods.ThrowIfNotWritten(
             NativeMethods.OfficePptxSlideSetTitle(_handle, slide, title), $"SetSlideTitle({slide})");
+        GC.KeepAlive(this);
     }
 
     /// <summary>Add a plain text paragraph to a slide's body area.</summary>
@@ -57,6 +62,7 @@ public sealed class PptxWriter : IDisposable
         EnsureHandle();
         NativeMethods.ThrowIfNotWritten(
             NativeMethods.OfficePptxSlideAddText(_handle, slide, text), $"AddSlideText({slide})");
+        GC.KeepAlive(this);
     }
 
     /// <summary>
@@ -74,6 +80,7 @@ public sealed class PptxWriter : IDisposable
         NativeMethods.ThrowIfNotWritten(
             NativeMethods.OfficePptxSlideAddImage(_handle, slide, data, (nuint)data.Length, format, x, y, cx, cy),
             $"AddSlideImage({slide})");
+        GC.KeepAlive(this);
     }
 
     /// <summary>Save the presentation to a file.</summary>
@@ -81,6 +88,7 @@ public sealed class PptxWriter : IDisposable
     {
         EnsureHandle();
         int rc = NativeMethods.OfficePptxWriterSave(_handle, path, out int errorCode);
+        GC.KeepAlive(this);
         if (rc != NativeMethods.OfficeOk)
             throw new OfficeOxideException(errorCode, "PptxWriter.Save");
     }
@@ -90,6 +98,7 @@ public sealed class PptxWriter : IDisposable
     {
         EnsureHandle();
         IntPtr ptr = NativeMethods.OfficePptxWriterToBytes(_handle, out nuint len, out int errorCode);
+        GC.KeepAlive(this);
         if (ptr == IntPtr.Zero)
             throw new OfficeOxideException(errorCode, "PptxWriter.ToBytes");
         try

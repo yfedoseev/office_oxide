@@ -278,7 +278,7 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
                     // form (base64).
                     let (mut image_bytes, mut image_base64) = (0usize, 0usize);
                     crate::ir::for_each_image_mut(&mut tmp, |i| {
-                        let n = i.data.as_ref().map_or(0, Vec::len);
+                        let n = i.byte_len().unwrap_or(0);
                         image_bytes = image_bytes.saturating_add(n);
                         image_base64 = image_base64.saturating_add(n.div_ceil(3) * 4);
                     });
@@ -304,7 +304,9 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
                 // its text, and its pictures their place without bytes.
                 let (stripped, chars) = story.without_images.get_or_insert_with(|| {
                     let mut part = story.part.clone();
-                    crate::ir::for_each_image_mut(&mut part.content, |i| i.data = None);
+                    crate::ir::for_each_image_mut(&mut part.content, |i| {
+                        i.data = None;
+                    });
                     let chars = serde_json::to_vec(&part.content).map_or(usize::MAX, |v| v.len());
                     (part, chars)
                 });
@@ -493,7 +495,6 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
     // The parts that could not be read end the last section, one paragraph
     // each, as a spreadsheet's report does; charged to the text budget before
     // the budget's notice is read below.
-    let unreadable_warnings = doc.unreadable_warnings();
     let unreadable_lines =
         crate::core::unreadable::report_ir_lines(&doc.unreadable_text_warnings());
     if !unreadable_lines.is_empty() {
@@ -537,40 +538,39 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
                 || copied_text_notice.is_some()
                 || doc.link_notice.is_some()
                 || image_cut.is_some(),
-            warnings: unreadable_warnings
-                .into_iter()
-                .chain(copied_text_notice)
-                .chain(doc.link_notice.clone())
-                .chain(image_cut)
-                .chain(crate::core::core_properties::package_warnings(Some(
-                    &doc.package_properties,
-                )))
-                .chain(
-                    doc.styles
-                        .as_ref()
-                        .filter(|s| s.unusable_style_names > 0)
-                        .map(|s| {
-                            format!(
-                                "{} paragraph style name(s) were not exposed because they exceed \
-                                 255 characters or contain control characters",
-                                s.unusable_style_names
-                            )
-                        }),
-                )
-                .chain(
-                    doc.styles
-                        .as_ref()
-                        .filter(|s| s.styles_left_out > 0)
-                        .map(|s| {
-                            format!(
-                                "{} style(s) were left out because the style sheet holds more \
-                                 than {} styles",
-                                s.styles_left_out,
-                                crate::docx::styles::MAX_STYLES
-                            )
-                        }),
-                )
-                .collect(),
+            warnings: {
+                use crate::options::DamageKind::{Recovered, Truncated};
+                let mut warnings = doc.unreadable_notices();
+                warnings.push_all(Truncated, copied_text_notice);
+                warnings.push_all(Truncated, doc.link_notice.clone());
+                warnings.push_all(Truncated, image_cut);
+                warnings.push_all(
+                    Recovered,
+                    crate::core::core_properties::package_warnings(Some(&doc.package_properties)),
+                );
+                if let Some(s) = doc.styles.as_ref().filter(|s| s.unusable_style_names > 0) {
+                    warnings.push(
+                        Recovered,
+                        format!(
+                            "{} paragraph style name(s) were not exposed because they exceed \
+                             255 characters or contain control characters",
+                            s.unusable_style_names
+                        ),
+                    );
+                }
+                if let Some(s) = doc.styles.as_ref().filter(|s| s.styles_left_out > 0) {
+                    warnings.push(
+                        Recovered,
+                        format!(
+                            "{} style(s) were left out because the style sheet holds more \
+                             than {} styles",
+                            s.styles_left_out,
+                            crate::docx::styles::MAX_STYLES
+                        ),
+                    );
+                }
+                crate::core::notice::report(warnings)
+            },
             ..crate::core::core_properties::ooxml_metadata_extras(
                 cp,
                 doc.app_properties.as_ref(),
@@ -1172,7 +1172,7 @@ fn collect_paragraph_inline_images(
                     // its target; it used to be dropped without trace.
                     let (data, ext) = match embedded_image(d, doc) {
                         Some((data, ext)) => (data, ext),
-                        None if d.linked_image.is_some() => (None, None),
+                        None if d.linked_image.is_some() => (ImageData::default(), None),
                         None => continue,
                     };
                     let format =
@@ -1186,7 +1186,7 @@ fn collect_paragraph_inline_images(
                     out.push(Element::Image(Image {
                         alt_text: d.description.clone(),
                         decorative: d.decorative,
-                        data,
+                        data: data.data,
                         source_url: linked_image_url(d),
                         format,
                         display_width_emu: Some(d.width.0.max(0) as u64),
@@ -1328,7 +1328,7 @@ fn drawing_to_float_element(
 
     let (data, ext) = match embedded_image(d, doc) {
         Some((data, ext)) => (data, ext),
-        None if d.linked_image.is_some() => (None, None),
+        None if d.linked_image.is_some() => (ImageData::default(), None),
         None => return None,
     };
     let format = ext.as_deref().and_then(|e| match e {
@@ -1339,7 +1339,7 @@ fn drawing_to_float_element(
     Some(Element::Image(Image {
         alt_text: d.description.clone(),
         decorative: d.decorative,
-        data,
+        data: data.data,
         source_url: linked_image_url(d),
         format,
         display_width_emu: Some(width_emu),
@@ -1376,13 +1376,30 @@ fn linked_image_url(d: &crate::docx::DrawingInfo) -> Option<String> {
 fn embedded_image(
     d: &crate::docx::DrawingInfo,
     doc: &crate::docx::DocxDocument,
-) -> Option<(Option<Vec<u8>>, Option<String>)> {
+) -> Option<(ImageData, Option<String>)> {
     if d.relationship_id.is_empty() {
         return None;
     }
-    let (data, ext) = doc.images.get(&d.relationship_id)?;
-    let copy = crate::limits::charge_image_bytes(data.len()).then(|| data.to_vec());
-    Some((copy, ext.clone()))
+    let (pic, ext) = doc.picture(&d.relationship_id)?;
+    let data = if crate::limits::charge_image_bytes(pic.len()) {
+        ImageData::of(pic)
+    } else {
+        ImageData::default()
+    };
+    Some((data, ext.map(str::to_string)))
+}
+
+/// The bytes an IR image carries: a copy of the picture in `Image::data`,
+/// inflated for the copy when the picture is held as its stored stream.
+#[derive(Default)]
+pub(crate) struct ImageData {
+    pub(crate) data: Option<Vec<u8>>,
+}
+
+impl ImageData {
+    pub(crate) fn of(pic: &crate::core::picture::PictureBytes) -> Self {
+        Self { data: pic.to_vec() }
+    }
 }
 
 /// Translate a paragraph's `<w:jc>` justification into the IR's

@@ -50,6 +50,7 @@ public sealed class Document : IDisposable
     public static Document Open(string path, ParseOptions? options)
     {
         var h = NativeMethods.OfficeDocumentOpenWith(path, options?.Handle ?? IntPtr.Zero, out var err);
+        GC.KeepAlive(options);
         if (h == IntPtr.Zero) throw new OfficeOxideException(err, "Open");
         return new Document(h, path);
     }
@@ -60,6 +61,7 @@ public sealed class Document : IDisposable
         ArgumentNullException.ThrowIfNull(data);
         var h = NativeMethods.OfficeDocumentOpenFromBytesWith(
             data, (nuint)data.Length, format, options?.Handle ?? IntPtr.Zero, out var err);
+        GC.KeepAlive(options);
         if (h == IntPtr.Zero) throw new OfficeOxideException(err, "FromBytes");
         return new Document(h, null);
     }
@@ -73,6 +75,7 @@ public sealed class Document : IDisposable
     {
         EnsureOpen();
         var ptr = NativeMethods.OfficeDocumentDamageJson(_handle, out var err);
+        GC.KeepAlive(this);
         if (ptr == IntPtr.Zero) throw new OfficeOxideException(err, nameof(Damage));
         return DocumentDamage.Parse(NativeMethods.PtrToStringAndFree(ptr) ?? "[]");
     }
@@ -97,6 +100,7 @@ public sealed class Document : IDisposable
         {
             EnsureOpen();
             var ptr = NativeMethods.OfficeDocumentFormat(_handle);
+            GC.KeepAlive(this);
             return NativeMethods.PtrToStaticString(ptr)
                    ?? throw new OfficeOxideException(OfficeOxideErrorCode.Internal, "Format");
         }
@@ -120,11 +124,56 @@ public sealed class Document : IDisposable
     /// <summary>Return the format-agnostic IR serialised as JSON.</summary>
     public string ToIrJson() => CallString(NativeMethods.OfficeDocumentToIrJson, nameof(ToIrJson));
 
+    /// <summary>
+    /// The document as <paramref name="kind"/> (<c>text</c>, <c>markdown</c>,
+    /// <c>markdown_images</c>, <c>html</c> or <c>ir_json</c>) in UTF-8 bytes. A .NET
+    /// <c>string</c> is UTF-16, two bytes per character, so for a large document
+    /// the bytes are about half its size.
+    /// </summary>
+    public byte[] ToUtf8Bytes(string kind)
+    {
+        using var stream = new MemoryStream();
+        WriteTo(stream, kind);
+        return stream.ToArray();
+    }
+
+    /// <summary>
+    /// Copy the document as <paramref name="kind"/> (see <see cref="ToUtf8Bytes"/>)
+    /// into <paramref name="destination"/> as UTF-8, with no UTF-16 string in between.
+    /// </summary>
+    public unsafe void WriteTo(Stream destination, string kind)
+    {
+        ArgumentNullException.ThrowIfNull(destination);
+        EnsureOpen();
+        var ptr = NativeMethods.OfficeDocumentRenderBytes(_handle, kind, out var len, out var err);
+        GC.KeepAlive(this);
+        if (ptr == IntPtr.Zero) throw new OfficeOxideException(err, $"WriteTo({kind})");
+        try
+        {
+            using var source = new UnmanagedMemoryStream((byte*)ptr, (long)len);
+            source.CopyTo(destination);
+        }
+        finally
+        {
+            NativeMethods.OfficeOxideFreeBytes(ptr, len);
+        }
+    }
+
+    /// <summary>Write the document as <paramref name="kind"/> (see <see cref="ToUtf8Bytes"/>) to the file at <paramref name="path"/>, never as a .NET string (an .xlsx and the IR JSON are also never held whole).</summary>
+    public void WriteTo(string path, string kind)
+    {
+        EnsureOpen();
+        var rc = NativeMethods.OfficeDocumentWriteToPath(_handle, kind, path, out _);
+        GC.KeepAlive(this);
+        if (rc != 0) throw new OfficeOxideException(rc, $"WriteTo({kind})");
+    }
+
     /// <summary>Save/convert the document to a file. Target format is inferred from the extension.</summary>
     public void SaveAs(string path)
     {
         EnsureOpen();
         var rc = NativeMethods.OfficeDocumentSaveAs(_handle, path, out var err);
+        GC.KeepAlive(this);
         if (rc != 0) throw new OfficeOxideException(err, nameof(SaveAs));
     }
 
@@ -146,6 +195,7 @@ public sealed class Document : IDisposable
     {
         EnsureOpen();
         var ptr = call(_handle, out var err);
+        GC.KeepAlive(this);
         if (ptr == IntPtr.Zero) throw new OfficeOxideException(err, op);
         return NativeMethods.PtrToStringAndFree(ptr) ?? string.Empty;
     }

@@ -235,6 +235,8 @@ fn test_docx_header_with_a_large_image_shared_by_many_sections_charges_the_image
 }
 
 #[test]
+// Reads or fills the eager picture field kept for 0.1.x callers.
+#[allow(deprecated)]
 fn test_pptx_pictures_sharing_one_image_stop_copying_at_the_budget() {
     let _limits = limits();
     let pic = r#"<p:pic><p:nvPicPr><p:cNvPr id="3" name="P"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rId1"/></p:blipFill><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="100" cy="100"/></a:xfrm></p:spPr></p:pic>"#;

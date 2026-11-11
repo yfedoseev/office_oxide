@@ -15,24 +15,34 @@ use super::table::Table;
 impl DocxDocument {
     /// What was lost to the parts that could not be read, one warning for
     /// each part listed and one for the rest, as `Metadata::warnings` lists
-    /// them and as every rendering writes them. Empty when every part read.
-    pub(crate) fn unreadable_warnings(&self) -> Vec<String> {
-        self.unreadable_parts
-            .iter()
-            .chain(self.cosmetic_parts.iter())
-            .map(|p| format!("skipped unreadable part {p}"))
-            .chain(
-                (self.unreadable_parts_omitted > 0).then(|| {
-                    crate::core::unreadable::omitted_warning(self.unreadable_parts_omitted)
-                }),
-            )
-            .collect()
+    /// them and as every rendering writes them, with the kind of each: a
+    /// part that held text is an unreadable part, one that holds none (a
+    /// theme, a font) a repair, and the parts left out of the list a cut.
+    /// Empty when every part read.
+    pub(crate) fn unreadable_notices(&self) -> crate::core::notice::Notices {
+        let mut out = crate::core::notice::Notices::new();
+        for p in &self.unreadable_parts {
+            out.push(
+                crate::options::DamageKind::UnreadablePart,
+                format!("skipped unreadable part {p}"),
+            );
+        }
+        for p in &self.cosmetic_parts {
+            out.push(crate::options::DamageKind::Recovered, format!("skipped unreadable part {p}"));
+        }
+        if self.unreadable_parts_omitted > 0 {
+            out.push(
+                crate::options::DamageKind::Truncated,
+                crate::core::unreadable::omitted_warning(self.unreadable_parts_omitted),
+            );
+        }
+        out
     }
 
     /// The warnings for the unreadable parts that lost text, and for the
     /// rest left out of the list: what every rendering writes in band. A
     /// part that holds no text (the theme) is only in
-    /// [`Self::unreadable_warnings`].
+    /// [`Self::unreadable_notices`].
     pub(crate) fn unreadable_text_warnings(&self) -> Vec<String> {
         self.unreadable_parts
             .iter()

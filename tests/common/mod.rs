@@ -19,6 +19,7 @@ use office_oxide::cfb::{CFB_SIGNATURE, END_OF_CHAIN, FAT_SECT, FREE_SECT};
 use office_oxide::{Document, DocumentFormat};
 use std::io::Cursor;
 
+pub mod ooxml;
 pub mod ppt;
 
 /// Serialises the tests of one binary that change a process-wide limit
@@ -1140,6 +1141,13 @@ fn build_cfb(word_doc: &[u8], table: &[u8]) -> Vec<u8> {
     let wd_sectors = word_doc.len() / 512;
     let zero_table_sectors = table.len().div_ceil(512);
     let total_sectors = 2 + wd_sectors + zero_table_sectors; // dir + FAT + streams
+    // One FAT sector addresses 128 sectors; past that the FAT would run into
+    // the stream data and the document come out silently cut short.
+    assert!(
+        total_sectors <= 128,
+        "{total_sectors} sectors need more than one FAT sector: build the streams with \
+         build_doc_streams and the container with cfb_with_streams"
+    );
     let mut file = vec![0u8; 512 + total_sectors * 512];
 
     write_header(&mut file);
@@ -1303,7 +1311,14 @@ pub fn cfb_with_stream(name: &str, data: &[u8]) -> Vec<u8> {
     const FREE_SECT: u32 = 0xFFFF_FFFF;
     const NO_ENTRY: u32 = 0xFFFF_FFFF;
     let data_sectors = data.len().div_ceil(512).max(1);
-    let fat_sectors = (2 + data_sectors).div_ceil(128);
+    // The FAT must address its own sectors too.
+    let mut fat_sectors = 1;
+    while fat_sectors * 128 < 1 + fat_sectors + data_sectors {
+        fat_sectors += 1;
+    }
+    // Past 109 FAT sectors (about 7 MB) the header's DIFAT cannot list them,
+    // and the stream would come out silently cut.
+    assert!(fat_sectors <= 109, "a {}-byte stream needs a DIFAT chain", data.len());
     let total = 1 + fat_sectors + data_sectors; // directory + FAT + data
     let mut file = vec![0u8; 512 * (1 + total)];
     file[0..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
@@ -2015,4 +2030,58 @@ pub fn ppt_stream_without_persist(
     }
     stream.extend_from_slice(&ppt_container(RT_MAIN_MASTER, 0, master_groups));
     stream
+}
+
+/// A BIFF8 workbook with `strings` shared strings and one sheet of
+/// `rows` × `cols` cells alternating `LABELSST` and `NUMBER`.
+#[allow(dead_code)]
+pub fn xls_with_cells(rows: u16, cols: u16, strings: &[&str]) -> Vec<u8> {
+    let cells: Vec<(u16, u16)> = (0..rows)
+        .flat_map(|r| (0..cols).map(move |c| (r, c)))
+        .collect();
+    xls_with_cells_at(&cells, strings)
+}
+
+/// A BIFF8 workbook with `strings` shared strings and one sheet with a cell
+/// at each `(row, col)` of `cells`: a `LABELSST` in even columns, a `NUMBER`
+/// in odd ones.
+#[allow(dead_code)]
+pub fn xls_with_cells_at(cells: &[(u16, u16)], strings: &[&str]) -> Vec<u8> {
+    let mut s = Vec::new();
+    let mut bof = 0x0600u16.to_le_bytes().to_vec();
+    bof.extend_from_slice(&0x0005u16.to_le_bytes());
+    bof.extend_from_slice(&[0u8; 12]);
+    s.extend(biff(0x0809, &bof));
+    let mut bs = 0u32.to_le_bytes().to_vec();
+    bs.extend_from_slice(&[0, 0, 1, 0, b'S']);
+    s.extend(biff(0x0085, &bs));
+    let mut sst = (cells.len() as u32).to_le_bytes().to_vec();
+    sst.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+    for t in strings {
+        sst.extend_from_slice(&(t.len() as u16).to_le_bytes());
+        sst.push(0);
+        sst.extend_from_slice(t.as_bytes());
+    }
+    s.extend(biff(0x00FC, &sst));
+    s.extend(biff(0x000A, &[]));
+    let mut bof = 0x0600u16.to_le_bytes().to_vec();
+    bof.extend_from_slice(&0x0010u16.to_le_bytes());
+    bof.extend_from_slice(&[0u8; 12]);
+    s.extend(biff(0x0809, &bof));
+    for &(r, c) in cells {
+        let mut d = r.to_le_bytes().to_vec();
+        d.extend_from_slice(&c.to_le_bytes());
+        d.extend_from_slice(&0u16.to_le_bytes());
+        if c % 2 == 0 {
+            d.extend_from_slice(
+                &(((r as usize + c as usize) % strings.len()) as u32).to_le_bytes(),
+            );
+            s.extend(biff(0x00FD, &d));
+        } else {
+            d.extend_from_slice(&((r as f64) * 10.0 + c as f64 + 0.5).to_le_bytes());
+            s.extend(biff(0x0203, &d));
+        }
+    }
+    s.extend(biff(0x000A, &[]));
+    cfb_with_stream("Workbook", &s)
 }

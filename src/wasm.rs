@@ -61,19 +61,55 @@ impl WasmParseOptions {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    /// `{limits, derived}`: every limit these options read under, by name,
+    /// and every bound derived from them, as the other bindings show them.
+    /// A value is a number, a `BigInt` from 2^53 on (past
+    /// `Number.MAX_SAFE_INTEGER`) so none is rounded, and `Infinity` for no
+    /// bound.
+    pub fn limits(&self) -> Result<JsValue, JsValue> {
+        use serde::Serialize;
+        #[derive(Serialize)]
+        #[serde(untagged)]
+        enum Bound {
+            Number(f64),
+            Exact(u64),
+        }
+        let bound = |v: &serde_json::Value| match v.as_u64() {
+            Some(u64::MAX) => Bound::Number(f64::INFINITY),
+            // Number.MAX_SAFE_INTEGER, as the Node binding switches.
+            Some(v) if v < 1 << 53 => Bound::Number(v as f64),
+            Some(v) => Bound::Exact(v),
+            None => Bound::Number(f64::NAN),
+        };
+        let json: serde_json::Value = serde_json::from_str(&self.inner.limits.introspection_json())
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let table = |key: &str| -> std::collections::BTreeMap<String, Bound> {
+            json[key]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(name, v)| (name.clone(), bound(v)))
+                .collect()
+        };
+        let shown = std::collections::BTreeMap::from([
+            ("limits", table("limits")),
+            ("derived", table("derived")),
+        ]);
+        shown
+            .serialize(
+                &serde_wasm_bindgen::Serializer::new()
+                    .serialize_maps_as_objects(true)
+                    .serialize_large_number_types_as_bigints(true),
+            )
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// The names of every option.
     pub fn names() -> Vec<String> {
-        let mut names = vec![
-            "include_hidden_text".to_string(),
-            "include_deleted_text".to_string(),
-            "on_incomplete".to_string(),
-        ];
-        names.extend(
-            crate::limits::Limits::NAMES
-                .iter()
-                .map(|n| (*n).to_string()),
-        );
-        names
+        crate::options::ParseOptions::names()
+            .into_iter()
+            .map(str::to_string)
+            .collect()
     }
 }
 
@@ -129,6 +165,22 @@ impl WasmDocument {
             .damage()
             .serialize(&serializer)
             .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// The document as `kind` (`"text"`, `"markdown"`, `"markdown_images"`,
+    /// `"html"` or `"ir_json"`) in UTF-8 bytes, for output too large to hand
+    /// over as a string.
+    #[wasm_bindgen(js_name = "toBuffer")]
+    pub fn to_buffer(&self, kind: &str) -> Result<Vec<u8>, JsValue> {
+        let mut out = Vec::new();
+        match self.inner.write_output(kind, &mut out) {
+            Some(Ok(())) => Ok(out),
+            Some(Err(e)) => Err(JsValue::from_str(&e.to_string())),
+            None => Err(JsValue::from_str(&format!(
+                "unknown output kind {kind:?}; the kinds are: {}",
+                Document::OUTPUT_KINDS.join(", ")
+            ))),
+        }
     }
 
     /// Return the format name: "docx", "xlsx", or "pptx".

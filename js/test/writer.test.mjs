@@ -114,7 +114,7 @@ test('toMarkdownWithImages embeds images', () => {
 test('the CommonJS entry point exports the same API as the ESM one', () => {
   const cjs = createRequire(import.meta.url)('../lib/index.cjs');
   assert.deepEqual(Object.keys(cjs).sort(), Object.keys(esm).sort());
-  for (const cls of ['Document', 'EditableDocument', 'XlsxWriter', 'PptxWriter']) {
+  for (const cls of ['Document', 'EditableDocument', 'ParseOptions', 'XlsxWriter', 'PptxWriter']) {
     const names = (c) => Object.getOwnPropertyNames(c.prototype).concat(Object.getOwnPropertyNames(c)).sort();
     assert.deepEqual(names(cjs[cls]), names(esm[cls]), cls);
   }

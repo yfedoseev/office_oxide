@@ -414,6 +414,8 @@ fn ir_image_count(ir: &office_oxide::DocumentIR) -> usize {
 }
 
 #[test]
+// Reads or fills the eager picture field kept for 0.1.x callers.
+#[allow(deprecated)]
 fn test_one_picture_drawn_from_many_anchors_shares_its_bytes_and_is_bounded_in_the_ir() {
     let mut limits = set_budgets();
     // A picture's allowance is half of the memory budget.

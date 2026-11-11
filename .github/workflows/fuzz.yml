@@ -64,19 +64,22 @@ jobs:
       - name: Build the fuzz targets
         run: cargo fuzz build
 
-      # 60 s on every change, 10 min on the daily run. Any crash fails the job.
+      # 60 s on every change, 10 min on the daily run. Any crash fails the job,
+      # and so does an input that takes more than 10 s (`-timeout`): the limits
+      # bound size, not time, so a slow input is the sign of an algorithm that
+      # grows faster than its input.
       - name: Fuzz
         env:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           secs=60
           if [ "$EVENT_NAME" = "schedule" ]; then secs=600; fi
-          cargo fuzz run fuzz_parse -- -max_total_time="$secs" -rss_limit_mb=4096
+          cargo fuzz run fuzz_parse -- -max_total_time="$secs" -rss_limit_mb=4096 -timeout=10
           # The structure-aware targets reach parsers whole-file fuzzing rarely
           # gets to (salvage of damaged parts, default-password decryption, the
           # .doc font table); a short run each.
           for target in fuzz_ooxml_salvage fuzz_default_password fuzz_doc_header_fonts; do
-            cargo fuzz run "$target" -- -max_total_time=$((secs / 3)) -rss_limit_mb=4096
+            cargo fuzz run "$target" -- -max_total_time=$((secs / 3)) -rss_limit_mb=4096 -timeout=10
           done
 
       # Whole-file fuzzing rarely reaches the legacy style sheet; this target
@@ -87,7 +90,7 @@ jobs:
         run: |
           secs=60
           if [ "$EVENT_NAME" = "schedule" ]; then secs=600; fi
-          cargo fuzz run fuzz_doc_stsh -- -max_total_time="$secs" -rss_limit_mb=4096
+          cargo fuzz run fuzz_doc_stsh -- -max_total_time="$secs" -rss_limit_mb=4096 -timeout=10
 
       # Whole-file fuzzing rarely reaches the WPS downrev packages either —
       # they sit behind a valid deck and a valid ZIP. This target builds the
@@ -98,7 +101,7 @@ jobs:
         run: |
           secs=60
           if [ "$EVENT_NAME" = "schedule" ]; then secs=600; fi
-          cargo fuzz run fuzz_ppt_downrev -- -max_total_time="$secs" -rss_limit_mb=4096
+          cargo fuzz run fuzz_ppt_downrev -- -max_total_time="$secs" -rss_limit_mb=4096 -timeout=10
 
       - name: Upload crash artifacts
         if: failure()

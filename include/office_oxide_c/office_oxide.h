@@ -140,6 +140,14 @@ int32_t office_options_set(OfficeParseOptionsHandle* handle, const char* name, u
 /** The names office_options_set accepts, comma-separated. Free with office_oxide_free_string. */
 char* office_options_names(void);
 
+/**
+ * The limits `options` hold (NULL: the process-wide ones in force) and the
+ * bounds derived from them, as JSON: {"limits": {name: value}, "derived":
+ * {name: value}}. 18446744073709551615 means no bound. Free with
+ * office_oxide_free_string.
+ */
+char* office_options_limits_json(const OfficeParseOptionsHandle* options);
+
 /** Open a document from a path under `options` (NULL: the process-wide settings). */
 OfficeDocumentHandle* office_document_open_with(
     const char* path,
@@ -190,6 +198,24 @@ char* office_document_to_html(const OfficeDocumentHandle* handle, int* error_cod
  * OFFICE_ERR_EXTRACTION if the IR cannot be serialised.
  */
 char* office_document_to_ir_json(const OfficeDocumentHandle* handle, int* error_code);
+
+/**
+ * Render the document as `kind` ("text", "markdown", "markdown_images",
+ * "html" or "ir_json") into UTF-8 bytes with no terminating NUL; the length
+ * is stored in `out_len`. For output too large to hand over as a string.
+ * Free with office_oxide_free_bytes(ptr, len).
+ */
+uint8_t* office_document_render_bytes(const OfficeDocumentHandle* handle, const char* kind,
+                                      size_t* out_len, int* error_code);
+
+/**
+ * Write the document as `kind` (as above) to the file at `path`: an .xlsx and
+ * the IR JSON are written as they are produced and never held whole; other
+ * formats are built once in the library and written. Returns OFFICE_OK,
+ * OFFICE_ERR_INVALID_ARG (bad handle, path or kind) or OFFICE_ERR_IO.
+ */
+int32_t office_document_write_to_path(const OfficeDocumentHandle* handle, const char* kind,
+                                      const char* path, int* error_code);
 
 /**
  * Save/convert to a file. Target format detected from extension.

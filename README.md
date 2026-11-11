@@ -71,7 +71,7 @@ let ir = doc.to_ir(); // Format-agnostic intermediate representation
 
 ```toml
 [dependencies]
-office_oxide = "0.1.16"
+office_oxide = "0.1.17"
 ```
 
 ### JavaScript / WASM
@@ -278,12 +278,51 @@ use office_oxide::ppt::PptDocument;
 
 ### Limits for untrusted input
 
-A spreadsheet can reference one shared string from every cell, so its
-rendered text can be the string times the cell count — gigabytes from a
-few hundred kilobytes. Every renderer stops at a per-document text budget
-(256 Mi characters by default) and appends a visible `[output truncated: …]`
-notice; the `.xls` reader also flags `Metadata::text_truncated`. A process
-that reads larger workbooks whole raises the limit once at startup:
+Office files are zip packages and compound files that a few kilobytes can
+make enormous: a zip entry that inflates a thousandfold, a shared string
+referenced from every cell, a sheet whose rows are padded to 16,384 columns.
+Every reader is bounded by eight limits (`office_oxide::limits::Limits`),
+and a document that hits one is still read, with what was cut reported in
+`Metadata::warnings`, `Metadata::text_truncated` and `Document::damage()`.
+
+| Limit | Default | What it bounds |
+|---|---|---|
+| `package_entries` | 100,000 | entries in one OOXML package |
+| `package_bytes` | 2 GiB | bytes inflated from one package (embedded packages share a quarter) |
+| `part_bytes` | 512 MiB | the inflated size of one part |
+| `inflate_ratio` | 1,000 | inflated-to-stored ratio of a part over 64 MiB |
+| `embedded_depth` | 3 | how deep embedded packages are opened |
+| `embedded_packages` | 256 | embedded packages opened per document |
+| `text_chars` | 256 Mi | characters of text a document can multiply: a workbook's cell text, and text copied out of shared storage (hyperlink targets, shared headers, notes); scaled down for small files |
+| `memory_bytes` | 1 GiB | what a file can multiply: padding, picture copies, the write estimate |
+
+`memory_bytes`, `package_bytes` and `part_bytes` also set bounds derived from
+them by fixed fractions. `Limits::derived()` returns them, and
+`office-oxide limits [--strict] [--limit NAME=VALUE]` prints the limits and
+everything derived from them, so the effect of a setting is visible before a
+document is read. `Limits::strict()` (`--strict`, `ParseOptions(strict=True)`)
+divides the size limits by eight for input nobody vouches for.
+
+**Where they apply.** `Document::open_with` / `from_reader_with` (and every
+binding's options object) bind the options to that document: each of its
+conversions runs under them, on any thread, and other documents are not
+affected. The process-wide setters (`limits::set_max_*`, `Limits::apply`)
+set the defaults everything else reads. `ParseOptions::default()` copies the
+process-wide values when it is created, so a setter called later does not
+change options made earlier. The direct format readers
+(`docx::DocxDocument::open`, `xlsx::XlsxDocument::open`, …) and work you run
+on your own threads read the process-wide settings.
+
+**There is no time limit.** The limits bound sizes and counts, not time: a
+crafted file can still make a parser spend CPU out of proportion to its
+size, through an algorithm that is slow in some quantity the file controls.
+Such cases are fixed as they are found, and the fuzz targets fail an input
+that takes too long, but nothing bounds the next one. Read untrusted input
+under a process timeout (or in a subprocess you can kill), as you would with
+any document parser.
+
+A process that reads larger workbooks whole raises the text limit once at
+startup:
 
 ```rust
 office_oxide::limits::set_max_text_chars(1 << 30);
@@ -303,7 +342,7 @@ Wheels available for Linux, macOS, and Windows. Python 3.10–3.14.
 
 ```toml
 [dependencies]
-office_oxide = "0.1.16"
+office_oxide = "0.1.17"
 ```
 
 ### JavaScript/WASM
@@ -365,6 +404,7 @@ office-oxide replace report.docx OLD NEW --output edited.docx   # …written to 
 office-oxide text report.docx --include-hidden --include-deleted  # also hidden text and tracked deletions
 office-oxide text upload.docx --strict           # untrusted input: tighter limits, error if anything is missing
 office-oxide text big.xlsx --limit text_chars=50000000   # set a limit by name (`max` for none)
+office-oxide limits --strict                     # the limits in force and the bounds derived from them
 ```
 
 All six formats are supported for reading (docx, xlsx, pptx, doc, xls, ppt); `replace` writes

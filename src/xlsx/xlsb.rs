@@ -151,6 +151,7 @@ pub(super) fn from_zip<R: Read + Seek>(
     let (unreadable_sheets, unreadable_sheets_omitted, _) = unreadable_sheets.finish();
     let (unreadable_parts, unreadable_parts_omitted, cosmetic_parts) = shared.unreadable.finish();
     Ok(XlsxDocument {
+        lazy_pictures: Default::default(),
         input_bytes: 0,
         workbook: WorkbookInfo {
             sheets,

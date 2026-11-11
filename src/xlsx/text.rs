@@ -1037,8 +1037,8 @@ pub(crate) struct ReportNotice {
     pub(crate) title: String,
     /// The in-band lines, each a bracketed notice.
     pub(crate) lines: Vec<String>,
-    /// The `Metadata::warnings` entries for the same.
-    pub(crate) warnings: Vec<String>,
+    /// The `Metadata::warnings` entries for the same, with their kinds.
+    pub(crate) warnings: crate::core::notice::Notices,
 }
 
 impl ReportNotice {
@@ -1064,7 +1064,12 @@ impl XlsxDocument {
                 // text; a heading would write it as markup.
                 title: "Unreadable sheet".to_string(),
                 lines: vec![unreadable_notice(name, err)],
-                warnings: vec![format!("skipped unreadable sheet {name:?}: {err}")],
+                warnings: [(
+                    crate::options::DamageKind::UnreadablePart,
+                    format!("skipped unreadable sheet {name:?}: {err}"),
+                )]
+                .into_iter()
+                .collect(),
             })
             .collect();
         if self.unreadable_sheets_omitted > 0 {
@@ -1073,24 +1078,35 @@ impl XlsxDocument {
             out.push(ReportNotice {
                 title: "Unreadable sheets".to_string(),
                 lines: vec![format!("[{more}]")],
-                warnings: vec![more],
+                warnings: [(crate::options::DamageKind::Truncated, more)]
+                    .into_iter()
+                    .collect(),
             });
         }
         if !self.unreadable_parts.is_empty() || self.unreadable_parts_omitted > 0 {
-            let mut warnings: Vec<String> = self
-                .unreadable_parts
-                .iter()
-                .map(|(part, err)| format!("skipped unreadable part {part}: {err}"))
-                .collect();
+            let mut warnings = crate::core::notice::Notices::new();
+            warnings.push_all(
+                crate::options::DamageKind::UnreadablePart,
+                self.unreadable_parts
+                    .iter()
+                    .map(|(part, err)| format!("skipped unreadable part {part}: {err}")),
+            );
             if self.unreadable_parts_omitted > 0 {
-                warnings.push(format!(
-                    "and {} more unreadable parts not listed",
-                    self.unreadable_parts_omitted
-                ));
+                warnings.push(
+                    crate::options::DamageKind::Truncated,
+                    format!(
+                        "and {} more unreadable parts not listed",
+                        self.unreadable_parts_omitted
+                    ),
+                );
             }
             out.push(ReportNotice {
                 title: "Unreadable parts".to_string(),
-                lines: warnings.iter().map(|w| inert(&format!("[{w}]"))).collect(),
+                lines: warnings
+                    .texts()
+                    .iter()
+                    .map(|w| inert(&format!("[{w}]")))
+                    .collect(),
                 warnings,
             });
         }
@@ -1232,6 +1248,7 @@ mod tests {
 </styleSheet>"#;
         let ss = super::super::styles::StyleSheet::parse(styles).expect("styles parse");
         let doc = XlsxDocument {
+            lazy_pictures: Default::default(),
             input_bytes: 0,
             workbook: super::super::WorkbookInfo {
                 sheets: Vec::new(),
@@ -1305,6 +1322,7 @@ mod tests {
             chart_text: Vec::new(),
         };
         let doc = XlsxDocument {
+            lazy_pictures: Default::default(),
             input_bytes: 0,
             workbook: super::super::WorkbookInfo {
                 sheets: Vec::new(),
@@ -1377,6 +1395,7 @@ mod tests {
             chart_text: Vec::new(),
         };
         let doc = XlsxDocument {
+            lazy_pictures: Default::default(),
             input_bytes: 0,
             workbook: super::super::WorkbookInfo {
                 sheets: Vec::new(),
@@ -1416,6 +1435,7 @@ mod tests {
     #[test]
     fn test_plain_text_includes_chart_text() {
         let doc = XlsxDocument {
+            lazy_pictures: Default::default(),
             input_bytes: 0,
             workbook: super::super::WorkbookInfo {
                 sheets: Vec::new(),

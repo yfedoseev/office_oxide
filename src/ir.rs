@@ -968,8 +968,7 @@ pub(crate) fn image_bytes_in(elements: &[Element]) -> u64 {
                 for e in els {
                     match e {
                         Element::Image(i) => {
-                            total =
-                                total.saturating_add(i.data.as_ref().map_or(0, |d| d.len() as u64));
+                            total = total.saturating_add(i.byte_len().map_or(0, |n| n as u64));
                         },
                         Element::TextBox(tb) => stack.push(Work::Elems(&tb.content)),
                         Element::Footnote(n) | Element::Endnote(n) => {
@@ -1977,6 +1976,23 @@ pub struct Image {
     /// (DrawingML `<a:blip r:link>`). Usually a URL; `data` is then `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_url: Option<String>,
+}
+
+impl Image {
+    /// The image bytes, from [`Self::data`].
+    pub fn bytes(&self) -> Option<&[u8]> {
+        self.data.as_deref()
+    }
+
+    /// The number of image bytes.
+    pub fn byte_len(&self) -> Option<usize> {
+        self.data.as_ref().map(Vec::len)
+    }
+
+    /// Whether the image carries its bytes.
+    pub fn has_bytes(&self) -> bool {
+        self.data.is_some()
+    }
 }
 
 impl DocumentIR {

@@ -50,3 +50,13 @@ pub(crate) use sprm::{ChpProps, LevelSource, OutlineLevel, PapProps, TapInfo};
 // builds.
 #[cfg(test)]
 pub(crate) use list_format::ListLevel;
+
+/// The per-element types of this reader, for the size table in
+/// `type_sizes`.
+#[cfg(test)]
+pub(crate) mod element_types {
+    pub(crate) use super::chpx::FkpRun;
+    pub(crate) use super::papx::{DocParagraph, FkpParagraph};
+    pub(crate) use super::piece_table::Piece;
+    pub(crate) use super::sprm::{ChpProps, PapProps, TapCellInfo};
+}

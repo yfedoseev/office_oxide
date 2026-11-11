@@ -881,11 +881,11 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                     // at the sheet origin. When position-aware writers
                     // wrap images in TextBox the outer branch below
                     // unwraps the EMU coords.
-                    if let (Some(data), Some(fmt)) = (&img.data, &img.format) {
+                    if let (Some(data), Some(fmt)) = (img.bytes(), &img.format) {
                         let cx = img.display_width_emu.unwrap_or(3_000_000) as i64;
                         let cy = img.display_height_emu.unwrap_or(2_000_000) as i64;
                         sheet.add_image_with_alt(
-                            data.clone(),
+                            data.to_vec(),
                             fmt.extension(),
                             0,
                             0,
@@ -906,7 +906,7 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                     let cy = tb.height_emu.unwrap_or(0) as i64;
                     for inner in &tb.content {
                         if let Element::Image(img) = inner {
-                            if let (Some(data), Some(fmt)) = (&img.data, &img.format) {
+                            if let (Some(data), Some(fmt)) = (img.bytes(), &img.format) {
                                 let icx = if cx > 0 {
                                     cx
                                 } else {
@@ -918,7 +918,7 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                                     img.display_height_emu.unwrap_or(2_000_000) as i64
                                 };
                                 sheet.add_image_with_alt(
-                                    data.clone(),
+                                    data.to_vec(),
                                     fmt.extension(),
                                     x,
                                     y,
@@ -1381,9 +1381,9 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
         Element::Image(img) => {
             let cx = img.display_width_emu.unwrap_or(3_000_000);
             let cy = img.display_height_emu.unwrap_or(2_000_000);
-            if let (Some(data), Some(fmt)) = (&img.data, &img.format) {
+            if let (Some(data), Some(fmt)) = (img.bytes(), &img.format) {
                 slide.add_image_with_alt(
-                    data.clone(),
+                    data.to_vec(),
                     fmt.clone(),
                     0,
                     0,
@@ -1446,9 +1446,9 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
                             .display_height_emu
                             .unwrap_or(tb.height_emu.unwrap_or(2_000_000));
                         let (x, y) = (tb.x_emu.unwrap_or(0), tb.y_emu.unwrap_or(0));
-                        if let (Some(data), Some(fmt)) = (&img.data, &img.format) {
+                        if let (Some(data), Some(fmt)) = (img.bytes(), &img.format) {
                             slide.add_image_with_alt(
-                                data.clone(),
+                                data.to_vec(),
                                 fmt.clone(),
                                 x,
                                 y,

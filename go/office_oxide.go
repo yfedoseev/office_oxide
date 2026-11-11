@@ -246,6 +246,28 @@ func OptionNames() []string {
 	return strings.Split(C.GoString(out), ",")
 }
 
+// Limits returns the limits these options hold and the bounds the library
+// derives from them, by name. NoLimit means no bound.
+func (o *ParseOptions) Limits() (limits, derived map[string]uint64, err error) {
+	if o == nil || o.handle == nil {
+		return nil, nil, ErrClosed
+	}
+	out := C.office_options_limits_json(o.handle)
+	runtime.KeepAlive(o)
+	if out == nil {
+		return nil, nil, &Error{Code: int(C.OFFICE_ERR_INTERNAL), Op: "ParseOptions.Limits"}
+	}
+	defer C.office_oxide_free_string(out)
+	var v struct {
+		Limits  map[string]uint64 `json:"limits"`
+		Derived map[string]uint64 `json:"derived"`
+	}
+	if err := json.Unmarshal([]byte(C.GoString(out)), &v); err != nil {
+		return nil, nil, err
+	}
+	return v.Limits, v.Derived, nil
+}
+
 // Close releases the options. Safe to call multiple times.
 func (o *ParseOptions) Close() {
 	if o == nil || o.handle == nil {
@@ -411,6 +433,49 @@ func (d *Document) ToIRJSON() (string, error) {
 	}
 	var errCode C.int
 	return cStrOrErr(C.office_document_to_ir_json(d.handle, &errCode), errCode, "ToIRJSON")
+}
+
+// Bytes renders the document as kind ("text", "markdown", "markdown_images",
+// "html" or "ir_json") in UTF-8 bytes. It is the same content as the string
+// methods, in a form the caller can hand on without another copy.
+func (d *Document) Bytes(kind string) ([]byte, error) {
+	if d.handle == nil {
+		return nil, ErrClosed
+	}
+	ckind := C.CString(kind)
+	defer C.free(unsafe.Pointer(ckind))
+	var outLen C.size_t
+	var errCode C.int
+	ptr := C.office_document_render_bytes(d.handle, ckind, &outLen, &errCode)
+	runtime.KeepAlive(d)
+	if ptr == nil {
+		return nil, &Error{Code: int(errCode), Op: "Bytes(" + kind + ")"}
+	}
+	defer C.office_oxide_free_bytes(ptr, outLen)
+	out := make([]byte, int(outLen))
+	copy(out, unsafe.Slice((*byte)(unsafe.Pointer(ptr)), int(outLen)))
+	return out, nil
+}
+
+// WriteFile writes the document as kind (see Bytes) to the file at path,
+// through the library's writers: an .xlsx and the IR JSON are written as they
+// are produced and never held whole; other formats are built once in the
+// library and written, never as a Go string.
+func (d *Document) WriteFile(path, kind string) error {
+	if d.handle == nil {
+		return ErrClosed
+	}
+	ckind := C.CString(kind)
+	defer C.free(unsafe.Pointer(ckind))
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+	var errCode C.int
+	rc := C.office_document_write_to_path(d.handle, ckind, cpath, &errCode)
+	runtime.KeepAlive(d)
+	if rc != 0 {
+		return &Error{Code: int(rc), Op: "WriteFile(" + kind + ")"}
+	}
+	return nil
 }
 
 // SaveAs writes the document to `path`. Target format is inferred from the

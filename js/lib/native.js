@@ -88,6 +88,7 @@ export const native = {
   optionsFree: lib.func('void office_options_free(void* handle)'),
   optionsSet: lib.func('int32_t office_options_set(void* handle, const char* name, uint64_t value)'),
   optionsNames: lib.func('HeapStr office_options_names()'),
+  optionsLimitsJson: lib.func('HeapStr office_options_limits_json(void* options)'),
   documentFree: lib.func('void office_document_free(void* handle)'),
   documentFormat: lib.func('const char* office_document_format(void* handle)'),
   documentPlainText: lib.func('HeapStr office_document_plain_text(void* handle, _Out_ int* error_code)'),
@@ -95,6 +96,8 @@ export const native = {
   documentToMarkdownWithImages: lib.func('HeapStr office_document_to_markdown_with_images(void* handle, _Out_ int* error_code)'),
   documentToHtml: lib.func('HeapStr office_document_to_html(void* handle, _Out_ int* error_code)'),
   documentToIrJson: lib.func('HeapStr office_document_to_ir_json(void* handle, _Out_ int* error_code)'),
+  documentRenderBytes: lib.func('uint8_t* office_document_render_bytes(void* handle, const char* kind, _Out_ size_t* out_len, _Out_ int* error_code)'),
+  documentWriteToPath: lib.func('int32_t office_document_write_to_path(void* handle, const char* kind, const char* path, _Out_ int* error_code)'),
   documentSaveAs: lib.func('int32_t office_document_save_as(void* handle, const char* path, _Out_ int* error_code)'),
 
   editableOpen: lib.func('void* office_editable_open(const char* path, _Out_ int* error_code)'),

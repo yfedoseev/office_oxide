@@ -71,6 +71,7 @@ const n = {
   optionsFree: lib.func('void office_options_free(void* handle)'),
   optionsSet: lib.func('int32_t office_options_set(void* handle, const char* name, uint64_t value)'),
   optionsNames: lib.func('HeapStr office_options_names()'),
+  optionsLimitsJson: lib.func('HeapStr office_options_limits_json(void* options)'),
   documentFree: lib.func('void office_document_free(void* handle)'),
   documentFormat: lib.func('const char* office_document_format(void* handle)'),
   documentPlainText: lib.func('HeapStr office_document_plain_text(void* handle, _Out_ int* error_code)'),
@@ -78,6 +79,8 @@ const n = {
   documentToMarkdownWithImages: lib.func('HeapStr office_document_to_markdown_with_images(void* handle, _Out_ int* error_code)'),
   documentToHtml: lib.func('HeapStr office_document_to_html(void* handle, _Out_ int* error_code)'),
   documentToIrJson: lib.func('HeapStr office_document_to_ir_json(void* handle, _Out_ int* error_code)'),
+  documentRenderBytes: lib.func('uint8_t* office_document_render_bytes(void* handle, const char* kind, _Out_ size_t* out_len, _Out_ int* error_code)'),
+  documentWriteToPath: lib.func('int32_t office_document_write_to_path(void* handle, const char* kind, const char* path, _Out_ int* error_code)'),
   documentSaveAs: lib.func('int32_t office_document_save_as(void* handle, const char* path, _Out_ int* error_code)'),
   editableOpen: lib.func('void* office_editable_open(const char* path, _Out_ int* error_code)'),
   editableOpenFromBytes: lib.func('void* office_editable_open_from_bytes(const uint8_t* data, size_t len, const char* format, _Out_ int* error_code)'),
@@ -231,6 +234,27 @@ class ParseOptions {
 
   static names() { return n.optionsNames().split(','); }
 
+  /**
+   * The limits these options hold and the bounds the library derives from
+   * them: `{ limits: { name: value }, derived: { name: value } }`. A value
+   * beyond `Number.MAX_SAFE_INTEGER` is a `bigint`, and no bound is `Infinity`.
+   */
+  limits() {
+    const MAX = 2n ** 64n - 1n;
+    // Quote every integer too large for a double before parsing, so none is rounded.
+    const text = n.optionsLimitsJson(this._handle()).replace(/:(\d{16,})/g, ':"$1"');
+    const exact = (v) => {
+      if (typeof v !== 'string') return v;
+      const b = BigInt(v);
+      if (b === MAX) return Infinity;
+      // A number while a double holds it exactly, as WASM gives it.
+      return b <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(b) : b;
+    };
+    const { limits, derived } = JSON.parse(text);
+    const map = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, exact(v)]));
+    return { limits: map(limits), derived: map(derived) };
+  }
+
   _handle() { if (!this._h) throw new Error('ParseOptions is closed'); return this._h; }
   close() { if (this._h) { n.optionsFree(this._h); this._h = null; } }
   [Symbol.dispose]() { this.close(); }
@@ -283,6 +307,30 @@ class Document {
   toMarkdownWithImages() { return this._call(n.documentToMarkdownWithImages, 'toMarkdownWithImages'); }
   toHtml() { return this._call(n.documentToHtml, 'toHtml'); }
   toIr() { return JSON.parse(this._call(n.documentToIrJson, 'toIr')); }
+
+  /**
+   * The document as UTF-8 bytes in a Buffer: `kind` is 'text', 'markdown',
+   * 'markdown_images', 'html' or 'ir_json'. A JS string holds two bytes per
+   * character once any character is outside Latin-1, so for a large document
+   * the Buffer is up to half the size of the string form.
+   */
+  toBuffer(kind) {
+    this._ensure();
+    const outLen = [0];
+    const e = [0];
+    const ptr = n.documentRenderBytes(this._h, kind, outLen, e);
+    if (!ptr) throw new OfficeOxideError(e[0], `toBuffer(${kind})`);
+    if (outLen[0] === 0) return Buffer.alloc(0);
+    return takeBytes(ptr, outLen[0]);
+  }
+
+  /** Write the document as `kind` (see `toBuffer`) to the file at `path`, never as a JS string (an `.xlsx` and the IR JSON are also never held whole). */
+  writeTo(path, kind) {
+    this._ensure();
+    const e = [0];
+    const rc = n.documentWriteToPath(this._h, kind, path, e);
+    if (rc !== 0) throw new OfficeOxideError(rc, `writeTo(${kind})`);
+  }
 
   saveAs(p) {
     this._ensure();

@@ -252,51 +252,7 @@ fn test_empty_styled_cells_parse_without_a_heap_allocation_per_cell() {
 
 // ---------------------------------------------------------------- XLS
 
-use common::{biff, cfb_with_stream};
-
-/// A BIFF8 workbook with `strings` shared strings and one sheet of
-/// `rows` × `cols` cells alternating `LABELSST` and `NUMBER`.
-fn xls_with_cells(rows: u16, cols: u16, strings: &[&str]) -> Vec<u8> {
-    let mut s = Vec::new();
-    let mut bof = 0x0600u16.to_le_bytes().to_vec();
-    bof.extend_from_slice(&0x0005u16.to_le_bytes());
-    bof.extend_from_slice(&[0u8; 12]);
-    s.extend(biff(0x0809, &bof));
-    let mut bs = 0u32.to_le_bytes().to_vec();
-    bs.extend_from_slice(&[0, 0, 1, 0, b'S']);
-    s.extend(biff(0x0085, &bs));
-    let mut sst = ((rows as u32) * (cols as u32)).to_le_bytes().to_vec();
-    sst.extend_from_slice(&(strings.len() as u32).to_le_bytes());
-    for t in strings {
-        sst.extend_from_slice(&(t.len() as u16).to_le_bytes());
-        sst.push(0);
-        sst.extend_from_slice(t.as_bytes());
-    }
-    s.extend(biff(0x00FC, &sst));
-    s.extend(biff(0x000A, &[]));
-    let mut bof = 0x0600u16.to_le_bytes().to_vec();
-    bof.extend_from_slice(&0x0010u16.to_le_bytes());
-    bof.extend_from_slice(&[0u8; 12]);
-    s.extend(biff(0x0809, &bof));
-    for r in 0..rows {
-        for c in 0..cols {
-            let mut d = r.to_le_bytes().to_vec();
-            d.extend_from_slice(&c.to_le_bytes());
-            d.extend_from_slice(&0u16.to_le_bytes());
-            if c % 2 == 0 {
-                d.extend_from_slice(
-                    &(((r as usize + c as usize) % strings.len()) as u32).to_le_bytes(),
-                );
-                s.extend(biff(0x00FD, &d));
-            } else {
-                d.extend_from_slice(&((r as f64) * 10.0 + c as f64 + 0.5).to_le_bytes());
-                s.extend(biff(0x0203, &d));
-            }
-        }
-    }
-    s.extend(biff(0x000A, &[]));
-    cfb_with_stream("Workbook", &s)
-}
+use common::xls_with_cells;
 
 /// Every BIFF record was copied into its own `Vec`, every cell's text
 /// was rendered into a `display` grid at `open()`, and `plain_text()`
@@ -333,6 +289,170 @@ fn test_xls_cells_open_within_one_allocation_each_and_render_borrowing() {
     assert!(
         per_cell < 0.8,
         "{render_allocs} allocations rendering {cells} cells ({per_cell:.2} per cell)"
+    );
+}
+
+/// Opening a sheet gathered every cell into a list (32 bytes each) and then
+/// built the grid while the whole list was still alive, so the open peaked
+/// at the list plus the grid plus the Workbook stream: 7x the file for a
+/// large sheet. The grid now takes the cells off the list as it is filled,
+/// so the two are never both whole.
+#[test]
+fn test_xls_open_does_not_hold_the_cell_list_and_the_grid_at_once() {
+    let _serial = serial();
+    const ROWS: u16 = 2_000;
+    const COLS: u16 = 50;
+    let bytes = xls_with_cells(ROWS, COLS, &["a", "b"]);
+    let input = bytes.len();
+    let (doc, peak) = peak_during(|| {
+        office_oxide::Document::from_reader(Cursor::new(bytes), office_oxide::DocumentFormat::Xls)
+            .unwrap()
+    });
+    let live = LIVE_BYTES.load(Ordering::SeqCst);
+    let (_, after_drop) = (drop(doc), LIVE_BYTES.load(Ordering::SeqCst));
+    let kept = live.saturating_sub(after_drop);
+    let cells = (ROWS as usize) * (COLS as usize);
+    // Beyond what the document keeps and the stream it reads, the open may
+    // spend a few bytes per cell, not a second copy of every cell.
+    let transient = peak.saturating_sub(kept).saturating_sub(2 * input);
+    assert!(
+        transient < cells * 16,
+        "open peaked at {peak} bytes for {cells} cells: {kept} kept, {input} input, \
+         {transient} transient ({} per cell)",
+        transient / cells
+    );
+}
+
+/// A strict open decides whether the document is complete. For a `.xls` the
+/// reader alone knows, so the check must not build the IR, which costs many
+/// times what the open does (hundreds of bytes per cell).
+#[test]
+fn test_a_strict_xls_open_does_not_build_the_ir() {
+    let _serial = serial();
+    let bytes = xls_with_cells(2_000, 50, &["a", "b"]);
+    let open = |options: &office_oxide::options::ParseOptions| {
+        office_oxide::Document::from_reader_with(
+            Cursor::new(bytes.clone()),
+            office_oxide::DocumentFormat::Xls,
+            options,
+        )
+        .unwrap()
+    };
+    let (_, plain) = peak_during(|| open(&office_oxide::options::ParseOptions::default()));
+    let mut strict = office_oxide::options::ParseOptions::default();
+    strict.on_incomplete = office_oxide::options::OnIncomplete::Error;
+    let (_, checked) = peak_during(|| open(&strict));
+    assert!(
+        checked < plain + plain / 4,
+        "a strict open peaked at {checked} bytes, a plain one at {plain}"
+    );
+}
+
+/// A workbook of `sheets` sheets whose parts each carry `padding` bytes the
+/// reader skips (an extension block), stored uncompressed, and a few cells.
+fn workbook_of_padded_sheets(sheets: usize, padding: usize) -> Vec<u8> {
+    let mut names = String::new();
+    let mut rels = String::from(
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+    );
+    for i in 1..=sheets {
+        names.push_str(&format!(r#"<sheet name="S{i}" sheetId="{i}" r:id="rId{i}"/>"#));
+        rels.push_str(&format!(r#"<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>"#));
+    }
+    rels.push_str("</Relationships>");
+    let workbook = format!(
+        r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{names}</sheets></workbook>"#
+    );
+    let pad = "A".repeat(padding);
+    let sheet_xml: Vec<(String, String)> = (1..=sheets)
+        .map(|i| {
+            (
+                format!("xl/worksheets/sheet{i}.xml"),
+                format!(
+                    r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>{i}</v></c></row></sheetData><extLst><ext uri="{{00000000-0000-0000-0000-000000000000}}">{pad}</ext></extLst></worksheet>"#
+                ),
+            )
+        })
+        .collect();
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let mut add = |name: &str, data: &[u8]| {
+        zip.start_file(name, stored).unwrap();
+        zip.write_all(data).unwrap();
+    };
+    add("[Content_Types].xml", br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#);
+    add("_rels/.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#);
+    add("xl/_rels/workbook.xml.rels", rels.as_bytes());
+    add("xl/workbook.xml", workbook.as_bytes());
+    for (name, xml) in &sheet_xml {
+        add(name, xml.as_bytes());
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+/// Every sheet's XML was read before any was parsed, so a workbook of many
+/// large sheets held all of their XML at once. Sheets are now read and parsed
+/// in batches of bounded size, each batch's XML dropped before the next.
+#[test]
+fn test_a_many_sheet_workbook_does_not_hold_every_sheets_xml_at_once() {
+    let _serial = serial();
+    const SHEETS: usize = 6;
+    const PADDING: usize = 16 << 20;
+    let bytes = workbook_of_padded_sheets(SHEETS, PADDING);
+    let input = bytes.len();
+    let (doc, peak) = peak_during(|| open_xlsx(bytes));
+    assert_eq!(doc.as_xlsx().unwrap().worksheets.len(), SHEETS);
+    assert!(doc.plain_text().contains('6'));
+    let transient = peak.saturating_sub(input);
+    assert!(
+        transient < 4 * PADDING,
+        "opening {SHEETS} sheets of {PADDING} bytes of XML peaked {transient} bytes above the input"
+    );
+}
+
+/// One sheet whose part is larger than any part should be held whole was
+/// read into memory and parsed from there, so the open held all of its XML.
+/// Such a part is now parsed as it is inflated, a few megabytes at a time.
+#[test]
+fn test_a_very_large_sheet_is_not_held_whole_while_it_is_parsed() {
+    let _serial = serial();
+    const ROWS: usize = 72;
+    const FILLER: usize = 1 << 20;
+    let filler = format!("<!--{}-->", "x".repeat(FILLER));
+    let mut rows = String::new();
+    for r in 1..=ROWS {
+        rows.push_str(&format!(r#"<row r="{r}"><c r="A{r}"><v>{r}</v></c></row>"#));
+        rows.push_str(&filler);
+    }
+    let sheet = format!(
+        r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{rows}</sheetData><mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells></worksheet>"#
+    );
+    let xml_len = sheet.len();
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, data) in [
+        ("[Content_Types].xml", &br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#[..]),
+        ("_rels/.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#),
+        ("xl/_rels/workbook.xml.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#),
+        ("xl/workbook.xml", br#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#),
+        ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+    ] {
+        zip.start_file(name, stored).unwrap();
+        zip.write_all(data).unwrap();
+    }
+    drop(sheet);
+    let bytes = zip.finish().unwrap().into_inner();
+    let input = bytes.len();
+    let (doc, peak) = peak_during(|| open_xlsx(bytes));
+    let book = doc.as_xlsx().unwrap();
+    assert_eq!(book.worksheets[0].rows.len(), ROWS);
+    assert_eq!(book.worksheets[0].merged_cells, ["A1:B1"]);
+    let transient = peak.saturating_sub(input);
+    assert!(
+        transient < xml_len / 3,
+        "opening a sheet of {xml_len} bytes of XML peaked {transient} bytes above the input"
     );
 }
 

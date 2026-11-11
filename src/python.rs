@@ -176,16 +176,35 @@ impl PyParseOptions {
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
+    /// The limits these options hold, by name (`None` for no bound).
+    fn limits(&self) -> std::collections::BTreeMap<&'static str, Option<u64>> {
+        crate::limits::Limits::NAMES
+            .iter()
+            .map(|name| (*name, self.inner.limits.get(name).filter(|v| *v != u64::MAX)))
+            .collect()
+    }
+
+    /// The bounds the library derives from these limits (picture, padding,
+    /// write and embedded-package budgets), by name (`None` for no bound).
+    fn derived(&self) -> PyResult<std::collections::BTreeMap<String, Option<u64>>> {
+        let value = serde_json::to_value(self.inner.limits.derived())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let map = value.as_object().cloned().unwrap_or_default();
+        Ok(map
+            .into_iter()
+            .map(|(k, v)| {
+                let v = v
+                    .as_u64()
+                    .filter(|n| *n != u64::MAX && *n != usize::MAX as u64);
+                (k, v)
+            })
+            .collect())
+    }
+
     /// The names of every option.
     #[staticmethod]
     fn names() -> Vec<&'static str> {
-        let mut names = vec![
-            "include_hidden_text",
-            "include_deleted_text",
-            "on_incomplete",
-        ];
-        names.extend_from_slice(crate::limits::Limits::NAMES);
-        names
+        crate::options::ParseOptions::names()
     }
 }
 
@@ -201,17 +220,158 @@ impl PyParseOptions {
 /// (The block is marked `text` because it is Python shown to Python users;
 /// an indented block here is collected as a Rust doctest and fails to
 /// compile under `cargo test --all-features --doc`.)
-#[pyclass(name = "Document", module = "office_oxide")]
+/// `frozen`, so no call takes a borrow flag: with the GIL released during
+/// a call, another thread's `close()` (or a second call) would otherwise
+/// raise "Already borrowed" where it used to wait. Each call holds the
+/// document by its own reference, so `close()` while a call runs only drops
+/// the handle's.
+#[pyclass(name = "Document", module = "office_oxide", frozen)]
 struct PyDocument {
-    inner: Option<Document>,
+    inner: std::sync::Mutex<Option<std::sync::Arc<Document>>>,
     source: Option<String>,
 }
 
 impl PyDocument {
-    fn get(&self) -> PyResult<&Document> {
+    fn new(doc: Document, source: Option<String>) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(Some(std::sync::Arc::new(doc))),
+            source,
+        }
+    }
+
+    /// The open document, for one call.
+    fn get(&self) -> PyResult<std::sync::Arc<Document>> {
         self.inner
-            .as_ref()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Document is closed"))
+    }
+
+    /// The document rendered as `kind` in UTF-8 bytes, built without the GIL.
+    fn render_bytes<'py>(
+        &self,
+        py: Python<'py>,
+        kind: &str,
+    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        let doc = self.get()?;
+        let mut out = Vec::new();
+        py.detach(|| doc.write_output(kind, &mut out))
+            .unwrap_or_else(|| Err(std::io::Error::other("unknown output kind")))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(pyo3::types::PyBytes::new(py, &out))
+    }
+
+    /// Write the document as `kind` to a path (streamed to the file without
+    /// the GIL) or to an object with a binary `write` method (in chunks, each
+    /// handed over with the GIL).
+    fn write_to(&self, py: Python<'_>, kind: &str, target: &Bound<'_, PyAny>) -> PyResult<()> {
+        let doc = self.get()?;
+        let result = if let Ok(path) = target.extract::<PathBuf>() {
+            py.detach(|| {
+                let file = std::fs::File::create(&path)?;
+                let mut out = std::io::BufWriter::with_capacity(1 << 16, file);
+                doc.write_output(kind, &mut out)
+                    .unwrap_or_else(|| Err(std::io::Error::other("unknown output kind")))?;
+                std::io::Write::flush(&mut out)
+            })
+        } else if target.hasattr("write")? {
+            let mut out = PyFileWriter {
+                file: target.clone().unbind(),
+                buf: Vec::with_capacity(PyFileWriter::CHUNK),
+                raised: None,
+            };
+            let written = py.detach(|| {
+                doc.write_output(kind, &mut out)
+                    .unwrap_or_else(|| Err(std::io::Error::other("unknown output kind")))?;
+                std::io::Write::flush(&mut out)
+            });
+            // What the object's `write` raised is raised as itself.
+            if let Some(raised) = out.raised.take() {
+                return Err(raised);
+            }
+            written
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "target must be a path or a binary file object with a write method",
+            ));
+        };
+        result.map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+}
+
+/// A `std::io::Write` over a Python binary file object, for writing without
+/// the GIL: the bytes are gathered in chunks, and each chunk is handed to the
+/// object's `write` with the GIL taken for that call only.
+struct PyFileWriter {
+    file: Py<PyAny>,
+    buf: Vec<u8>,
+    /// The exception the object's `write` raised, to raise unchanged.
+    raised: Option<PyErr>,
+}
+
+impl PyFileWriter {
+    const CHUNK: usize = 1 << 20;
+
+    fn hand_over(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let chunk = std::mem::take(&mut self.buf);
+        let file = &self.file;
+        let handed = Python::attach(|py| -> PyResult<()> {
+            // A raw object may take less than it is given; the rest is
+            // handed over again. An object that returns no count (`None`)
+            // took it all, as `shutil.copyfileobj` assumes, except a raw
+            // stream, whose `None` means a non-blocking write took nothing.
+            let raw = file
+                .bind(py)
+                .is_instance(&py.import("io")?.getattr("RawIOBase")?)?;
+            let mut rest = &chunk[..];
+            while !rest.is_empty() {
+                let bytes = pyo3::types::PyBytes::new(py, rest);
+                let n = file.call_method1(py, "write", (bytes,))?;
+                let taken = if n.is_none(py) {
+                    if raw {
+                        return Err(pyo3::exceptions::PyBlockingIOError::new_err(
+                            "the non-blocking stream took none of the output",
+                        ));
+                    }
+                    rest.len()
+                } else {
+                    n.extract::<usize>(py)?.min(rest.len())
+                };
+                if taken == 0 {
+                    return Err(pyo3::exceptions::PyOSError::new_err(
+                        "the file object's write took no bytes",
+                    ));
+                }
+                rest = &rest[taken..];
+            }
+            Ok(())
+        });
+        if let Err(e) = handed {
+            let message = e.to_string();
+            self.raised = Some(e);
+            return Err(std::io::Error::other(message));
+        }
+        self.buf = chunk;
+        self.buf.clear();
+        Ok(())
+    }
+}
+
+impl std::io::Write for PyFileWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= Self::CHUNK {
+            self.hand_over()?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.hand_over()
     }
 }
 
@@ -223,16 +383,18 @@ impl PyDocument {
     /// mismatched extensions. Raises OfficeOxideError on parse failure.
     #[staticmethod]
     #[pyo3(signature = (path, /, *, options=None))]
-    fn open(path: PathBuf, options: Option<PyRef<'_, PyParseOptions>>) -> PyResult<Self> {
+    fn open(
+        py: Python<'_>,
+        path: PathBuf,
+        options: Option<PyRef<'_, PyParseOptions>>,
+    ) -> PyResult<Self> {
         let source = path.display().to_string();
-        let inner = match &options {
-            Some(o) => Document::open_with(&path, &o.inner)?,
-            None => Document::open(&path)?,
-        };
-        Ok(PyDocument {
-            inner: Some(inner),
-            source: Some(source),
-        })
+        let options = options.map(|o| o.inner.clone());
+        let inner = py.detach(|| match &options {
+            Some(o) => Document::open_with(&path, o),
+            None => Document::open(&path),
+        })?;
+        Ok(PyDocument::new(inner, Some(source)))
     }
 
     /// Open a document from raw bytes with an explicit format.
@@ -241,6 +403,7 @@ impl PyDocument {
     #[staticmethod]
     #[pyo3(signature = (data, format, /, *, options=None))]
     fn from_bytes(
+        py: Python<'_>,
         data: &[u8],
         format: &str,
         options: Option<PyRef<'_, PyParseOptions>>,
@@ -248,14 +411,12 @@ impl PyDocument {
         let fmt = DocumentFormat::from_extension(format)
             .ok_or_else(|| OfficeOxideError::new_err(format!("unsupported format: {format}")))?;
         let cursor = Cursor::new(data.to_vec());
-        let inner = match &options {
-            Some(o) => Document::from_reader_with(cursor, fmt, &o.inner)?,
-            None => Document::from_reader(cursor, fmt)?,
-        };
-        Ok(PyDocument {
-            inner: Some(inner),
-            source: None,
-        })
+        let options = options.map(|o| o.inner.clone());
+        let inner = py.detach(|| match &options {
+            Some(o) => Document::from_reader_with(cursor, fmt, o),
+            None => Document::from_reader(cursor, fmt),
+        })?;
+        Ok(PyDocument::new(inner, None))
     }
 
     /// The format as a short string ("docx", "xlsx", …).
@@ -281,8 +442,10 @@ impl PyDocument {
     /// `None`) and `detail`. Empty for a sound document. Converts the
     /// document once.
     fn damage<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, pyo3::types::PyDict>>> {
+        let doc = self.get()?;
+        let found = py.detach(|| doc.damage());
         let mut out = Vec::new();
-        for d in self.get()?.damage() {
+        for d in found {
             let item = pyo3::types::PyDict::new(py);
             let kind = match d.kind {
                 crate::options::DamageKind::UnreadablePart => "unreadable_part",
@@ -299,13 +462,15 @@ impl PyDocument {
     }
 
     /// Extract plain text from the document.
-    fn plain_text(&self) -> PyResult<String> {
-        Ok(self.get()?.plain_text())
+    fn plain_text(&self, py: Python<'_>) -> PyResult<String> {
+        let doc = self.get()?;
+        Ok(py.detach(|| doc.plain_text()))
     }
 
     /// Convert the document to Markdown.
-    fn to_markdown(&self) -> PyResult<String> {
-        Ok(self.get()?.to_markdown())
+    fn to_markdown(&self, py: Python<'_>) -> PyResult<String> {
+        let doc = self.get()?;
+        Ok(py.detach(|| doc.to_markdown()))
     }
 
     /// Convert to markdown, embedding each image inline as
@@ -313,24 +478,28 @@ impl PyDocument {
     ///
     /// Images are otherwise dropped from markdown entirely, which loses
     /// both their content and their position.
-    fn to_markdown_with_images(&self) -> PyResult<String> {
+    fn to_markdown_with_images(&self, py: Python<'_>) -> PyResult<String> {
         use crate::ir_render::{ImageEmbed, MarkdownOptions};
-        Ok(self.get()?.to_markdown_with(MarkdownOptions {
-            image_embed: ImageEmbed::Base64,
+        let doc = self.get()?;
+        Ok(py.detach(|| {
+            doc.to_markdown_with(MarkdownOptions {
+                image_embed: ImageEmbed::Base64,
+            })
         }))
     }
 
     /// Convert the document to an HTML fragment.
-    fn to_html(&self) -> PyResult<String> {
-        Ok(self.get()?.to_html())
+    fn to_html(&self, py: Python<'_>) -> PyResult<String> {
+        let doc = self.get()?;
+        Ok(py.detach(|| doc.to_html()))
     }
 
     /// Convert the document to a format-agnostic intermediate representation
     /// (nested dicts/lists).
     fn to_ir<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        let doc_ir = self.get()?.to_ir();
-        let json_str = doc_ir
-            .to_json_string()
+        let doc = self.get()?;
+        let json_str = py
+            .detach(|| doc.to_ir().to_json_string())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         let json_module = py.import("json")?;
         let result = json_module.call_method1("loads", (json_str,))?;
@@ -338,26 +507,105 @@ impl PyDocument {
     }
 
     /// Convert the document to a format-agnostic intermediate representation as a JSON string.
-    fn to_ir_json(&self) -> PyResult<String> {
-        let doc_ir = self.get()?.to_ir();
-        doc_ir
-            .to_json_string()
+    fn to_ir_json(&self, py: Python<'_>) -> PyResult<String> {
+        let doc = self.get()?;
+        py.detach(|| doc.to_ir().to_json_string())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Plain text as UTF-8 `bytes`. A Python `str` stores every character at
+    /// the width of its widest one (four bytes each once the text holds one
+    /// character outside the Basic Multilingual Plane), so for a large
+    /// document the bytes are up to four times smaller.
+    fn plain_text_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        self.render_bytes(py, "text")
+    }
+
+    /// Markdown as UTF-8 `bytes` (see `plain_text_bytes`).
+    fn to_markdown_bytes<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        self.render_bytes(py, "markdown")
+    }
+
+    /// Markdown with images inline as UTF-8 `bytes` (see `plain_text_bytes`).
+    fn to_markdown_with_images_bytes<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        self.render_bytes(py, "markdown_images")
+    }
+
+    /// HTML as UTF-8 `bytes` (see `plain_text_bytes`).
+    fn to_html_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        self.render_bytes(py, "html")
+    }
+
+    /// The IR as JSON in UTF-8 `bytes` (see `plain_text_bytes`); for a
+    /// picture-heavy document this is the form to use, or `write_ir_json`.
+    fn to_ir_json_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        self.render_bytes(py, "ir_json")
+    }
+
+    /// Write plain text to `target`, a path or a binary file object, as UTF-8,
+    /// never as a Python `str`.
+    #[pyo3(signature = (target, /))]
+    fn write_text(&self, py: Python<'_>, target: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.write_to(py, "text", target)
+    }
+
+    /// Write Markdown (with images inline when `images=True`) to `target`, a
+    /// path or a binary file object, as UTF-8, never as a Python `str`.
+    #[pyo3(signature = (target, /, *, images=false))]
+    fn write_markdown(
+        &self,
+        py: Python<'_>,
+        target: &Bound<'_, PyAny>,
+        images: bool,
+    ) -> PyResult<()> {
+        self.write_to(
+            py,
+            if images {
+                "markdown_images"
+            } else {
+                "markdown"
+            },
+            target,
+        )
+    }
+
+    /// Write HTML to `target`, a path or a binary file object, as UTF-8.
+    #[pyo3(signature = (target, /))]
+    fn write_html(&self, py: Python<'_>, target: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.write_to(py, "html", target)
+    }
+
+    /// Write the IR as JSON to `target`, a path or a binary file object, as
+    /// UTF-8, as it is produced: a picture-heavy document's JSON is never
+    /// held whole.
+    #[pyo3(signature = (target, /))]
+    fn write_ir_json(&self, py: Python<'_>, target: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.write_to(py, "ir_json", target)
     }
 
     /// Save/convert the document to a file. Legacy formats are converted to OOXML.
     ///
     /// Example: doc.save_as("output.docx") converts DOC → DOCX.
     #[pyo3(signature = (path, /))]
-    fn save_as(&self, path: PathBuf) -> PyResult<()> {
-        self.get()?
-            .save_as(&path)
+    fn save_as(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        let doc = self.get()?;
+        py.detach(|| doc.save_as(&path))
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
     }
 
-    /// Release resources. The document becomes unusable after this.
-    fn close(&mut self) {
-        self.inner = None;
+    /// Release resources. The document becomes unusable after this; a call
+    /// already running on another thread finishes first.
+    fn close(&self) {
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     fn __enter__(slf: Py<Self>) -> Py<Self> {
@@ -365,7 +613,7 @@ impl PyDocument {
     }
 
     fn __exit__(
-        &mut self,
+        &self,
         _exc_type: Option<Py<PyAny>>,
         _exc_val: Option<Py<PyAny>>,
         _exc_tb: Option<Py<PyAny>>,
@@ -375,7 +623,7 @@ impl PyDocument {
     }
 
     fn __repr__(&self) -> String {
-        match (&self.inner, &self.source) {
+        match (self.get().ok(), &self.source) {
             (Some(d), Some(s)) => {
                 format!("<Document format={:?} source={:?}>", d.format(), s)
             },
@@ -386,22 +634,55 @@ impl PyDocument {
 }
 
 /// An editable document that supports text replacement and saving.
-#[pyclass(name = "EditableDocument", module = "office_oxide")]
+/// `frozen`, with the document behind a lock taken without the GIL: an edit
+/// on one thread waits for another's, as when the GIL serialised them,
+/// instead of raising "Already borrowed".
+#[pyclass(name = "EditableDocument", module = "office_oxide", frozen)]
 struct PyEditable {
-    inner: Option<EditableDocument>,
+    inner: std::sync::Mutex<Option<EditableDocument>>,
 }
 
 impl PyEditable {
-    fn get(&self) -> PyResult<&EditableDocument> {
-        self.inner
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("EditableDocument is closed"))
+    fn new(doc: EditableDocument) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(Some(doc)),
+        }
     }
 
-    fn get_mut(&mut self) -> PyResult<&mut EditableDocument> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("EditableDocument is closed"))
+    /// Run `f` on the open document, from code that has released the GIL
+    /// (anything long holds the lock that way).
+    fn with<T>(&self, f: impl FnOnce(&mut EditableDocument) -> PyResult<T>) -> PyResult<T> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::on_open(guard, f)
+    }
+
+    /// [`Self::with`] from code holding the GIL: it is released while the
+    /// lock is waited for, so a thread waiting behind a long save does not
+    /// stop every other Python thread.
+    fn with_attached<T>(
+        &self,
+        py: Python<'_>,
+        f: impl FnOnce(&mut EditableDocument) -> PyResult<T>,
+    ) -> PyResult<T> {
+        use pyo3::sync::MutexExt;
+        let guard = self
+            .inner
+            .lock_py_attached(py)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::on_open(guard, f)
+    }
+
+    fn on_open<T>(
+        mut guard: std::sync::MutexGuard<'_, Option<EditableDocument>>,
+        f: impl FnOnce(&mut EditableDocument) -> PyResult<T>,
+    ) -> PyResult<T> {
+        let doc = guard.as_mut().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("EditableDocument is closed")
+        })?;
+        f(doc)
     }
 }
 
@@ -410,29 +691,33 @@ impl PyEditable {
     /// Open a document for editing. Supports DOCX, XLSX, PPTX.
     #[staticmethod]
     #[pyo3(signature = (path, /))]
-    fn open(path: PathBuf) -> PyResult<Self> {
-        let inner = EditableDocument::open(&path)?;
-        Ok(PyEditable { inner: Some(inner) })
+    fn open(py: Python<'_>, path: PathBuf) -> PyResult<Self> {
+        let inner = py.detach(|| EditableDocument::open(&path))?;
+        Ok(PyEditable::new(inner))
     }
 
     /// Open a document for editing from raw bytes with an explicit format
     /// ("docx", "xlsx" or "pptx"), without a temporary file.
     #[staticmethod]
     #[pyo3(signature = (data, format, /))]
-    fn from_bytes(data: &[u8], format: &str) -> PyResult<Self> {
+    fn from_bytes(py: Python<'_>, data: &[u8], format: &str) -> PyResult<Self> {
         let fmt = DocumentFormat::from_extension(format)
             .ok_or_else(|| OfficeOxideError::new_err(format!("unsupported format: {format}")))?;
-        let inner = EditableDocument::from_reader(Cursor::new(data.to_vec()), fmt)?;
-        Ok(PyEditable { inner: Some(inner) })
+        let cursor = Cursor::new(data.to_vec());
+        let inner = py.detach(|| EditableDocument::from_reader(cursor, fmt))?;
+        Ok(PyEditable::new(inner))
     }
 
     /// Replace every occurrence of `find` with `replace` in text content.
     /// Returns the number of replacements.
     #[pyo3(signature = (find, replace, /))]
-    fn replace_text(&mut self, find: &str, replace: &str) -> PyResult<usize> {
-        self.get_mut()?
-            .replace_text(find, replace)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    fn replace_text(&self, py: Python<'_>, find: &str, replace: &str) -> PyResult<usize> {
+        py.detach(|| {
+            self.with(|doc| {
+                doc.replace_text(find, replace)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+            })
+        })
     }
 
     /// Set a cell value in an XLSX document.
@@ -440,7 +725,8 @@ impl PyEditable {
     /// `value` may be None (empty), str, bool, int, or float.
     #[pyo3(signature = (sheet_index, cell_ref, value, /))]
     fn set_cell(
-        &mut self,
+        &self,
+        py: Python<'_>,
         sheet_index: usize,
         cell_ref: &str,
         value: &Bound<'_, PyAny>,
@@ -457,26 +743,34 @@ impl PyEditable {
                 ));
             },
         };
-        self.get_mut()?.set_cell(sheet_index, cell_ref, cv)?;
-        Ok(())
+        self.with_attached(py, |doc| Ok(doc.set_cell(sheet_index, cell_ref, cv)?))
     }
 
     /// Save the edited document to a file.
     #[pyo3(signature = (path, /))]
-    fn save(&self, path: PathBuf) -> PyResult<()> {
-        self.get()?.save(&path)?;
-        Ok(())
+    fn save(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        py.detach(|| self.with(|doc| Ok(doc.save(&path)?)))
     }
 
     /// Serialize the edited document to bytes.
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-        let mut cursor = Cursor::new(Vec::new());
-        self.get()?.write_to(&mut cursor)?;
-        Ok(pyo3::types::PyBytes::new(py, &cursor.into_inner()))
+        let bytes = py.detach(|| {
+            self.with(|doc| {
+                let mut cursor = Cursor::new(Vec::new());
+                Ok(doc.write_to(&mut cursor).map(|()| cursor.into_inner())?)
+            })
+        })?;
+        Ok(pyo3::types::PyBytes::new(py, &bytes))
     }
 
-    fn close(&mut self) {
-        self.inner = None;
+    /// Release the document; an edit running on another thread finishes
+    /// first (waited for without the GIL).
+    fn close(&self, py: Python<'_>) {
+        use pyo3::sync::MutexExt;
+        *self
+            .inner
+            .lock_py_attached(py)
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     fn __enter__(slf: Py<Self>) -> Py<Self> {
@@ -484,12 +778,13 @@ impl PyEditable {
     }
 
     fn __exit__(
-        &mut self,
+        &self,
+        py: Python<'_>,
         _exc_type: Option<Py<PyAny>>,
         _exc_val: Option<Py<PyAny>>,
         _exc_tb: Option<Py<PyAny>>,
     ) -> bool {
-        self.close();
+        self.close(py);
         false
     }
 }
@@ -501,22 +796,22 @@ impl PyEditable {
 /// Extract plain text from a file path.
 #[pyfunction]
 #[pyo3(signature = (path, /))]
-fn extract_text(path: PathBuf) -> PyResult<String> {
-    Ok(crate::extract_text(&path)?)
+fn extract_text(py: Python<'_>, path: PathBuf) -> PyResult<String> {
+    Ok(py.detach(|| crate::extract_text(&path))?)
 }
 
 /// Convert a file to markdown.
 #[pyfunction]
 #[pyo3(signature = (path, /))]
-fn to_markdown(path: PathBuf) -> PyResult<String> {
-    Ok(crate::to_markdown(&path)?)
+fn to_markdown(py: Python<'_>, path: PathBuf) -> PyResult<String> {
+    Ok(py.detach(|| crate::to_markdown(&path))?)
 }
 
 /// Convert a file to HTML.
 #[pyfunction]
 #[pyo3(signature = (path, /))]
-fn to_html(path: PathBuf) -> PyResult<String> {
-    Ok(crate::to_html(&path)?)
+fn to_html(py: Python<'_>, path: PathBuf) -> PyResult<String> {
+    Ok(py.detach(|| crate::to_html(&path))?)
 }
 
 /// Create an Office document from Markdown text.
@@ -524,10 +819,15 @@ fn to_html(path: PathBuf) -> PyResult<String> {
 /// `format` must be one of `"docx"`, `"xlsx"`, or `"pptx"`.
 #[pyfunction]
 #[pyo3(signature = (markdown, format, path, /))]
-fn create_from_markdown(markdown: &str, format: &str, path: PathBuf) -> PyResult<()> {
+fn create_from_markdown(
+    py: Python<'_>,
+    markdown: &str,
+    format: &str,
+    path: PathBuf,
+) -> PyResult<()> {
     let fmt = crate::format::DocumentFormat::from_extension(format)
         .ok_or_else(|| OfficeOxideError::new_err(format!("unsupported format: {format}")))?;
-    crate::create::create_from_markdown(markdown, fmt, &path)?;
+    py.detach(|| crate::create::create_from_markdown(markdown, fmt, &path))?;
     Ok(())
 }
 
@@ -539,9 +839,34 @@ fn version() -> &'static str {
 
 // ─── XlsxWriter ─────────────────────────────────────────────────────────────
 
-#[pyclass(name = "XlsxWriter", module = "office_oxide")]
+/// `frozen`, with the writer behind a lock that a long call takes without
+/// the GIL, so a call on one thread waits for another's instead of raising
+/// "Already borrowed".
+#[pyclass(name = "XlsxWriter", module = "office_oxide", frozen)]
 struct PyXlsxWriter {
-    writer: crate::xlsx::write::XlsxWriter,
+    writer: std::sync::Mutex<crate::xlsx::write::XlsxWriter>,
+}
+
+impl PyXlsxWriter {
+    /// The writer, from code that has released the GIL.
+    fn w(&self) -> std::sync::MutexGuard<'_, crate::xlsx::write::XlsxWriter> {
+        self.writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The writer, from code holding the GIL: released while the lock is
+    /// waited for, so a call behind a long save does not stop every other
+    /// Python thread.
+    fn w_attached(
+        &self,
+        py: Python<'_>,
+    ) -> std::sync::MutexGuard<'_, crate::xlsx::write::XlsxWriter> {
+        use pyo3::sync::MutexExt;
+        self.writer
+            .lock_py_attached(py)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 #[pymethods]
@@ -549,13 +874,13 @@ impl PyXlsxWriter {
     #[new]
     fn new() -> Self {
         Self {
-            writer: crate::xlsx::write::XlsxWriter::new(),
+            writer: std::sync::Mutex::new(crate::xlsx::write::XlsxWriter::new()),
         }
     }
 
     /// Add a worksheet; returns its 0-based index.
-    fn add_sheet(&mut self, name: &str) -> usize {
-        self.writer.add_sheet_get_index(name)
+    fn add_sheet(&self, py: Python<'_>, name: &str) -> usize {
+        self.w_attached(py).add_sheet_get_index(name)
     }
 
     /// Set a cell value (str, float, int, bool, or None).
@@ -564,28 +889,37 @@ impl PyXlsxWriter {
     /// `set_formula` for a formula. An `int` beyond 2**53 raises
     /// `ValueError`: Excel stores numbers as doubles and would change it.
     fn set_cell(
-        &mut self,
+        &self,
+        py: Python<'_>,
         sheet: usize,
         row: usize,
         col: usize,
         value: &pyo3::Bound<'_, pyo3::PyAny>,
     ) -> PyResult<()> {
         let data = writer_cell_data(value)?;
-        require_written(self.writer.sheet_set_cell(sheet, row, col, data), "set_cell")
+        require_written(self.w_attached(py).sheet_set_cell(sheet, row, col, data), "set_cell")
     }
 
     /// Set a formula cell, e.g. `set_formula(0, 3, 1, "SUM(B1:B3)")`. A
     /// leading `=` is accepted and dropped.
-    fn set_formula(&mut self, sheet: usize, row: usize, col: usize, formula: &str) -> PyResult<()> {
+    fn set_formula(
+        &self,
+        py: Python<'_>,
+        sheet: usize,
+        row: usize,
+        col: usize,
+        formula: &str,
+    ) -> PyResult<()> {
         let data = crate::xlsx::write::CellData::Formula(formula.to_string());
-        require_written(self.writer.sheet_set_cell(sheet, row, col, data), "set_formula")
+        require_written(self.w_attached(py).sheet_set_cell(sheet, row, col, data), "set_formula")
     }
 
     /// Set a cell with styling. bg_color is a 6-char hex string or None
     /// (the default, as the type stub always said).
     #[pyo3(signature = (sheet, row, col, value, bold, bg_color=None))]
     fn set_cell_styled(
-        &mut self,
+        &self,
+        py: Python<'_>,
         sheet: usize,
         row: usize,
         col: usize,
@@ -604,7 +938,7 @@ impl PyXlsxWriter {
             style = style.background(bg.to_string());
         }
         require_written(
-            self.writer
+            self.w_attached(py)
                 .sheet_set_cell_styled(sheet, row, col, data, style),
             "set_cell_styled",
         )
@@ -612,26 +946,27 @@ impl PyXlsxWriter {
 
     /// Merge a rectangular range. row_span and col_span must be >= 1.
     fn merge_cells(
-        &mut self,
+        &self,
+        py: Python<'_>,
         sheet: usize,
         row: usize,
         col: usize,
         row_span: usize,
         col_span: usize,
     ) {
-        self.writer
+        self.w_attached(py)
             .sheet_merge_cells(sheet, row, col, row_span, col_span);
     }
 
     /// Set column width in Excel character units (e.g. 20.0).
-    fn set_column_width(&mut self, sheet: usize, col: usize, width: f64) {
-        self.writer.sheet_set_column_width(sheet, col, width);
+    fn set_column_width(&self, py: Python<'_>, sheet: usize, col: usize, width: f64) {
+        self.w_attached(py)
+            .sheet_set_column_width(sheet, col, width);
     }
 
     /// Save to file.
-    fn save(&self, path: PathBuf) -> PyResult<()> {
-        self.writer
-            .save(&path)
+    fn save(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        py.detach(|| self.w().save(&path))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -640,19 +975,46 @@ impl PyXlsxWriter {
         &self,
         py: pyo3::Python<'py>,
     ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyBytes>> {
-        let mut cursor = std::io::Cursor::new(Vec::new());
-        self.writer
-            .write_to(&mut cursor)
+        let bytes = py
+            .detach(|| {
+                let mut cursor = std::io::Cursor::new(Vec::new());
+                self.w().write_to(&mut cursor).map(|_| cursor.into_inner())
+            })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        Ok(pyo3::types::PyBytes::new(py, &cursor.into_inner()))
+        Ok(pyo3::types::PyBytes::new(py, &bytes))
     }
 }
 
 // ─── PptxWriter ──────────────────────────────────────────────────────────────
 
-#[pyclass(name = "PptxWriter", module = "office_oxide")]
+/// `frozen`, with the writer behind a lock that a long call takes without
+/// the GIL, so a call on one thread waits for another's instead of raising
+/// "Already borrowed".
+#[pyclass(name = "PptxWriter", module = "office_oxide", frozen)]
 struct PyPptxWriter {
-    writer: crate::pptx::write::PptxWriter,
+    writer: std::sync::Mutex<crate::pptx::write::PptxWriter>,
+}
+
+impl PyPptxWriter {
+    /// The writer, from code that has released the GIL.
+    fn w(&self) -> std::sync::MutexGuard<'_, crate::pptx::write::PptxWriter> {
+        self.writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The writer, from code holding the GIL: released while the lock is
+    /// waited for, so a call behind a long save does not stop every other
+    /// Python thread.
+    fn w_attached(
+        &self,
+        py: Python<'_>,
+    ) -> std::sync::MutexGuard<'_, crate::pptx::write::PptxWriter> {
+        use pyo3::sync::MutexExt;
+        self.writer
+            .lock_py_attached(py)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 #[pymethods]
@@ -660,33 +1022,34 @@ impl PyPptxWriter {
     #[new]
     fn new() -> Self {
         Self {
-            writer: crate::pptx::write::PptxWriter::new(),
+            writer: std::sync::Mutex::new(crate::pptx::write::PptxWriter::new()),
         }
     }
 
     /// Override canvas size. 914400 EMU = 1 inch.
-    fn set_presentation_size(&mut self, cx: u64, cy: u64) {
-        self.writer.set_presentation_size(cx, cy);
+    fn set_presentation_size(&self, py: Python<'_>, cx: u64, cy: u64) {
+        self.w_attached(py).set_presentation_size(cx, cy);
     }
 
     /// Add a slide; returns its 0-based index.
-    fn add_slide(&mut self) -> usize {
-        self.writer.add_slide_get_index()
+    fn add_slide(&self, py: Python<'_>) -> usize {
+        self.w_attached(py).add_slide_get_index()
     }
 
     /// Set the slide title.
-    fn set_slide_title(&mut self, slide: usize, title: &str) -> PyResult<()> {
-        require_written(self.writer.slide_set_title(slide, title), "set_slide_title")
+    fn set_slide_title(&self, py: Python<'_>, slide: usize, title: &str) -> PyResult<()> {
+        require_written(self.w_attached(py).slide_set_title(slide, title), "set_slide_title")
     }
 
     /// Add a plain text paragraph to the slide body.
-    fn add_slide_text(&mut self, slide: usize, text: &str) -> PyResult<()> {
-        require_written(self.writer.slide_add_text(slide, text), "add_slide_text")
+    fn add_slide_text(&self, py: Python<'_>, slide: usize, text: &str) -> PyResult<()> {
+        require_written(self.w_attached(py).slide_add_text(slide, text), "add_slide_text")
     }
 
     /// Embed an image. format: "png" | "jpeg" | "gif". x,y,cx,cy in EMU.
     fn add_slide_image(
-        &mut self,
+        &self,
+        py: Python<'_>,
         slide: usize,
         data: &[u8],
         format: &str,
@@ -706,16 +1069,15 @@ impl PyPptxWriter {
             },
         };
         require_written(
-            self.writer
+            self.w_attached(py)
                 .slide_add_image(slide, data.to_vec(), fmt, x, y, cx, cy),
             "add_slide_image",
         )
     }
 
     /// Save to file.
-    fn save(&self, path: PathBuf) -> PyResult<()> {
-        self.writer
-            .save(&path)
+    fn save(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        py.detach(|| self.w().save(&path))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -724,11 +1086,13 @@ impl PyPptxWriter {
         &self,
         py: pyo3::Python<'py>,
     ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyBytes>> {
-        let mut cursor = std::io::Cursor::new(Vec::new());
-        self.writer
-            .write_to(&mut cursor)
+        let bytes = py
+            .detach(|| {
+                let mut cursor = std::io::Cursor::new(Vec::new());
+                self.w().write_to(&mut cursor).map(|_| cursor.into_inner())
+            })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        Ok(pyo3::types::PyBytes::new(py, &cursor.into_inner()))
+        Ok(pyo3::types::PyBytes::new(py, &bytes))
     }
 }
 

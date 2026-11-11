@@ -95,7 +95,7 @@ pub struct DocDocument {
     /// Structural problems the reader worked around (container header
     /// counts that disagree with its chains, streams shorter than their
     /// declared size). Reach `Metadata::warnings`.
-    warnings: Vec<String>,
+    warnings: crate::core::notice::Notices,
 }
 
 /// One of the subdocuments stored after the main text in a `.doc`.
@@ -320,15 +320,18 @@ impl DocDocument {
         // Refuse pieces that read far more than the stream holds, and cut the
         // table where the text budget runs out, before any text is decoded.
         let mut text_budget = crate::limits::TextBudget::new();
-        let mut work_warnings: Vec<String> = Vec::new();
+        let mut work_warnings = crate::core::notice::Notices::new();
         if cps_out_of_order {
-            work_warnings.push(PIECE_TABLE_OUT_OF_ORDER.into());
+            work_warnings.push(crate::options::DamageKind::Recovered, PIECE_TABLE_OUT_OF_ORDER);
         }
         if !super::fib::is_word_version(fib.n_fib) {
-            work_warnings.push(super::fib::damaged_version_warning(fib.n_fib, language_from_fonts));
+            work_warnings.push(
+                crate::options::DamageKind::Recovered,
+                super::fib::damaged_version_warning(fib.n_fib, language_from_fonts),
+            );
         }
         if super::piece_table::bound_piece_reads(&mut pieces, word_doc.len(), &mut text_budget)? {
-            work_warnings.push(text_budget.notice());
+            work_warnings.push(crate::options::DamageKind::Truncated, text_budget.notice());
         }
         let text_complete = covers_declared_length(&pieces, fib.text_len);
 
@@ -348,10 +351,10 @@ impl DocDocument {
         if runs_work_too_large(&pieces, chpx_runs.iter().map(|r| (r.fc_start, r.fc_end))) {
             chpx_runs.clear();
             work_warnings.push(
+                crate::options::DamageKind::Recovered,
                 "the pieces of this file are laid out so that reading its character formatting \
                  would take too long; character formatting was not read, and deleted or hidden \
-                 text was not excluded"
-                    .into(),
+                 text was not excluded",
             );
         }
 
@@ -422,7 +425,7 @@ impl DocDocument {
                 );
                 header_footers = stories;
                 if cut {
-                    work_warnings.push(text_budget.notice());
+                    work_warnings.push(crate::options::DamageKind::Truncated, text_budget.notice());
                     hdd_cut = true;
                 }
                 text_start =
@@ -488,7 +491,7 @@ impl DocDocument {
         // Build structured paragraphs (with table / list PAP flags) from the
         // PAPX FKP, when the FIB advertises one. Without it we cannot detect
         // tables or lists, so `doc_to_ir` falls back to the line heuristic.
-        let mut style_warnings: Vec<String> = Vec::new();
+        let mut style_warnings = crate::core::notice::Notices::new();
         // The Data stream (if present) holds the pictures, decoded lazily, and
         // the property lists of paragraphs whose PAPX is too large to fit.
         let data_stream = cfb.open_stream("Data").unwrap_or_default();
@@ -504,13 +507,13 @@ impl DocDocument {
                 runs_work_too_large(&pieces, fkp.iter().map(|r| (r.fc_start, r.fc_end)));
             if too_large {
                 work_warnings.push(
+                    crate::options::DamageKind::Recovered,
                     "the pieces of this file are laid out so that reading its paragraphs would \
-                     take too long; its tables and paragraph structure were not read"
-                        .into(),
+                     take too long; its tables and paragraph structure were not read",
                 );
             }
             if unresolved > 0 {
-                style_warnings.push(format!(
+                style_warnings.push(crate::options::DamageKind::Recovered, format!(
                     "{unresolved} sprmPHugePapx reference(s) point outside the Data stream, at \
                      an invalid PrcData, or exceed the expansion budget; those paragraphs lose their properties (table structure \
                      may be affected)"
@@ -525,7 +528,7 @@ impl DocDocument {
                 // headings fall back to the line heuristic, and the reason is
                 // reported as a warning rather than dropped.
                 let sheet = parse_style_sheet(&table_stream, &fib);
-                style_warnings.extend(sheet.warnings);
+                style_warnings.push_all(crate::options::DamageKind::Recovered, sheet.warnings);
                 let styles = sheet.styles;
                 build_paragraphs_symbols(
                     &word_doc,
@@ -556,7 +559,7 @@ impl DocDocument {
         // surface its identity — before this, `ObjectPool` was never
         // traversed at all, so an embedded Excel workbook, Equation
         // Editor object, etc. left no trace anywhere.
-        let mut embedded_warnings = Vec::new();
+        let mut embedded_warnings = crate::core::notice::Notices::new();
         let found_objects = super::ole_objects::extract_ole_objects_with_storage(&cfb);
         let ole_objects = read_embedded_word_texts(&mut cfb, found_objects, &mut embedded_warnings);
         let summary_properties = crate::cfb::read_document_properties(&mut cfb);
@@ -564,9 +567,9 @@ impl DocDocument {
         // lost content just as surely as a piece-table gap.
         let text_complete = text_complete && !hdd_cut && cfb.truncated_streams().is_empty();
         let mut warnings = container_warnings(&cfb);
-        warnings.extend(embedded_warnings);
-        warnings.extend(style_warnings);
-        warnings.extend(work_warnings);
+        warnings.append(embedded_warnings);
+        warnings.append(style_warnings);
+        warnings.append(work_warnings);
 
         Ok(Self {
             text,
@@ -649,18 +652,21 @@ impl DocDocument {
             )
         };
         let mut warnings = container_warnings(cfb);
-        warnings.extend(papx.warnings);
+        warnings.push_all(crate::options::DamageKind::Recovered, papx.warnings);
         if !super::fib::is_word_version(fib.n_fib) {
-            warnings.push(super::fib::damaged_version_warning(fib.n_fib, None));
+            warnings.push(
+                crate::options::DamageKind::Recovered,
+                super::fib::damaged_version_warning(fib.n_fib, None),
+            );
         }
         if budget_cut {
-            warnings.push(text_budget.notice());
+            warnings.push(crate::options::DamageKind::Truncated, text_budget.notice());
         }
         if overlapping {
             warnings.push(
+                crate::options::DamageKind::Recovered,
                 "the pieces of this Word 6/95 file are laid out so that reading its paragraphs \
-                 would take too long; its tables and paragraph structure were not read"
-                    .into(),
+                 would take too long; its tables and paragraph structure were not read",
             );
         }
         Ok(Self {
@@ -730,7 +736,7 @@ impl DocDocument {
             text_budget: crate::limits::TextBudget::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
         })
     }
 
@@ -743,6 +749,11 @@ impl DocDocument {
     /// Structural problems the reader worked around rather than failing
     /// on; see `Metadata::warnings`.
     pub fn warnings(&self) -> &[String] {
+        self.warnings.texts()
+    }
+
+    /// [`Self::warnings`] with the kind of each.
+    pub(crate) fn notices(&self) -> &crate::core::notice::Notices {
         &self.warnings
     }
 
@@ -754,7 +765,7 @@ impl DocDocument {
     /// Warnings about pictures left out because of a limit, if any; see
     /// `Metadata::warnings`. Pictures are decoded on first use, so this
     /// decodes them if nothing has yet.
-    pub(crate) fn image_warnings(&self) -> Vec<String> {
+    pub(crate) fn image_warnings(&self) -> crate::core::notice::Notices {
         self.decoded_images().1.warnings()
     }
 
@@ -971,7 +982,7 @@ const PIECE_TABLE_OUT_OF_ORDER: &str = "the piece table's character positions ar
 fn read_embedded_word_texts<R: Read + Seek>(
     cfb: &mut CfbReader<R>,
     found: Vec<(super::ole_objects::EmbeddedOleObject, usize)>,
-    warnings: &mut Vec<String>,
+    warnings: &mut crate::core::notice::Notices,
 ) -> Vec<super::ole_objects::EmbeddedOleObject> {
     use crate::core::embedded;
     let mut session = embedded::Session::begin();
@@ -984,7 +995,7 @@ fn read_embedded_word_texts<R: Read + Seek>(
             .borrow_mut()
             .push(format!("embedded object {name} was not read: {why}"));
     });
-    warnings.extend(refused.into_inner());
+    warnings.push_all(crate::options::DamageKind::Recovered, refused.into_inner());
     out
 }
 
@@ -997,7 +1008,7 @@ fn read_embedded_objects<R: Read + Seek>(
     session: &crate::core::embedded::Session,
     walk: &mut super::ole_objects::ObjectWalk,
     prefix: &str,
-    warnings: &mut Vec<String>,
+    warnings: &mut crate::core::notice::Notices,
     out: &mut Vec<super::ole_objects::EmbeddedOleObject>,
 ) {
     for (mut object, storage) in found {
@@ -1036,7 +1047,7 @@ fn embedded_word_text<R: Read + Seek>(
     storage: usize,
     session: &crate::core::embedded::Session,
     name: &str,
-    warnings: &mut Vec<String>,
+    warnings: &mut crate::core::notice::Notices,
 ) -> (Option<String>, Option<crate::core::embedded::Admission>) {
     use super::ole_objects::find_direct_child;
     use crate::cfb::EntryType;
@@ -1072,12 +1083,16 @@ fn embedded_word_text<R: Read + Seek>(
     let EmbeddedRead { text, notes } = match read {
         Ok(read) => read,
         Err(why) => {
-            warnings.push(format!("embedded object {name} was not read: {why}"));
+            warnings.push(
+                crate::options::DamageKind::Recovered,
+                format!("embedded object {name} was not read: {why}"),
+            );
             return (None, Some(admission));
         },
     };
     for note in notes {
-        warnings.push(format!("embedded object {name}: {note}"));
+        warnings
+            .push(crate::options::DamageKind::Recovered, format!("embedded object {name}: {note}"));
     }
     // Two embedded documents are the same when their text is: the
     // `WordDocument` stream alone does not say (the piece table, fonts and
@@ -1223,9 +1238,11 @@ fn has_vba_project<R: Read + Seek>(cfb: &CfbReader<R>) -> bool {
 
 /// The container's own structural warnings plus one line per stream that
 /// was read short.
-fn container_warnings<R: Read + Seek>(cfb: &CfbReader<R>) -> Vec<String> {
-    let mut out = cfb.warnings().to_vec();
-    out.extend(
+fn container_warnings<R: Read + Seek>(cfb: &CfbReader<R>) -> crate::core::notice::Notices {
+    let mut out = cfb.notices().clone();
+    // A stream read short lost whatever followed the cut.
+    out.push_all(
+        crate::options::DamageKind::Truncated,
         cfb.truncated_streams()
             .iter()
             .map(|name| format!("stream {name:?} is shorter than its declared size")),
@@ -1587,13 +1604,14 @@ fn parse_comments(
     fc_ref: u32,
     lcb_ref: u32,
     authors: &[String],
-    warnings: &mut Vec<String>,
+    warnings: &mut crate::core::notice::Notices,
 ) -> Vec<ParsedComment> {
     let bodies = match parse_plcf_and_txt_ranges(table_stream, raw_comment_text, fc_txt, lcb_txt) {
         Ok(Some(bodies)) => bodies,
         Ok(None) => return Vec::new(),
         Err(()) => {
             warnings.push(
+                crate::options::DamageKind::Recovered,
                 "comments are not split: the comment text boundaries (PlcfandTxt) run backwards,                  so the comments are shown as one block"
                     .to_string(),
             );
@@ -1760,7 +1778,7 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             header_footers: Vec::new(),
             text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
@@ -1803,7 +1821,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             text: "Body".into(),
             paragraphs: Vec::new(),
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
         };
         let ir = crate::convert_doc::doc_to_ir(&doc);
         assert!(ir.metadata.text_truncated);
@@ -1839,7 +1857,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             text: "Body".into(),
             paragraphs: Vec::new(),
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
         };
         let text = doc.plain_text();
         assert_eq!(text, "Body\n[Embedded Equation Editor/MathType Object]\n");
@@ -1867,7 +1885,7 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             header_footers: Vec::new(),
             text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
@@ -1892,7 +1910,7 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             header_footers: Vec::new(),
             text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
@@ -1923,7 +1941,7 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             header_footers: Vec::new(),
             text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
@@ -1954,7 +1972,7 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             header_footers: Vec::new(),
             text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
@@ -1981,7 +1999,7 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             header_footers: Vec::new(),
             text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
@@ -2016,7 +2034,7 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             header_footers: Vec::new(),
             text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
@@ -2039,7 +2057,7 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
-            warnings: Vec::new(),
+            warnings: crate::core::notice::Notices::new(),
             header_footers: Vec::new(),
             text_budget: crate::limits::TextBudget::new(),
             data_stream: Vec::new(),
@@ -2784,7 +2802,7 @@ mod tests {
             and_ref_fc,
             and_ref.len() as u32,
             &authors,
-            &mut Vec::new(),
+            &mut crate::core::notice::Notices::new(),
         );
 
         assert_eq!(comments.len(), 2, "expected 2 split comments: {comments:?}");
@@ -2820,7 +2838,7 @@ mod tests {
             and_txt.len() as u32,
             and_ref.len() as u32,
             &[],
-            &mut Vec::new(),
+            &mut crate::core::notice::Notices::new(),
         );
         assert!(comments.is_empty(), "count mismatch must fall back to empty: {comments:?}");
     }

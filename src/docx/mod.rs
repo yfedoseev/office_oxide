@@ -145,7 +145,20 @@ pub struct DocxDocument {
     /// IR converter populate `Image::data` so downstream renderers
     /// (the positional PDF reader, plain-text export with alt-text,
     /// etc.) can place actual bitmap content.
+    ///
+    /// Empty when the document was read with
+    /// [`read_options::lazy_pictures`](crate::read_options::lazy_pictures)
+    /// on; [`Self::picture`] and [`Self::pictures`] give the pictures either
+    /// way.
+    #[deprecated(
+        since = "0.1.17",
+        note = "use DocxDocument::picture / pictures, which also work when pictures are read lazily; removed in 0.2.0"
+    )]
     pub images: std::collections::HashMap<String, (std::sync::Arc<[u8]>, Option<String>)>,
+    /// The pictures, keyed as `images` is, with the lower-cased extension of
+    /// each part.
+    pub(crate) pictures:
+        std::collections::HashMap<String, (crate::core::picture::PictureBytes, Option<String>)>,
     /// Parsed `docProps/core.xml`. `None` when the package carries no
     /// core-properties part.
     pub core_properties: Option<crate::core::properties::CoreProperties>,
@@ -182,6 +195,28 @@ pub struct NoteBody {
 }
 
 impl DocxDocument {
+    /// The picture the relationship `rel_id` names (`rIdN` in the main
+    /// document, `<part>:rIdN` in a header, footer or note), with the
+    /// lower-cased extension of its part. Works whether or not pictures are
+    /// read lazily.
+    pub fn picture(
+        &self,
+        rel_id: &str,
+    ) -> Option<(&crate::core::picture::PictureBytes, Option<&str>)> {
+        self.pictures
+            .get(rel_id)
+            .map(|(pic, ext)| (pic, ext.as_deref()))
+    }
+
+    /// Every picture, by the key [`Self::picture`] takes.
+    pub fn pictures(
+        &self,
+    ) -> impl Iterator<Item = (&str, &crate::core::picture::PictureBytes, Option<&str>)> {
+        self.pictures
+            .iter()
+            .map(|(k, (pic, ext))| (k.as_str(), pic, ext.as_deref()))
+    }
+
     /// Open a DOCX file from a file path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let bytes = std::fs::metadata(path.as_ref()).map_or(0, |m| m.len());
@@ -239,6 +274,9 @@ impl DocxDocument {
         Self::from_opc(opc)
     }
 
+    // The reader fills the deprecated eager `images` map for callers that
+    // still read it.
+    #[allow(deprecated)]
     fn from_opc<R: Read + Seek>(mut opc: OpcReader<R>) -> Result<Self> {
         debug!("DocxDocument: parsing started");
         // Refuse a package whose primary part is not WordprocessingML — an
@@ -549,7 +587,7 @@ impl DocxDocument {
         // `<part>:<rId>` — see `qualify_part_images`.
         let mut part_images: std::collections::HashMap<
             String,
-            (std::sync::Arc<[u8]>, Option<String>),
+            (crate::core::picture::PictureBytes, Option<String>),
         > = std::collections::HashMap::new();
         let mut headers_footers: Vec<HeaderFooter> = Vec::new();
         // A header or footer part is parsed and stored once per (part,
@@ -789,8 +827,10 @@ impl DocxDocument {
         // relationships. We capture the raw bytes plus the lower-cased
         // file extension so downstream code can decide on the format
         // without re-sniffing magic bytes.
-        let mut images: std::collections::HashMap<String, (std::sync::Arc<[u8]>, Option<String>)> =
-            std::collections::HashMap::new();
+        let mut pictures: std::collections::HashMap<
+            String,
+            (crate::core::picture::PictureBytes, Option<String>),
+        > = std::collections::HashMap::new();
         for rel in doc_rels.get_by_type(rel_types::IMAGE) {
             if rel.target_mode != TargetMode::Internal {
                 continue;
@@ -816,16 +856,26 @@ impl DocxDocument {
                 .rsplit('.')
                 .next()
                 .map(|s| s.to_lowercase());
-            images.insert(rel.id.clone(), (data, ext));
+            pictures.insert(rel.id.clone(), (data, ext));
         }
-        images.extend(part_images);
+        pictures.extend(part_images);
+        // The eager map the public field has always held, sharing each
+        // picture's bytes; left empty when pictures are held lazily.
+        let images = if crate::read_options::lazy_pictures() {
+            std::collections::HashMap::new()
+        } else {
+            pictures
+                .iter()
+                .filter_map(|(k, (pic, ext))| Some((k.clone(), (pic.bytes()?, ext.clone()))))
+                .collect()
+        };
 
         debug!(
             "DocxDocument: {} block elements, {} sections, {} embedded fonts, {} images",
             body.elements.len(),
             sections.len(),
             embedded_fonts.len(),
-            images.len()
+            pictures.len()
         );
         package_properties.crc_mismatched_parts = opc.crc_mismatched_parts();
         // Private-use text in a symbol-font run, now that the styles are known.
@@ -843,6 +893,7 @@ impl DocxDocument {
         let (unreadable_parts, unreadable_parts_omitted, cosmetic_parts) =
             unreadable_parts.into_inner().finish_with_cosmetic();
         Ok(DocxDocument {
+            pictures,
             input_bytes: 0,
             body,
             styles,
@@ -2522,7 +2573,10 @@ fn qualify_part_images<R: Read + Seek>(
     part: &crate::core::opc::PartName,
     rels: &crate::core::relationships::Relationships,
     opc: &mut OpcReader<R>,
-    images: &mut std::collections::HashMap<String, (std::sync::Arc<[u8]>, Option<String>)>,
+    images: &mut std::collections::HashMap<
+        String,
+        (crate::core::picture::PictureBytes, Option<String>),
+    >,
     read: &mut ImageParts,
     skip: &dyn Fn(&str, &dyn std::fmt::Display),
 ) {
@@ -2561,8 +2615,10 @@ fn qualify_part_images<R: Read + Seek>(
 /// Image parts already read, by part name (compared as a zip lookup is, without
 /// regard to case): the bytes, or `None` when the part
 /// could not be read.
-type ImageParts =
-    std::collections::HashMap<crate::core::opc::PartName, Option<std::sync::Arc<[u8]>>>;
+type ImageParts = std::collections::HashMap<
+    crate::core::opc::PartName,
+    Option<crate::core::picture::PictureBytes>,
+>;
 
 /// The bytes of the image part `part`, read once however many relationships
 /// name it. A part that cannot be read is reported once and not tried again.
@@ -2571,12 +2627,12 @@ fn read_image_part<R: Read + Seek>(
     opc: &mut OpcReader<R>,
     read: &mut ImageParts,
     skip: &dyn Fn(&str, &dyn std::fmt::Display),
-) -> Option<std::sync::Arc<[u8]>> {
+) -> Option<crate::core::picture::PictureBytes> {
     if let Some(found) = read.get(part) {
         return found.clone();
     }
-    let data: Option<std::sync::Arc<[u8]>> = match opc.read_part(part) {
-        Ok(data) => Some(data.into()),
+    let data: Option<crate::core::picture::PictureBytes> = match opc.read_picture(part) {
+        Ok(data) => Some(data),
         Err(e) => {
             skip(part.as_str(), &e);
             None

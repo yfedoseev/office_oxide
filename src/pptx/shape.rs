@@ -50,6 +50,15 @@ pub struct PictureShape {
     /// Raw image bytes resolved via `embed_rid`, if the slide carried a
     /// resolvable IMAGE relationship at parse time. Shared (`Arc`): every
     /// picture that embeds one media part holds the same bytes.
+    ///
+    /// `None` when the deck was read with
+    /// [`read_options::lazy_pictures`](crate::read_options::lazy_pictures)
+    /// on; [`PptxDocument::slide_picture`](super::PptxDocument::slide_picture)
+    /// gives the picture either way.
+    #[deprecated(
+        since = "0.1.17",
+        note = "use PptxDocument::slide_picture, which also works when pictures are read lazily; removed in 0.2.0"
+    )]
     pub data: Option<std::sync::Arc<[u8]>>,
     /// Image format inferred from the relationship target extension or
     /// byte signature (e.g. `"png"`, `"jpeg"`, `"gif"`, `"emf"`).

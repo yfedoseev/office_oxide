@@ -72,6 +72,9 @@ pub struct XlsxDocument {
     /// The size of the file this document was read from (0 when unknown): small
     /// inputs get a text budget scaled to them (see [`crate::limits`]).
     pub(crate) input_bytes: u64,
+    /// The pictures, when read lazily, by the token their
+    /// `WorksheetPicture::data` holds (see [`Self::picture`]).
+    pub(crate) lazy_pictures: LazyPictures,
     /// Workbook-level metadata (name, sheets list, date system).
     pub workbook: WorkbookInfo,
     /// Parsed worksheets in sheet-order.
@@ -149,6 +152,19 @@ pub struct XlsxDocument {
 }
 
 impl XlsxDocument {
+    /// The bytes of `pic`, one of this workbook's pictures (`Worksheet::images`
+    /// or `cell_images`): shared, whether or not pictures are read lazily
+    /// (when they are, `pic.data` is empty).
+    // Reads or fills the eager picture field kept for 0.1.x callers.
+    #[allow(deprecated)]
+    pub fn picture(&self, pic: &worksheet::WorksheetPicture) -> crate::core::picture::PictureBytes {
+        self.lazy_pictures
+            .get(&(pic.data.as_ptr() as usize))
+            .filter(|(token, _)| std::sync::Arc::ptr_eq(token, &pic.data))
+            .map(|(_, found)| found.clone())
+            .unwrap_or_else(|| pic.data.clone().into())
+    }
+
     /// Parse and cache styles on demand. Returns the stylesheet if available.
     pub fn ensure_styles(&mut self) -> Option<&StyleSheet> {
         if self.styles.is_none() {
@@ -403,8 +419,16 @@ impl XlsxDocument {
             text_shapes: std::sync::Arc<[crate::xlsx::worksheet::WorksheetTextShape]>,
             comments: std::sync::Arc<[crate::xlsx::worksheet::SheetComment]>,
             comments_truncated: bool,
+            /// The sheet already parsed, when its part was large enough to
+            /// be read and parsed a piece at a time (`data` is then empty).
+            streamed: Option<(Worksheet, shared_formula::SharedFormulas)>,
         }
         let mut bundles = Vec::with_capacity(workbook.sheets.len());
+        // Sheets bundled so far, and how many of them are worksheets, for the
+        // conventional part names guessed below: `bundles` is emptied each
+        // time a batch is parsed, so it cannot count them.
+        let mut bundled = 0usize;
+        let mut worksheets_bundled = 0usize;
         // Pivot cache records materialised for sources outside the
         // workbook share one text budget, like every other cell text.
         let mut pivot_budget = crate::limits::TextBudget::new();
@@ -419,6 +443,93 @@ impl XlsxDocument {
         // content, not repeated among the embedded charts'.
         let mut chartsheet_charts: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // Phase 2, run on each batch of sheets as phase 1 gathers it: parse
+        // the worksheets (in parallel when the feature is enabled). A sheet
+        // whose part does not parse is recorded, not fatal. The
+        // shared-formula followers are written afterwards, in sheet order,
+        // against one document-wide budget.
+        let parse_bundle = |b: SheetBundle| -> Result<
+            std::result::Result<(Worksheet, shared_formula::SharedFormulas), (String, String)>,
+        > {
+            let name = b.name.clone();
+            if matches!(b.kind, crate::ir::SheetKind::Chart | crate::ir::SheetKind::Dialog) {
+                let mut ws = Worksheet::without_cells(b.name, b.kind);
+                ws.state = b.state;
+                ws.chart_text = b.chart_text;
+                return Ok(Ok((ws, shared_formula::SharedFormulas::default())));
+            }
+            // A sheet cut off between tags reaches end-of-file without an
+            // XML error and would read as complete: check the root closed.
+            // (an Excel 4.0 macro sheet's root is `macrosheet`)
+            let root = if b.kind == crate::ir::SheetKind::Macro {
+                "macrosheet"
+            } else {
+                "worksheet"
+            };
+            let whole = match b.streamed {
+                Some(done) => Ok(done),
+                None => crate::core::xml::check_root_closed(&b.data, &b.name, root)
+                    .and_then(|()| Worksheet::parse_unresolved(&b.data, b.name.clone(), &b.rels)),
+            };
+            let parsed = match whole {
+                Ok(done) => Ok((done, None)),
+                // Malformed XML part-way through: the rows before the damage
+                // parsed fine, so they are kept and the loss is said. A sheet
+                // with no complete row, or whose error is not XML damage,
+                // stays unreadable.
+                Err(e) => match worksheet::salvage_prefix(&b.data) {
+                    Some((prefix, rows)) => {
+                        match Worksheet::parse_unresolved(&prefix, b.name.clone(), &b.rels) {
+                            Ok(done) => Ok((
+                                done,
+                                Some(format!(
+                                    "its XML is malformed ({e}); the {rows} complete row(s) before \
+                                     the damage were read and everything after them was not"
+                                )),
+                            )),
+                            Err(_) => Err(e),
+                        }
+                    },
+                    None => Err(e),
+                },
+            };
+            match parsed {
+                Ok(((mut ws, shared), damage)) => {
+                    ws.kind = b.kind;
+                    ws.state = b.state;
+                    ws.tables = b.tables;
+                    ws.pivot_tables = b.pivot_tables;
+                    ws.images = b.images;
+                    ws.text_shapes = b.text_shapes;
+                    ws.comments = b.comments;
+                    ws.comments_truncated = b.comments_truncated;
+                    ws.damage = damage;
+                    Ok(Ok((ws, shared)))
+                },
+                Err(e) => {
+                    log::warn!("xlsx: sheet {name:?} is unreadable and skipped: {e}");
+                    Ok(Err((name, e.to_string())))
+                },
+            }
+        };
+        // Sheets are read and parsed in batches of at most this much raw XML
+        // (and at least one sheet), each batch's XML dropped before the next
+        // is read: reading every sheet before parsing any held the XML of
+        // the whole workbook at once.
+        const BATCH_XML_BYTES: usize = 32 << 20;
+        type ParsedSheet =
+            std::result::Result<(Worksheet, shared_formula::SharedFormulas), (String, String)>;
+        let mut parsed: Vec<ParsedSheet> = Vec::with_capacity(workbook.sheets.len());
+        let mut batch_bytes = 0usize;
+        let flush = |bundles: &mut Vec<SheetBundle>,
+                     batch_bytes: &mut usize,
+                     parsed: &mut Vec<ParsedSheet>|
+         -> Result<()> {
+            *batch_bytes = 0;
+            parsed
+                .extend(crate::core::parallel::map_collect(std::mem::take(bundles), parse_bundle)?);
+            Ok(())
+        };
         for sheet in &workbook.sheets {
             // Skip sheets with empty r:id (virtual sheets, VBA modules, etc.)
             if sheet.rel_id.is_empty() {
@@ -440,7 +551,7 @@ impl XlsxDocument {
                 resolve_relative_zip_path("xl/workbook.xml", &rel.target)
             } else {
                 // Fallback: guess by index
-                let idx = bundles.len() + 1;
+                let idx = bundled + 1;
                 format!("xl/worksheets/sheet{}.xml", idx)
             };
 
@@ -464,6 +575,7 @@ impl XlsxDocument {
                 } else {
                     Vec::new()
                 };
+                bundled += 1;
                 bundles.push(SheetBundle {
                     name: sheet.name.clone(),
                     state: sheet.state,
@@ -477,6 +589,7 @@ impl XlsxDocument {
                     text_shapes: std::sync::Arc::from([]),
                     comments: std::sync::Arc::from([]),
                     comments_truncated: false,
+                    streamed: None,
                 });
                 continue;
             }
@@ -486,28 +599,62 @@ impl XlsxDocument {
             // cannot be read is that sheet's error, never a cue to read a
             // different sheet's cells under this sheet's name. Only a
             // worksheet has a conventional name to fall back to.
-            let read = match Self::read_xml_entry(&mut archive, &entries, &sheet_path) {
-                Err(crate::core::Error::MissingPart(_))
-                    if kind == crate::ir::SheetKind::Worksheet =>
-                {
-                    let idx = bundles
-                        .iter()
-                        .filter(|b| b.kind == crate::ir::SheetKind::Worksheet)
-                        .count()
-                        + 1;
-                    let alt = format!("xl/worksheets/sheet{}.xml", idx);
-                    // The fallback part is a sheet's content like any other.
-                    sheet_parts
-                        .claim(&entries, &alt, &sheet.name)
-                        .and_then(|()| {
-                            Self::read_xml_entry(&mut archive, &entries, &alt)
-                                .map_err(|_| format!("worksheet part {sheet_path} not found"))
-                        })
-                },
-                Err(crate::core::Error::MissingPart(_)) => {
-                    Err(format!("sheet part {sheet_path} not found"))
-                },
-                other => other.map_err(|e| format!("worksheet part {sheet_path}: {e}")),
+            // A very large part is parsed as it is inflated, so its XML is
+            // never held whole; anything that part cannot be read that way
+            // is read whole below, as before. The parser needs the sheet's
+            // relationships (for its hyperlinks), so they are read first.
+            let root = if kind == crate::ir::SheetKind::Macro {
+                "macrosheet"
+            } else {
+                "worksheet"
+            };
+            let mut early_rels = None;
+            let mut streamed = None;
+            if matches!(kind, crate::ir::SheetKind::Worksheet | crate::ir::SheetKind::Macro)
+                && opc::entry_size(&mut archive, &entries, &sheet_path)
+                    .is_some_and(|n| n >= worksheet::STREAMED_SHEET_BYTES)
+            {
+                // Read before the sheet here, but reported only once the
+                // sheet proves readable, as when it is read after it.
+                let mut scratch = shared_parts::ReportList::default();
+                let rels = read_rels_reporting(
+                    &mut archive,
+                    &entries,
+                    &sheet_rels_path(&sheet_path),
+                    &mut scratch,
+                );
+                streamed = worksheet::parse_streamed(
+                    &mut archive,
+                    &entries,
+                    &sheet_path,
+                    sheet.name.clone(),
+                    &rels,
+                    root,
+                );
+                early_rels = scratch.first().is_none().then_some(rels);
+            }
+            let read = if streamed.is_some() {
+                Ok(Vec::new())
+            } else {
+                match Self::read_xml_entry(&mut archive, &entries, &sheet_path) {
+                    Err(crate::core::Error::MissingPart(_))
+                        if kind == crate::ir::SheetKind::Worksheet =>
+                    {
+                        let idx = worksheets_bundled + 1;
+                        let alt = format!("xl/worksheets/sheet{}.xml", idx);
+                        // The fallback part is a sheet's content like any other.
+                        sheet_parts
+                            .claim(&entries, &alt, &sheet.name)
+                            .and_then(|()| {
+                                Self::read_xml_entry(&mut archive, &entries, &alt)
+                                    .map_err(|_| format!("worksheet part {sheet_path} not found"))
+                            })
+                    },
+                    Err(crate::core::Error::MissingPart(_)) => {
+                        Err(format!("sheet part {sheet_path} not found"))
+                    },
+                    other => other.map_err(|e| format!("worksheet part {sheet_path}: {e}")),
+                }
             };
             let ws_data = match read {
                 Ok(data) => data,
@@ -521,9 +668,14 @@ impl XlsxDocument {
             };
 
             // Read worksheet relationships (for hyperlinks)
-            let rels_path = sheet_rels_path(&sheet_path);
-            let ws_rels =
-                read_rels_reporting(&mut archive, &entries, &rels_path, &mut shared.unreadable);
+            let ws_rels = early_rels.unwrap_or_else(|| {
+                read_rels_reporting(
+                    &mut archive,
+                    &entries,
+                    &sheet_rels_path(&sheet_path),
+                    &mut shared.unreadable,
+                )
+            });
 
             // Resolve the worksheet's DRAWING rel up-front (Phase 1
             // has access to &mut archive). Each entry decodes
@@ -561,6 +713,10 @@ impl XlsxDocument {
                 &mut pivot_budget,
             );
 
+            bundled += 1;
+            if kind == crate::ir::SheetKind::Worksheet {
+                worksheets_bundled += 1;
+            }
             bundles.push(SheetBundle {
                 name: sheet.name.clone(),
                 state: sheet.state,
@@ -574,77 +730,14 @@ impl XlsxDocument {
                 text_shapes,
                 comments,
                 comments_truncated,
+                streamed,
             });
+            batch_bytes = batch_bytes.saturating_add(bundles.last().map_or(0, |b| b.data.len()));
+            if batch_bytes >= BATCH_XML_BYTES {
+                flush(&mut bundles, &mut batch_bytes, &mut parsed)?;
+            }
         }
-
-        // Phase 2: parse worksheets (parallel when feature enabled). A
-        // sheet whose part does not parse is recorded, not fatal. The
-        // shared-formula followers are written afterwards, in sheet order,
-        // against one document-wide budget.
-        let parsed = crate::core::parallel::map_collect(
-            bundles,
-            |b| -> Result<
-                std::result::Result<(Worksheet, shared_formula::SharedFormulas), (String, String)>,
-            > {
-                let name = b.name.clone();
-                if matches!(b.kind, crate::ir::SheetKind::Chart | crate::ir::SheetKind::Dialog) {
-                    let mut ws = Worksheet::without_cells(b.name, b.kind);
-                    ws.state = b.state;
-                    ws.chart_text = b.chart_text;
-                    return Ok(Ok((ws, shared_formula::SharedFormulas::default())));
-                }
-                // A sheet cut off between tags reaches end-of-file without an
-                // XML error and would read as complete: check the root closed.
-                // (an Excel 4.0 macro sheet's root is `macrosheet`)
-                let root = if b.kind == crate::ir::SheetKind::Macro {
-                    "macrosheet"
-                } else {
-                    "worksheet"
-                };
-                let whole = crate::core::xml::check_root_closed(&b.data, &b.name, root)
-                    .and_then(|()| Worksheet::parse_unresolved(&b.data, b.name.clone(), &b.rels));
-                let parsed = match whole {
-                    Ok(done) => Ok((done, None)),
-                    // Malformed XML part-way through: the rows before the damage
-                    // parsed fine, so they are kept and the loss is said. A sheet
-                    // with no complete row, or whose error is not XML damage,
-                    // stays unreadable.
-                    Err(e) => match worksheet::salvage_prefix(&b.data) {
-                        Some((prefix, rows)) => {
-                            match Worksheet::parse_unresolved(&prefix, b.name.clone(), &b.rels) {
-                                Ok(done) => Ok((
-                                    done,
-                                    Some(format!(
-                                        "its XML is malformed ({e}); the {rows} complete row(s) before \
-                                         the damage were read and everything after them was not"
-                                    )),
-                                )),
-                                Err(_) => Err(e),
-                            }
-                        },
-                        None => Err(e),
-                    },
-                };
-                match parsed {
-                    Ok(((mut ws, shared), damage)) => {
-                        ws.kind = b.kind;
-                        ws.state = b.state;
-                        ws.tables = b.tables;
-                        ws.pivot_tables = b.pivot_tables;
-                        ws.images = b.images;
-                        ws.text_shapes = b.text_shapes;
-                        ws.comments = b.comments;
-                        ws.comments_truncated = b.comments_truncated;
-                        ws.damage = damage;
-                        Ok(Ok((ws, shared)))
-                    },
-                    Err(e) => {
-                        log::warn!("xlsx: sheet {name:?} is unreadable and skipped: {e}");
-                        Ok(Err((name, e.to_string())))
-                    },
-                }
-            },
-        )?;
+        flush(&mut bundles, &mut batch_bytes, &mut parsed)?;
         let mut worksheets = Vec::with_capacity(parsed.len());
         let mut formula_budget = crate::limits::TextBudget::new();
         for p in parsed {
@@ -773,7 +866,9 @@ impl XlsxDocument {
         let (unreadable_sheets, unreadable_sheets_omitted, _) = unreadable_sheets.finish();
         let (unreadable_parts, unreadable_parts_omitted, cosmetic_parts) =
             shared.unreadable.finish();
+        let lazy_pictures = lazy_pictures_of(&media);
         Ok(XlsxDocument {
+            lazy_pictures,
             input_bytes: 0,
             workbook,
             worksheets,
@@ -1435,7 +1530,33 @@ fn part_key(entries: &opc::ZipEntryIndex, path: &str) -> String {
 /// Media parts already read, by part name. A picture's bytes are shared by
 /// every anchor and rich value that names the part, where each used to get a
 /// copy (and a decompression) of its own.
-type MediaCache = std::collections::HashMap<String, Option<std::sync::Arc<[u8]>>>;
+///
+/// Each entry is the picture and what a `WorksheetPicture::data` that draws
+/// it holds: the bytes, or, when pictures are read lazily, an empty token
+/// whose allocation names the picture (see `XlsxDocument::picture`).
+type MediaCache = std::collections::HashMap<
+    String,
+    Option<(crate::core::picture::PictureBytes, std::sync::Arc<[u8]>)>,
+>;
+
+/// The pictures of a workbook read lazily, by the address of the token a
+/// `WorksheetPicture::data` holds in their place. The token is kept here
+/// too, so its address cannot be reused for another allocation while the
+/// workbook lives, whatever a caller does with its pictures.
+pub(crate) type LazyPictures =
+    std::collections::HashMap<usize, (std::sync::Arc<[u8]>, crate::core::picture::PictureBytes)>;
+
+/// The table [`LazyPictures`] for the pictures `cache` read.
+fn lazy_pictures_of(cache: &MediaCache) -> LazyPictures {
+    if !crate::read_options::lazy_pictures() {
+        return LazyPictures::new();
+    }
+    cache
+        .values()
+        .flatten()
+        .map(|(pic, token)| (token.as_ptr() as usize, (token.clone(), pic.clone())))
+        .collect()
+}
 
 fn read_media_cached<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
@@ -1443,15 +1564,24 @@ fn read_media_cached<R: Read + Seek>(
     path: &str,
     cache: &mut MediaCache,
     unreadable: &mut shared_parts::ReportList,
-) -> Option<std::sync::Arc<[u8]>> {
+) -> Option<(crate::core::picture::PictureBytes, std::sync::Arc<[u8]>)> {
     let key = part_key(entries, path);
     if let Some(hit) = cache.get(&key) {
         return hit.clone();
     }
     // A part that cannot be read is remembered, and reported once: each
     // anchor naming it would otherwise inflate it again.
-    let bytes: Option<std::sync::Arc<[u8]>> = match opc::read_zip_entry(archive, entries, path) {
-        Ok(bytes) => Some(bytes.into()),
+    let bytes = match opc::read_zip_picture(archive, entries, path) {
+        Ok(pic) => {
+            // Held lazily, the picture's anchors hold a token of their own
+            // allocation, never a copy of the bytes.
+            let held: std::sync::Arc<[u8]> = if crate::read_options::lazy_pictures() {
+                std::sync::Arc::from(Vec::new())
+            } else {
+                pic.bytes()?
+            };
+            Some((pic, held))
+        },
         Err(e) => {
             log::warn!("xlsx: picture part {path} unreadable: {e}");
             unreadable.record(entries, path, &e.to_string());
@@ -1512,6 +1642,8 @@ fn read_optional_cosmetic<R: Read + Seek>(
 /// `richValueRel.xml` (+ its own `.rels`) -> `xl/media/*`. Any missing or
 /// malformed part along the way yields an empty map — this is a
 /// best-effort recovery, not a hard requirement for opening the file.
+// Reads or fills the eager picture field kept for 0.1.x callers.
+#[allow(deprecated)]
 fn read_rich_value_images<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &opc::ZipEntryIndex,
@@ -1582,7 +1714,8 @@ fn read_rich_value_images<R: Read + Seek>(
             continue;
         };
         let media_path = resolve_relative_zip_path(rel_path, &rel.target);
-        let Some(bytes) = read_media_cached(archive, entries, &media_path, media, unreadable)
+        let Some((pic, bytes)) =
+            read_media_cached(archive, entries, &media_path, media, unreadable)
         else {
             continue;
         };
@@ -1590,7 +1723,11 @@ fn read_rich_value_images<R: Read + Seek>(
             .extension()
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_else(|| guess_image_format_from_bytes(&bytes).to_string());
+            .unwrap_or_else(|| {
+                pic.bytes()
+                    .map_or("png", |b| guess_image_format_from_bytes(&b))
+                    .to_string()
+            });
 
         // No anchor coordinates exist for an in-cell rich value — it has
         // no `<xdr:from>`/`<xdr:to>` at all, unlike a drawing-anchored
@@ -2876,6 +3013,8 @@ mod tests {
     /// empty-cell path parsed and then dropped the `vm`, so such a cell's
     /// rich-value image was lost.
     #[test]
+    // Reads or fills the eager picture field kept for 0.1.x callers.
+    #[allow(deprecated)]
     fn test_a_self_closing_vm_cell_keeps_its_value_metadata_link() {
         let doc = open_bytes(rich_value_image_package(r#"<c r="B2" vm="1"/>"#));
         let ws = &doc.worksheets[0];
@@ -2894,6 +3033,8 @@ mod tests {
     /// fixture mirrors the exact shape of the real-corpus reproducer
     /// (`phpspreadsheet_drawing_in_cell.xlsx`) byte for byte.
     #[test]
+    // Reads or fills the eager picture field kept for 0.1.x callers.
+    #[allow(deprecated)]
     fn test_a_rich_value_image_cell_resolves_to_a_real_image_not_a_value_error() {
         let doc =
             open_bytes(rich_value_image_package(r#"<c r="B2" t="e" vm="1"><v>#VALUE!</v></c>"#));

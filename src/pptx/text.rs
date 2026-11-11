@@ -6,24 +6,37 @@ use super::shape::{
 impl PptxDocument {
     /// What was lost to the parts that could not be read, one warning for
     /// each part listed and one for the rest, as `Metadata::warnings` lists
-    /// them and as every rendering writes them. Empty when every part read.
-    pub(crate) fn unreadable_warnings(&self) -> Vec<String> {
-        self.unreadable_parts
-            .iter()
-            .chain(self.cosmetic_parts.iter())
-            .map(|(part, err)| format!("skipped unreadable part {part}: {err}"))
-            .chain(
-                (self.unreadable_parts_omitted > 0).then(|| {
-                    crate::core::unreadable::omitted_warning(self.unreadable_parts_omitted)
-                }),
-            )
-            .collect()
+    /// them and as every rendering writes them, with the kind of each: a
+    /// part that held text is an unreadable part, one that holds none (a
+    /// theme, a font) a repair, and the parts left out of the list a cut.
+    /// Empty when every part read.
+    pub(crate) fn unreadable_notices(&self) -> crate::core::notice::Notices {
+        let mut out = crate::core::notice::Notices::new();
+        for (part, err) in &self.unreadable_parts {
+            out.push(
+                crate::options::DamageKind::UnreadablePart,
+                format!("skipped unreadable part {part}: {err}"),
+            );
+        }
+        for (part, err) in &self.cosmetic_parts {
+            out.push(
+                crate::options::DamageKind::Recovered,
+                format!("skipped unreadable part {part}: {err}"),
+            );
+        }
+        if self.unreadable_parts_omitted > 0 {
+            out.push(
+                crate::options::DamageKind::Truncated,
+                crate::core::unreadable::omitted_warning(self.unreadable_parts_omitted),
+            );
+        }
+        out
     }
 
     /// The warnings for the unreadable parts that can change the text, and
     /// for the rest left out of the list: what every rendering writes in
     /// band. A part that holds no text (a theme, a font) is only in
-    /// [`Self::unreadable_warnings`].
+    /// [`Self::unreadable_notices`].
     pub(crate) fn unreadable_text_warnings(&self) -> Vec<String> {
         self.unreadable_parts
             .iter()
@@ -652,6 +665,8 @@ mod tests {
 
     fn make_doc(slides: Vec<Slide>) -> PptxDocument {
         PptxDocument {
+            slide_pictures: Vec::new(),
+            lazy_pictures: false,
             input_bytes: 0,
             core_properties: None,
             app_properties: None,

@@ -22,6 +22,25 @@ test('a limit in the options applies to that document only', () => {
   const plain = Document.fromBytes(bytes, 'xlsx');
   assert.ok(small.plainText().length < plain.plainText().length);
   small.close(); plain.close(); opts.close();
+  // The process-wide limit, which new options start from, is untouched.
+  const fresh = new ParseOptions();
+  assert.equal(fresh.limits().limits.text_chars, 256 * 2 ** 20);
+  fresh.close();
+});
+
+// Every option, as every binding names it.
+const OPTION_NAMES = [
+  'include_hidden_text', 'include_deleted_text', 'on_incomplete', 'lazy_pictures',
+  'package_entries', 'package_bytes', 'part_bytes', 'inflate_ratio',
+  'embedded_depth', 'embedded_packages', 'text_chars', 'memory_bytes',
+];
+
+test('the options name every option', () => {
+  assert.deepEqual([...ParseOptions.names()].sort(), [...OPTION_NAMES].sort());
+  for (const name of OPTION_NAMES) {
+    const opts = new ParseOptions({ [name]: name === 'on_incomplete' ? 'report' : 1 });
+    opts.close();
+  }
 });
 
 test('damage lists a cut and strict options refuse it with code 7', () => {
@@ -64,4 +83,71 @@ test('the CommonJS entry point exports ParseOptions too', () => {
   assert.equal(typeof cjs.ParseOptions, 'function');
   const opts = new cjs.ParseOptions({ text_chars: 10 });
   opts.close();
+});
+
+test('a limit is a number while a double holds it exactly, then a bigint', () => {
+  const opts = new ParseOptions({ memory_bytes: 2 ** 50, package_bytes: 2n ** 60n });
+  try {
+    const { limits } = opts.limits();
+    assert.equal(limits.memory_bytes, 2 ** 50);
+    assert.equal(limits.package_bytes, 2n ** 60n);
+  } finally {
+    opts.close();
+  }
+});
+
+test('the options report their limits and the bounds derived from them', () => {
+  const opts = new ParseOptions({ memory_bytes: 1000, part_bytes: Infinity });
+  try {
+    const { limits, derived } = opts.limits();
+    assert.equal(limits.memory_bytes, 1000);
+    assert.equal(limits.part_bytes, Infinity);
+    assert.equal(derived.write_bytes, 500);
+    // Every limit, by name: the options' names less the four settings.
+    const settings = ['include_hidden_text', 'include_deleted_text', 'on_incomplete', 'lazy_pictures'];
+    assert.deepEqual(Object.keys(limits).sort(),
+      ParseOptions.names().filter((n) => !settings.includes(n)).sort());
+  } finally {
+    opts.close();
+  }
+  const big = new ParseOptions({ memory_bytes: 2n ** 62n });
+  try {
+    assert.equal(big.limits().limits.memory_bytes, 2n ** 62n, 'a large limit is exact');
+  } finally {
+    big.close();
+  }
+});
+
+test('a document as a Buffer or a file is its string form in UTF-8', async () => {
+  const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const w = new XlsxWriter();
+  w.addSheet('S');
+  w.setCell(0, 0, 0, 'omega \u{1D74E} and é');
+  const bytes = w.toBytes();
+  w.close();
+  const doc = Document.fromBytes(bytes, 'xlsx');
+  const dir = mkdtempSync(join(tmpdir(), 'oo-out-'));
+  try {
+    const forms = {
+      text: doc.plainText(),
+      markdown: doc.toMarkdown(),
+      markdown_images: doc.toMarkdownWithImages(),
+      html: doc.toHtml(),
+    };
+    for (const [kind, str] of Object.entries(forms)) {
+      assert.ok(str.includes('\u{1D74E}'), kind);
+      assert.deepEqual(doc.toBuffer(kind), Buffer.from(str, 'utf8'), kind);
+      const p = join(dir, kind);
+      doc.writeTo(p, kind);
+      assert.deepEqual(readFileSync(p), Buffer.from(str, 'utf8'), kind);
+    }
+    assert.deepEqual(JSON.parse(doc.toBuffer('ir_json').toString('utf8')), doc.toIr());
+    assert.throws(() => doc.toBuffer('pdf'), OfficeOxideError);
+    assert.throws(() => doc.writeTo(join(dir, 'no', 'such', 'dir'), 'text'), OfficeOxideError);
+  } finally {
+    doc.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

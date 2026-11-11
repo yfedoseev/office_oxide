@@ -545,6 +545,8 @@ fn test_a_linked_picture_with_a_script_scheme_is_not_rendered_as_a_source() {
 /// A video shape is a picture (its poster frame) whose `p:nvPr` names the
 /// clip; the clip reference was skipped.
 #[test]
+// Reads or fills the eager picture field kept for 0.1.x callers.
+#[allow(deprecated)]
 fn test_a_video_shape_surfaces_its_clip() {
     let nv_pr = r#"<a:videoFile r:link="rIdV"/><p:extLst><p:ext uri="{DAA4B4D4-6D71-4841-9C94-3DA1B2A7D8E3}"><p14:media xmlns:p14="http://schemas.microsoft.com/office/powerpoint/2010/main" r:embed="rIdM"/></p:ext></p:extLst>"#;
     let mut pkg = deck(&[&picture(nv_pr, r#"<a:blip r:embed="rIdP"/>"#, "")]);
@@ -879,6 +881,8 @@ fn test_layout_and_master_static_text_is_available_but_not_slide_text() {
 /// was exercised by any test. An image target without an extension is
 /// typed by sniffing its bytes.
 #[test]
+// Reads or fills the eager picture field kept for 0.1.x callers.
+#[allow(deprecated)]
 fn test_embedded_picture_and_chart_parts_are_loaded_through_the_slide_rels() {
     let chart_frame = r#"<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="7" name="Chart"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="0" y="3000"/><a:ext cx="100" cy="100"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rIdC"/></a:graphicData></a:graphic></p:graphicFrame>"#;
     let tree = format!("{}{chart_frame}", picture("", r#"<a:blip r:embed="rIdI"/>"#, "logo"));

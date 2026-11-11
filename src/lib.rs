@@ -81,6 +81,8 @@ pub mod options;
 /// Which text readers return: hidden text and tracked deletions.
 pub mod read_options;
 mod stream;
+#[cfg(test)]
+mod type_sizes;
 
 #[cfg(not(target_family = "wasm"))]
 pub mod ffi;
@@ -588,8 +590,11 @@ impl Document {
     /// structure shows is missing, and repairs that left the content intact.
     /// Empty for a sound document.
     ///
-    /// This converts the document once. [`Damage::is_loss`](options::Damage::is_loss)
-    /// tells a loss from an informational repair.
+    /// Each warning is classified by the kind it was recorded with where it
+    /// was raised. A `.xls` or `.ppt` file's reader alone decides what is
+    /// lost, so it is not converted; any other format is converted once.
+    /// [`Damage::is_loss`](options::Damage::is_loss) tells a loss from an
+    /// informational repair.
     pub fn damage(&self) -> Vec<options::Damage> {
         use options::{Damage, DamageKind};
         let mut found: Vec<Damage> = self
@@ -601,44 +606,47 @@ impl Document {
                 detail,
             })
             .collect();
-        let ir = self.to_ir();
-        let reported_as_part = |warning: &str| {
-            found
-                .iter()
-                .any(|d| d.part.as_deref().is_some_and(|p| warning.contains(p)))
-        };
-        let mut warnings: Vec<Damage> = ir
-            .metadata
-            .warnings
-            .iter()
-            .filter(|w| !reported_as_part(w))
-            .map(|w| Damage {
-                kind: DamageKind::Recovered,
-                part: None,
-                detail: w.clone(),
-            })
-            .collect();
-        if ir.metadata.text_truncated {
-            // The reader's own account of the cut, when it gave one.
-            let detail = ir
-                .metadata
-                .warnings
-                .iter()
-                .find(|w| {
-                    let w = w.to_ascii_lowercase();
-                    w.contains("truncat") || w.contains("limit") || w.contains("cut")
-                })
-                .cloned()
-                .unwrap_or_else(|| "the text is incomplete".to_string());
-            warnings.retain(|d| d.detail != detail);
-            found.push(Damage {
-                kind: DamageKind::Truncated,
-                part: None,
-                detail,
-            });
-        }
-        found.extend(warnings);
+        let (notices, truncated) = self.loss_report();
+        // A part that could not be read says why the text is incomplete.
+        found.extend(classify_notices(&notices, truncated && found.is_empty()));
         found
+    }
+
+    /// The document-level warnings with their kinds, and whether the text is
+    /// incomplete: what [`Self::to_ir`] reports in `Metadata::warnings` and
+    /// `Metadata::text_truncated`. A `.xls` or `.ppt` reader decides both
+    /// itself (its conversion only copies them), so neither is converted; for
+    /// a `.xls`, the reader's account of each cut is included as well.
+    fn loss_report(&self) -> (core::notice::Notices, bool) {
+        use options::DamageKind;
+        let _scale = self.call_scope();
+        match &self.inner {
+            DocumentInner::Xls(doc) => {
+                let mut notices = doc.notices_typed().clone();
+                notices.push_all(DamageKind::Truncated, doc.notices().iter().cloned());
+                (notices, doc.truncated())
+            },
+            DocumentInner::Ppt(doc) => {
+                let mut notices = doc.notices().clone();
+                notices.append(doc.image_warnings());
+                (notices, !doc.text_complete() || doc.images_left_out())
+            },
+            _ => {
+                let scope = core::notice::ReportScope::begin();
+                let ir = self.to_ir();
+                let notices = scope.finish().unwrap_or_else(|| {
+                    // Every conversion reports its warnings; one that did
+                    // not is a bug, and its warnings are kept as repairs.
+                    debug_assert!(false, "the conversion reported no warnings");
+                    ir.metadata
+                        .warnings
+                        .iter()
+                        .map(|w| (DamageKind::Recovered, w.clone()))
+                        .collect()
+                });
+                (notices, ir.metadata.text_truncated)
+            },
+        }
     }
 
     /// Open a document from a file path using memory-mapped I/O.
@@ -777,6 +785,46 @@ impl Document {
             DocumentInner::Xls(_) => DocumentFormat::Xls,
             DocumentInner::Ppt(_) => DocumentFormat::Ppt,
         }
+    }
+
+    /// The output kinds [`Self::write_output`] takes.
+    #[cfg(any(not(target_family = "wasm"), feature = "wasm"))]
+    pub(crate) const OUTPUT_KINDS: [&'static str; 5] =
+        ["text", "markdown", "markdown_images", "html", "ir_json"];
+
+    /// Write this document as `kind` to `out`: `text`, `markdown`,
+    /// `markdown_images` (images inline as base64), `html` or `ir_json`;
+    /// `None` for any other kind. Through the writers: an `.xlsx` (a sheet at
+    /// a time) and the IR JSON are written as they are produced and never
+    /// held whole; the other formats are built once and then written. For the
+    /// C interface and the language bindings, which take the kind by name.
+    #[cfg(any(not(target_family = "wasm"), feature = "wasm"))]
+    pub(crate) fn write_output(
+        &self,
+        kind: &str,
+        out: &mut dyn std::io::Write,
+    ) -> Option<std::io::Result<()>> {
+        use ir_render::{ImageEmbed, MarkdownOptions};
+        Some(match kind {
+            "text" => self.write_plain_text(out),
+            "markdown" => self.write_markdown(out),
+            "markdown_images" => self.write_markdown_with(
+                MarkdownOptions {
+                    image_embed: ImageEmbed::Base64,
+                },
+                out,
+            ),
+            "html" => self.write_html(out),
+            "ir_json" => {
+                // Flushed here, not on drop, so a failed write is an error.
+                let mut buffered = std::io::BufWriter::with_capacity(1 << 16, out);
+                self.to_ir()
+                    .write_json(&mut buffered)
+                    .map_err(std::io::Error::other)
+                    .and_then(|()| std::io::Write::flush(&mut buffered))
+            },
+            _ => return None,
+        })
     }
 
     /// Extract plain text using the format-specific implementation.
@@ -1179,6 +1227,41 @@ pub fn to_html(path: impl AsRef<Path>) -> Result<String> {
     Ok(Document::open(path)?.to_html())
 }
 
+/// The damage entries for a document's typed warnings (unreadable parts are
+/// listed by part elsewhere): every cut is a truncation, everything else a
+/// repair; a document whose text is incomplete with no cut or unreadable
+/// part that says why gets one generic truncation entry.
+fn classify_notices(notices: &core::notice::Notices, truncated: bool) -> Vec<options::Damage> {
+    use options::{Damage, DamageKind};
+    let mut cut = Vec::new();
+    let mut repaired = Vec::new();
+    for (kind, text) in notices.iter() {
+        let entry = |kind| Damage {
+            kind,
+            part: None,
+            detail: text.to_string(),
+        };
+        match kind {
+            // Listed by part.
+            DamageKind::UnreadablePart => {},
+            DamageKind::Truncated => cut.push(entry(DamageKind::Truncated)),
+            DamageKind::Recovered => repaired.push(entry(DamageKind::Recovered)),
+        }
+    }
+    let unreadable = notices
+        .iter()
+        .any(|(kind, _)| kind == DamageKind::UnreadablePart);
+    if truncated && cut.is_empty() && !unreadable {
+        cut.push(Damage {
+            kind: DamageKind::Truncated,
+            part: None,
+            detail: "the text is incomplete".to_string(),
+        });
+    }
+    cut.extend(repaired);
+    cut
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1422,5 +1505,40 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         worker.join().expect("worker panicked");
+    }
+
+    /// A warning is classified by the kind it was raised with, not by its
+    /// words: a repair that mentions a limit stays a repair, and a cut whose
+    /// text says nothing of truncation is a truncation.
+    #[test]
+    fn test_damage_kind_comes_from_the_notice_not_its_wording() {
+        use options::DamageKind;
+        let mut notices = core::notice::Notices::new();
+        notices.push(DamageKind::Recovered, "part 'theme1.xml' exceeds the part size limit");
+        notices.push(DamageKind::UnreadablePart, "skipped unreadable part a.xml: bad");
+        notices.push(DamageKind::Truncated, "2 slides were not read");
+        notices.push(DamageKind::Truncated, "pictures were left out");
+        let found = classify_notices(&notices, true);
+        let kinds: Vec<_> = found.iter().map(|d| (d.kind, d.detail.as_str())).collect();
+        assert_eq!(
+            kinds,
+            [
+                (DamageKind::Truncated, "2 slides were not read"),
+                (DamageKind::Truncated, "pictures were left out"),
+                (DamageKind::Recovered, "part 'theme1.xml' exceeds the part size limit"),
+            ]
+        );
+        // Incomplete with nothing that says why: one generic entry.
+        let mut repairs = core::notice::Notices::new();
+        repairs.push(DamageKind::Recovered, "the text was cut by a limit, said a repair");
+        let found = classify_notices(&repairs, true);
+        assert_eq!(found[0].kind, DamageKind::Truncated);
+        assert_eq!(found[0].detail, "the text is incomplete");
+        assert_eq!(found[1].kind, DamageKind::Recovered);
+        assert!(classify_notices(&core::notice::Notices::new(), false).is_empty());
+        // An unreadable part says why: no generic entry beside it.
+        let mut skipped = core::notice::Notices::new();
+        skipped.push(DamageKind::UnreadablePart, "skipped unreadable part a.xml: bad");
+        assert!(classify_notices(&skipped, true).is_empty());
     }
 }

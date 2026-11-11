@@ -86,6 +86,7 @@ Two classes: `WasmDocument` reads, `WasmEditableDocument` edits.
 | `.toMarkdownWithImages()` | Markdown with each image inline as `[image-base64:…]`. |
 | `.toHtml()` | Convert to an HTML fragment. |
 | `.toIr()` | Return the format-agnostic document IR (JS object). |
+| `.toBuffer(kind)` | The document as UTF-8 bytes (`Uint8Array`), for output too large for a string: `kind` is `"text"`, `"markdown"`, `"markdown_images"`, `"html"` or `"ir_json"`. |
 | `.free()` | Release the underlying WASM memory. `[Symbol.dispose]` is also supported. |
 
 ### `WasmParseOptions`
@@ -95,7 +96,10 @@ starts from tighter limits and makes a document that cannot be read completely
 throw (the message contains `incomplete`). `.set(name, value)` sets any option by
 name (`WasmParseOptions.names()` lists them): a limit such as `text_chars` or
 `part_bytes` with a number (`Infinity` for none), `include_hidden_text` and
-`include_deleted_text` with a boolean, `on_incomplete` with `"report"` or `"error"`.
+`include_deleted_text` and `lazy_pictures` with a boolean, `on_incomplete` with
+`"report"` or `"error"`. `.limits()` returns `{limits, derived}`: every limit the
+options read under and every bound derived from them (a number, a `BigInt` past
+2^53, `Infinity` for none).
 
 ```js
 const opts = new WasmParseOptions(true);

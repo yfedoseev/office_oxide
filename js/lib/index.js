@@ -129,6 +129,27 @@ class ParseOptions {
 
   static names() { return n.optionsNames().split(','); }
 
+  /**
+   * The limits these options hold and the bounds the library derives from
+   * them: `{ limits: { name: value }, derived: { name: value } }`. A value
+   * beyond `Number.MAX_SAFE_INTEGER` is a `bigint`, and no bound is `Infinity`.
+   */
+  limits() {
+    const MAX = 2n ** 64n - 1n;
+    // Quote every integer too large for a double before parsing, so none is rounded.
+    const text = n.optionsLimitsJson(this._handle()).replace(/:(\d{16,})/g, ':"$1"');
+    const exact = (v) => {
+      if (typeof v !== 'string') return v;
+      const b = BigInt(v);
+      if (b === MAX) return Infinity;
+      // A number while a double holds it exactly, as WASM gives it.
+      return b <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(b) : b;
+    };
+    const { limits, derived } = JSON.parse(text);
+    const map = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, exact(v)]));
+    return { limits: map(limits), derived: map(derived) };
+  }
+
   _handle() { if (!this._h) throw new Error('ParseOptions is closed'); return this._h; }
   close() { if (this._h) { n.optionsFree(this._h); this._h = null; } }
   [Symbol.dispose]() { this.close(); }
@@ -181,6 +202,30 @@ class Document {
   toMarkdownWithImages() { return this._call(n.documentToMarkdownWithImages, 'toMarkdownWithImages'); }
   toHtml() { return this._call(n.documentToHtml, 'toHtml'); }
   toIr() { return JSON.parse(this._call(n.documentToIrJson, 'toIr')); }
+
+  /**
+   * The document as UTF-8 bytes in a Buffer: `kind` is 'text', 'markdown',
+   * 'markdown_images', 'html' or 'ir_json'. A JS string holds two bytes per
+   * character once any character is outside Latin-1, so for a large document
+   * the Buffer is up to half the size of the string form.
+   */
+  toBuffer(kind) {
+    this._ensure();
+    const outLen = [0];
+    const e = [0];
+    const ptr = n.documentRenderBytes(this._h, kind, outLen, e);
+    if (!ptr) throw new OfficeOxideError(e[0], `toBuffer(${kind})`);
+    if (outLen[0] === 0) return Buffer.alloc(0);
+    return takeBytes(ptr, outLen[0]);
+  }
+
+  /** Write the document as `kind` (see `toBuffer`) to the file at `path`, never as a JS string (an `.xlsx` and the IR JSON are also never held whole). */
+  writeTo(path, kind) {
+    this._ensure();
+    const e = [0];
+    const rc = n.documentWriteToPath(this._h, kind, path, e);
+    if (rc !== 0) throw new OfficeOxideError(rc, `writeTo(${kind})`);
+  }
 
   saveAs(p) {
     this._ensure();

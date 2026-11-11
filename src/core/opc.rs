@@ -394,6 +394,13 @@ impl<R: Read + Seek> OpcReader<R> {
         Ok(data)
     }
 
+    /// Read a picture part as [`read_zip_picture`] does: the same checks as
+    /// [`Self::read_part`], kept as its stored stream when pictures are held
+    /// lazily.
+    pub(crate) fn read_picture(&mut self, name: &PartName) -> Result<super::picture::PictureBytes> {
+        read_zip_picture(&mut self.archive, &self.entries, &name.as_str()[1..])
+    }
+
     /// Read and parse the relationships for a given part.
     pub fn read_rels_for(&mut self, part: &PartName) -> Result<Relationships> {
         let rels_zip_path = part.rels_path();
@@ -920,11 +927,50 @@ fn inflate_despite_declared_size<R: Read + Seek>(
     }
 }
 
-pub(crate) fn read_zip_entry<R: Read + Seek>(
+/// Read the picture part `name` as [`read_zip_entry`] does, with the same
+/// limits, checks and errors. With [`read_options::lazy_pictures`] on, a
+/// deflated entry that inflated to at least twice its stored size is then
+/// kept as its stored stream, to inflate on use, and the bytes just read are
+/// dropped; anything else is kept as read.
+///
+/// [`read_options::lazy_pictures`]: crate::read_options::lazy_pictures
+pub(crate) fn read_zip_picture<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &ZipEntryIndex,
     name: &str,
-) -> Result<Vec<u8>> {
+) -> Result<super::picture::PictureBytes> {
+    let data = read_zip_entry(archive, entries, name)?;
+    if !crate::read_options::lazy_pictures() {
+        return Ok(data.into());
+    }
+    let stored = archive
+        .index_for_name(name)
+        .or_else(|| entries.lookup(name))
+        .and_then(|index| archive.by_index_raw(index).ok())
+        .filter(|raw| {
+            raw.compression() == zip::CompressionMethod::Deflated
+                && raw.compressed_size().saturating_mul(2) <= data.len() as u64
+        })
+        .and_then(|raw| {
+            let size = raw.compressed_size();
+            let mut stored = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+            raw.take(size).read_to_end(&mut stored).ok()?;
+            Some(stored)
+        });
+    Ok(match stored {
+        Some(stored) => super::picture::PictureBytes::deflated(stored, &data),
+        None => data.into(),
+    })
+}
+
+/// The checks [`read_zip_entry`] makes before inflating `name`, for a reader
+/// that inflates it in pieces: its index and the most it may inflate to, or
+/// the same error `read_zip_entry` would give.
+fn checked_entry<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &ZipEntryIndex,
+    name: &str,
+) -> Result<(usize, u64, u64)> {
     // Exact match first, then the case-insensitive + backslash-normalised
     // index: `[Content_Types].xml` case variants and Windows-created ZIPs
     // that use backslash separators (e.g., `_rels\.rels`).
@@ -956,7 +1002,7 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
     } else {
         claimed
     };
-    let mut file = archive.by_index(index).map_err(|e| match e {
+    let file = archive.by_index(index).map_err(|e| match e {
         zip::result::ZipError::FileNotFound => Error::MissingPart(name.to_string()),
         e => Error::Zip(e),
     })?;
@@ -981,9 +1027,127 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
     // reading and against the actual size after.
     entries.charge(index, file.size(), name, 0)?;
     let declared = file.size();
+    drop(file);
+    Ok((index, cap, declared))
+}
+
+/// Inflate the part `name` in pieces of about a megabyte, handing each to
+/// `sink`, under the limits, checks and package account of
+/// [`read_zip_entry`]; for a part too large to hold whole. `Ok(false)` when
+/// it could not be read this way cleanly (a checksum or length that
+/// `read_zip_entry` reads past with a warning, a failed sink): the caller
+/// then reads it whole, which reports what is wrong as it always has, and
+/// what this read inflated is counted as a failed read. An error is what
+/// `read_zip_entry` would have refused before reading.
+pub(crate) fn stream_zip_entry<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &ZipEntryIndex,
+    name: &str,
+    mut sink: impl FnMut(&[u8]) -> bool,
+) -> Result<bool> {
+    let (index, cap, declared) = checked_entry(archive, entries, name)?;
+    let mut file = archive.by_index(index).map_err(|e| match e {
+        zip::result::ZipError::FileNotFound => Error::MissingPart(name.to_string()),
+        e => Error::Zip(e),
+    })?;
+    let mut capped = (&mut file).take(cap.saturating_add(1));
+    let mut chunk = vec![0u8; 1 << 20];
+    let mut total = 0u64;
+    // A refused stream is read again whole by the caller: what it inflated
+    // counts as a failed read, as for a whole read that fails, so the package
+    // budget sees both inflations.
+    let refused = |total: u64| {
+        entries.note_failed_read(index, total);
+        Ok(false)
+    };
+    loop {
+        match capped.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                total = total.saturating_add(n as u64);
+                if total > cap || !sink(&chunk[..n]) {
+                    return refused(total);
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {},
+            Err(_) => return refused(total),
+        }
+    }
+    drop(file);
+    if total != declared {
+        return refused(total);
+    }
+    entries.charge(index, total, name, declared)?;
+    entries.commit(index, total);
+    Ok(true)
+}
+
+/// The declared (uncompressed) size of the entry `name`, if the package
+/// holds it.
+pub(crate) fn entry_size<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &ZipEntryIndex,
+    name: &str,
+) -> Option<u64> {
+    let index = archive
+        .index_for_name(name)
+        .or_else(|| entries.lookup(name))?;
+    archive.by_index_raw(index).ok().map(|f| f.size())
+}
+
+/// `read_to_end` into `buf`, growing it toward `declared` bytes rather than
+/// by doubling. The declared size is the file's to state, so the buffer
+/// starts small and grows only as bytes arrive, but never by more than it
+/// holds: an entry of the size it declares ends in a buffer of exactly that
+/// size, where doubling past a capacity of 1 MiB left up to twice the entry
+/// allocated, and one that declares more than it holds costs no more than
+/// doubling did. On an error `buf` holds every byte read before it, as with
+/// `read_to_end`.
+fn read_to_end_toward(r: &mut impl Read, buf: &mut Vec<u8>, declared: u64) -> std::io::Result<()> {
+    let declared = usize::try_from(declared).unwrap_or(usize::MAX);
+    let mut probe = [0u8; 64];
+    loop {
+        // Fill what is allocated, and no more.
+        let spare = (buf.capacity() - buf.len()) as u64;
+        (&mut *r).take(spare).read_to_end(buf)?;
+        if buf.len() < buf.capacity() {
+            return Ok(());
+        }
+        // Full: a small read tells whether anything is left before the
+        // buffer grows.
+        let n = loop {
+            match r.read(&mut probe) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {},
+                read => break read?,
+            }
+        };
+        if n == 0 {
+            return Ok(());
+        }
+        let toward = declared.saturating_sub(buf.len());
+        let grow = if toward >= n {
+            toward.min(buf.len().max(n))
+        } else {
+            buf.len().max(n)
+        };
+        buf.reserve_exact(grow);
+        buf.extend_from_slice(&probe[..n]);
+    }
+}
+
+pub(crate) fn read_zip_entry<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &ZipEntryIndex,
+    name: &str,
+) -> Result<Vec<u8>> {
+    let (index, cap, declared) = checked_entry(archive, entries, name)?;
+    let mut file = archive.by_index(index).map_err(|e| match e {
+        zip::result::ZipError::FileNotFound => Error::MissingPart(name.to_string()),
+        e => Error::Zip(e),
+    })?;
     let mut buf = Vec::with_capacity((declared as usize).min(1 << 20));
     let mut capped = (&mut file).take(cap.saturating_add(1));
-    let read = capped.read_to_end(&mut buf);
+    let read = read_to_end_toward(&mut capped, &mut buf, declared);
     drop(file);
     match read {
         Ok(_) => {},
@@ -1201,6 +1365,56 @@ impl<W: Write + Seek> OpcWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader of `data` that fails after giving it all, as a zip entry
+    /// whose checksum is wrong does.
+    struct FailingAtEnd<'a>(&'a [u8]);
+    impl Read for FailingAtEnd<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "checksum"));
+            }
+            let n = out.len().min(self.0.len()).min(7_000);
+            out[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    /// An entry read into a buffer started at 1 MiB ends in a buffer of its
+    /// declared size when it holds that much, at most twice what it holds
+    /// when it declares more or less, and keeps what it read on an error.
+    #[test]
+    fn test_an_entry_is_read_into_a_buffer_of_its_declared_size() {
+        let read = |len: usize, declared: u64| {
+            let data: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let mut buf = Vec::with_capacity((declared as usize).min(1 << 20));
+            read_to_end_toward(&mut &data[..], &mut buf, declared).unwrap();
+            assert_eq!(buf, data, "{len} declared {declared}");
+            buf.capacity()
+        };
+        for len in [
+            0,
+            1,
+            64,
+            65,
+            (1 << 20) - 1,
+            1 << 20,
+            (1 << 20) + 1,
+            5 << 20,
+            (5 << 20) + 3,
+        ] {
+            assert_eq!(read(len, len as u64), len, "an honest entry of {len}");
+        }
+        for (len, declared) in [(3 << 20, 100 << 20), (3 << 20, 1 << 10), (3 << 20, 0)] {
+            assert!(read(len, declared) <= 2 * len + 64, "{len} declared {declared}");
+        }
+        let data = vec![7u8; (2 << 20) + 5];
+        let mut buf = Vec::with_capacity(1 << 20);
+        let err = read_to_end_toward(&mut FailingAtEnd(&data), &mut buf, data.len() as u64);
+        assert!(err.is_err());
+        assert_eq!(buf, data);
+    }
 
     fn archive_of(names: &[&str]) -> ZipArchive<std::io::Cursor<Vec<u8>>> {
         use std::io::Write;
@@ -1572,6 +1786,27 @@ mod tests {
         assert!(matches!(err, Error::PackageLimit(_)), "{err:?}");
         // The refusal is sticky: the limit is spent for every entry.
         assert!(read_zip_entry(&mut archive, &entries, "a.bin").is_err());
+    }
+
+    /// A part that streaming gives up on after inflating it is read whole by
+    /// the caller, so what it inflated counts as a failed read.
+    #[test]
+    fn test_a_refused_stream_counts_its_bytes_as_a_failed_read() {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts: zip::write::FileOptions<'_, '_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("a.xml", opts).unwrap();
+        zip.write_all(&vec![b'x'; 3 << 20]).unwrap();
+        let mut archive = ZipArchive::new(zip.finish().unwrap()).unwrap();
+        let entries = ZipEntryIndex::new(&archive);
+        let mut seen = 0u64;
+        let streamed = stream_zip_entry(&mut archive, &entries, "a.xml", |c| {
+            seen += c.len() as u64;
+            seen < (2 << 20)
+        });
+        assert!(matches!(streamed, Ok(false)));
+        assert_eq!(entries.failed.get(), seen);
     }
 
     /// A part that fails after inflating is not committed, so it would be

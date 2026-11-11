@@ -46,6 +46,10 @@ pub struct ParseOptions {
     pub include_deleted_text: bool,
     /// What to do when the result is known to be incomplete.
     pub on_incomplete: OnIncomplete,
+    /// Keep deflated pictures as their stored streams and inflate them only
+    /// when used (see
+    /// [`read_options::lazy_pictures`](crate::read_options::lazy_pictures)).
+    pub lazy_pictures: bool,
 }
 
 impl Default for ParseOptions {
@@ -57,6 +61,7 @@ impl Default for ParseOptions {
             include_hidden_text: crate::read_options::include_hidden_text(),
             include_deleted_text: crate::read_options::include_deleted_text(),
             on_incomplete: OnIncomplete::Report,
+            lazy_pictures: crate::read_options::lazy_pictures(),
         }
     }
 }
@@ -72,16 +77,38 @@ impl ParseOptions {
         }
     }
 
+    /// The options that are not limits, by the names [`Self::set_option`]
+    /// takes.
+    const SETTING_NAMES: &'static [&'static str] = &[
+        "include_hidden_text",
+        "include_deleted_text",
+        "on_incomplete",
+        "lazy_pictures",
+    ];
+
+    /// Every name [`Self::set_option`] accepts: the settings, then the
+    /// limits ([`Limits::NAMES`]). The one list every binding gives its
+    /// callers, so none of them can miss an option.
+    pub fn names() -> Vec<&'static str> {
+        Self::SETTING_NAMES
+            .iter()
+            .chain(Limits::NAMES)
+            .copied()
+            .collect()
+    }
+
     /// Set an option by name, for callers that cannot name a Rust field (the
     /// command line, the C interface, the language bindings).
     ///
     /// `name` is a limit (see [`Limits::NAMES`]) with a number as its value, or
-    /// one of `include_hidden_text` and `include_deleted_text` (0 or 1), or
-    /// `on_incomplete` (0 reports, 1 is an error).
+    /// one of `include_hidden_text`, `include_deleted_text` and
+    /// `lazy_pictures` (0 or 1), or `on_incomplete` (0 reports, 1 is an error).
+    /// [`Self::names`] lists them all.
     pub fn set_option(&mut self, name: &str, value: u64) -> Result<(), OptionError> {
         match name {
             "include_hidden_text" => self.include_hidden_text = value != 0,
             "include_deleted_text" => self.include_deleted_text = value != 0,
+            "lazy_pictures" => self.lazy_pictures = value != 0,
             "on_incomplete" => {
                 self.on_incomplete = if value == 0 {
                     OnIncomplete::Report
@@ -97,8 +124,12 @@ impl ParseOptions {
         Ok(())
     }
 
-    pub(crate) fn read_settings(&self) -> (bool, bool) {
-        (self.include_hidden_text, self.include_deleted_text)
+    pub(crate) fn read_settings(&self) -> crate::read_options::Settings {
+        crate::read_options::Settings {
+            hidden: self.include_hidden_text,
+            deleted: self.include_deleted_text,
+            lazy_pictures: self.lazy_pictures,
+        }
     }
 }
 
@@ -171,5 +202,24 @@ impl std::fmt::Display for Damage {
             Some(part) => write!(f, "{part}: {}", self.detail),
             None => f.write_str(&self.detail),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A repair that left the content whole is not a loss; every other kind
+    /// is.
+    #[test]
+    fn test_only_a_repair_is_not_a_loss() {
+        let damage = |kind| Damage {
+            kind,
+            part: None,
+            detail: String::new(),
+        };
+        assert!(!damage(DamageKind::Recovered).is_loss());
+        assert!(damage(DamageKind::Truncated).is_loss());
+        assert!(damage(DamageKind::UnreadablePart).is_loss());
     }
 }

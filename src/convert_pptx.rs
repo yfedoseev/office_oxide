@@ -19,7 +19,11 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
     let mut notes_cache: std::collections::HashMap<usize, (Vec<Element>, usize)> =
         std::collections::HashMap::new();
 
-    for slide in doc.slides.iter() {
+    for (slide_index, slide) in doc.slides.iter().enumerate() {
+        let pictures = doc
+            .lazy_pictures
+            .then(|| doc.slide_pictures.get(slide_index))
+            .flatten();
         if let Some(ref err) = slide.parse_error {
             // An unreadable slide keeps its place as a notice, so the loss
             // is visible in every projection of the IR.
@@ -70,7 +74,7 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         shape_entries.sort_by(|a, b| spatial_cmp(a.0, b.0));
 
         for (_, shape) in &shape_entries {
-            convert_shape(shape, &mut elements);
+            convert_shape(shape, &mut elements, pictures);
         }
 
         // Propagate slide background colour to the section so the
@@ -197,7 +201,6 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
     // The parts that could not be read end the last section, one paragraph
     // each, as a spreadsheet's report does; charged to the text budget before
     // the budget's notice is read below.
-    let unreadable_warnings = doc.unreadable_warnings();
     let unreadable_lines =
         crate::core::unreadable::report_ir_lines(&doc.unreadable_text_warnings());
     if !unreadable_lines.is_empty() {
@@ -242,13 +245,20 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         },
         sections,
     };
-    // Every part the reader skipped, by name and reason, as the DOCX
-    // conversion lists them.
-    ir.metadata.warnings.extend(unreadable_warnings);
-    ir.metadata.warnings.extend(copied_text_notice);
-    ir.metadata
-        .warnings
-        .extend(crate::limits::image_budget_warning());
+    // The package's own warnings, then every part the reader skipped, by
+    // name and reason, as the DOCX conversion lists them, then the cuts.
+    {
+        use crate::options::DamageKind::{Recovered, Truncated};
+        let mut warnings = crate::core::notice::Notices::new();
+        warnings.push_all(
+            Recovered,
+            crate::core::core_properties::package_warnings(Some(&doc.package_properties)),
+        );
+        warnings.append(doc.unreadable_notices());
+        warnings.push_all(Truncated, copied_text_notice);
+        warnings.push_all(Truncated, crate::limits::image_budget_warning());
+        ir.metadata.warnings = crate::core::notice::report(warnings);
+    }
     ir
 }
 
@@ -388,7 +398,17 @@ fn plain_text_from_body(body: &crate::pptx::TextBody) -> String {
     parts.join("\n")
 }
 
-fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
+/// The pictures of the slide being converted, by relationship id, when
+/// pictures are read lazily (see [`crate::pptx::PptxDocument::slide_picture`]).
+type SlidePictures = std::collections::HashMap<String, crate::core::picture::PictureBytes>;
+
+// Reads or fills the eager picture field kept for 0.1.x callers.
+#[allow(deprecated)]
+fn convert_shape(
+    shape: &crate::pptx::Shape,
+    elements: &mut Vec<Element>,
+    pictures: Option<&SlidePictures>,
+) {
     match shape {
         crate::pptx::Shape::AutoShape(auto) => {
             // Skip title placeholder — used as section title
@@ -471,15 +491,28 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
                 .as_ref()
                 .map(|p| (Some(p.cx.max(0) as u64), Some(p.cy.max(0) as u64)))
                 .unwrap_or((None, None));
+            let data = match pictures {
+                Some(table) => pic
+                    .embed_rid
+                    .as_deref()
+                    .and_then(|rid| table.get(rid))
+                    .filter(|p| crate::limits::charge_image_bytes(p.len()))
+                    .map(crate::convert_docx::ImageData::of)
+                    .unwrap_or_default(),
+                None => crate::convert_docx::ImageData {
+                    data: pic
+                        .data
+                        .as_deref()
+                        .filter(|d| crate::limits::charge_image_bytes(d.len()))
+                        .map(<[u8]>::to_vec),
+                },
+            };
             let img_el = Element::Image(Image {
                 alt_text: pic.alt_text.clone(),
                 // Pictures share the media bytes; each IR image owns a copy,
-                // charged to the image-byte budget.
-                data: pic
-                    .data
-                    .as_deref()
-                    .filter(|d| crate::limits::charge_image_bytes(d.len()))
-                    .map(<[u8]>::to_vec),
+                // charged to the image-byte budget (inflated for the copy
+                // when pictures are read lazily).
+                data: data.data,
                 format,
                 display_width_emu: display_w,
                 display_height_emu: display_h,
@@ -491,7 +524,7 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
         },
         crate::pptx::Shape::Group(grp) => {
             for child in &grp.children {
-                convert_shape(child, elements);
+                convert_shape(child, elements, pictures);
             }
         },
         crate::pptx::Shape::GraphicFrame(gf) => match gf.content {
@@ -1058,7 +1091,7 @@ mod tests {
             hyperlink: None,
         });
         let mut elements = Vec::new();
-        convert_shape(&shape, &mut elements);
+        convert_shape(&shape, &mut elements, None);
         assert_eq!(elements.len(), 1, "expected one placeholder element, got {elements:?}");
         match &elements[0] {
             Element::Image(img) => {
@@ -1101,7 +1134,7 @@ mod tests {
             hyperlink: None,
         });
         let mut elements = Vec::new();
-        convert_shape(&shape, &mut elements);
+        convert_shape(&shape, &mut elements, None);
         assert!(
             !elements.iter().any(|e| matches!(e, Element::TextBox(_))),
             "a body placeholder's content must not be wrapped in a positioned TextBox: {elements:?}"
@@ -1140,7 +1173,7 @@ mod tests {
             hyperlink: None,
         });
         let mut elements = Vec::new();
-        convert_shape(&shape, &mut elements);
+        convert_shape(&shape, &mut elements, None);
         // A placeholder with a real (non-zero) position wraps its content
         // in a positioned `TextBox` (see `push_positional_textbox`), so
         // the tagged `Paragraph` lives one level down from `elements`.
@@ -1185,7 +1218,7 @@ mod tests {
             hyperlink: None,
         });
         let mut elements = Vec::new();
-        convert_shape(&shape, &mut elements);
+        convert_shape(&shape, &mut elements, None);
         assert!(
             elements.iter().any(|e| matches!(e, Element::TextBox(_))),
             "a real free-floating text box must keep its positioned wrap: {elements:?}"

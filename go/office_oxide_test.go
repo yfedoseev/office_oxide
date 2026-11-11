@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -368,5 +369,143 @@ func TestStrictOptionsAcceptASoundDocumentAndBadNamesAreRefused(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("part_bytes is not listed")
+	}
+}
+
+func TestParseOptionsReportTheirLimitsAndTheBoundsDerivedFromThem(t *testing.T) {
+	o, err := NewParseOptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+	if err := o.Set("memory_bytes", 1000); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Set("part_bytes", NoLimit); err != nil {
+		t.Fatal(err)
+	}
+	limits, derived, err := o.Limits()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limits["memory_bytes"] != 1000 || limits["part_bytes"] != NoLimit || derived["write_bytes"] != 500 {
+		t.Fatalf("limits %v derived %v", limits, derived)
+	}
+	if len(limits) != 8 {
+		t.Fatalf("expected the eight limits, got %v", limits)
+	}
+}
+
+func TestDocumentBytesAndFilesEqualTheStringForms(t *testing.T) {
+	w := NewXlsxWriter()
+	defer w.Close()
+	s := w.AddSheet("S")
+	if err := w.SetCell(s, 0, 0, "omega \U0001D74E and é"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := w.ToBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := OpenFromBytes(data, "xlsx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doc.Close()
+	dir := t.TempDir()
+	forms := map[string]func() (string, error){
+		"text":            doc.PlainText,
+		"markdown":        doc.ToMarkdown,
+		"markdown_images": doc.ToMarkdownWithImages,
+		"html":            doc.ToHTML,
+		"ir_json":         doc.ToIRJSON,
+	}
+	for kind, render := range forms {
+		want, err := render()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(want, "\U0001D74E") {
+			t.Fatalf("%s lost the character: %q", kind, want)
+		}
+		got, err := doc.Bytes(kind)
+		if err != nil || string(got) != want {
+			t.Fatalf("%s as bytes: %v %q", kind, err, got)
+		}
+		path := dir + "/" + kind
+		if err := doc.WriteFile(path, kind); err != nil {
+			t.Fatal(err)
+		}
+		if file, _ := os.ReadFile(path); string(file) != want {
+			t.Fatalf("%s as a file differs", kind)
+		}
+	}
+	if _, err := doc.Bytes("pdf"); err == nil {
+		t.Fatal("an unknown kind was accepted")
+	}
+}
+
+// Every option, as every binding names it.
+var optionNames = []string{
+	"include_hidden_text", "include_deleted_text", "on_incomplete", "lazy_pictures",
+	"package_entries", "package_bytes", "part_bytes", "inflate_ratio",
+	"embedded_depth", "embedded_packages", "text_chars", "memory_bytes",
+}
+
+func TestOptionNamesListEveryOptionAndSetTakesEach(t *testing.T) {
+	got := append([]string(nil), OptionNames()...)
+	want := append([]string(nil), optionNames...)
+	sort.Strings(got)
+	sort.Strings(want)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("OptionNames() = %v, want %v", got, want)
+	}
+	for _, name := range optionNames {
+		opts, err := NewParseOptions()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := opts.Set(name, 1); err != nil {
+			t.Errorf("Set(%q): %v", name, err)
+		}
+		opts.Close()
+	}
+}
+
+// Empty output comes back as an empty slice, call after call. (The library
+// once handed out the dangling pointer of an empty allocation, which Go's
+// stack scanner aborts on if the stack moves while Bytes holds it; that is
+// checked in the library's own tests, since a test here cannot move the
+// stack inside Bytes.)
+func TestEmptyOutputAsBytesIsAnEmptySlice(t *testing.T) {
+	w := NewPptxWriter()
+	defer w.Close()
+	data, err := w.ToBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := OpenFromBytes(data, "pptx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doc.Close()
+	for i := 0; i < 200; i++ {
+		out, err := doc.Bytes("text")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(out) != 0 {
+			t.Fatalf("an empty deck's text is %q", out)
+		}
+		// Grow the stack between calls, so later calls run on moved stacks.
+		var grow func(int) int
+		grow = func(n int) int {
+			var pad [256]byte
+			if n == 0 {
+				return int(pad[0])
+			}
+			return grow(n-1) + int(pad[n%256])
+		}
+		_ = grow(64)
 	}
 }
