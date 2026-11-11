@@ -63,8 +63,9 @@ impl WasmParseOptions {
 
     /// `{limits, derived}`: every limit these options read under, by name,
     /// and every bound derived from them, as the other bindings show them.
-    /// A value is a number, a `BigInt` past 2^53 so none is rounded, and
-    /// `Infinity` for no bound.
+    /// A value is a number, a `BigInt` from 2^53 on (past
+    /// `Number.MAX_SAFE_INTEGER`) so none is rounded, and `Infinity` for no
+    /// bound.
     pub fn limits(&self) -> Result<JsValue, JsValue> {
         use serde::Serialize;
         #[derive(Serialize)]

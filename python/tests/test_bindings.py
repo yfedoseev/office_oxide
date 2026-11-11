@@ -191,25 +191,36 @@ def _big_workbook() -> bytes:
     return w.to_bytes()
 
 
-def _python_ticks_inside(work) -> tuple[int, int]:
-    """How many times a pure-Python thread ran while `work()` was inside the
-    library, over repeated calls for about 0.3 s, and how many calls that was.
+@functools.lru_cache(maxsize=8)
+def _workbook_of(rows: int) -> bytes:
+    """A workbook of `rows` rows of eight cells of longer text, so a call on it
+    costs more per cell written."""
+    w = XlsxWriter()
+    w.add_sheet("S")
+    pad = "x" * 40
+    for r in range(rows):
+        for c in range(8):
+            w.set_cell(0, r, c, f"cell {r} {c} {pad}")
+    return w.to_bytes()
+
+
+def _python_ticks_in_calls(work) -> tuple[int, int]:
+    """How many calls of `work()` another Python thread ran in the middle of,
+    over about 0.5 s, and how many calls that was.
+
     A call that keeps the GIL starves every other Python thread for its whole
-    length. The interpreter can still switch threads in the few bytecodes
-    between taking a timestamp and entering the library, so only ticks well
-    inside a call count, with a short switch interval to keep that edge small.
+    length. Threads can still switch at its edges: before the call is
+    entered, or after it returns while the interpreter takes the GIL back
+    (which an OS delay can stretch). So only ticks in the middle half of each
+    call count, and each call is long (tens of milliseconds), far longer than
+    any such edge.
     """
     import sys
     import threading
     import time
 
-    # A few switch intervals at each edge of a call: enough to keep out a
-    # tick taken between the timestamp and the call, small enough to leave a
-    # window inside a call of a few milliseconds on a fast machine.
-    margin = 0.0005
     old_interval = sys.getswitchinterval()
     sys.setswitchinterval(0.0001)
-
     ticks: list[float] = []
     stop = threading.Event()
 
@@ -222,24 +233,20 @@ def _python_ticks_inside(work) -> tuple[int, int]:
     t.start()
     time.sleep(0.02)
     calls: list[tuple[float, float]] = []
-
-    def counted():
-        return sum(1 for x in list(ticks) for a, b in calls if a + margin < x < b - margin)
-
-    # Rounds of 0.3 s until three ticks land inside calls, for at most 3 s:
-    # a call that keeps the GIL lets none land however long this runs.
-    for _ in range(10):
-        deadline = time.perf_counter() + 0.3
-        while time.perf_counter() < deadline:
-            start = time.perf_counter()
-            work()
-            calls.append((start, time.perf_counter()))
-        if counted() >= 3:
-            break
+    deadline = time.perf_counter() + 0.5
+    while time.perf_counter() < deadline or len(calls) < 4:
+        start = time.perf_counter()
+        work()
+        calls.append((start, time.perf_counter()))
     stop.set()
     t.join()
     sys.setswitchinterval(old_interval)
-    return counted(), len(calls)
+
+    def middle(a, b):
+        quarter = (b - a) / 4
+        return any(a + quarter < x < b - quarter for x in ticks)
+
+    return sum(1 for a, b in calls if middle(a, b)), len(calls)
 
 
 @pytest.mark.parametrize(
@@ -249,18 +256,32 @@ def _python_ticks_inside(work) -> tuple[int, int]:
 def test_library_calls_release_the_gil(call):
     # A parse that keeps the GIL starves every other Python thread, and a host
     # whose logging handler needs the GIL deadlocks against the parse thread.
-    data = _big_workbook()
-    doc = Document.from_bytes(data, "xlsx")
-    work = {
-        "open": lambda: Document.from_bytes(data, "xlsx"),
-        "plain_text": doc.plain_text,
-        "to_markdown": doc.to_markdown,
-        "to_html": doc.to_html,
-        "to_ir_json": doc.to_ir_json,
-        "damage": doc.damage,
-    }[call]
-    inside, calls = _python_ticks_inside(work)
-    assert inside >= 3, f"{call}: another Python thread ran {inside} times inside {calls} calls"
+    import time
+
+    def work_for(data):
+        doc = Document.from_bytes(data, "xlsx")
+        return {
+            "open": lambda: Document.from_bytes(data, "xlsx"),
+            "plain_text": doc.plain_text,
+            "to_markdown": doc.to_markdown,
+            "to_html": doc.to_html,
+            "to_ir_json": doc.to_ir_json,
+            "damage": doc.damage,
+        }[call]
+
+    # A workbook on which one call takes at least 30 ms on this machine.
+    rows = 10000
+    while True:
+        work = work_for(_workbook_of(rows))
+        began = time.perf_counter()
+        work()
+        if time.perf_counter() - began >= 0.03 or rows >= 160000:
+            break
+        rows *= 2
+    in_middle, calls = _python_ticks_in_calls(work)
+    assert in_middle >= 3, (
+        f"{call}: another Python thread ran in the middle of {in_middle} of {calls} calls"
+    )
 
 
 def test_a_logging_handler_that_needs_the_gil_does_not_hang_a_parse():
@@ -478,21 +499,45 @@ def test_writing_to_a_non_blocking_raw_stream_that_takes_nothing_raises():
         doc.write_text(Full())
 
 
-def test_a_call_waiting_behind_a_long_one_does_not_hold_the_gil():
-    """A writer call waiting for another thread's long `to_bytes` waits
-    without the GIL, so the other Python threads keep running."""
+def _long_xlsx_writer(rows):
+    w = XlsxWriter()
+    w.add_sheet("S")
+    for r in range(rows):
+        w.set_cell(0, r, 0, f"cell {r}")
+    return w, w.to_bytes, lambda: w.set_cell(0, 0, 1, "late")
+
+
+def _long_pptx_writer(rows):
+    p = office_oxide.PptxWriter()
+    for i in range(rows // 50):
+        s = p.add_slide()
+        p.set_slide_title(s, f"slide {i}")
+        for j in range(20):
+            p.add_slide_text(s, f"line {j} of slide {i}")
+    return p, p.to_bytes, p.add_slide
+
+
+def _long_editable(rows):
+    ed = EditableDocument.from_bytes(_workbook_of(rows // 8), "xlsx")
+    return ed, ed.to_bytes, lambda: ed.set_cell(0, "A1", "late")
+
+
+@pytest.mark.parametrize(
+    "make", [_long_xlsx_writer, _long_pptx_writer, _long_editable],
+    ids=["xlsx_writer", "pptx_writer", "editable"],
+)
+def test_a_call_waiting_behind_a_long_one_does_not_hold_the_gil(make):
+    """A call waiting for another thread's long save waits without the GIL,
+    so the other Python threads keep running."""
     import threading
     import time
 
-    # A workbook whose to_bytes takes at least 0.3 s on this machine.
+    # An object whose save takes at least 0.3 s on this machine.
     rows = 50000
     while True:
-        w = XlsxWriter()
-        w.add_sheet("S")
-        for r in range(rows):
-            w.set_cell(0, r, 0, f"cell {r}")
+        obj, long_call, waiter_call = make(rows)
         began = time.monotonic()
-        w.to_bytes()
+        long_call()
         if time.monotonic() - began >= 0.3 or rows >= 3_200_000:
             break
         rows *= 2
@@ -507,7 +552,7 @@ def test_a_call_waiting_behind_a_long_one_does_not_hold_the_gil():
 
     def save():
         window["start"] = time.monotonic()
-        w.to_bytes()
+        long_call()
         window["end"] = time.monotonic()
 
     spinner = threading.Thread(target=spin)
@@ -517,7 +562,7 @@ def test_a_call_waiting_behind_a_long_one_does_not_hold_the_gil():
     while "start" not in window:
         time.sleep(0.001)
     time.sleep(0.02)
-    waiter = threading.Thread(target=lambda: w.set_cell(0, 0, 1, "late"))
+    waiter = threading.Thread(target=waiter_call)
     waiter.start()
     saver.join()
     waiter.join()
