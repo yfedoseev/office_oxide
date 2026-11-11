@@ -446,16 +446,25 @@ def test_a_file_object_that_takes_part_of_each_write_gets_all_of_it():
 def test_writing_to_a_non_blocking_raw_stream_that_takes_nothing_raises():
     """A raw stream's `write` returns None when a non-blocking write took
     nothing; the output was dropped and the call reported success."""
-    import os
+    import io
 
-    r, w = os.pipe()
-    os.set_blocking(w, False)
+    class Full(io.RawIOBase):
+        """A non-blocking raw stream with no room: it takes the first write
+        in part, then nothing."""
+
+        def __init__(self):
+            self.calls = 0
+
+        def writable(self):
+            return True
+
+        def write(self, b):
+            self.calls += 1
+            return 1000 if self.calls == 1 else None
+
     doc = Document.from_bytes(_big_workbook(), "xlsx")
-    try:
-        with open(w, "wb", buffering=0) as raw, pytest.raises(BlockingIOError):
-            doc.write_text(raw)
-    finally:
-        os.close(r)
+    with pytest.raises(BlockingIOError):
+        doc.write_text(Full())
 
 
 def test_a_call_waiting_behind_a_long_one_does_not_hold_the_gil():
