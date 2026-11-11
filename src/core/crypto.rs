@@ -15,7 +15,7 @@
 //!
 //! Each primitive is checked against its published test vectors.
 
-use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
+use aes::cipher::{BlockCipherDecrypt, KeyInit};
 use md5::Digest;
 
 pub(crate) fn md5(data: &[u8]) -> [u8; 16] {
@@ -103,7 +103,7 @@ impl Aes {
     }
 
     fn decrypt_block(&self, block: &mut [u8; 16]) {
-        let block = GenericArray::from_mut_slice(block);
+        let block: &mut aes::Block = block.into();
         match self {
             Self::Aes128(c) => c.decrypt_block(block),
             Self::Aes192(c) => c.decrypt_block(block),
@@ -113,8 +113,8 @@ impl Aes {
 
     #[cfg(test)]
     pub(crate) fn encrypt_block(&self, block: &mut [u8; 16]) {
-        use aes::cipher::BlockEncrypt;
-        let block = GenericArray::from_mut_slice(block);
+        use aes::cipher::BlockCipherEncrypt;
+        let block: &mut aes::Block = block.into();
         match self {
             Self::Aes128(c) => c.encrypt_block(block),
             Self::Aes192(c) => c.encrypt_block(block),
@@ -185,39 +185,23 @@ impl Aes {
 }
 
 /// The RC4 stream cipher, for a key of 1 to 16 bytes (Office uses 5 to 16).
-pub(crate) struct Rc4(Rc4Key);
+pub(crate) struct Rc4(rc4::Rc4);
 
-macro_rules! rc4_keys {
-    ($($n:literal => $variant:ident / $size:ident),* $(,)?) => {
-        enum Rc4Key { $($variant(rc4::Rc4<rc4::consts::$size>)),* }
-
-        impl Rc4 {
-            /// `None` for an empty key or one over 16 bytes.
-            pub(crate) fn new(key: &[u8]) -> Option<Self> {
-                match key.len() {
-                    $($n => rc4::Rc4::<rc4::consts::$size>::new_from_slice(key)
-                        .ok()
-                        .map(|c| Self(Rc4Key::$variant(c))),)*
-                    _ => None,
-                }
-            }
-
-            /// XOR the next keystream bytes into `data`.
-            pub(crate) fn apply(&mut self, data: &mut [u8]) {
-                use rc4::StreamCipher;
-                match &mut self.0 {
-                    $(Rc4Key::$variant(c) => c.apply_keystream(data)),*
-                }
-            }
+impl Rc4 {
+    /// `None` for an empty key or one over 16 bytes.
+    pub(crate) fn new(key: &[u8]) -> Option<Self> {
+        if !(1..=16).contains(&key.len()) {
+            return None;
         }
-    };
-}
+        <rc4::Rc4 as KeyInit>::new_from_slice(key).ok().map(Self)
+    }
 
-rc4_keys!(
-    1 => K1 / U1, 2 => K2 / U2, 3 => K3 / U3, 4 => K4 / U4, 5 => K5 / U5, 6 => K6 / U6,
-    7 => K7 / U7, 8 => K8 / U8, 9 => K9 / U9, 10 => K10 / U10, 11 => K11 / U11,
-    12 => K12 / U12, 13 => K13 / U13, 14 => K14 / U14, 15 => K15 / U15, 16 => K16 / U16,
-);
+    /// XOR the next keystream bytes into `data`.
+    pub(crate) fn apply(&mut self, data: &mut [u8]) {
+        use rc4::StreamCipher;
+        self.0.apply_keystream(data);
+    }
+}
 
 #[cfg(test)]
 mod tests {
