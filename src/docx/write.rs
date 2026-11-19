@@ -1642,12 +1642,32 @@ impl DocxWriter {
             }
             write_docx_element(&mut w, element, image_rids, &mut image_counter, links);
         }
-        if last_para_idx.is_none() && !unanchored.is_empty() {
+        let cited_after = last_para_idx.is_none() && !unanchored.is_empty();
+        if cited_after {
             let p = DocxRichParagraph {
                 runs: citations().collect(),
                 props: Default::default(),
             };
             write_rich_paragraph(&mut w, &p, links);
+        }
+
+        // Word always ends a body with a paragraph, after a closing table
+        // too, and LibreOffice's DOCX import never finishes a body whose
+        // last block is a `w:tbl`: it repeats the table's last cell
+        // without end. The final section's `SectPr` is written below, not
+        // here, so it doesn't count as the last block.
+        let last_block = self
+            .elements
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|&(i, _)| Some(i) != last_sectpr_idx)
+            .map(|(_, e)| e);
+        if !cited_after
+            && matches!(last_block, Some(DocxElement::Table(_) | DocxElement::RichTable(_)))
+        {
+            w.write_event(Event::Empty(BytesStart::new("w:p")))
+                .expect("write closing paragraph");
         }
 
         if let Some(sp) = sect_pr {
