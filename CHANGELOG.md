@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **DOCX: a body whose last block is a table ends with a paragraph.** The writer ended `<w:body>` with the table, which Word never does, and LibreOffice then repeated the table's last cell without end when it read the file, so converting it never finished. An empty paragraph now follows a closing table (before the body's section properties), as Word writes it (#543).
+
 ## [0.1.17] - 2026-11-10
 
 ### Added
