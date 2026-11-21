@@ -869,15 +869,14 @@ jobs:
           subject-path: release-files/*
 
       # Generate CycloneDX SBOM and attach to the release.
-      - name: Install cargo-cyclonedx
+      - name: Install sbom-attest
         uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
-          tool: cargo-cyclonedx
+          tool: sbom-attest@0.4.2
 
       - name: Generate SBOM
         run: |
-          cargo cyclonedx -f json --spec-version 1.5
-          mv office_oxide.cdx.json sbom.cdx.json
+          sbom-attest generate --locked --target x86_64-unknown-linux-gnu -p office_oxide,office_oxide_cli,office_oxide_mcp --features office_oxide/python,office_oxide/wasm --name office_oxide --cdx sbom.cdx.json
 
       - name: Upload SBOM to release
         run: gh release upload "${{ github.ref_name }}" sbom.cdx.json --clobber
